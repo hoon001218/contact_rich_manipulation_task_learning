@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Play a trained UR5e/RH56 shelf-grasp policy."""
+"""Play a trained UR5e/force-sensor hand shelf-grasp policy."""
 
 from __future__ import annotations
 
@@ -42,4 +42,3 @@ if not stock_player.is_file():
 
 sys.path.insert(0, str(stock_player.parent))
 runpy.run_path(str(stock_player), run_name="__main__")
-

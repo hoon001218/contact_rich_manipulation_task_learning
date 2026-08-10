@@ -1,4 +1,4 @@
-"""Manager-based UR5e/RH56 primitive shelf-grasp environment."""
+"""Manager-based UR5e/ROAS left-hand primitive shelf-grasp environment."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
 from . import mdp
-from .assets import ARM_JOINT_NAMES, FINGERTIP_BODY_NAMES, HAND_JOINT_NAMES, TCP_BODY_NAME, make_ur5e_rh56_cfg
+from .assets import ARM_JOINT_NAMES, FINGERTIP_BODY_NAMES, HAND_JOINT_NAMES, TCP_BODY_NAME, make_ur5e_hand_cfg
 
 
 SHELF_TOP_HEIGHT = 0.495
@@ -88,7 +88,7 @@ class ShelfGraspSceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.62, -0.38, 0.83)),
     )
 
-    robot = make_ur5e_rh56_cfg()
+    robot = make_ur5e_hand_cfg()
 
     object = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
@@ -127,7 +127,7 @@ class ShelfGraspSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Six arm actions followed by six independent RH56 actions."""
+    """Six arm actions followed by six independent left-hand actions."""
 
     arm = mdp.JointPositionActionCfg(
         asset_name="robot",

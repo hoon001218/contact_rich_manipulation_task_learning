@@ -1,4 +1,4 @@
-"""UR5e and Inspire RH56 assembly used by the grasp environment."""
+"""UR5e and ROAS-provided left force-sensor hand assembly."""
 
 from __future__ import annotations
 
@@ -26,32 +26,41 @@ ARM_JOINT_NAMES = (
     "wrist_3_joint",
 )
 HAND_JOINT_NAMES = (
-    "thumb_proximal_yaw_joint",
-    "thumb_proximal_pitch_joint",
-    "index_proximal_joint",
-    "middle_proximal_joint",
-    "ring_proximal_joint",
-    "pinky_proximal_joint",
+    "left_thumb_1_joint",
+    "left_thumb_2_joint",
+    "left_index_1_joint",
+    "left_middle_1_joint",
+    "left_ring_1_joint",
+    "left_little_1_joint",
 )
-FINGERTIP_BODY_NAMES = ("thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip")
-TCP_BODY_NAME = "tcp"
+FINGERTIP_BODY_NAMES = (
+    "thumb_force_sensor_4",
+    "index_force_sensor_3",
+    "middle_force_sensor_3",
+    "ring_force_sensor_3",
+    "little_force_sensor_3",
+)
+TCP_BODY_NAME = "palm_force_sensor"
 
 DEFAULT_UR5E_USD_PATH = (
     "omniverse://192.168.0.13/NVIDIA/Assets/Isaac/5.0/"
     "Isaac/Robots/UniversalRobots/ur5e/ur5e.usd"
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_RH56_URDF_PATH = REPOSITORY_ROOT / "assets/robots/inspire_rh56/inspire_rh56_right.urdf"
+DEFAULT_HAND_URDF_PATH = (
+    REPOSITORY_ROOT / "assets/robots/Roas_provided_urdf/urdf/urdf_left_with_force_sensor.urdf"
+)
 
 _UR_TOOL_FRAME_CANDIDATES = ("tool0", "tool_frame", "flange", "wrist_3_link")
-_HAND_BASE_BODY_CANDIDATES = ("hand_base_link", "base")
+_HAND_BASE_BODY_CANDIDATES = ("base_link",)
+_PREEXISTING_MOUNT_JOINT_NAMES = ("robot_gripper_joint",)
 
 
-def validate_rh56_urdf_assets(urdf_path: str) -> None:
+def validate_hand_urdf_assets(urdf_path: str) -> None:
     """Fail early when the URDF or one of its meshes is missing or still an LFS pointer."""
     source = Path(urdf_path)
     if not source.is_file():
-        raise FileNotFoundError(f"RH56 URDF not found: {source}")
+        raise FileNotFoundError(f"Hand URDF not found: {source}")
 
     missing: list[Path] = []
     lfs_pointers: list[Path] = []
@@ -65,11 +74,11 @@ def validate_rh56_urdf_assets(urdf_path: str) -> None:
 
     if missing:
         preview = ", ".join(str(path) for path in missing[:3])
-        raise FileNotFoundError(f"RH56 URDF references missing mesh files: {preview}")
+        raise FileNotFoundError(f"Hand URDF references missing mesh files: {preview}")
     if lfs_pointers:
         preview = ", ".join(str(path) for path in lfs_pointers[:3])
         raise RuntimeError(
-            f"RH56 mesh files are Git LFS pointers, not mesh binaries ({len(lfs_pointers)} references). "
+            f"Hand mesh files are Git LFS pointers, not mesh binaries ({len(lfs_pointers)} references). "
             f"Fetch the LFS assets before training. Examples: {preview}"
         )
 
@@ -166,6 +175,17 @@ def _remove_nested_articulation_roots(stage: Usd.Stage, subtree_path: str) -> No
             prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
 
 
+def _deactivate_preexisting_mount_joints(stage: Usd.Stage, robot_path: str) -> None:
+    """Disable mount joints authored in the UR5e USD before attaching this hand."""
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot_path)):
+        if prim.GetName() not in _PREEXISTING_MOUNT_JOINT_NAMES:
+            continue
+        joint = UsdPhysics.Joint(prim)
+        if joint:
+            joint.GetJointEnabledAttr().Set(False)
+            prim.SetActive(False)
+
+
 def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
     for prim in Usd.PrimRange(stage.GetPrimAtPath(subtree_path)):
         if prim.IsInstance():
@@ -173,16 +193,16 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
 
 
 @clone
-def spawn_ur5e_rh56(
+def spawn_ur5e_hand(
     prim_path: str,
-    cfg: "Ur5eRh56SpawnerCfg",
+    cfg: "Ur5eHandSpawnerCfg",
     translation: tuple[float, float, float] | None = None,
     orientation: tuple[float, float, float, float] | None = None,
     **kwargs,
 ) -> Usd.Prim:
-    """Spawn UR5e, import RH56 URDF, and join both into one articulation."""
+    """Spawn UR5e, import the left-hand URDF, and join both into one articulation."""
     del kwargs
-    validate_rh56_urdf_assets(cfg.rh56_urdf_path)
+    validate_hand_urdf_assets(cfg.hand_urdf_path)
 
     stage = get_current_stage()
     ur_cfg = sim_utils.UsdFileCfg(
@@ -193,9 +213,9 @@ def spawn_ur5e_rh56(
     )
     ur_cfg.func(prim_path, ur_cfg, translation=translation, orientation=orientation)
 
-    hand_path = f"{prim_path}/InspireRH56"
+    hand_path = f"{prim_path}/ROASLeftHand"
     hand_cfg = sim_utils.UrdfFileCfg(
-        asset_path=cfg.rh56_urdf_path,
+        asset_path=cfg.hand_urdf_path,
         fix_base=False,
         merge_fixed_joints=False,
         convert_mimic_joints_to_normal_joints=False,
@@ -214,8 +234,8 @@ def spawn_ur5e_rh56(
     hand_root = stage.GetPrimAtPath(hand_path)
     if not robot_root.IsValid() or not hand_root.IsValid():
         raise RuntimeError(
-            "UR5e or RH56 did not compose into the stage. Check HAND_RL_UR5E_USD_PATH and "
-            "HAND_RL_RH56_URDF_PATH."
+            "UR5e or hand did not compose into the stage. Check HAND_RL_UR5E_USD_PATH and "
+            "HAND_RL_HAND_URDF_PATH."
         )
 
     _deinstance_subtree(stage, hand_path)
@@ -223,6 +243,7 @@ def spawn_ur5e_rh56(
     tool_body = _nearest_rigid_body_ancestor(tool_frame)
     hand_base = _find_named_prim(stage, hand_path, cfg.hand_base_candidates, rigid_body_only=True)
 
+    _deactivate_preexisting_mount_joints(stage, prim_path)
     hand_root_world = _world_transform(hand_root)
     hand_base_relative_to_root = _world_transform(hand_base) * hand_root_world.GetInverse()
     mount_world = _make_offset_matrix(cfg.mount_translation, cfg.mount_rotation_deg) * _world_transform(tool_frame)
@@ -230,17 +251,17 @@ def spawn_ur5e_rh56(
     _set_world_transform_on_reference_root(hand_root, desired_hand_root_world)
 
     _remove_nested_articulation_roots(stage, hand_path)
-    _create_fixed_joint(stage, f"{prim_path}/UR5e_RH56_mount_joint", tool_body, hand_base, mount_world)
+    _create_fixed_joint(stage, f"{prim_path}/UR5e_hand_mount_joint", tool_body, hand_base, mount_world)
     return robot_root
 
 
 @configclass
-class Ur5eRh56SpawnerCfg(RigidObjectSpawnerCfg):
+class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     """Configuration for the assembled robot."""
 
-    func: Callable = spawn_ur5e_rh56
+    func: Callable = spawn_ur5e_hand
     ur5e_usd_path: str = DEFAULT_UR5E_USD_PATH
-    rh56_urdf_path: str = str(DEFAULT_RH56_URDF_PATH)
+    hand_urdf_path: str = str(DEFAULT_HAND_URDF_PATH)
     rigid_props: sim_utils.RigidBodyPropertiesCfg = sim_utils.RigidBodyPropertiesCfg(
         disable_gravity=False,
         max_depenetration_velocity=1.0,
@@ -253,14 +274,20 @@ class Ur5eRh56SpawnerCfg(RigidObjectSpawnerCfg):
     tool_frame_candidates: tuple[str, ...] = _UR_TOOL_FRAME_CANDIDATES
     hand_base_candidates: tuple[str, ...] = _HAND_BASE_BODY_CANDIDATES
     mount_translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    mount_rotation_deg: tuple[float, float, float] = (0.0, 90.0, 0.0)
+    # The extra 180-degree pitch makes the fingers extend from the wrist toward
+    # the shelf (+X in the environment) instead of back toward the robot.
+    mount_rotation_deg: tuple[float, float, float] = (0.0, 180.0, -90.0)
 
 
-def make_ur5e_rh56_cfg() -> ArticulationCfg:
+def make_ur5e_hand_cfg() -> ArticulationCfg:
     """Create the assembled articulation with environment-overridable asset paths."""
-    spawn_cfg = Ur5eRh56SpawnerCfg(
+    hand_urdf_path = os.environ.get(
+        "HAND_RL_HAND_URDF_PATH",
+        os.environ.get("HAND_RL_RH56_URDF_PATH", str(DEFAULT_HAND_URDF_PATH)),
+    )
+    spawn_cfg = Ur5eHandSpawnerCfg(
         ur5e_usd_path=os.environ.get("HAND_RL_UR5E_USD_PATH", DEFAULT_UR5E_USD_PATH),
-        rh56_urdf_path=os.environ.get("HAND_RL_RH56_URDF_PATH", str(DEFAULT_RH56_URDF_PATH)),
+        hand_urdf_path=hand_urdf_path,
     )
     return ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
@@ -269,13 +296,13 @@ def make_ur5e_rh56_cfg() -> ArticulationCfg:
             pos=(0.0, 0.0, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
             joint_pos={
-                "shoulder_pan_joint": 0.0,
-                "shoulder_lift_joint": -1.75,
-                "elbow_joint": 1.90,
-                "wrist_1_joint": -1.72,
+                "shoulder_pan_joint": -0.25,
+                "shoulder_lift_joint": -1.80,
+                "elbow_joint": 1.20,
+                "wrist_1_joint": -0.97,
                 "wrist_2_joint": -1.57,
                 "wrist_3_joint": 0.0,
-                ".*(thumb|index|middle|ring|pinky).*": 0.0,
+                ".*(thumb|index|middle|ring|little).*": 0.0,
             },
             joint_vel={".*": 0.0},
         ),
@@ -302,9 +329,9 @@ def make_ur5e_rh56_cfg() -> ArticulationCfg:
                 damping=40.0,
             ),
             "hand": ImplicitActuatorCfg(
-                joint_names_expr=[".*(thumb|index|middle|ring|pinky).*"],
-                effort_limit_sim=2.0,
-                velocity_limit_sim=2.1,
+                joint_names_expr=[".*(thumb|index|middle|ring|little).*"],
+                effort_limit_sim=10.0,
+                velocity_limit_sim=1.0,
                 stiffness=20.0,
                 damping=1.0,
             ),

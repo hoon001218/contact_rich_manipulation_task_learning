@@ -207,4 +207,7 @@ AMENT_IGNORE
 .agent/
 .codex/
 
+logs/
+outputs/
+
 # End of https://www.toptal.com/developers/gitignore/api/python,ros2

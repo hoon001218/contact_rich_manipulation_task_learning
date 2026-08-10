@@ -1,6 +1,6 @@
 # Hand RL
 
-UR5e 끝단에 Inspire RH56 오른손을 부착하고 shelf 위의 primitive cube를
+UR5e 끝단에 ROAS 제공 force-sensor 왼손을 부착하고 shelf 위의 primitive cube를
 grasp/lift하도록 학습하는 Isaac Lab manager-based 환경이다.
 
 저장소 루트에서 설치한다.
@@ -21,6 +21,5 @@ conda activate env_isaaclab
 ```
 
 빠른 검증은 `--num_envs 1 --max_iterations 1 --headless`를 사용한다.
-Nucleus 또는 로컬 USD 경로는 `HAND_RL_UR5E_USD_PATH`, RH56 URDF 경로는
-`HAND_RL_RH56_URDF_PATH` 환경변수로 덮어쓸 수 있다.
-
+Nucleus 또는 로컬 USD 경로는 `HAND_RL_UR5E_USD_PATH`, hand URDF 경로는
+`HAND_RL_HAND_URDF_PATH` 환경변수로 덮어쓸 수 있다.

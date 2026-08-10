@@ -235,7 +235,7 @@
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0" />
       <geometry>
-        <mesh filename="meshes/visual/right_index_proximal.glb" />
+        <mesh filename="meshes/visual/right_middle_proximal.glb" />
       </geometry>
     </visual>
     <collision>

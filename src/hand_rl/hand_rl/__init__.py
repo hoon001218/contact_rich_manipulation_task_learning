@@ -1,4 +1,3 @@
-"""UR5e and Inspire RH56 reinforcement-learning tasks."""
+"""UR5e and force-sensor hand reinforcement-learning tasks."""
 
 from . import grasp  # noqa: F401
-

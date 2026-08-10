@@ -1,4 +1,4 @@
-"""RSL-RL PPO configuration for RH56 shelf grasping."""
+"""RSL-RL PPO configuration for force-sensor hand shelf grasping."""
 
 from isaaclab.utils import configclass
 
@@ -43,4 +43,3 @@ class HandGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
-

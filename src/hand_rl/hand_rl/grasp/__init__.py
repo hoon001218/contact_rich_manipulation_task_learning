@@ -1,4 +1,4 @@
-"""Register the RH56 shelf-grasp environment."""
+"""Register the force-sensor left-hand shelf-grasp environment."""
 
 import gymnasium as gym
 
@@ -18,4 +18,3 @@ if TASK_ID not in gym.registry:
             "rsl_rl_cfg_entry_point": HandGraspPPORunnerCfg,
         },
     )
-

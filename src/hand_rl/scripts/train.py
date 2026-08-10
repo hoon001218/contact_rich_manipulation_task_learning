@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the UR5e/RH56 shelf-grasp policy with RSL-RL."""
+"""Train the UR5e/force-sensor hand shelf-grasp policy with RSL-RL."""
 
 from __future__ import annotations
 
@@ -42,4 +42,3 @@ if not stock_trainer.is_file():
 
 sys.path.insert(0, str(stock_trainer.parent))
 runpy.run_path(str(stock_trainer), run_name="__main__")
-
