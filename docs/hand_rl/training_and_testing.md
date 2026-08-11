@@ -37,7 +37,7 @@ PPO update와 checkpoint 경로를 검증한다.
 ```bash
 ./IsaacLab/isaaclab.sh -p src/hand_rl/scripts/train.py \
   --num_envs 1 \
-  --max_iterations 1 \
+  --max_iterations 100000 \
   --device cuda:0 \
   --headless
 ```
@@ -57,6 +57,7 @@ RTX 3090 기준 시작 설정은 1024 environments다.
 ```bash
 ./IsaacLab/isaaclab.sh -p src/hand_rl/scripts/train.py \
   --num_envs 1024 \
+  --max_iterations 30000 \
   --device cuda:0 \
   --headless
 ```
@@ -124,7 +125,7 @@ Checkpoint 절대경로를 지정하여 GUI에서 재생한다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/hand_rl/scripts/play.py \
-  --checkpoint /home/hoon/workspace/contact_rich_manipulation_task_learning/logs/rsl_rl/hand_rh56_grasp/2026-08-08_16-50-42/model_7700.pt \
+  --checkpoint logs/rsl_rl/hand_rh56_grasp/2026-08-11_10-37-25/model_9200.pt \
   --num_envs 1 \
   --device cuda:0
 ```

@@ -22,9 +22,11 @@ primitive shelf 위에 놓인 cube를 집어서 shelf 표면으로부터 12 cm �
 UR5e와 hand 경로는 각각 `HAND_RL_UR5E_USD_PATH`,
 `HAND_RL_HAND_URDF_PATH` 환경변수로 덮어쓸 수 있다. Hand 장착 pose는
 `Ur5eHandSpawnerCfg.mount_translation`과 `mount_rotation_deg`에서 조정한다.
-초기 장착 회전은 제공된 xacro의 `L_hand_base_joint`와 UR5e tool-frame 방향을
-함께 반영한 `(0, 180, -90)` deg이다. 추가된 180도 pitch는 손가락이 로봇
-쪽이 아니라 shelf의 `+X` 방향을 향하게 한다.
+UR5e tool frame 기준 hand 장착 회전은 `(0, 90, 0)` deg이다. 이 회전은 ROAS
+hand base의 축 정의를 보상하여 UR5e 말단 Z축과 손가락이 모두 shelf 방향으로
+수평을 향하게 한다. 제공된 xacro의 `L_hand_base_joint`에 있는 -90도 yaw는 원래
+parent frame용이므로 UR5e mount에 중복 적용하지 않는다. 이를 적용하면 wrist와
+hand가 90도 비틀린다.
 Palm/TCP 기준 body는 `palm_force_sensor`다.
 
 Shelf board 상면은 각 environment origin 기준 `z=0.495 m`이다. Reset마다
@@ -99,16 +101,20 @@ velocity는 0으로 초기화된다.
 
 | Joint | Position (rad) |
 |---|---:|
-| shoulder pan | -0.25 |
-| shoulder lift | -1.80 |
-| elbow | 1.20 |
-| wrist 1 | -0.97 |
-| wrist 2 | -1.57 |
-| wrist 3 | 0.00 |
+| shoulder pan | -0.2496 |
+| shoulder lift | -1.7995 |
+| elbow | 1.1994 |
+| wrist 1 | 0.6010 |
+| wrist 2 | 1.5712 |
+| wrist 3 | -1.5700 |
 
-이 자세에서 nominal wrist 3 높이는 약 0.698 m, palm 높이는 약 0.686 m로
-shelf 상면 0.495 m보다 충분히 높다. Fingertip은 object의 nominal XY 중심
-부근에서 약 16 cm 위에 놓여 충돌 없이 아래로 접근할 수 있다.
+이 자세는 UR5e 말단 Z축을 손가락 방향에 맞춘 수치 역기구학 결과에
+`wrist_3_joint`의 90도 roll을 적용한 것이다. Zero-noise reset에서 말단 Z축은 약
+`(0.969, -0.247, -0.001)`, 손가락 진행 방향은 약
+`(0.946, -0.324, -0.013)`으로 shelf 쪽을 유지한다. Palm의 로컬 +Z 법선은 약
+`(-0.001, 0.001, -1.000)`으로 아래를 향하며, palm 위치는 약
+`(0.465, 0.019, 0.686) m`이다. 따라서 shelf 상면 `z=0.495 m` 위에서 초기 충돌
+없이 물체를 향해 접근할 수 있다.
 
 ## PPO 기본값
 

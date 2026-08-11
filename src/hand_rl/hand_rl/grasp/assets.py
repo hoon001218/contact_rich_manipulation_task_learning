@@ -274,9 +274,9 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     tool_frame_candidates: tuple[str, ...] = _UR_TOOL_FRAME_CANDIDATES
     hand_base_candidates: tuple[str, ...] = _HAND_BASE_BODY_CANDIDATES
     mount_translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # The extra 180-degree pitch makes the fingers extend from the wrist toward
-    # the shelf (+X in the environment) instead of back toward the robot.
-    mount_rotation_deg: tuple[float, float, float] = (0.0, 180.0, -90.0)
+    # Compensate the vendor hand-base frame by 90 degrees so the UR5e flange
+    # axis and the fingers can both point horizontally toward the shelf.
+    mount_rotation_deg: tuple[float, float, float] = (0.0, 90.0, 0.0)
 
 
 def make_ur5e_hand_cfg() -> ArticulationCfg:
@@ -296,12 +296,14 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             pos=(0.0, 0.0, 0.0),
             rot=(1.0, 0.0, 0.0, 0.0),
             joint_pos={
-                "shoulder_pan_joint": -0.25,
-                "shoulder_lift_joint": -1.80,
-                "elbow_joint": 1.20,
-                "wrist_1_joint": -0.97,
-                "wrist_2_joint": -1.57,
-                "wrist_3_joint": 0.0,
+                "shoulder_pan_joint": -0.2496,
+                "shoulder_lift_joint": -1.7995,
+                "elbow_joint": 1.1994,
+                "wrist_1_joint": 0.6010,
+                "wrist_2_joint": 1.5712,
+                # Roll the hand about the shelf-facing flange axis so its palm
+                # normal points down toward the grasp object.
+                "wrist_3_joint": -1.5700,
                 ".*(thumb|index|middle|ring|little).*": 0.0,
             },
             joint_vel={".*": 0.0},
