@@ -209,5 +209,6 @@ AMENT_IGNORE
 
 logs/
 outputs/
+examples/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,ros2
