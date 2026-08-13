@@ -9,7 +9,6 @@ from pathlib import Path
 
 import gymnasium as gym
 
-
 TASK_ID = "Isaac-Shelf-Sweep-UR5e-v0"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,8 +18,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 def _has_task_argument(arguments: list[str]) -> bool:
     return any(
-        argument == "--task" or argument.startswith("--task=")
-        for argument in arguments
+        argument == "--task" or argument.startswith("--task=") for argument in arguments
     )
 
 
@@ -32,8 +30,7 @@ if TASK_ID not in gym.registry:
         kwargs={
             "env_cfg_entry_point": "sweeping_policy.shelf_sweep.env_cfg:ShelfSweepEnvCfg",
             "rsl_rl_cfg_entry_point": (
-                "sweeping_policy.shelf_sweep.rsl_rl_ppo_cfg:"
-                "ShelfSweepPPORunnerCfg"
+                "sweeping_policy.shelf_sweep.rsl_rl_ppo_cfg:" "ShelfSweepPPORunnerCfg"
             ),
         },
     )
@@ -42,10 +39,14 @@ if not _has_task_argument(sys.argv[1:]):
     sys.argv.extend(("--task", TASK_ID))
 
 repository_root = Path(__file__).resolve().parents[3]
-trainer = (
-    repository_root
-    / "IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
+# trainer = (
+#     repository_root
+#     / "IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
+# )
+trainer = Path(
+    "/home/irol/Github_repo/Contact-Rich-Manipulation/IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
 )
+
 if not trainer.is_file():
     raise FileNotFoundError(f"Isaac Lab RSL-RL trainer not found: {trainer}")
 
