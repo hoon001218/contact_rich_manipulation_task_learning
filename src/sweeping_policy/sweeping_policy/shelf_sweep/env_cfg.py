@@ -22,6 +22,11 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
+
+from isaaclab.sensors import FrameTransformerCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
+from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
+
 from . import mdp
 from .assets import (
     ARM_JOINT_NAMES,
@@ -339,3 +344,25 @@ class ShelfSweepEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024 * 16
         self.viewer.eye = (2.2, 2.2, 1.8)
         self.viewer.lookat = (-0.45, 0.0, 0.85)
+
+
+        # Listens to the required transforms
+        marker_cfg = FRAME_MARKER_CFG.copy()
+        marker_cfg.markers["frame"].scale = (0.05, 0.05, 0.05)
+        marker_cfg.prim_path = "/Visuals/FrameTransformer"
+        self.scene.ee_frame = FrameTransformerCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/base_link",
+            debug_vis=False,
+            visualizer_cfg=marker_cfg,
+            target_frames=[
+                FrameTransformerCfg.FrameCfg(
+                    prim_path="{ENV_REGEX_NS}/Robot/robotiq_base_link",
+                    name="end_effector",
+                    offset=OffsetCfg(
+                        pos=[0.13, 0.0, 0.0],
+                    ),
+                ),
+            ],
+        )
+
+

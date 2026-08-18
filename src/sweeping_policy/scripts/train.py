@@ -39,12 +39,9 @@ if not _has_task_argument(sys.argv[1:]):
     sys.argv.extend(("--task", TASK_ID))
 
 repository_root = Path(__file__).resolve().parents[3]
-# trainer = (
-#     repository_root
-#     / "IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
-# )
-trainer = Path(
-    "/home/irol/Github_repo/Contact-Rich-Manipulation/IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
+trainer = (
+    repository_root
+    / "IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py"
 )
 
 if not trainer.is_file():

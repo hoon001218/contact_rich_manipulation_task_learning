@@ -1,4 +1,4 @@
-"""Register the force-sensor left-hand shelf-grasp environment."""
+"""Register the RH56E2 right-hand shelf-grasp environment."""
 
 import gymnasium as gym
 

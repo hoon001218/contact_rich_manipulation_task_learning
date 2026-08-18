@@ -1,4 +1,4 @@
-"""Manager-based UR5e/ROAS left-hand primitive shelf-grasp environment."""
+"""Manager-based UR5e/ROAS right-hand primitive shelf-grasp environment."""
 
 from __future__ import annotations
 
@@ -127,7 +127,7 @@ class ShelfGraspSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """Six arm actions followed by six independent left-hand actions."""
+    """Six arm actions followed by six independent right-hand actions."""
 
     arm = mdp.JointPositionActionCfg(
         asset_name="robot",

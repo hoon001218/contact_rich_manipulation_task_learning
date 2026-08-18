@@ -62,12 +62,17 @@ def target_position_in_eef_frame(
     rows = torch.arange(env.num_envs, device=env.device)
     target_ids = env.target_id.squeeze(-1).long()
     target_pos_w = objects.data.object_pos_w[rows, target_ids]
+
+    # "World" frame에 대한 EEF frame의 상대 위치를 계산합니다.
     eef_pos_w, eef_quat_w = _eef_pose_w(robot, eef_cfg)
     target_pos_eef, _ = math_utils.subtract_frame_transforms(
         eef_pos_w,
         eef_quat_w,
         target_pos_w,
     )
+    print("EEF position in world frame:", eef_pos_w)
+    print("Target position in world frame:", target_pos_w)
+    print("Target position in EEF frame:", target_pos_eef)
     return target_pos_eef
 
 
@@ -104,4 +109,6 @@ def goal_position_in_eef_frame(
         eef_quat_w,
         env.target_goal_pos_w,
     )
+    # print("EEF position in world frame:", eef_pos_w)
+    # print("Goal position in EEF frame:", goal_pos_eef)
     return goal_pos_eef

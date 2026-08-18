@@ -1,4 +1,4 @@
-"""UR5e and ROAS-provided left force-sensor hand assembly."""
+"""UR5e and ROAS-provided RH56E2 right-hand assembly."""
 
 from __future__ import annotations
 
@@ -26,21 +26,21 @@ ARM_JOINT_NAMES = (
     "wrist_3_joint",
 )
 HAND_JOINT_NAMES = (
-    "left_thumb_1_joint",
-    "left_thumb_2_joint",
-    "left_index_1_joint",
-    "left_middle_1_joint",
-    "left_ring_1_joint",
-    "left_little_1_joint",
+    "right_thumb_1_joint",
+    "right_thumb_2_joint",
+    "right_index_1_joint",
+    "right_middle_1_joint",
+    "right_ring_1_joint",
+    "right_little_1_joint",
 )
 FINGERTIP_BODY_NAMES = (
-    "thumb_force_sensor_4",
-    "index_force_sensor_3",
-    "middle_force_sensor_3",
-    "ring_force_sensor_3",
-    "little_force_sensor_3",
+    "right_thumb_force_sensor_4",
+    "right_index_force_sensor_3",
+    "right_middle_force_sensor_3",
+    "right_ring_force_sensor_3",
+    "right_little_force_sensor_3",
 )
-TCP_BODY_NAME = "palm_force_sensor"
+TCP_BODY_NAME = "right_plam_force_sensor"
 
 DEFAULT_UR5E_USD_PATH = (
     "omniverse://192.168.0.13/NVIDIA/Assets/Isaac/5.0/"
@@ -48,7 +48,9 @@ DEFAULT_UR5E_USD_PATH = (
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_HAND_URDF_PATH = (
-    REPOSITORY_ROOT / "assets/robots/Roas_provided_urdf/urdf/urdf_left_with_force_sensor.urdf"
+    REPOSITORY_ROOT
+    / "assets/robots/Roas_provided_inspire_urdf/RH56E2 URDF/"
+    "RH56E2_R_2025_9_11/urdf/RH56E2_R_2025_9_11_relative.urdf"
 )
 
 _UR_TOOL_FRAME_CANDIDATES = ("tool0", "tool_frame", "flange", "wrist_3_link")
@@ -200,7 +202,7 @@ def spawn_ur5e_hand(
     orientation: tuple[float, float, float, float] | None = None,
     **kwargs,
 ) -> Usd.Prim:
-    """Spawn UR5e, import the left-hand URDF, and join both into one articulation."""
+    """Spawn UR5e, import the RH56E2 right-hand URDF, and join them as one articulation."""
     del kwargs
     validate_hand_urdf_assets(cfg.hand_urdf_path)
 
@@ -213,7 +215,7 @@ def spawn_ur5e_hand(
     )
     ur_cfg.func(prim_path, ur_cfg, translation=translation, orientation=orientation)
 
-    hand_path = f"{prim_path}/ROASLeftHand"
+    hand_path = f"{prim_path}/ROASRightHand"
     hand_cfg = sim_utils.UrdfFileCfg(
         asset_path=cfg.hand_urdf_path,
         fix_base=False,
@@ -274,9 +276,10 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     tool_frame_candidates: tuple[str, ...] = _UR_TOOL_FRAME_CANDIDATES
     hand_base_candidates: tuple[str, ...] = _HAND_BASE_BODY_CANDIDATES
     mount_translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # Compensate the vendor hand-base frame by 90 degrees so the UR5e flange
-    # axis and the fingers can both point horizontally toward the shelf.
-    mount_rotation_deg: tuple[float, float, float] = (0.0, 90.0, 0.0)
+    # The right-hand vendor frame is mirrored relative to the former left-hand
+    # asset. Rotate it by -90 degrees so the fingers extend away from the robot
+    # and toward the shelf (+x in this task), rather than back into the arm.
+    mount_rotation_deg: tuple[float, float, float] = (0.0, -90.0, 0.0)
 
 
 def make_ur5e_hand_cfg() -> ArticulationCfg:
