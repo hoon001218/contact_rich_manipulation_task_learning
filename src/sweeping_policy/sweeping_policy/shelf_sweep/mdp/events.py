@@ -238,7 +238,9 @@ class initialize_robot_at_reaching_pose(ManagerTermBase):
                 "Object randomization must run before reaching-pose IK initialization."
             )
 
-        direction = torch.sign(env.sweep_dir[env_ids, 1])
+        # direction = torch.sign(env.sweep_dir[env_ids, 1])
+        direction = torch.ones(len(env_ids), device=env.device, dtype=torch.float32)
+        # print("Direction of sweep for IK initialization:", direction)
         desired_eef_pos = env.target_work_pos_w[env_ids].clone()
         desired_eef_pos[:, 0] += reaching_x_offset
         desired_eef_pos[:, 1] -= env.target_width[env_ids, 0] * direction

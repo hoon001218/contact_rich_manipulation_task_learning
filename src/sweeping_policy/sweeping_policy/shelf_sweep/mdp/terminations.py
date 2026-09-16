@@ -13,6 +13,7 @@ from isaaclab.managers import SceneEntityCfg
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+from isaaclab.sensors import FrameTransformer
 
 LEFT_FINGER_OFFSET = (0.13, 0.07, 0.0)
 RIGHT_FINGER_OFFSET = (0.13, -0.07, 0.0)
@@ -104,3 +105,4 @@ def hand_velocity_termination(
     """Terminate when any UR5e arm joint exceeds the reference speed limit."""
     robot: Articulation = env.scene[asset_cfg.name]
     return torch.any(torch.abs(robot.data.joint_vel[:, :6]) > threshold, dim=1)
+

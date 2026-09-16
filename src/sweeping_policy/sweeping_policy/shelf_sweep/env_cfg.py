@@ -46,6 +46,7 @@ OBJECT_INITIAL_POSES = {
     "can_1": (-0.60, 0.20, 1.05),
 }
 
+
 WORKING_X_RANGE = (-0.78, -0.57)
 WORKING_Y_RANGE = (-0.22, 0.22)
 WORKING_HEIGHT = 1.05
@@ -173,7 +174,8 @@ class ObservationsCfg:
         target_obs_state = ObsTerm(
             func=mdp.target_position_in_eef_frame,
             params={
-                "eef_cfg": EEF_CFG,
+                "robot_cfg": SceneEntityCfg("robot"),
+                "eef_frame_cfg": SceneEntityCfg("ee_frame"),
                 "object_collection_cfg": SceneEntityCfg("objects"),
             },
             noise=Unoise(n_min=-0.01, n_max=0.01),
@@ -184,11 +186,17 @@ class ObservationsCfg:
         )
         ee_pose = ObsTerm(
             func=mdp.eef_pose_in_robot_root_frame,
-            params={"eef_cfg": EEF_CFG},
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "eef_frame_cfg": SceneEntityCfg("ee_frame"),
+            },
         )
         goal_pos = ObsTerm(
             func=mdp.goal_position_in_eef_frame,
-            params={"eef_cfg": EEF_CFG},
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "eef_frame_cfg": SceneEntityCfg("ee_frame"),
+            },
         )
 
         def __post_init__(self):
@@ -364,5 +372,4 @@ class ShelfSweepEnvCfg(ManagerBasedRLEnvCfg):
                 ),
             ],
         )
-
 
