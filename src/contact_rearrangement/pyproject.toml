@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contact-rearrangement"
+version = "0.1.0"
+description = "Isaac Lab shelf scene for contact-rich non-prehensile rearrangement"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["contact_rearrangement*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
