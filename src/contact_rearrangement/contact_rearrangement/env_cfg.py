@@ -5,7 +5,7 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.envs import ManagerBasedEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import EventTermCfg as EventTerm, ObservationGroupCfg, ObservationTermCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
@@ -13,6 +13,11 @@ from .assets import make_object_collection_cfg, make_ur5e_hand_cfg
 from .catalog import DEFAULT_SHELF_USD_PATH, SHELF_POSITION
 from .sampling import RobotStartRules, SpawnRules
 from .spawn import reset_spawn_scene
+from .sensors import (
+    InitialVisionCfg, TactileCfg, VisionReferencesCfg, make_initial_camera_cfg, make_tactile_contact_cfg,
+    tool_wrench, tool_wrench_valid, initial_rgb, initial_depth, initial_role_masks, initial_camera_pose,
+    tactile_contacts, tactile_valid,
+)
 
 
 @configclass
@@ -37,6 +42,29 @@ class ContactRearrangementSceneCfg(InteractiveSceneCfg):
     )
     robot = make_ur5e_hand_cfg()
     objects = make_object_collection_cfg()
+    vision_references = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/VisionReferences", spawn=VisionReferencesCfg())
+    initial_camera = make_initial_camera_cfg()
+    silhouette_camera = make_initial_camera_cfg(reference=True)
+
+    # Keep all 17 URDF sensor links separate: palm, thumb 1-4, then
+    # index/middle/ring/little 1-3. Each attribute creates its own ContactSensor.
+    contact_right_plam_force_sensor = make_tactile_contact_cfg("right_plam_force_sensor")
+    contact_right_thumb_force_sensor_1 = make_tactile_contact_cfg("right_thumb_force_sensor_1")
+    contact_right_thumb_force_sensor_2 = make_tactile_contact_cfg("right_thumb_force_sensor_2")
+    contact_right_thumb_force_sensor_3 = make_tactile_contact_cfg("right_thumb_force_sensor_3")
+    contact_right_thumb_force_sensor_4 = make_tactile_contact_cfg("right_thumb_force_sensor_4")
+    contact_right_index_force_sensor_1 = make_tactile_contact_cfg("right_index_force_sensor_1")
+    contact_right_index_force_sensor_2 = make_tactile_contact_cfg("right_index_force_sensor_2")
+    contact_right_index_force_sensor_3 = make_tactile_contact_cfg("right_index_force_sensor_3")
+    contact_right_middle_force_sensor_1 = make_tactile_contact_cfg("right_middle_force_sensor_1")
+    contact_right_middle_force_sensor_2 = make_tactile_contact_cfg("right_middle_force_sensor_2")
+    contact_right_middle_force_sensor_3 = make_tactile_contact_cfg("right_middle_force_sensor_3")
+    contact_right_ring_force_sensor_1 = make_tactile_contact_cfg("right_ring_force_sensor_1")
+    contact_right_ring_force_sensor_2 = make_tactile_contact_cfg("right_ring_force_sensor_2")
+    contact_right_ring_force_sensor_3 = make_tactile_contact_cfg("right_ring_force_sensor_3")
+    contact_right_little_force_sensor_1 = make_tactile_contact_cfg("right_little_force_sensor_1")
+    contact_right_little_force_sensor_2 = make_tactile_contact_cfg("right_little_force_sensor_2")
+    contact_right_little_force_sensor_3 = make_tactile_contact_cfg("right_little_force_sensor_3")
 
 
 @configclass
@@ -46,22 +74,29 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """The policy observation specification will be added in the next implementation stage."""
+    """Raw F/T, binary tactile contact, and the accepted initial RGB-D snapshot."""
+
+    @configclass
+    class SensorsCfg(ObservationGroupCfg):
+        wrench = ObservationTermCfg(func=tool_wrench)
+        wrench_valid = ObservationTermCfg(func=tool_wrench_valid)
+        tactile = ObservationTermCfg(func=tactile_contacts)
+        tactile_valid = ObservationTermCfg(func=tactile_valid)
+        rgb = ObservationTermCfg(func=initial_rgb)
+        depth = ObservationTermCfg(func=initial_depth)
+        role_masks = ObservationTermCfg(func=initial_role_masks)
+        camera_pose = ObservationTermCfg(func=initial_camera_pose)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    sensors = SensorsCfg()
 
 
 @configclass
 class EventsCfg:
     reset_scene = EventTerm(func=reset_spawn_scene, mode="reset")
-
-
-@configclass
-class InitialVisionCfg:
-    """Requirements for the future front-camera acceptance step; not yet measured."""
-
-    min_target_visible_fraction: float = 0.40
-    camera_side: str = "+X"
-    silhouette_reference: str = "full_unoccluded_target_at_same_pose"
-    require_full_target_in_frame: bool = True
 
 
 @configclass
@@ -80,6 +115,7 @@ class ContactRearrangementEnvCfg(ManagerBasedEnvCfg):
     target_asset: str | None = None
     blocker_asset: str | None = None
     initial_vision: InitialVisionCfg = InitialVisionCfg()
+    tactile: TactileCfg = TactileCfg()
 
     def __post_init__(self):
         self.decimation = 4

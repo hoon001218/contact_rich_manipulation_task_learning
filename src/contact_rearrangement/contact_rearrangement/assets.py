@@ -51,6 +51,10 @@ FINGERTIP_BODY_NAMES = (
     "right_little_force_sensor_3",
 )
 TCP_BODY_NAME = "right_plam_force_sensor"
+FORCE_TORQUE_PROXIMAL_BODY_NAME = "SensorMountProximal"
+FORCE_TORQUE_BODY_NAME = "ToolForceTorqueLink"
+FORCE_TORQUE_JOINT_NAME = "ToolForceTorqueJoint"
+TOOL_SENSOR_MOUNT_JOINT_NAME = "ToolSensorMountJoint"
 TACTILE_BODY_NAMES = (
     TCP_BODY_NAME,
     *(f"right_thumb_force_sensor_{index}" for index in range(1, 5)),
@@ -85,7 +89,18 @@ def validate_hand_urdf_assets(urdf_path: str) -> None:
 
     missing: list[Path] = []
     lfs_pointers: list[Path] = []
-    for mesh in ElementTree.parse(source).findall(".//mesh"):
+    urdf = ElementTree.parse(source)
+    tactile_links = {link.attrib["name"]: link for link in urdf.findall("link") if "force_sensor" in link.attrib["name"]}
+    if set(tactile_links) != set(TACTILE_BODY_NAMES):
+        raise ValueError(
+            f"Hand URDF must contain the 17 canonical tactile links; "
+            f"missing={sorted(set(TACTILE_BODY_NAMES) - set(tactile_links))}, "
+            f"unexpected={sorted(set(tactile_links) - set(TACTILE_BODY_NAMES))}."
+        )
+    for name, link in tactile_links.items():
+        if link.find("collision/geometry/mesh") is None:
+            raise ValueError(f"Tactile link {name!r} needs its own URDF collision mesh.")
+    for mesh in urdf.findall(".//mesh"):
         mesh_path = source.parent / mesh.attrib["filename"]
         if not mesh_path.is_file():
             missing.append(mesh_path)
@@ -190,6 +205,67 @@ def _create_fixed_joint(
     joint.CreateCollisionEnabledAttr().Set(False)
 
 
+def _create_sensor_mount(
+    robot_root: Usd.Prim,
+    tool_body: Usd.Prim,
+    start_world: Gf.Vec3d,
+    length: float,
+    radius: float,
+    mass: float,
+) -> tuple[Gf.Vec3d, Usd.Prim]:
+    """Split the spacer at a fixed articulation load-cell joint at its center.
+
+    Both halves are separate links so their mass/inertia are explicit without
+    modifying the supplied wrist mass. The distal link's actor frame and its
+    incoming joint's child frame both originate at the sensor center and align
+    with physical wrist/tool XYZ. All hand loads cross this single fixed joint.
+    """
+    stage = robot_root.GetStage()
+    sensor_world = Gf.Matrix4d(1.0)
+    sensor_world.SetRotate(Gf.Transform(_world_transform(tool_body)).GetRotation())
+    displacement = sensor_world.TransformDir(Gf.Vec3d(0.0, 0.0, length))
+    sensor_world.SetTranslateOnly(start_world + displacement * 0.5)
+    half_length, half_mass = length * 0.5, mass * 0.5
+    inertia_radial = half_mass * (3.0 * radius**2 + half_length**2) / 12.0
+    inertia_axial = half_mass * radius**2 / 2.0
+
+    def half_link(name: str, world: Gf.Matrix4d, center_z: float, color: tuple[float, float, float]):
+        body = UsdGeom.Xform.Define(stage, robot_root.GetPath().AppendChild(name)).GetPrim()
+        _set_world_transform_on_reference_root(body, world)
+        UsdPhysics.RigidBodyAPI.Apply(body).CreateRigidBodyEnabledAttr(True)
+        PhysxSchema.PhysxRigidBodyAPI.Apply(body).CreateDisableGravityAttr(False)
+        mass_api = UsdPhysics.MassAPI.Apply(body)
+        mass_api.CreateMassAttr(half_mass)
+        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(0.0, 0.0, center_z))
+        mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(inertia_radial, inertia_radial, inertia_axial))
+        mass_api.CreatePrincipalAxesAttr(Gf.Quatf(1.0))
+        cylinder = UsdGeom.Cylinder.Define(stage, body.GetPath().AppendChild("Cylinder"))
+        cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
+        cylinder.CreateHeightAttr(half_length)
+        cylinder.CreateRadiusAttr(radius)
+        cylinder.CreateExtentAttr([
+            Gf.Vec3f(-radius, -radius, -half_length * 0.5),
+            Gf.Vec3f(radius, radius, half_length * 0.5),
+        ])
+        cylinder.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, center_z))
+        cylinder.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+        UsdPhysics.CollisionAPI.Apply(cylinder.GetPrim()).CreateCollisionEnabledAttr(True)
+        PhysxSchema.PhysxCollisionAPI.Apply(cylinder.GetPrim())
+        return body
+
+    proximal_world = Gf.Matrix4d(sensor_world)
+    proximal_world.SetTranslateOnly(start_world + displacement * 0.25)
+    proximal = half_link(FORCE_TORQUE_PROXIMAL_BODY_NAME, proximal_world, 0.0, (0.18, 0.20, 0.23))
+    distal = half_link(FORCE_TORQUE_BODY_NAME, sensor_world, length * 0.25, (0.24, 0.27, 0.30))
+    proximal_joint_world = Gf.Matrix4d(sensor_world)
+    proximal_joint_world.SetTranslateOnly(start_world)
+    _create_fixed_joint(stage, str(robot_root.GetPath().AppendChild(TOOL_SENSOR_MOUNT_JOINT_NAME)),
+                        tool_body, proximal, proximal_joint_world)
+    _create_fixed_joint(stage, str(robot_root.GetPath().AppendChild(FORCE_TORQUE_JOINT_NAME)),
+                        proximal, distal, sensor_world)
+    return start_world + displacement, distal
+
+
 def _remove_nested_articulation_roots(stage: Usd.Stage, subtree_path: str) -> None:
     for prim in Usd.PrimRange(stage.GetPrimAtPath(subtree_path)):
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
@@ -213,6 +289,43 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
             prim.SetInstanceable(False)
 
 
+def _preserve_tactile_parent_slots(stage: Usd.Stage, hand_path: str) -> None:
+    """Keep five parent CAD recesses from being filled by a single convex hull.
+
+    Their original collision meshes contain the palm/pad-2 slots, but a single
+    convex hull encloses those tactile bodies and intercepts object contact.
+    Only these existing parent colliders are decomposed; all 17 tactile-link
+    colliders, rigid bodies, joints, inertias, and visuals remain unchanged.
+    """
+    parent_names = ("right_plam_1", *(f"right_{finger}_2" for finger in ("index", "middle", "ring", "little")))
+    bodies = [prim for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+    colliders = []
+    for name in parent_names:
+        matching = [body for body in bodies if body.GetName() == name]
+        if len(matching) != 1:
+            raise RuntimeError(f"Tactile parent {name!r} must resolve exactly one rigid body, got {len(matching)}.")
+        body_colliders = [
+            prim for prim in Usd.PrimRange(matching[0])
+            if prim.HasAPI(UsdPhysics.CollisionAPI)
+            and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False
+        ]
+        if not body_colliders:
+            raise RuntimeError(f"Tactile parent {name!r} has no enabled collision geometry.")
+        for collider in body_colliders:
+            meshes = [UsdGeom.Mesh(prim) for prim in Usd.PrimRange(collider) if prim.IsA(UsdGeom.Mesh)]
+            if not any(len(mesh.GetPointsAttr().Get() or []) >= 4 and mesh.GetFaceVertexCountsAttr().Get() for mesh in meshes):
+                raise RuntimeError(f"Tactile parent collider {collider.GetPath()} has no usable triangle mesh.")
+            colliders.append(collider)
+    # Tight surface projection and finer decomposition preserve millimetre
+    # slots; the SDK defaults (10% error, 32 hulls) can bridge those recesses.
+    cfg = sim_utils.ConvexDecompositionPropertiesCfg(
+        max_convex_hulls=128, hull_vertex_limit=64, voxel_resolution=1_000_000,
+        error_percentage=0.5, shrink_wrap=True, min_thickness=0.0001,
+    )
+    for collider in colliders:
+        sim_utils.define_mesh_collision_properties(str(collider.GetPath()), cfg, stage=stage)
+
+
 @clone
 def spawn_ur5e_hand(
     prim_path: str,
@@ -223,6 +336,10 @@ def spawn_ur5e_hand(
 ) -> Usd.Prim:
     """Spawn UR5e, import the RH56E2 right-hand URDF, and join them as one articulation."""
     del kwargs
+    if not all(math.isfinite(value) and value > 0.0 for value in (
+        cfg.sensor_mount_length, cfg.sensor_mount_radius, cfg.sensor_mount_mass
+    )):
+        raise ValueError("Sensor mount length, radius and mass must be finite and positive.")
     validate_hand_urdf_assets(cfg.hand_urdf_path)
 
     stage = get_current_stage()
@@ -260,19 +377,34 @@ def spawn_ur5e_hand(
         )
 
     _deinstance_subtree(stage, hand_path)
+    _preserve_tactile_parent_slots(stage, hand_path)
     tool_frame = _find_named_prim(stage, prim_path, cfg.tool_frame_candidates)
     tool_body = _nearest_rigid_body_ancestor(tool_frame)
+    if tool_body.IsInstance():
+        tool_body.SetInstanceable(False)
     hand_base = _find_named_prim(stage, hand_path, cfg.hand_base_candidates, rigid_body_only=True)
 
     _deactivate_preexisting_mount_joints(stage, prim_path)
     hand_root_world = _world_transform(hand_root)
     hand_base_relative_to_root = _world_transform(hand_base) * hand_root_world.GetInverse()
-    mount_world = _make_offset_matrix(cfg.mount_translation, cfg.mount_rotation_deg) * _world_transform(tool_frame)
+    mount_offset = _make_offset_matrix(cfg.mount_translation, cfg.mount_rotation_deg)
+    # The authored tool0 permutes the physical wrist/tool axes. Compose the
+    # hand in its tool body frame before applying the roll about forward +Z.
+    tool_body_world = _world_transform(tool_body)
+    attachment_in_tool_body = _world_transform(tool_frame) * tool_body_world.GetInverse()
+    tool_roll = _make_offset_matrix((0.0, 0.0, 0.0), (0.0, 0.0, cfg.mount_tool_roll_deg))
+    # USD row vectors: vendor alignment, attachment frame, tool +Z roll, world.
+    mount_world = mount_offset * attachment_in_tool_body * tool_roll * tool_body_world
+    hand_anchor, sensor_body = _create_sensor_mount(
+        robot_root, tool_body, mount_world.ExtractTranslation(), cfg.sensor_mount_length,
+        cfg.sensor_mount_radius, cfg.sensor_mount_mass,
+    )
+    mount_world.SetTranslateOnly(hand_anchor)
     desired_hand_root_world = hand_base_relative_to_root.GetInverse() * mount_world
     _set_world_transform_on_reference_root(hand_root, desired_hand_root_world)
 
     _remove_nested_articulation_roots(stage, hand_path)
-    _create_fixed_joint(stage, f"{prim_path}/UR5e_hand_mount_joint", tool_body, hand_base, mount_world)
+    _create_fixed_joint(stage, f"{prim_path}/UR5e_hand_mount_joint", sensor_body, hand_base, mount_world)
     return robot_root
 
 
@@ -299,6 +431,12 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     # asset. Rotate it by -90 degrees so the fingers extend away from the robot
     # along the flange's forward direction rather than back into the arm.
     mount_rotation_deg: tuple[float, float, float] = (0.0, -90.0, 0.0)
+    mount_tool_roll_deg: float = -90.0
+    # Sensor and adapter proxy; 50 mm diameter matches the hand's base flange.
+    sensor_mount_length: float = 0.05
+    sensor_mount_radius: float = 0.025
+    # Nominal sensor/adapter mass pending hardware measurement; split equally.
+    sensor_mount_mass: float = 0.20
 
 
 def make_ur5e_hand_cfg() -> ArticulationCfg:
@@ -360,6 +498,80 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             ),
         },
     )
+
+
+class ToolForceTorqueSensor:
+    """Six-axis fixed-joint load cell at the spacer center, in SI units.
+
+    ``[Fx, Fy, Fz, Tx, Ty, Tz]`` is the wrench transmitted from the arm-side
+    parent to the hand-side child. Its origin is the spacer center and XYZ
+    follows the physical wrist/tool frame (+Z along the cylinder toward the
+    hand), before the hand's additional mount roll. Raw readings include hand
+    gravity, inertia and contacts; they are not external-contact-only forces.
+
+    The installed PhysX Tensor API reports the incoming wrench in the *child
+    joint frame*. We author that frame as identity at the distal link origin,
+    so the backend's vector already has the requested frame and moment point:
+    https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#link-incoming-joint-force
+
+    Call ``update`` after a completed physics step. ``reset`` invalidates only
+    selected environments without inventing a zero physical measurement. The
+    zero cache after reset is accompanied by ``valid=False`` until updated.
+    """
+
+    def __init__(self, robot):
+        self.robot = robot
+        try:
+            self.body_index = robot.body_names.index(FORCE_TORQUE_BODY_NAME)
+        except ValueError as exc:
+            raise RuntimeError("Articulation has no distal F/T sensor link.") from exc
+        shape = (robot.num_instances, 6)
+        self.data_raw_wrench = torch.zeros(shape, dtype=torch.float32, device=robot.device)
+        self.bias = torch.zeros_like(self.data_raw_wrench)
+        self.valid = torch.zeros(robot.num_instances, dtype=torch.bool, device=robot.device)
+        self.metadata = {
+            "body_name": FORCE_TORQUE_BODY_NAME,
+            "joint_name": FORCE_TORQUE_JOINT_NAME,
+            "frame": "sensor_center_physical_tool_xyz",
+            "axis_z": "physical tool forward, from arm toward hand",
+            "direction": "parent_to_child",
+            "components": ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz"),
+            "units": ("N", "N", "N", "N*m", "N*m", "N*m"),
+            "sample": "mean reaction over the last completed physics step",
+            "includes": ("gravity", "inertia", "contact", "external_force"),
+            "nominal_mount_mass_kg": robot.cfg.spawn.sensor_mount_mass,
+        }
+
+    def reset(self, env_ids=None) -> None:
+        """Clear the cache/tare for selected episodes and mark readings invalid."""
+        selected = slice(None) if env_ids is None else env_ids
+        self.data_raw_wrench[selected] = 0.0
+        self.bias[selected] = 0.0
+        self.valid[selected] = False
+
+    def update(self, dt: float | None = None) -> None:
+        """Read the actual link reaction after simulation; never apply a force."""
+        del dt
+        # Read directly: the IsaacLab 2.3.2 wrapper has a contradictory frame
+        # docstring and a time_stamp/timestamp cache typo. Backend source and
+        # PhysX documentation both explicitly specify the child joint frame.
+        wrench = self.robot.root_physx_view.get_link_incoming_joint_force()[:, self.body_index, :]
+        if not torch.isfinite(wrench).all():
+            raise RuntimeError("PhysX returned a nonfinite F/T sensor joint reaction.")
+        self.data_raw_wrench.copy_(wrench)
+        self.valid[:] = True
+
+    def read(self, env_ids=None, *, tared: bool = False) -> torch.Tensor:
+        """Return cached wrench; callers must also honor the ``valid`` mask."""
+        values = self.data_raw_wrench - self.bias if tared else self.data_raw_wrench
+        return values.clone() if env_ids is None else values[env_ids].clone()
+
+    def tare(self, env_ids=None) -> None:
+        """Record an explicit instantaneous bias, without gravity compensation."""
+        selected = slice(None) if env_ids is None else env_ids
+        if not self.valid[selected].all():
+            raise RuntimeError("Cannot tare before a completed physics-step F/T sample.")
+        self.bias[selected] = self.data_raw_wrench[selected]
 
 
 # Robot reset kinematics. Candidate poses are calculated on the CPU without
@@ -828,6 +1040,7 @@ def make_object_collection_cfg() -> RigidObjectCollectionCfg:
                 prim_path=f"{{ENV_REGEX_NS}}/{spec.name}",
                 spawn=(FlatBoxUsdCfg if spec.asset_name in YCB_BOX_ASSETS else sim_utils.UsdFileCfg)(
                     usd_path=spec.usd_path,
+                    semantic_tags=[("class", spec.asset_name)],
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         disable_gravity=False,
                         kinematic_enabled=False,

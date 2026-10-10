@@ -247,6 +247,53 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(sample_scene(self.catalog, self.rules, random.Random(9)),
                          sample_scene(self.catalog, self.rules, random.Random(9)))
 
+    def test_new_layout_retains_explicit_episode_composition_and_id_order(self):
+        class LayoutRandom(random.Random):
+            def randint(self, low, high):
+                raise AssertionError("A fixed episode must not draw a new type count.")
+
+            def sample(self, population, k, **kwargs):
+                raise AssertionError("A fixed episode must not draw a new type subset.")
+
+        original = sample_scene(self.catalog, self.rules, random.Random(9))
+        for ids in (original.active_ids, tuple(reversed(original.active_ids))):
+            with self.subTest(ids=ids):
+                proposal = sample_scene(self.catalog, self.rules, LayoutRandom(4),
+                                        target_id=original.target_id, blocker_id=original.blocker_id,
+                                        active_ids=ids)
+                validate_sample(proposal, self.catalog, self.rules)
+                self.assertEqual(proposal.active_ids, ids)
+                self.assertEqual((proposal.target_id, proposal.blocker_id),
+                                 (original.target_id, original.blocker_id))
+                self.assertEqual(Counter(self.catalog[index].asset_name for index in proposal.active_ids),
+                                 Counter(self.catalog[index].asset_name for index in original.active_ids))
+                self.assertNotEqual(proposal.positions, original.positions)
+                self.assertNotEqual(proposal.yaws, original.yaws)
+
+    def test_invalid_fixed_composition_fails_without_changing_ids_or_density(self):
+        original = sample_scene(self.catalog, self.rules, random.Random(9))
+        target, blocker = original.target_id, original.blocker_id
+        another_target = 10 * (target // 10) + (target + 1) % 10
+        malformed = (
+            (original.active_ids, None, blocker, "explicit"),
+            (original.active_ids, target, None, "explicit"),
+            (original.active_ids + (original.active_ids[-1],), target, blocker, "unique"),
+            (original.active_ids[:-1] + (len(self.catalog),), target, blocker, "index the catalog"),
+            (tuple(index for index in original.active_ids if index != blocker), target, blocker, "present"),
+            (original.active_ids[:-1] + (another_target,), target, blocker, "exactly once"),
+            ((target, blocker), target, blocker, "active object limits"),
+            ((target, blocker, 10 * (blocker // 10) + (blocker + 1) % 10,
+              10 * (blocker // 10) + (blocker + 2) % 10), target, blocker, "asset type limits"),
+            ((0, 10, 20, 30), 0, 10, "whole-shelf density"),
+        )
+        for ids, fixed_target, fixed_blocker, message in malformed:
+            with self.subTest(ids=ids, message=message), self.assertRaisesRegex(ValueError, message):
+                sample_scene(self.catalog, self.rules, random.Random(4),
+                             target_id=fixed_target, blocker_id=fixed_blocker, active_ids=ids)
+        with self.assertRaisesRegex(ValueError, "every catalog asset type"):
+            sample_scene(self.catalog, replace(self.rules, all_asset_types=True), random.Random(4),
+                         target_id=0, blocker_id=10, active_ids=(0, 10, 20, 30))
+
     def test_explicit_roles_and_individually_missing_roles(self):
         for target, blocker in ((2, 17), (2, None), (None, 17)):
             sample = sample_scene(self.catalog, self.rules, random.Random(20), target_id=target, blocker_id=blocker)
@@ -391,6 +438,29 @@ class SamplingTests(unittest.TestCase):
         catalog[surrounding] = replace(catalog[surrounding], asset_name=catalog[sample.target_id].asset_name)
         with self.assertRaisesRegex(ValueError, "exactly once"):
             validate_sample(sample, catalog, self.rules)
+
+    def test_blocker_front_reservation_rejects_clutter_outside_target_access(self):
+        catalog = (
+            ObjectGeometry("target", (-.025, -.025, 0), (.025, .025, .1)),
+            ObjectGeometry("blocker", (-.05, -.10, 0), (.05, .10, .1)),
+            ObjectGeometry("front_clutter", (-.02, -.02, 0), (.02, .02, .1)),
+            ObjectGeometry("rear_clutter", (-.025, -.025, 0), (.025, .025, .1)),
+        )
+        sample = SceneSample((0, 1, 2, 3), 0, 1,
+            {0: (-.82, 0, 1.05), 1: (-.68, .05, 1.05),
+             2: (-.57, .11, 1.05), 3: (-.84, .28, 1.05)},
+            {index: 0.0 for index in range(4)}, (-.785, -.51, -.06, .06), (-.68, -.20))
+        rules = replace(self.rules, min_objects=4, max_objects=4, min_asset_types=4, max_asset_types=4,
+                        min_x_coverage=0, min_y_coverage=0, min_neighbor_fraction=0,
+                        min_shelf_occupancy=0, min_region_occupancy=0, reserve_blocker_front=False)
+        # This distractor is outside A0 yet covers the wide Blocker's front.
+        validate_sample(sample, catalog, rules)
+        enabled = replace(rules, reserve_blocker_front=True)
+        with self.assertRaisesRegex(ValueError, "Blocker frontal-view corridor"):
+            validate_sample(sample, catalog, enabled)
+        positions = dict(sample.positions)
+        positions[2] = (-.57, .22, 1.05)
+        validate_sample(replace(sample, positions=positions), catalog, enabled)
 
     def test_clear_endpoint_does_not_hide_mid_translation_collision(self):
         catalog = tuple(ObjectGeometry(str(index), (-.025, -.025, 0), (.025, .025, .05)) for index in range(4))

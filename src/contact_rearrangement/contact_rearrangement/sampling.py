@@ -22,6 +22,15 @@ Polygon = tuple[Point, ...]
 Region = tuple[float, float, float, float]
 _EPS = 1.0e-9
 
+# Columns are the palm TCP's local axes in world coordinates. Its +Y is the
+# finger/tool forward axis: point it toward the shelf (-X). The hand's -90deg
+# roll about tool +Z puts palm +Z toward world -Y and palm +X toward world +Z.
+ROBOT_START_TCP_ROTATION = (
+    (0.0, -1.0, 0.0),
+    (0.0, 0.0, -1.0),
+    (1.0, 0.0, 0.0),
+)
+
 
 @dataclass(frozen=True)
 class ObjectGeometry:
@@ -54,6 +63,7 @@ class SpawnRules:
     min_shelf_occupancy: float = 0.35
     region_grid: tuple[int, int] = (2, 3)
     min_region_occupancy: float = 0.10
+    reserve_blocker_front: bool = True
     max_attempts: int = 300
 
 
@@ -121,6 +131,16 @@ def rectangle_polygon(region: Region) -> Polygon:
     """Return a counterclockwise polygon for (xmin, xmax, ymin, ymax)."""
     xmin, xmax, ymin, ymax = region
     return ((xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax))
+
+
+def _blocker_front_region(polygon: Polygon, rules: SpawnRules) -> Region:
+    """Keep non-role footprints out of a conservative frontal-view corridor.
+
+    This improves front-camera proposals; it does not measure silhouette
+    visibility. The rendered acceptance step must still check both roles.
+    """
+    return (max(x for x, _ in polygon), rules.x_range[1],
+            min(y for _, y in polygon) - rules.gap, max(y for _, y in polygon) + rules.gap)
 
 
 def footprint_polygon(geometry: ObjectGeometry, center_xy: Point, yaw: float) -> Polygon:
@@ -520,6 +540,8 @@ def _check_inputs(geometries: Sequence[ObjectGeometry], rules: SpawnRules) -> No
         raise ValueError("Asset type limits must satisfy 2 <= min <= max <= catalog type count.")
     if len(rules.region_grid) != 2 or any(not isinstance(value, int) or value < 1 for value in rules.region_grid):
         raise ValueError("Region grid must contain two positive integer cell counts.")
+    if not isinstance(rules.reserve_blocker_front, bool):
+        raise ValueError("reserve_blocker_front must be boolean.")
     if rules.max_attempts < 1 or not 0.0 < rules.min_blocked_ratio <= 1.0:
         raise ValueError("max_attempts must be positive and min_blocked_ratio must be in (0, 1].")
     if any(not 0.0 <= value <= 1.0 for value in
@@ -624,6 +646,11 @@ def validate_sample(sample: SceneSample, geometries: Sequence[ObjectGeometry], r
     for index in ids:
         if index not in (target, blocker) and not polygons_separated(polygons[index], access, rules.gap):
             raise ValueError("Surrounding objects must begin outside the initial access region.")
+    if rules.reserve_blocker_front:
+        blocker_front = rectangle_polygon(_blocker_front_region(polygons[blocker], rules))
+        if any(index not in (target, blocker) and not polygons_separated(polygon, blocker_front)
+               for index, polygon in polygons.items()):
+            raise ValueError("Surrounding objects must begin outside the Blocker frontal-view corridor.")
     if not all(math.isfinite(value) for value in sample.clearance_witness):
         raise ValueError("Clearance witness must be finite.")
     path = _validated_path(sample)
@@ -675,19 +702,35 @@ def _clearance_candidates(geometry: ObjectGeometry, initial: PlanarPose, access:
 
 
 def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: random.Random,
-                 target_id: int | None = None, blocker_id: int | None = None) -> SceneSample:
+                 target_id: int | None = None, blocker_id: int | None = None,
+                 active_ids: Sequence[int] | None = None) -> SceneSample:
     """Choose episode roles/count once, then sample whole-shelf clutter around them.
 
     The Target species appears only once. The requested count describes asset
     types; non-Target types are duplicated as needed to meet whole-shelf density,
     even in all_asset_types mode. Types, instance IDs and count stay fixed across
-    layout retries. A conservative finite
+    layout retries. Passing ``active_ids`` with both explicit role IDs retains
+    that exact composition and ID order while proposing new poses, so image
+    visibility rejection cannot redraw the episode's types or instance count.
+    A conservative finite
     SE(2) witness reserves rearrangement room but is not an actor goal or proof
     of reachable physical manipulation. Camera visibility must be checked by
     future rendered instance masks; planar blockage is not a visibility test.
     """
     _check_inputs(geometries, rules)
     types = {_asset_type(geometry) for geometry in geometries}
+    fixed_ids = tuple(active_ids) if active_ids is not None else None
+    if fixed_ids is not None:
+        if target_id is None or blocker_id is None:
+            raise ValueError("Fixed active IDs require explicit Target and Blocker IDs.")
+        if any(type(index) is not int or not 0 <= index < len(geometries) for index in fixed_ids):
+            raise ValueError("Fixed active IDs must index the catalog with integer IDs.")
+        if len(set(fixed_ids)) != len(fixed_ids):
+            raise ValueError("Fixed active IDs must be unique.")
+        if not rules.min_objects <= len(fixed_ids) <= rules.max_objects:
+            raise ValueError("Fixed active IDs must respect active object limits.")
+        if target_id not in fixed_ids or blocker_id not in fixed_ids:
+            raise ValueError("Target and Blocker must be present in fixed active IDs.")
     for index in (target_id, blocker_id):
         if index is not None and (not isinstance(index, int) or not 0 <= index < len(geometries)):
             raise ValueError("Explicit role IDs must index the catalog.")
@@ -711,7 +754,15 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     groups = {asset: tuple(index for index, geometry in enumerate(geometries) if _asset_type(geometry) == asset)
               for asset in sorted(types)}
     role_types = {target_type, _asset_type(geometries[blocker])}
-    if rules.all_asset_types:
+    if fixed_ids is not None:
+        if sum(_asset_type(geometries[index]) == target_type for index in fixed_ids) != 1:
+            raise ValueError("Target asset type must occur exactly once among fixed active IDs.")
+        selected_types = {_asset_type(geometries[index]) for index in fixed_ids}
+        if not rules.min_asset_types <= len(selected_types) <= rules.max_asset_types:
+            raise ValueError("Fixed active asset type count must respect asset type limits.")
+        if rules.all_asset_types and selected_types != types:
+            raise ValueError("Fixed all-asset-types scenes must contain every catalog asset type.")
+    elif rules.all_asset_types:
         type_count = len(types)
         if not rules.min_asset_types <= type_count <= rules.max_asset_types:
             raise ValueError("All-asset-types count must satisfy asset type limits.")
@@ -720,8 +771,11 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         type_count = rng.randint(rules.min_asset_types, rules.max_asset_types)
         selected_types = role_types | set(rng.sample(sorted(types - role_types), type_count - len(role_types)))
     selected_ids = [target, blocker]
-    for asset in sorted(selected_types - role_types):
-        selected_ids.append(rng.choice(groups[asset]))
+    if fixed_ids is not None:
+        selected_ids.extend(index for index in fixed_ids if index not in (target, blocker))
+    else:
+        for asset in sorted(selected_types - role_types):
+            selected_ids.append(rng.choice(groups[asset]))
     # Footprint area is invariant to yaw. Pick the episode's composition once,
     # before trying positions, until its summed area meets the requested density.
     # Add copies of the least-represented non-Target types, breaking ties at
@@ -734,8 +788,9 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     }
     counts = {asset: sum(_asset_type(geometries[index]) == asset for index in selected_ids)
               for asset in remaining}
-    for copies in remaining.values():
-        rng.shuffle(copies)
+    if fixed_ids is None:
+        for copies in remaining.values():
+            rng.shuffle(copies)
     usable_area = ((rules.x_range[1] - rules.x_range[0] - 2 * rules.edge_margin)
                    * (rules.y_range[1] - rules.y_range[0] - 2 * rules.edge_margin))
     # Every equal-area cell meeting its minimum also requires that minimum
@@ -743,6 +798,9 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     required_occupancy = max(rules.min_shelf_occupancy, rules.min_region_occupancy)
     required_area = required_occupancy * usable_area
     active_area = sum(area(index) for index in selected_ids)
+    if fixed_ids is not None and active_area < required_area - _EPS:
+        raise ValueError("Fixed active IDs cannot meet whole-shelf density: "
+                         f"occupancy={active_area / usable_area:.4f}, required={required_occupancy:.4f}.")
     while len(selected_ids) < rules.min_objects or active_area < required_area - _EPS:
         available = [asset for asset, copies in remaining.items() if copies]
         if not available or len(selected_ids) >= rules.max_objects:
@@ -795,6 +853,8 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
                     for index in (target, blocker)}
         if overlap_area(polygons[blocker], access) / polygon_area(polygons[blocker]) < rules.min_blocked_ratio:
             continue
+        blocker_front = (rectangle_polygon(_blocker_front_region(polygons[blocker], rules))
+                         if rules.reserve_blocker_front else None)
         initial = PlanarPose(blocker_x, blocker_y, yaws[blocker])
         path = next((candidate for candidate in _clearance_candidates(geometries[blocker], initial, access_region, rules, rng)
                      if _path_supported_clear(geometries[blocker], candidate, (polygons[target],), rules)), None)
@@ -847,6 +907,8 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
                 polygon = footprint_polygon(geometries[index], (x, y), yaws[index])
                 if not _supported(polygon, rules) or not polygons_separated(polygon, access, rules.gap):
                     continue
+                if blocker_front is not None and not polygons_separated(polygon, blocker_front):
+                    continue
                 if any(not polygons_separated(polygon, sweep, rules.gap) for sweep in sweeps):
                     continue
                 if any(not polygons_separated(polygon, other, rules.gap) for other in polygons.values()):
@@ -885,7 +947,8 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         kind = "pivot" if any(motion.pivot is not None for motion in path) else (
             "rotate_translate" if any(abs(motion.end.yaw - motion.start.yaw) > _EPS for motion in path)
             else "translation")
-        sample = SceneSample(ids, target, blocker, positions, yaws, access_region,
+        sample = SceneSample(fixed_ids if fixed_ids is not None else ids,
+                             target, blocker, positions, yaws, access_region,
                              (path[-1].end.x, path[-1].end.y), path, kind)
         validate_sample(sample, geometries, rules)
         return sample

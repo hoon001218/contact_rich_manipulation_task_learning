@@ -19,8 +19,12 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 import isaaclab.envs.mdp as mdp
 
 from .catalog import OBJECT_SPECS
-from .assets import RobotPoseModel
-from .sampling import ObjectGeometry, SpawnRules, oriented_box_separated, robot_start_region, sample_scene
+from .assets import RobotPoseModel, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
+from .sensors import initialize_sensors, InitialVisionRejected
+from .sampling import (
+    ROBOT_START_TCP_ROTATION, ObjectGeometry, SpawnRules,
+    oriented_box_separated, robot_start_region, sample_scene,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -240,8 +244,7 @@ def _initialize_spawn_metadata(env: ManagerBasedEnv) -> None:
     env.target_object_id = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
     env.blocker_object_id = torch.full_like(env.target_object_id, -1)
     env.access_region = torch.zeros((env.num_envs, 4), device=env.device)
-    # The initial-vision camera is not implemented at the spawn stage. Never
-    # interpret a geometric overlap test as measured image visibility.
+    # These become valid only after actual RGB/instance-reference acceptance.
     env.target_visibility_validated = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     env.target_visible_fraction = torch.full((env.num_envs,), torch.nan, device=env.device)
     env.spawn_initial_state = torch.zeros((env.num_envs, count, 13), device=env.device)
@@ -254,6 +257,7 @@ def _initialize_spawn_metadata(env: ManagerBasedEnv) -> None:
     env.robot_start_region = torch.zeros((env.num_envs, 6), device=env.device)
     env.robot_start_elbow_height = torch.zeros(env.num_envs, device=env.device)
     env.robot_start_attempts = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    initialize_sensors(env)
 
 
 def _scene_collision_boxes(env: ManagerBasedEnv, sample) -> list[tuple]:
@@ -290,9 +294,13 @@ def robot_start_collision_reason(env: ManagerBasedEnv, sample, transforms: dict)
         for other_center, other_rotation, other_half, name in obstacles:
             if not oriented_box_separated(center, rotation, half, other_center, other_rotation, other_half, clearance):
                 return f"scene: {box.path} / {name}"
-        robot_boxes.append((box.body_name, center, rotation, half))
+        # Fixed sensor halves belong to the wrist housing for the existing
+        # mechanical-neighbor exclusions; their scene bounds remain separate.
+        arm_owner = "wrist_3_link" if box.body_name in (FORCE_TORQUE_PROXIMAL_BODY_NAME, FORCE_TORQUE_BODY_NAME) else box.body_name
+        robot_boxes.append((arm_owner, center, rotation, half))
     arm_bodies = {"base_link", "shoulder_link", "upper_arm_link", "forearm_link",
-                  "wrist_1_link", "wrist_2_link", "wrist_3_link"}
+                  "wrist_1_link", "wrist_2_link", "wrist_3_link",
+                  FORCE_TORQUE_PROXIMAL_BODY_NAME, FORCE_TORQUE_BODY_NAME}
     for index, (name, center, rotation, half) in enumerate(robot_boxes):
         if name not in arm_bodies:
             continue
@@ -318,8 +326,7 @@ def _sample_robot_start(env: ManagerBasedEnv, sample, seed: int) -> tuple:
     region = robot_start_region(sample, env.spawn_geometries, env.spawn_rules, rules)
     lower, upper = np.array(region)[[0, 2, 4]], np.array(region)[[1, 3, 5]]
     origin = env.scene.env_origins[0].cpu().numpy()
-    # Palm +Z faces the shelf (-X); finger +Y points down (-Z).
-    orientation = np.array(((0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (0.0, -1.0, 0.0)))
+    orientation = np.asarray(ROBOT_START_TCP_ROTATION)
     rng = random.Random(seed ^ 0x5D2EA91C)
     failures = {}
     for attempt in range(1, rules.max_attempts + 1):
@@ -366,6 +373,17 @@ def validate_robot_start_state(env: ManagerBasedEnv, env_ids: torch.Tensor) -> N
             transform[:3, 3] = physical[env_id, body_id, :3] - origin + origin_zero
             transforms[name] = transform
         actual_tcp = transforms[model.tcp_body_name][:3, 3] - origin_zero
+        actual_orientation = transforms[model.tcp_body_name][:3, :3]
+        orientation_error = Rotation.from_matrix(
+            np.asarray(ROBOT_START_TCP_ROTATION) @ actual_orientation.T
+        ).magnitude()
+        if orientation_error > 0.01 + 1.0e-5:
+            raise RuntimeError(f"Actual tool does not face the shelf: TCP rotation error={orientation_error}rad.")
+        # The assembled UR wrist/tool +Z coincides with palm TCP +Y. Check the
+        # native wrist pose too, so a frame/mount mismatch cannot pass silently.
+        tool_forward = transforms["wrist_3_link"][:3, 2]
+        if np.linalg.norm(tool_forward - np.array((-1.0, 0.0, 0.0))) > 0.01 + 1.0e-5:
+            raise RuntimeError(f"Actual UR tool forward axis does not face the shelf: {tool_forward}.")
         region = env.robot_start_region[env_id].cpu().numpy()
         if np.any(actual_tcp < region[[0, 2, 4]] - 1.0e-5) or np.any(actual_tcp > region[[1, 3, 5]] + 1.0e-5):
             raise RuntimeError("Actual hand TCP is outside its Blocker-front starting region.")
@@ -388,6 +406,7 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
     if env_ids.numel() == 0:
         return
     _initialize_spawn_metadata(env)
+    env.initial_vision_sensor.prepare()
     if env.cfg.robot_start.enabled and not hasattr(env, "robot_pose_model"):
         env.robot_pose_model = RobotPoseModel.from_env(env)
     objects = env.scene["objects"]
@@ -428,8 +447,76 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
         samples.append(sample)
         robot_starts.append(_sample_robot_start(env, sample, seed) if env.cfg.robot_start.enabled else None)
 
-    # Candidate FK/IK and collision checks never change live state. A failed
-    # sample therefore cannot leave selected robots at a fallback default pose.
+    # Rendering requires native candidate poses. Preserve the selected state
+    # and metadata so exhausted vision retries are transactional as well.
+    robot = env.scene["robot"]
+    # This writer expects actor pose with COM velocity, including moving bodies.
+    previous_states = objects.data.object_state_w[env_ids].clone()
+    previous_q, previous_v = robot.data.joint_pos[env_ids].clone(), robot.data.joint_vel[env_ids].clone()
+    previous_targets = robot.data.joint_pos_target[env_ids].clone()
+    previous_root = robot.data.root_state_w[env_ids].clone()
+    previous_velocity_targets = robot.data.joint_vel_target[env_ids].clone()
+    names = ("active_object_mask", "active_object_ids", "target_object_id", "blocker_object_id", "access_region",
+             "target_visibility_validated", "target_visible_fraction", "blocker_visibility_validated",
+             "blocker_visible_fraction", "initial_vision_rgb", "initial_vision_depth", "initial_vision_role_masks",
+             "initial_camera_pose_w", "initial_camera_intrinsics", "initial_vision_pixel_counts",
+             "initial_camera_attempts", "spawn_initial_state", "spawn_seeds",
+             "spawn_reset_counts", "robot_initial_joint_pos", "robot_start_tcp_pos_w", "robot_start_region",
+             "robot_start_elbow_height", "robot_start_attempts")
+    saved = {name: getattr(env, name)[selected_ids].clone() for name in names}
+    previous_samples = [env.spawn_samples[index] for index in selected_ids]
+    camera = env.scene["initial_camera"]
+    previous_camera = (camera.data.pos_w[env_ids].clone(), camera.data.quat_w_ros[env_ids].clone())
+    fixed_ids = [sample.active_ids for sample in samples]
+    try:
+        for layout_attempt in range(env.cfg.initial_vision.max_layout_attempts):
+            _apply_spawn_candidates(env, env_ids, samples, seeds, robot_starts)
+            env.spawn_reset_counts[selected_ids] = saved["spawn_reset_counts"] + 1
+            env.scene.write_data_to_sim()
+            env.sim.forward()
+            try:
+                images = env.initial_vision_sensor.capture(env_ids, layout_attempt=layout_attempt)
+            except InitialVisionRejected as error:
+                if layout_attempt + 1 >= env.cfg.initial_vision.max_layout_attempts:
+                    raise
+                print(f"[VISION RETRY]: layout={layout_attempt + 1}: {error}", flush=True)
+                samples, robot_starts = [], []
+                for env_id, seed, active_ids in zip(selected_ids, seeds, fixed_ids):
+                    retry_seed = seed ^ ((layout_attempt + 1) * 0x71D5AF)
+                    old = env.spawn_samples[env_id]
+                    sample = sample_scene(env.spawn_geometries, env.spawn_rules, random.Random(retry_seed),
+                                          target_id=old.target_id, blocker_id=old.blocker_id, active_ids=active_ids)
+                    samples.append(sample)
+                    robot_starts.append(_sample_robot_start(env, sample, retry_seed) if env.cfg.robot_start.enabled else None)
+                continue
+            env.initial_vision_sensor.commit(images)
+            env.tool_force_torque_sensor.reset(env_ids)
+            env.binary_tactile_sensor.reset(env_ids)
+            # Wrenches stay invalid at this unchanged physics timestamp.
+            env.ft_last_update_time = env.sim.current_time
+            env.tactile_last_update_time = env.sim.current_time
+            return
+    except Exception:
+        objects.write_object_state_to_sim(previous_states, env_ids=env_ids)
+        robot.write_root_state_to_sim(previous_root, env_ids=env_ids)
+        robot.write_joint_state_to_sim(previous_q, previous_v, env_ids=env_ids)
+        robot.set_joint_position_target(previous_targets, env_ids=env_ids)
+        robot.set_joint_velocity_target(previous_velocity_targets, env_ids=env_ids)
+        for name, value in saved.items():
+            getattr(env, name)[selected_ids] = value
+        for index, sample in zip(selected_ids, previous_samples):
+            env.spawn_samples[index] = sample
+        objects.parked_mask = ~env.active_object_mask
+        camera.set_world_poses(*previous_camera, env_ids, convention="ros")
+        camera.reset(env_ids)
+        env.scene.write_data_to_sim()
+        env.sim.forward()
+        raise
+
+
+def _apply_spawn_candidates(env, env_ids, samples, seeds, robot_starts):
+    selected_ids = env_ids.cpu().tolist()
+    objects = env.scene["objects"]
     mdp.reset_scene_to_default(env, env_ids, reset_joint_targets=True)
     states = objects.data.default_object_state[env_ids].clone()
     states[..., 7:] = 0.0

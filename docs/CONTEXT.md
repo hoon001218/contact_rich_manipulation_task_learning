@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-09, Asia/Seoul**.
+최종 갱신: **2026-10-10, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -42,8 +42,9 @@ acceptance 조건으로 요구한다. X/Y coverage와 병진·평면 pivot·회�
 초기 기본값으로 선택했다. 사용자가 직접 정한 최종 연구 난이도 수치는 아니다.
 앞쪽 +X camera의 실제 초기 영상에서 Target 가시 비율 **40% 이상**을 요구하기로
 했다. 분모는 같은 camera·같은 pose에서 가림 없이 렌더링한 전체 Target
-silhouette 픽셀 수다. **Camera와 영상 acceptance gate는 아직 구현 전**이며
-스폰 직후 visibility는 미검증(`False`, fraction `NaN`)으로 남긴다.
+silhouette 픽셀 수다. 현재 앞쪽 RGB-D camera와 실제 silhouette acceptance를
+구현하며 **Blocker 전체 가시성**도 함께 요구한다. Target·Blocker 둘 다 전체
+bounds가 frame 안에 있어야 한다. 승인한 초기 snapshot은 episode 동안 고정한다.
 YCB 003·004·005·006의 초기 회전을 **X축 −90°**로 교정하고, 원본 USD의
 수정 전·후 각 8장 렌더에서 라벨·캔 고리·병뚜껑으로 상하를 확인했다.
 이전 큰 footprint 우선 복사본 구성의 35% 규칙은 실제 USD 측정 bounds로 일반·all-types 각각 seed 0–19,
@@ -52,7 +53,8 @@ all-types는 10종·14 instance였다. 일반·all-types 각각 **4개 GPU 환�
 정착·전체/부분 reset 검사도 통과했다. 각 모드의 8개 layout을 각각 5초 진행한
 범위이며 기하 benchmark와 물리 검사를 구분한다. 당시 unit test 21개도 통과했다.
 이 분포와 통과 결과를 현재 균형 구성의 결과로 사용하지 않는다. 현재 균형
-구성도 기하 sample **40/40개**와 일반 모드 **4개 GPU 환경·151 step·5.03초**의
+구성은 Blocker 앞 reserve·camera gate 추가 전 기하 sample **40/40개**와
+일반 모드 **4개 GPU 환경·151 step·5.03초**의
 정착·전체/부분 reset 검사를 통과했다. 당시 unit test **23개**도 통과했으며
 현재 구성의 별도 all-types GPU 실행은 완료한 것으로 기록하지 않는다.
 **전물체의 2 mm 낙하 여유를 제거**하고 003·004에만 visible mesh를 유지한
@@ -70,10 +72,32 @@ debug draw 표시를 추가했다. 물리·USD asset을 수정하지 않는 확�
 구조이며 스폰 규칙·기본값·실행 명령을 유지했다. 통합 후 unit test **23개**와
 일반 모드 **4개 GPU 환경·151 step·5.03초** 검사가 통과했으며 초기·자동 reset
 뒤 8개 장면 설명이 통합 전과 같았다. 아래 기존 실행 결과와 구분해 기록한다.
-현재 사용자는 **Blocker 앞의 충돌 없는 hand 시작 영역 randomization과
+사용자는 **Blocker 앞의 충돌 없는 hand 시작 영역 randomization과
 elbow-down 금지**를 요청했다. RobotStartRules·실제 USD FK/IK·초기 collision
-판정을 구현했고 최종 24개 시작·반복 reset·5초 물리 검사와 unit test **29개**가
-통과했다. 이전 모듈 통합·스폰 검사와 이 새 기능의 검사를 구분한다.
+판정을 구현했고 2026-10-09의 24개 시작·반복 reset·5초 물리 검사와 unit test
+**29개**가 통과했다. 당시 손가락/tool은 아래를 향했다. 사용자의 후속 요청에
+따라 tool 전방을 **선반 방향인 world −X**로 교정했고 palm normal이 위를
+향하던 이 단계의 4개 GPU 환경·151 step·5.03초 검사도 통과했다. 이어
+사용자가 tool 기준 Z축으로 hand를 **−90° 회전**하도록 요청해 mount에 roll을
+추가한다. 현재 tool 전방은 −X를 유지하고 palm normal은 world −Y를 향한다.
+새 hand roll의 4개 GPU 환경·151 step·13개 시작 pose 검사도 통과했다.
+앞 단계의 통과 결과와 새 hand roll의 검사를 구분한다. 후속 요청으로 실제
+센서·연결부의 공간을 고려해 UR5e 말단과 hand 사이에 **길이 5 cm·직경
+5 cm의 원통 연결부**를 추가한다. 연결부는 wrist-3의 compound collider이며
+별도 body나 DOF를 만들지 않는다. 연결부 추가 전 검증과 새 조립 검사를 구분한다.
+새 연결부의 4개 GPU 환경·151 step·13개 시작 pose 검사도 통과했다.
+후속 센서 단계에서는 원통을 25 mm 두 rigid half로 나누고 중앙 fixed joint의
+실제 F/T를 읽는다. 앞쪽 camera pose를 무작위로 제안해 Target ≥40%·Blocker
+100%(면적 2 pixel 허용)를 실제 렌더로 승인하며 raw F/T와 초기 RGB-D/mask를
+`sensors` observation group에 제공한다. 이번 센서 단계의 검증은 별도로 기록한다.
+최종 4개 GPU 환경 검사에서 18개 시작 pose의 실제 가시성과 capture 중 native
+state 무변경, 초기 snapshot 보존·F/T 유효성·알려진 force/torque 응답이 통과했다.
+가시성 proposal을 개선하려고 `reserve_blocker_front=True`로 Blocker 앞의
+직선 +X 통로를 주변 물체로부터 비운다. 기존 전체 선반 밀도와 Target A₀는
+유지하며 이 통로가 실제 가시성을 보장하는 것으로 취급하지 않는다.
+현재 hand의 17개 tactile link 각각에 독립 `ContactSensor`를 붙이고 world net
+normal force norm **>0.01 N**을 binary contact로 제공한다. 2개 GPU 환경에서
+17개 pad의 실제 contact ON/OFF·부분 reset·render cache 보존 검증도 통과했다.
 
 | 상태 | 의미 |
 |---|---|
@@ -317,6 +341,11 @@ history 제거·교란 시 성능 변화, 비슷한 현재 관측과 서로 다�
 | 2026-10-09 중복 종류 편중 교정 | 사용자가 한 종류가 공간을 과하게 채우는 문제를 지적했다. 큰 footprint 우선 복사본 선택을 폐기하고 선택된 non-target 종류의 최소 active 개수를 우선하는 균형 구성으로 변경했다. 종류·역할·density·clearance 조건을 유지하고 현재 source의 기하 40개와 일반 모드 4개 GPU 환경·5.03초 검사가 통과했다. |
 | 2026-10-09 책임별 모듈 통합 | 사용자가 과하게 세분화된 패키지 구조를 정리하도록 요청했다. Metadata·asset 생성·환경 설정·spawn/reset·순수 sampling·visualization의 6개 모듈로 통합하고 기본값·동작을 유지했다. 이전 모듈은 wrapper 없이 제거했다. 통합 후 23개 unit test·simulator 없는 import·CLI와 4개 GPU 환경·5.03초 검사가 통과했다. |
 | 2026-10-09 Blocker 앞 hand 시작 randomization | 사용자가 충돌 없는 hand 시작 영역 randomization과 elbow-down 금지를 요청했다. USD FK·SciPy IK·scene collision과 별도 robot seed를 구현했다. 초기 151-step 검사 뒤 callback·실패 시 state 유지·COM cache·arm 이웃 OBB 처리를 보강했고 최종 24개 시작·5초 stress와 29개 unit test가 통과했다. |
+| 2026-10-10 Tool 전방 교정 | 사용자가 아래를 향하던 tool을 선반 정면으로 향하게 요청했다. Palm normal을 전방으로 맞췄던 초기 orientation을 교정해 TCP +Y와 wrist-3 +Z가 world −X를 향하게 한다. 시작 영역·elbow-up·15 mm scene 여유는 유지하고 실제 PhysX TCP 회전과 tool 축을 검증한다. |
+| 2026-10-10 Tool 기준 hand −90° roll | 사용자가 tool Z축 기준 hand 회전을 요청했다. 기존 vendor adapter `(0,-90,0)` deg에 별도 `mount_tool_roll_deg=-90`을 추가해 physical tool body인 `wrist_3_link`의 +Z축으로 hand 조립 transform을 회전한다. Tool 전방 −X와 기존 시작 조건은 유지하며 TCP 목표는 X→+Z, Y→−X, Z→−Y다. |
+| 2026-10-10 말단–hand 원통 연결부 | 사용자가 실제 센서·연결부 공간을 고려해 길이 5 cm 원통을 요청했다. Wrist-3 compound collider로 직경 5 cm의 visible `SensorMount`를 추가하고 hand fixed anchor를 physical tool +Z로 5 cm 옮긴다. Hand roll·TCP 방향·39 body·18 DOF를 유지하며 enabled robot collider는 40개가 된다. 원본 USD·기존 mass/inertia는 유지하고 실제 센서 질량·F/T 구현과 구분한다. |
+| 2026-10-10 중앙 F/T·초기 vision | 원통 중앙 fixed-joint F/T와 앞쪽 camera를 추가한다. 원통의 두 25 mm rigid half를 통해 hand load가 중앙 joint를 지나게 하고 raw sensor-frame wrench를 읽는다. 실제 같은 pose의 비가림 silhouette로 Target ≥40%·Blocker 전체 가시성을 승인하고 초기 RGB-D를 보존한다. Nominal mount mass 0.20 kg는 구현값이며 실제 하드웨어 질량으로 확정하지 않는다. |
+| 2026-10-10 독립 tactile 17채널 | 기존 URDF tactile link 17개에 독립 ContactSensor를 연결하고 net normal force norm >0.01 N을 binary로 관측한다. Palm·finger pad-2의 원래 CAD slot을 메우던 부모 5개 convex hull을 convex decomposition으로 바꿔 접촉이 pad까지 닿게 한다. Source URDF·visual·mass/inertia·41 body·18 DOF·41 collider prim은 유지한다. 실제 sphere contact로 모든 채널 ON/OFF와 reset/다중 환경 cache 보존을 확인했다. |
 
 Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. 논문의 성과를 우리
 과업의 성공·속도·상태 이해 결과로 기록하지 않는다.
@@ -332,12 +361,14 @@ Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. �
 ## 7. 현재 Isaac Lab 구현
 
 새 환경의 위치는 [src/contact_rearrangement](../src/contact_rearrangement/README.md)다.
-`ManagerBasedEnv`를 사용하는 스폰 단계이며 action/observation manager는 비어 있다.
+`ManagerBasedEnv`를 사용하는 스폰·센서 단계다. Action manager는 비어 있으며
+observation manager의 `sensors` group은 raw F/T·17채널 tactile과 valid mask·초기 RGB-D·역할
+mask·camera pose를 반환한다. 아직 학습 정책용 기하·시간 이력 encoder는 없다.
 Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history는 후속 구현 범위다.
 
 ### 장면과 초기 설정
 
-- UR5e + RH56E2 **오른손**을 fixed joint로 하나의 articulation에 조립한다. 손의 fixed link와 mimic 관계를 유지하고 contact-report API를 활성화한다. 손 mount 회전은 tool frame 기준 `(0,-90,0)` deg다.
+- UR5e + RH56E2 **오른손**을 fixed joint로 하나의 articulation에 조립한다. 손의 fixed link와 mimic 관계를 유지하고 contact-report API를 활성화한다. 기존 vendor adapter `mount_rotation_deg=(0,-90,0)` deg에 `mount_tool_roll_deg=-90` deg를 추가한다. 추가 roll은 physical tool body인 `wrist_3_link` local +Z축을 기준으로 hand 조립 transform에 적용한다. 같은 tool +Z로 hand anchor를 5 cm 옮기고 길이 5 cm·직경 5 cm 원통을 두 25 mm rigid half로 조립한다. 중앙 fixed joint를 F/T 측정점으로 삼아 hand load가 통과하게 한다. 현재 41 body·18 DOF·41 enabled robot collider이며 nominal 원통 질량 0.20 kg는 실제 센서 질량이 아닌 구현 기본값이다. 원본 asset과 기존 wrist mass/inertia는 유지한다.
 - Kinematic speedrack shelf와 **기존 6종 + YCB 4종 = 10종** asset을 사용한다. YCB는 `NVIDIA/Assets/Isaac/5.1/Isaac/Props/YCB/Axis_Aligned_Physics`의 `003_cracker_box`, `004_sugar_box`, `005_tomato_soup_can`, `006_mustard_bottle`이다. 해당 폴더에서 확인한 4개 USD는 rigid body와 collision이 이미 authoring되어 있다.
 - 장면당 **4–10종**을 선택하고 종류별 최소 하나씩 사용한다. 요구 면적에 도달할 때까지 추가 가능한 non-target 종류 중 active 개수가 가장 적은 종류에 복사본을 추가하며 동률은 무작위로 정한다. Blocker도 해당 종류의 첫 instance로 센다. 현재 같은 pool capacity에서는 non-target 개수 차이가 최대 1이다. Target은 정확히 1개이며 별도 종류별 고정 최대값을 추가하지 않는다. `all_asset_types=True`는 catalog 10종을 모두 선택하고 같은 균형 원칙으로 중복을 추가한다. Instance 최소 4·cap 40, 종류당 10-copy·환경당 100-body pool은 별도 값이다. 공간 배치는 packing을 위해 큰 footprint부터 진행하며 복사본 종류 선택 순서와 구별한다. Inactive는 `z=4.0/4.4/4.8/5.2 m`에 주차하고 속도를 0으로 설정한다. Parking은 작업층 camera ROI 밖에 두며 USD visibility를 수정해 숨기지 않는다. **Pool의 모든 body는 simulation enabled와 native gravity를 유지**해 topology를 바꾸지 않는다. 후속 actor·reward·종료에는 active mask를 적용한다. Observation K를 100으로 확정하는 뜻은 아니다.
 - `TaskObjectPool`은 매 physics write/substep에서 inactive body에만 world force `-m*g`를 추가해 중력을 상쇄한다. PhysX `apply_forces_and_torques_at_position`에 실제 **world COM 위치**를 명시해 asset root pivot과 COM의 차이로 불필요한 토크가 생기지 않도록 한다. Active body의 추가 힘은 0이며 native gravity와 접촉 동역학을 유지한다. Live CPU simulation/gravity flag나 USD visibility를 매 reset마다 바꾸지 않는다.
@@ -353,19 +384,31 @@ Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history�
 - 기본 물리 주기는 `1/120 s`, decimation은 4로 환경 step은 `1/30 s`다. 기본 환경 수 1, 간격 2.5 m다.
 - 장면 확인용 `spawn_scene.py`는 기본적으로 시뮬레이션 시간 5초마다 전체 환경을 reset해 새 배치를 생성한다. 실제 `env.step_dt`로 간격을 계산하며 현재 설정에서는 150 step이다. `--reset_interval N`으로 step 간격을 지정하고 0이면 자동 reset을 끈다. 이 설정은 실행 스크립트의 확인 주기이며 학습 episode timeout을 확정하는 것은 아니다.
 - `RoleObbVisualizer`는 Target 초록색·Blocker 빨간색 OBB를 표시한다. 각 역할의 12개 모서리를 현재 body link pose·local bounds에서 계산해 YCB upright·root offset·합성 scale을 반영하고 매 step과 전체/부분 reset 뒤 갱신한다. Debug draw만 사용하며 USD prim·collider·material·physics state를 쓰지 않는다. GUI·livestream에서 기본 표시하고 `--disable_role_obb`로 끈다. 일반 headless에서는 생략하며 `--headless --validate`에서 viewport 없이 overlay 검사를 실행한다. 제한된 headless·GUI 검사 결과는 8절에 기록한다.
-- Reset은 물체 sample 뒤 Blocker 앞의 robot 시작 후보를 찾는다. 선택한 모든 환경의 CPU 후보 승인 뒤 elbow-up joint position·zero joint velocity와 동일 PD target, active mask·역할·초기 state·A₀·robot 시작 metadata를 해당 환경에만 쓴다. 후보 실패 시 기존 physical pose와 metadata를 유지하며 추가 physics/settling step은 없다. Pool의 simulation/native gravity와 inactive parking/countergravity를 유지한다. 이전 composition·모듈 통합 검사는 최종 robot randomization의 24개 pose·5초 stress와 구분한다.
-- 17개 tactile용 링크와 독립 구동 관절의 존재는 확장 버전에서도 검증했다. 새 환경의 `ContactSensorCfg`, binary tactile observation, wrist F/T 신호·보정은 아직 구현되지 않았다.
+- Reset은 물체 sample 뒤 Blocker 앞의 robot 시작 후보를 찾고 실제 앞쪽 camera 렌더로 초기 가시성을 승인한다. Camera 32개 후보가 실패하면 같은 역할·종류·active ID·개수로 pose를 다시 제안하며 최대 8개 layout을 검사한다. 승인된 pose·A₀·robot 시작 metadata와 initial snapshot을 해당 환경에 저장하고 후보 실패 시 기존 physical pose·metadata로 복구한다. Render는 physics/settling step을 추가하지 않으며 pool의 simulation/native gravity와 inactive parking/countergravity를 유지한다.
+- 17개 tactile link에 각각 독립 ContactSensor를 붙이고 binary contact·valid mask를 관측한다. 중앙 fixed-joint raw F/T도 구현한다. Sensor-frame 중력·bias 보정·filtering과 실제 하드웨어 threshold 교정은 후속 단계다.
 
-### Blocker 앞의 robot 시작 randomization — GPU stress 검사 통과
+### Blocker 앞의 robot 시작 randomization
 
 `cfg.robot_start`에 `RobotStartRules`를 둔다. 기본 제안 영역은 Blocker의
 **회전 footprint +X 최전방보다 12–40 cm 앞**, 동시에 **선반 앞 경계에서
 6 cm 이상 밖**, Blocker bounding center의 **Y ±8 cm**, shelf top 위
 **20–28 cm**다. 거리 기준은 palm TCP `right_plam_force_sensor`이며 손가락
-표면이 아니다. 손가락 local +Y는 world −Z, palm normal local +Z는 world −X를
-향하게 고정한다. 구체적인 영역 식은 [SPAWN_RULES.md](SPAWN_RULES.md)에 있다.
+표면이 아니다. 현재 TCP local +Y인 손가락/tool 전방은 **world −X, 선반 방향**,
+local +Z인 palm normal은 **world −Y**, local +X는 world +Z를 향하게 고정한다.
+조립된 USD에서 TCP +Y는 UR `wrist_3_link`의 local +Z인 tool 전방과 일치한다.
+기존 vendor adapter `(0,-90,0)` deg는 유지하고 tool +Z 기준 **hand −90° roll**을
+mount에 추가한다. Arm wrist 관절각만 바꾸는 것이 아니라 hand의 mount 회전과
+translation을 함께 변환한다. `tool0` attachment의 축은 physical tool body와
+다르므로 `tool0` 자체 local Z를 회전축으로 쓰지 않는다. 구체적인 영역 식과
+회전 행렬은 [SPAWN_RULES.md](SPAWN_RULES.md)에 있다.
 
-`assets.py`의 `RobotPoseModel`은 실제 조립 USD의 39-link joint frame·axis·scale로
+실제 센서·연결부 공간을 반영하는 길이 5 cm 원통을 wrist-3와 hand 사이에
+둔다. Hand fixed anchor는 physical tool +Z로 5 cm 이동하고 현재 −90° roll은
+유지한다. 현재 원통은 중앙 F/T joint를 둔 두 rigid half이므로 **41-link FK·
+18 DOF**, 외부 scene·arm self 검사에는 **41개** robot collider를 쓴다.
+Nominal mass/inertia는 구현값이며 실제 하드웨어 교정과 구분한다.
+
+`assets.py`의 `RobotPoseModel`은 실제 조립 USD의 41-link joint frame·axis·scale로
 FK를 구성하고 SciPy bounded IK로 arm 해를 찾는다. Finger q는 기존 열린 손의
 기본값을 유지한다. Elbow-up은 관절각 부호로 결정하지 않고 elbow joint center가
 shoulder–wrist-1 chord의 가장 가까운 점보다 **world Z로 5 cm 이상 위**인지
@@ -392,8 +435,10 @@ elbow-down fallback이나 물체 배치 재선정으로 조건을 완화하지 �
 실제 state/PD target·metadata 적용을 진행한다. 후보 실패 시에는 기존 선택
 환경의 physical pose·metadata도 유지한다.
 `cfg.robot_start.enabled=False`이면 기존 기본 자세를 사용한다. 수치는 후속
-제어·학습 분포에 맞춰 조정할 수 있다. 최종 24개 시작과 반복 reset·5초 물리
-검사가 통과했으며 조건·범위는 8절에 기록한다.
+제어·학습 분포에 맞춰 조정할 수 있다. Reset 검증은 실제 PhysX TCP의 전체
+회전 오차를 **0.01 rad 이하**로 확인하고 wrist-3 local +Z가 world −X인지도
+대조한다. 2026-10-09의 24개 시작과 반복 reset·5초 물리 검사는 이전 아래를
+향하던 tool 자세의 결과이며 조건·범위는 8절에 기록한다.
 
 ### 밀집 배치와 해소 가능성의 초기 조건
 
@@ -434,35 +479,117 @@ pivot은 실제 hand contact point를 인증하는 것이 아니다. UR5e의 접
 가능성, 손의 접촉점과 충돌, OSC로 밀 수 있는지, 마찰·회전·전도를 포함한 동역학,
 센서 기반 종료 판정과 실제 재배치 성공은 아직 입증하지 않았다.
 
-### 초기 vision의 가시성 조건 — 실제 camera 검사 후속
+### 중앙 fixed-joint F/T와 초기 센서 observation
+
+원통 중앙의 fixed joint에서 PhysX incoming-joint reaction을 직접 읽는다.
+측정 frame은 중앙점에 놓인 physical tool XYZ이며 parent→child 방향의
+`[Fx,Fy,Fz,Tx,Ty,Tz]`, 단위는 `[N,N,N,N·m,N·m,N·m]`다. 힘·토크에는 중력·
+관성·접촉·외력이 포함된다. Raw 관측에 자동 tare나 중력 보정을 적용하지 않는다.
+명시적인 `tare()`는 그 시점의 bias만 저장하며 중력 보정과 다르다. Reset은
+선택한 환경의 cache·bias를 비우고 `wrench_valid=False`로 둔다. 다음 완료된
+physics step 뒤 timestamp가 증가했을 때 반력을 읽어 valid로 갱신한다.
+
+`ObservationsCfg.sensors`는 concatenate하지 않는 dictionary다. `wrench` 6D,
+`wrench_valid` 1D, `tactile`·`tactile_valid` 각 bool 17D, RGB `480×640×3`,
+depth `480×640×1` m, Target/Blocker 순서의
+실제 instance mask `480×640×2`, camera world position+ROS quaternion(wxyz) 7D를
+반환한다. RGB/depth/mask/camera pose는 승인한 초기 snapshot의 cache를 읽으며
+episode 중 image를 갱신하지 않는다. 비가림 reference·가시성 비율은 reset의
+acceptance metadata이며 observation으로 제공하지 않는다. 초기 10D 물체 기하
+추정·GNN·history·보정 F/T는 아직 구현하지 않았다.
+
+### 기존 hand link의 독립 tactile 17채널
+
+Scene에 `contact_` + canonical tactile body name으로 17개 독립 ContactSensor를
+둔다. 각각 `{ENV_REGEX_NS}/Robot/ROASRightHand/{body_name}` 한 body만 검사한다.
+순서는 **palm 1개 → thumb 1–4 → index 1–3 → middle 1–3 → ring 1–3 → little 1–3**다.
+기존 URDF의 palm 이름 `right_plam_force_sensor`는 철자를 그대로 유지한다.
+초기 URDF 검사에서 정확한 17개 link와 기존 collision mesh를 확인한다.
+
+`cfg.tactile.force_threshold=0.01 N`은 finite positive 값이어야 한다.
+`env.binary_tactile_sensor.net_forces_w`의 world net normal contact force
+`[N_env,17,3]`에 대해 norm **> threshold**를 `contacts[N_env,17]` bool로 계산한다.
+`valid`도 같은 shape의 bool이다. SDK `ContactSensorCfg.force_threshold`는
+사용하지 않는 air/contact-time용 설정이므로 binary threshold로 대신 쓰지 않는다.
+각 sensor는 `update_period=0`, `history_length=0`이며 120 Hz physics의 마지막
+완료 step, 즉 30 Hz 관측의 마지막 substep 값을 읽는다. 자유 공간의 중력·
+관절하중 자체는 normal contact가 아니다. Render/reset의 같은 timestamp에서는
+stale report를 다시 읽지 않는다. 선택 reset은 cache를 zero·invalid로 비우고
+다음 완료 physics step 뒤 valid로 갱신하며 미선택 환경 cache는 유지한다.
+
+기존 단일 convex hull이 palm·finger pad-2의 CAD slot을 메워 pad collider까지
+접촉이 닿지 않는 문제를 교정했다. `assets._preserve_tactile_parent_slots()`는
+`right_plam_1`, `right_index_2`, `right_middle_2`, `right_ring_2`, `right_little_2`의
+기존 부모 collider 5개만 convex decomposition으로 바꾼다. 기본값은 최대
+128 hull·hull당 64 vertex·1M voxel·error 0.5%·shrink wrap·min thickness 0.1 mm다.
+17개 pad collider·source URDF·visual·mass/inertia는 유지한다. Robot은
+41 body·18 DOF·**41 collider prim**이며 decomposition의 cooked hull 수와
+collider prim 수를 구분한다. Sensor 책임은 기존 `sensors.py`에 통합한다.
+
+### 초기 vision의 실제 silhouette 판정
 
 `InitialVisionCfg`는 앞쪽 **+X camera에서 −X를 보는 방향**,
-`min_target_visible_fraction=0.40`, `require_full_target_in_frame=True`를 기록한다.
-선택한 분모는 같은 camera intrinsics·pose와 같은 settled Target pose에서
-Target만 외부 가림 없이 렌더링한 **전체 silhouette 픽셀 수**다. 실제 장면의
-Target mask 픽셀 수를 분자로 사용한다. 다른 물체뿐 아니라 shelf·robot 가림도
-포함하고 Target self-occlusion은 reference silhouette에 자연스럽게 반영한다.
+`min_target_visible_fraction=0.40`, `min_blocker_visible_fraction=1.0`을 설정한다.
+분모는 같은 camera intrinsics·상대 pose에서 해당 역할 물체만 외부 가림 없이
+렌더링한 **전체 silhouette 픽셀 수**다. 실제 장면의 해당 instance mask 픽셀
+수를 분자로 사용한다. 다른 물체뿐 아니라 shelf·robot 가림도 포함하며 물체
+self-occlusion은 reference silhouette에 자연스럽게 반영한다. 둘 다 전체 bounds가
+frame 안에 있어야 하고 reference 최소 32 pixel을 요구한다. Blocker는 전체
+reference 면적에서 최대 2 pixel의 손실을 허용하며 contour 경계 band로 빼지 않는다.
 가시 비율의 상한은 추가하지 않는다.
 
-현재 task camera는 없고 `target_visibility_validated=False`,
-`target_visible_fraction=NaN`이다. 향후 **고정 역할/개수 → pose 제안 → settle와
-안정성 검사 → RGB·instance mask·reference → 40% 조건 검사** 순으로 초기
-장면을 승인한다. 실패 시 같은 역할·종류·instance 조합·개수의 pose만 재시도한다. 승인된 초기
-vision과 같은 settled pose로 A₀를 정한 뒤 episode 내에서는 고정해야 한다.
-현재 A₀는 spawn pose 기준이며 이 후속 gate를 구현한 것으로 취급하지 않는다.
+`InitialCamera`는 640×480 RGB·image-plane depth·instance segmentation을 읽는다.
+카메라 X는 선반 전면보다 0.55–0.95 m 앞, Y는 Blocker 중심 ±0.35 m에서 제안해
+±0.50 m로 제한하며 높이는 선반 상면 **+0.18–0.48 m**다. 두 역할 사이를 보되
+aim Y ±0.06 m, aim 높이 상면 +0.10±0.03 m, optical-axis roll ±3°를 무작위로
+정한다. Pinhole focal length 18 mm·horizontal aperture 24 mm로 수평 시야각은
+약 67°다.
+두 역할의 전체 bounds를 실제 camera near/far clip `0.02–2.5 m`와 화면 안에서
+검사한다. Nonfinite/range 오류·음수 jitter는 거절하며 `camera_side="+X"`,
+전체 frame 포함과 같은 pose 비가림 reference 규칙은 필수다.
+
+동일 형상의 10종 visual reference를 physics 시작 전에 작업층 밖의 격리 lane
+`z+(20+5×env_id) m, y+5 m×type index`에 만들고 physics API를 제거한다. 환경
+사이도 Z로 5 m 분리한다. Reference 물체와
+`SilhouetteCamera`를 같은 offset으로 평행 이동해 실제 물체·camera의 상대 pose를
+보존한다. Live body의 visibility·physics topology는 바꾸지 않는다.
+순서는 **역할/종류/active ID/개수 고정 → pose·elbow-up 제안 → native state 적용 →
+camera·실제 mask·동일 pose reference → pixel 승인 → 초기 snapshot·A₀ commit**이다.
+최초 5회·이후 2회 `sim.render()`로 texture를 준비하며 physics step은 진행하지
+않는다. 따라서 settled pose가 아니라 승인된 reset pose의 가시성을 검사한다.
+32개 camera 후보가 실패하면 같은 composition의 pose를 재시도하고 최대 8개
+layout에서도 실패하면 기존 state·metadata로 복구해 명시적으로 실패한다.
+실패 복구는 물체 COM velocity와 robot state/목표뿐 아니라 모든 초기 image·
+camera·Target/Blocker 가시성 buffer도 보존한다.
+
+Camera는 로컬 `InitialCamera` subclass를 쓴다. Isaac Lab 2.3.2의 첫 Fabric pose
+조회는 `Camera.reset → _update_poses → XformPrimView`의 stage sync에서 Kit
+`app.update()`를 호출하므로 physics가 진행될 수 있다. `_update_poses`·
+`set_world_poses`·`camera.update` 동안 `/app/player/playSimulations=False`로
+보호하고 `try/finally`로 이전 값을 복구한다. 첫 camera data 읽기 전에 cache를
+준비하며 SDK·live body physics flag는 수정하지 않는다.
+
+`SpawnRules.reserve_blocker_front=True`는 rotated Blocker footprint의 가장
+큰 X부터 shelf front까지, Y bounds 양쪽에 `gap=3 mm`를 더한 직선 통로를
+주변 물체로부터 비운다. Target A₀와 clearance witness는 유지한다. Global
+35%·구역 10% 등 density 조건도 그대로 검사한다. 이는 camera proposal의
+성공 가능성을 높이는 기하 조건이며 실제 silhouette 판정을 대체하지 않는다.
 
 | 파일 | 역할 |
 |---|---|
 | [catalog.py](../src/contact_rearrangement/contact_rearrangement/catalog.py) | Simulator 없이 읽는 10종 metadata, 100개 pool, upright·parking·asset 경로 |
-| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | UR5e/RH56E2 조립·`RobotPoseModel` FK/IK·PD hold, FlatBoxUsdCfg·TaskObjectPool·물체 생성 |
-| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | Scene·ManagerBased, 주기·복제·seed·SpawnRules·RobotStartRules·후속 vision 요구 |
-| [spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py) | USD 측정·역할/reset·robot IK/충돌 후보 승인·state와 시작 metadata 적용 |
+| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | UR5e/RH56E2·중앙 F/T 조립/raw reader·tactile CAD slot collider·FK/IK·물체/pool |
+| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | Scene·카메라·ManagerBased·센서 observation, 주기·복제·seed·SpawnRules·RobotStartRules |
+| [spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py) | USD 측정·역할/reset·robot 후보·camera acceptance retry·state와 metadata commit/rollback |
 | [sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py) | 순수 장면 구성·density·SE(2) 경로, robot 시작 영역/elbow/3D OBB helpers |
+| [sensors.py](../src/contact_rearrangement/contact_rearrangement/sensors.py) | 초기 camera/reference render·snapshot·raw F/T·17개 독립 tactile cache/관측 |
 | [visualization.py](../src/contact_rearrangement/contact_rearrangement/visualization.py) | 현재 pose·local bounds의 Target/Blocker OBB debug draw |
 | [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 실행, 역할 OBB 표시, 스폰·상태·reset 검증 |
 
-실행은 **catalog·CLI → AppLauncher → scene/env 생성 → USD 측정/reset → physics
-step·OBB 갱신** 순서다. Metadata와 순수 sampling은 simulator 없이 읽으며
+현재 센서 책임을 모은 `sensors.py`를 더해 package는 7개 모듈이다. 이전 6개
+모듈 통합의 이력은 유지한다. 실행은 **catalog·CLI → camera 활성화 AppLauncher →
+scene/reference/camera 생성 → USD 측정/reset·pixel acceptance → physics step·
+F/T 갱신·OBB 표시** 순서다. Metadata와 순수 sampling은 simulator 없이 읽으며
 simulator 의존 모듈은 AppLauncher 뒤에 로드한다. `spawn.py`는 실제 geometry를
 `sampling.py`에 전달하고 그 결과를 state로 적용한다. `assets.py`의 pool은 매
 substep countergravity를 적용한다. `__init__.py`는 비어 있으며 package tree와
@@ -488,7 +615,7 @@ Examples와 `roas_sweeping`에서 shelf·6개 물체 종류와 배치를,
 
 ## 8. 개발과 검증 기록
 
-과거 기록의 모듈 이름은 당시 구조다. 현재 위치는 위 6개 모듈 표를 따르며,
+과거 기록의 모듈 이름은 당시 구조다. 현재 위치는 위 7개 모듈 표를 따르며,
 통합 전 검사 결과를 통합 후 runtime 검사의 통과로 사용하지 않는다.
 
 ### 2026-10-09 초기 고정 6개 장면 스폰과 reset — 이전 버전
@@ -959,7 +1086,7 @@ exit code 0으로 통과했다. 4개 CUDA 환경·5.03초에서 150-step 자동 
 로그는 `outputs/contact_rearrangement/refactor_cli_help.log`,
 `refactor_unit_tests.log`, `refactor_gpu_validation.log`에 남겼다.
 
-### 2026-10-09 Blocker 앞 hand 시작과 elbow-down 금지 — 최종 GPU stress 통과
+### 2026-10-09 Blocker 앞 hand 시작과 elbow-down 금지 — 이전 tool 방향의 검증
 
 사용자 요청으로 기존 고정 robot 시작 pose를 episode별 Blocker 앞 영역의
 collision-checked elbow-up 시작으로 확장했다. 6개 모듈 구조를 유지하고
@@ -968,6 +1095,9 @@ collision-checked elbow-up 시작으로 확장했다. 6개 모듈 구조를 유�
 물체 선정·배치 RNG를 유지하고 추가 physics step 없이 선택한 환경에만 적용한다.
 거리·높이·여유·80번 cap은 현재 구현 기본값이며 후속 제어·학습 분포에 맞춰
 조정할 수 있다.
+
+이 절의 수치와 렌더는 tool 전방이 world −Z였던 당시 orientation의 검사다.
+2026-10-10의 선반 방향 교정 결과로 사용하지 않는다.
 
 초기 구현은 4개 GPU 환경·151 step·5.03초의 검사에서 150-step·5초 자동 reset과
 마지막 전체/부분 reset, 선택하지 않은 환경의 q/velocity/PD target과 robot metadata
@@ -1006,8 +1136,9 @@ pose·PD target·reset count·역할·TCP metadata가 유지됐다. 최종 FK po
 
 **GUI 검사:** 45 step·1.5초의 실제 GUI 실행과 전체/부분 reset, COM cache를
 미리 읽은 뒤 reset하는 검사, OBB draw 전후 USD/PhysX 불변 조건도 통과했다.
-실제 렌더에서 손이 Blocker 앞 공간에서 선반을 향하고 elbow가 높게 위치한 것을
-확인했다. 자료는 `outputs/contact_rearrangement/robot_start_preview.{png,log}`다.
+실제 렌더에서 손이 Blocker 앞 공간에 있고 elbow가 높게 위치한 것을 확인했다.
+당시 palm normal은 선반을 향했지만 tool 전방은 아래를 향했다. 자료는
+`outputs/contact_rearrangement/robot_start_preview.{png,log}`다.
 Elbow 높이 계산은 `assets.py`의 FK와 `sampling.elbow_above_chord`를 공유한다.
 
 **최종 자동 reset 검사:** 현재 변경본의 일반 모드
@@ -1019,12 +1150,211 @@ Elbow 높이 계산은 `assets.py`의 FK와 `sampling.elbow_above_chord`를 공�
 위 통과를 손 전체 self collision·재배치 제어 성공·task camera 가시성의 보장으로
 확대하지 않는다.
 
+### 2026-10-10 Tool 전방을 선반 방향으로 교정 — hand roll 추가 전 검증
+
+사용자가 시작 자세에서 tool이 바닥을 향한다고 지적하고 정면인 선반 방향으로
+수정하도록 요청했다. 이전 목표 회전은 palm normal인 TCP +Z를 world −X로
+맞춰 실제 tool 전방인 TCP +Y·wrist-3 +Z를 world −Z로 향하게 했다.
+`sampling.ROBOT_START_TCP_ROTATION`을 TCP +X→world +Y, +Y→world −X,
++Z→world +Z로 교정했다. 손 mount·시작 영역·elbow-up·15 mm 외부 충돌 여유와
+물체 배치 규칙은 유지한다. Reset 검증에 실제 PhysX TCP 전체 회전과 wrist-3
+tool 축 검사를 추가했다.
+
+**선반 방향 GPU 검사:** 일반 모드 4개 GPU 환경·151 step·5.03초의
+`--validate` 실행이 exit code 0으로 통과했다. 초기 4개·5초 자동 reset 4개·
+부분 reset 1개·마지막 전체 reset 4개, **총 13개 시작 pose**에서 실제 PhysX
+TCP 회전 오차 ≤0.01001 rad와 wrist-3 tool 전방의 world −X 축 검사를 통과했다.
+Elbow-up·초기 scene 충돌 여유·부분 reset의 미선택 환경 유지·COM cache 갱신·
+OBB 표시 전후 물리 상태 불변도 확인했다. 로그는
+`outputs/contact_rearrangement/tool_forward_gpu_validation.log`다.
+이번 수정에서 순수 helper는 바꾸지 않았으므로 앞의 29개 unit test를 새 결과로
+기록하지 않는다.
+
+**선반 방향 GUI 검사:** 1개 환경·45 step·1.50초의 실제 GUI 실행과 전체/부분
+reset, OBB 표시 전후 물리 상태 불변 검사가 exit code 0으로 통과했다. 렌더에서
+tool·손가락이 선반 정면을 향하는 것을 확인했다. 45-step GUI 실행 중 캡처
+시점의 PD 유지 pose에서
+wrist-3 tool 전방은 world `(-0.99947666,-0.0005177,-0.03234399)`이며 정확한
+world −X와의 각도는 **0.03235 rad, 약 1.85°**였다. 초기 reset의 0.01 rad 조건과
+구분해 캡처 시점의 유지 pose는 별도 0.05 rad 검사를 통과했으며, 물리 진행 내내 정확한
+수평 회전이 유지된다는 의미는 아니다. 자료는
+`outputs/contact_rearrangement/tool_forward_preview.{png,log}`다. 이전
+`robot_start_preview` 렌더는 과거 orientation의 자료로 남긴다.
+
+### 2026-10-10 Tool +Z축 기준 hand −90° roll — 원통 연결부 추가 전 검증
+
+사용자가 tool 기준 Z축으로 hand를 −90° 회전하도록 요청했다.
+`Ur5eHandSpawnerCfg.mount_tool_roll_deg=-90.0`을 추가하고 기존 vendor adapter
+`mount_rotation_deg=(0,-90,0)` deg는 유지한다. 실제 조립에서는 `tool0` attachment
+frame과 physical tool body `wrist_3_link`의 축이 서로 달라, 두 frame 사이의
+transform을 반영한 뒤 physical tool +Z를 기준으로 hand mount를 회전한다.
+Hand의 상대 회전뿐 아니라 상대 translation도 함께 회전하며 UR wrist 관절의
+기본값만 바꾸는 방식으로 처리하지 않는다.
+
+TCP 목표는 X→world +Z, Y→world −X, Z→world −Y로 바꾼다. 손가락/tool 전방
+−X, 시작 영역, elbow-up, 15 mm 외부 충돌 여유와 물체 생성 규칙은 유지한다.
+앞 절의 `tool_forward_*` 검사·렌더는 hand roll 추가 전의 결과로 남긴다.
+
+**Hand roll GPU 검사:** 일반 모드 **4개 GPU 환경·151 step·5.03초**의
+`--validate`가 exit code 0으로 통과했다. 초기 4개·5초 자동 reset 4개·부분 reset
+1개·마지막 전체 reset 4개, **총 13개 시작 pose**에서 실제 PhysX TCP의 새
+회전과 wrist-3 tool 전방 −X, elbow-up·15 mm scene 여유를 확인했다. 미선택
+환경 유지·COM cache·pool flag 유지·역할 OBB 표시의 물리 상태 불변도 통과했다.
+로그는 `outputs/contact_rearrangement/hand_tool_roll_gpu_validation.log`다.
+
+**Hand roll 조립·GUI 검사:** 첫 reset의 실제 PhysX pose에서 physical tool body
+기준 새 hand 상대 회전이 **`R_new = Rz(-90°) @ R_old`**임을 확인했다. 회전
+오차는 **3.23141e−7 rad**였고 TCP 상대 translation에도 같은 회전이 적용된
+것을 1e−5 m 허용 오차로 확인했다. 기존 tool 정면 목표에 대한 전체 world
+회전 오차는 **1.15236e−5 rad**였다. 이로써 hand mount의 roll과 tool 전방
+유지를 실제 조립된 body pose로 대조했다.
+1개 GUI 환경·45 step·1.50초와 마지막 전체/부분 reset·역할 OBB 불변 검사도
+exit code 0으로 통과했다. 렌더는 실행 중 약 20번째 step의 캡처이며 앞의
+상대 transform 수치는 첫 update의 초기 pose에서 측정했다. 자료는
+`outputs/contact_rearrangement/hand_tool_roll_preview.{png,log}`다. 순수 helper를
+바꾸지 않았고 이번 수정에서 새 unit test 실행 결과를 추가하지 않는다.
+
+### 2026-10-10 UR5e 말단과 hand 사이 5 cm 원통 연결부 — 중앙 F/T 추가 전 검증
+
+사용자가 실제 센서·연결부를 고려해 UR5e 말단과 hand 사이에 길이 5 cm의
+원통을 요청했다. `Ur5eHandSpawnerCfg.sensor_mount_length=0.05 m`,
+`sensor_mount_radius=0.025 m`로 설정한다. 직경 50 mm는 실제 hand
+`base_link.STL`의 mount X/Y bounds ±25 mm를 기준으로 선택한 구현 기본값이다.
+Wrist-3 아래 visible collision Cylinder `SensorMount`를 추가하며 physical tool
++Z 방향 z=0–50 mm, 중심 z=25 mm에 둔다. World rigid rotation을 반영해 원본
+asset scale과 무관하게 실제 치수를 적용한다.
+
+Hand fixed-joint anchor를 같은 tool +Z 방향으로 50 mm 옮기고 −90° hand roll과
+TCP 목표 회전은 유지한다. 원통은 wrist-3 compound collider이므로 별도 rigid
+body나 DOF를 추가하지 않는다. FK body 39개·DOF 18개는 유지하며 robot collider는
+39개에서 **40개**로 늘어난다. 원통도 기존 15 mm scene 여유와 arm self
+collision 판정에 포함한다. 원본 USD를 수정하지 않고 기존 wrist mass/inertia를
+유지한다. 실제 센서 질량 보정·F/T 센서 출력은 아직 구현되지 않았다.
+위 `hand_tool_roll_*` 결과는 원통 추가 전 검증이며 새 조립 검사는 별도로 기록한다.
+
+**연결부 GPU 검사:** 일반 모드 **4개 GPU 환경·151 step·5.03초**의
+`--validate`가 exit code 0으로 통과했다. 초기 4개·5초 자동 reset 4개·부분 reset
+1개·마지막 전체 reset 4개, **총 13개 시작 pose**에서 실제 PhysX TCP 회전·tool
+전방 −X·elbow-up·15 mm scene 여유를 확인했다. Robot collider **40개**·shelf
+collider 17개, 실제 link 대 FK position 오차 **5.15e−7 m**였다. 미선택 환경
+유지·parking COM cache·pool flag·역할 OBB 표시의 물리 상태 불변도 통과했다.
+로그는 `outputs/contact_rearrangement/sensor_mount_gpu_validation.log`다.
+
+**연결부 조립·GUI 검사:** 첫 reset의 실제 PhysX pose에서 wrist-3→hand base
+offset은 tool body local `[0,0,0.05] m`, gap은 **0.049999997 m**였다. 원통의
+near/far end가 wrist와 hand base origin에 각각 1e−5 m 이내로 일치했고 길이
+50 mm·반지름 25 mm를 확인했다. 기존 −90° 상대 hand roll의 오차는
+**4.51901e−7 rad**였으며 TCP 상대 offset도 원통 추가 전 값에 `[0,0,0.05] m`를
+더한 값과 일치했다. 39 body·18 DOF·40 collider를 유지한 실제 조립을 대조했다.
+1개 GUI 환경·45 step·1.50초와 마지막 전체/부분 reset·역할 OBB 상태 불변
+검사도 exit code 0으로 통과했다. 실행 중 약 20번째 step의 넓은 시야 렌더와
+약 32번째 step의 연결부 근접 렌더에서 원통 공간을 확인했다. 자료는
+`outputs/contact_rearrangement/sensor_mount_preview.{png,log}`와
+`sensor_mount_detail.png`다. 위 상대 transform 수치는 첫 reset에서 측정했으며
+이번 수정에서 새 unit test 실행 결과를 추가하지 않는다.
+
+### 2026-10-10 원통 중앙 F/T와 initial vision acceptance
+
+사용자가 원통 중앙의 articulation fixed-joint F/T와 앞쪽 초기 vision camera를
+요청했다. 원통을 두 25 mm rigid half로 분리하고 중앙 fixed joint를 통해 hand
+load를 전달한다. Nominal 질량 합 0.20 kg와 원통 inertia를 명시하며 원본 wrist
+질량은 유지한다. Body·collider는 각각 41개, DOF는 18개다. Sensor frame의 raw
+반력을 읽고 reset 직후 stale sample은 valid=False로 제외한다. 자동 tare·중력
+보정·filtering은 추가하지 않는다.
+
+실제 같은 pose의 비가림 reference로 Target ≥40%·Blocker 전체(2 pixel tolerance)
+가시성을 검사한다. 앞쪽 camera 위치·aim·roll을 무작위로 정하고 승인한 RGB-D와
+실제 role mask를 초기 snapshot으로 보존한다. Physics step 없이 camera/layout
+retry를 진행하며 역할·종류·active ID·개수는 유지한다. `sensors.py` 한 모듈에
+render·snapshot·F/T observation 연결을 모으고 script는 camera를 자동 활성화한다.
+검증 결과는 이전 원통 geometry 검사와 구분해 기록한다.
+
+Blocker 앞 reserve 통로와 환경별 reference lane 분리를 추가했다. 변경 후
+순수 sampling 검사 **32개**가 **27.993초**에 통과했다. 이 결과는 렌더 가시성·
+F/T 정확도·GPU reset 검사의 통과가 아니며 실제 센서 실행 결과는 별도로 기록한다.
+
+낮은 camera 후보에서는 실제 robot arm·hand가 역할 물체를 가리는 것을 확인해
+기본 camera 높이를 상면 +0.18–0.48 m로 넓혔다. 1개 환경의 진단에서는 같은
+composition의 layout을 한 번 재시도한 뒤 높은 camera 후보가 Target **56.370%**·
+Blocker **100%**로 2번째 camera 시도에 승인됐다. 이는 한 진단 장면의 결과이며
+다중 환경 GPU 검증이나 전체 생성 성공률로 해석하지 않는다.
+
+Reset의 native physics counter 추적에서 첫 camera pose의 SDK Fabric sync가
+Kit update를 통해 physics를 진행시키는 경로를 확인했다. 로컬 `InitialCamera`와
+camera update guard로 이 경로를 보호한다. 이 수정의 reset/render/time/native
+counter 검증은 아래 최종 GPU 실행에서 통과했다.
+
+**최종 센서 GPU 검사:** `outputs/contact_rearrangement/initial_sensors_gpu_validation.log`
+실행이 exit code 0으로 통과했다. 4개 환경의 public script **151 env step·
+5.03초**, 추가 2 env step과 F/T bench 7 physics step을 검사했다. 전체 reset
+6회 중 2회는 부분 reset이며 **18개 승인 시작 pose**였다. Successful capture
+call은 **6회**, failed layout은 **2개**, render는 두 warmup call을 포함해
+**464회**였다. Capture 중 object/robot native pose·velocity·joint q/v·PD target·
+physics time/step은 정확히 유지됐으며 추가 physics step이 없었다. SDK 초기화의
+별도 physics step 2회는 env step·reset/capture 검사와 분리해 센다.
+
+18개 시작의 Target fraction은 **47.1253–100%**였다. Blocker는 17개가 정확히
+100%, 1개가 **99.97586%**로 정확히 **2 pixel** 손실을 허용한 경우였다. 승인한
+camera 후보 시도는 1–30회였다. Native robot은 **41 body·18 DOF·41 collider**다.
+Reset 직후 선택된 F/T는 zero·invalid였고 다음 physics step 뒤 valid·finite로
+갱신됐다. 미선택 F/T·snapshot cache를 보존했으며 153 env step 동안 승인한
+initial snapshot은 고정됐다.
+
+F/T bench는 distal link에 sensor XYZ별 **3 N force**와 **0.10 N·m torque**를
+독립 적용해 baseline 및 Newton–Euler의 중력·관성 항과 대조했다. Downstream은
+33개 body·질량 합 **0.876663 kg**였다. 최대 vector norm 오차는 force
+**0.0206053 N**, torque **0.00132915 N·m**로 기준 0.10 N·0.015 N·m보다 작았다.
+중앙 측정점·sensor frame·parent→child 부호·성분 순서를 실제 물리 반력으로
+확인했다. 이는 해당 제한된 초기 장면과 bench의 검증이며 모든 seed·실제
+재배치 성공·실제 하드웨어 교정·보정 F/T observation의 입증은 아니다.
+
+**센서 GUI·실패 복구 검사:** 1개 GUI 환경·45 env step·1.50초가 exit code 0으로
+통과했다. Target `ycb_003_cracker_box`는 **7724/9286 pixel, 83.178979%**, Blocker
+`ycb_006_mustard_bottle`은 **3608/3608 pixel, 100%**, camera 후보 3회였다.
+실제 원통은 25 mm half 두 개, 중앙점 wrist +25 mm·hand anchor +50 mm와
+41 body·18 DOF·41 collider를 확인했다. Capture 실패와 중간 commit 오류를
+강제한 이동 상태에서도 물체 COM velocity·robot root pose/velocity·q/qd·
+position/velocity target·camera pose·모든 초기 snapshot/역할/seed/count/sample·
+F/T raw/valid/tare·clock/step 복구가 통과했다. Authoritative root·DOF state는
+정확히 복구됐으며 derived robot link velocity는 kinematic 재계산 전 solver
+출력과 최대 **4.47e−5** 차이가 있어 exact 복구로 기록하지 않는다.
+자료는 `outputs/contact_rearrangement/initial_sensors_preview.log`,
+실제 초기 camera `initial_camera_preview.{png,json}`, GUI overview
+`initial_sensors_preview.png`, 연결부 확대 `initial_sensors_detail.png`다.
+Camera/F/T·전체/부분 reset의 재사용 검증 진입점은
+[check_sensors.py](../src/contact_rearrangement/tests/check_sensors.py)이며
+실행 명령은 [README](../src/contact_rearrangement/README.md)에 기록한다.
+
+**Repository 진입점 재현:** `check_sensors.py --num_envs 1`도 exit code 0으로
+통과했다. 151+2 env step·bench 7 physics step, reset/capture 각 6회(부분 reset
+0회), render 179회였다. 승인 6개의 Target **41.0632–100%**·Blocker 전부 100%,
+reset/capture의 physics step 증가 0·snapshot 보존·41 body/18 DOF/41 collider를
+확인했다. 6축 bench의 최대 norm 오차는 **0.0122181 N·0.000850297 N·m**였다.
+로그는 `outputs/contact_rearrangement/initial_sensors_reusable_check.log`다.
+기존 4환경·GUI 결과와 별도 실행이며 `compileall`·`git diff --check`도 통과했다.
+
+### 2026-10-10 Tactile 17채널 실제 접촉·reset 검증
+
+[check_tactile.py](../src/contact_rearrangement/tests/check_tactile.py) `--num_envs 2`
+GPU 실행이 exit code 0으로 통과했다. Public 151 env step·5.03초, reset 6회
+(부분 2회), render 116회에서 tactile cache와 physics time/step의 보존을 확인했다.
+반지름 3 mm의 test-only sphere로 모든 17개 pad의 해당 채널 ON, 분리 뒤
+4 physics step에서 모두 OFF를 확인했다. Probe penetration은 16개 pad 1 mm·
+`right_little_force_sensor_3`만 2 mm, 측정력은 0.108537–31.0263 N이었다. 이는
+binary 실제 접촉 검증이며 하중 교정으로 해석하지 않는다. 중력·PD hold만으로
+모두 OFF, 둘째 환경 palm ON을 유지한 env0 부분 reset의 contacts/valid/raw cache
+보존과 reset zero/invalid·다음 완료 step valid를 확인했다. Native 독립 body·
+reporter 17개, 41 body·18 DOF·41 collider prim, dense/역할/robot elbow-up·support·
+camera visibility·OBB 무변경도 통과했으며 FK 오차는 4.96e−7 m였다. 로그는
+`outputs/contact_rearrangement/tactile_gpu_validation.log`다. Probe는 검증 스크립트에만
+있으며 기본 task geometry에는 추가하지 않는다. Compile·diff check도 통과했다.
+
 ## 9. 다음 구체화와 구현에서 정할 사항
 
 아래는 미결 사항이며 다음 작업의 순서가 확정된 것은 아니다.
 
 1. 실제 학습 분포 구체화. 종류별 채택률·실패율, settle 이후 기하 조건 유지, 밀집도 수치와 sampler bias, 로봇의 실제 접촉·접근 가능성을 확인한다.
-2. 17개 binary tactile과 wrist F/T의 센서 정의, 중력·bias 보정, filtering·동기화·threshold.
+2. 구현한 tactile 17채널과 raw F/T의 실기 threshold·filtering·동기화 교정, F/T 중력·bias 보정 및 실제 센서 질량 교정.
 3. 18D OSC/hand 제어의 frame·scale·강성/감쇠·정책 주기 및 실기 제어 경로.
 4. 초기 vision snapshot의 좌표계·보존 시점, 관측 가능한 물체·padding mask, history 또는 hidden state의 reset.
 5. 고정 접근영역·footprint·전체 차단 계산과 Target 보호·비파지 조건·성공/실패·timeout의 정확한 정의.

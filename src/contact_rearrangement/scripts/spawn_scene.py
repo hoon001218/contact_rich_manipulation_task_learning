@@ -45,6 +45,7 @@ parser.add_argument("--validate", action="store_true", help="Check robot/objects
 parser.add_argument("--disable_role_obb", action="store_true", help="Hide the green Target / red Blocker viewport outlines.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+args_cli.enable_cameras = True
 if args_cli.num_envs < 1 or args_cli.max_steps < 0 or (
     args_cli.reset_interval is not None and args_cli.reset_interval < 0
 ):
@@ -84,6 +85,7 @@ from contact_rearrangement.assets import ARM_JOINT_NAMES, HAND_JOINT_NAMES, TACT
 from contact_rearrangement.env_cfg import ContactRearrangementEnvCfg
 from contact_rearrangement.sampling import scene_metrics, validate_sample
 from contact_rearrangement.spawn import validate_robot_start_state
+from contact_rearrangement.sensors import TACTILE_SENSOR_NAMES, tactile_contacts, tactile_valid
 from contact_rearrangement.visualization import RoleObbVisualizer
 
 
@@ -116,9 +118,19 @@ def validate_reset_state(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
         target_asset = OBJECT_SPECS[sample.target_id].asset_name
         if sum(OBJECT_SPECS[index].asset_name == target_asset for index in sample.active_ids) != 1:
             raise RuntimeError("Target asset type must appear exactly once in each scene.")
-        if env.target_visibility_validated[env_id] or not torch.isnan(env.target_visible_fraction[env_id]):
-            raise RuntimeError("Image visibility must remain unvalidated until a camera measurement is available.")
+        if not env.target_visibility_validated[env_id] or not env.blocker_visibility_validated[env_id]:
+            raise RuntimeError("Initial vision must be validated from rendered role silhouettes.")
+        visible = env.initial_vision_pixel_counts[env_id, :, 0]
+        full = env.initial_vision_pixel_counts[env_id, :, 1]
+        if full.min() < env.cfg.initial_vision.min_silhouette_pixels:
+            raise RuntimeError("Initial role silhouette has too few pixels.")
+        if env.target_visible_fraction[env_id] < env.cfg.initial_vision.min_target_visible_fraction:
+            raise RuntimeError("Rendered Target visible fraction is below its threshold.")
+        if visible[1] + env.cfg.initial_vision.blocker_pixel_tolerance < full[1]:
+            raise RuntimeError("Rendered Blocker is occluded beyond raster tolerance.")
     validate_pool_flags(env)
+    if tactile_contacts(env)[env_ids].any() or tactile_valid(env)[env_ids].any():
+        raise RuntimeError("Reset tactile readings must remain zero and invalid until physics advances.")
     robot = env.scene["robot"]
     torch.testing.assert_close(
         robot.data.joint_pos[env_ids], env.robot_initial_joint_pos[env_ids], atol=1e-5, rtol=0.0
@@ -141,6 +153,15 @@ def validate_scene(env: ManagerBasedEnv) -> None:
     missing_links = set(TACTILE_BODY_NAMES) - set(robot.body_names)
     if missing_joints or missing_links:
         raise RuntimeError(f"Missing robot joints: {sorted(missing_joints)}; hand links: {sorted(missing_links)}")
+    for name, body_name in zip(TACTILE_SENSOR_NAMES, TACTILE_BODY_NAMES):
+        sensor = env.scene[name]
+        if sensor.num_bodies != 1 or sensor.body_names != [body_name]:
+            raise RuntimeError(f"Contact sensor {name} must report only {body_name}.")
+    contacts, valid = tactile_contacts(env), tactile_valid(env)
+    if contacts.dtype != torch.bool or contacts.shape != (env.num_envs, 17) or valid.shape != contacts.shape:
+        raise RuntimeError("Tactile contact and validity must have 17 binary channels per environment.")
+    expected = env.binary_tactile_sensor.net_forces_w.norm(dim=-1) > env.cfg.tactile.force_threshold
+    torch.testing.assert_close(contacts, expected & valid, atol=0, rtol=0)
     if not robot.is_fixed_base:
         raise RuntimeError("The UR5e base must be fixed.")
     if not torch.isfinite(robot.data.joint_pos).all() or not torch.isfinite(objects.data.object_state_w).all():
@@ -213,7 +234,7 @@ def describe_samples(env: ManagerBasedEnv) -> None:
             f"x_coverage={metrics.x_coverage:.1%} y_coverage={metrics.y_coverage:.1%} "
             f"shelf_occupancy={metrics.shelf_occupancy:.1%} neighbors={metrics.local_neighbor_fraction:.1%} "
             f"min_region_occupancy={min(metrics.region_occupancies):.1%} "
-            f"clearance={sample.clearance_kind} visibility=unvalidated "
+            f"clearance={sample.clearance_kind} visibility=validated "
             f"asset_counts={dict(sorted(Counter(assets).items()))}", flush=True,
         )
         if env.cfg.robot_start.enabled:
@@ -221,6 +242,10 @@ def describe_samples(env: ManagerBasedEnv) -> None:
             print(f"[ROBOT START]: env={env_id} tcp_local={tcp} "
                   f"elbow_height={float(env.robot_start_elbow_height[env_id]):.3f}m "
                   f"attempts={int(env.robot_start_attempts[env_id])} collision_clearance=validated", flush=True)
+        print(f"[INITIAL VISION]: env={env_id} target={float(env.target_visible_fraction[env_id]):.3%} "
+              f"blocker={float(env.blocker_visible_fraction[env_id]):.3%} "
+              f"pixels(visible/full)={env.initial_vision_pixel_counts[env_id].cpu().tolist()} "
+              f"camera_attempts={int(env.initial_camera_attempts[env_id])}", flush=True)
 
 
 def validate_role_obb(env: ManagerBasedEnv, visualizer: RoleObbVisualizer) -> None:
@@ -343,6 +368,8 @@ def main() -> None:
             f"instances selected for >= {cfg.spawn_rules.min_shelf_occupancy:.0%} shelf occupancy "
             f"(instance cap {args_cli.max_objects})."
         )
+        print(f"[INFO]: 17 independent hand ContactSensors; binary net-normal-force threshold "
+              f"{cfg.tactile.force_threshold:g} N, last completed physics step.")
         if reset_interval:
             print(
                 f"[INFO]: Automatic reset every {reset_interval} environment steps "
