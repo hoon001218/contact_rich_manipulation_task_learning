@@ -2,8 +2,10 @@
 
 This module deliberately has no Isaac Sim imports.  Inputs are the public actor
 observation only: initial camera geometry, object masks and roles, followed by
-the newest-first history and its validity mask.  Both actor and critic use the
-same information; neither reads the current object poses from the simulator.
+the current and previous samples, newest first, and their validity mask. Both
+actor and critic use the same information; neither reads the current object
+poses from the simulator. Explicit checkpoint configurations retain their
+configured window length.
 """
 
 from __future__ import annotations
@@ -80,7 +82,7 @@ class SceneGraphEncoder(nn.Module):
 
 
 class HistoryEncoder(nn.Module):
-    """Causal convolutions over the fixed window, with explicit reset padding."""
+    """Encode the current/previous pair, with explicit previous-sample reset padding."""
 
     def __init__(self, cfg: ModelCfg):
         super().__init__()

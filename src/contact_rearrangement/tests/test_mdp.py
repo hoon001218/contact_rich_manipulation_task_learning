@@ -122,8 +122,8 @@ class RewardTests(unittest.TestCase):
         geometry = torch.zeros((2, 40, 10))
         valid = torch.zeros((2, 40), dtype=torch.bool)
         roles = torch.zeros((2, 40, 2))
-        history = torch.zeros((2, 16, 89))
-        history_valid = torch.zeros((2, 16), dtype=torch.bool)
+        history = torch.zeros((2, 2, 89))
+        history_valid = torch.zeros((2, 2), dtype=torch.bool)
         valid[:, 0] = True
         geometry[:, 0] = 1.
         geometry[:, 1:] = float("nan")
@@ -131,7 +131,7 @@ class RewardTests(unittest.TestCase):
         history[:, 1:] = float("nan")
         history_valid[:, 0] = True
         packed = mdp.pack_policy_observation(geometry, valid, roles, history, history_valid)
-        self.assertEqual(tuple(packed.shape), (2, 1960))
+        self.assertEqual(tuple(packed.shape), (2, 700))
         self.assertTrue(bool(torch.isfinite(packed).all()))
         self.assertEqual(float(packed[:, 10:400].abs().sum()), 0.)
 
@@ -142,7 +142,7 @@ class RewardTests(unittest.TestCase):
                 mdp.MdpCfg(**changed)
 
 
-def make_tensor_env():
+def make_tensor_env(num_envs=1):
     """Minimal physical-state fixture for testing the actual transition cache."""
     cfg = mdp.MdpCfg(stable_steps=2)
     state = SimpleNamespace()
@@ -151,14 +151,16 @@ def make_tensor_env():
     state.upright = torch.tensor([[1., 0., 0., 0.]] * 3)
     state.sensor_id = 0
     state.tcp_id = 0
+    state.joint_ids = list(range(12))
     state.last_time = torch.zeros(1, dtype=torch.float64)
-    state.history = torch.zeros((1, 16, 89))
-    state.history_valid = torch.ones((1, 16), dtype=torch.bool)
+    state.history = torch.zeros((1, 2, 89))
+    state.history_valid = torch.ones((1, 2), dtype=torch.bool)
     state.previous_center = torch.zeros((1, 40, 3))
     state.initial_center = torch.zeros_like(state.previous_center)
     state.initial_rotation = torch.tensor([[[1., 0., 0., 0.]] * 40])
     state.previous_velocity = torch.zeros((1, 40, 6))
     state.previous_wrench = torch.zeros((1, 6))
+    state.wrench_bias = torch.zeros((1, 6))
     state.initial_sensor_point = torch.zeros((1, 3))
     state.path_length = torch.zeros(1)
     state.stable_count = torch.zeros(1, dtype=torch.long)
@@ -180,7 +182,9 @@ def make_tensor_env():
     robot = SimpleNamespace(data=SimpleNamespace(body_link_pos_w=torch.zeros((1, 1, 3)),
                                                  body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]]]),
                                                  root_pos_w=torch.zeros((1, 3)),
-                                                 root_quat_w=torch.tensor([[1., 0., 0., 0.]])))
+                                                 root_quat_w=torch.tensor([[1., 0., 0., 0.]]),
+                                                 joint_pos=torch.zeros((1, 12)),
+                                                 joint_vel=torch.zeros((1, 12))))
 
     class Scene(dict):
         env_origins = torch.zeros((1, 3))
@@ -195,7 +199,17 @@ def make_tensor_env():
                           initial_object_valid=torch.zeros((1, 40), dtype=torch.bool),
                           initial_object_roles=torch.zeros((1, 40, 2)),
                           spawn_rules=SimpleNamespace(x_range=(-.9, -.5), y_range=(-.45, .45),
-                                                      shelf_top=1.05, ceiling=1.48))
+                                                      shelf_top=1.05, ceiling=1.48),
+                          action_manager=SimpleNamespace(action=torch.zeros((1, 18))))
+    if num_envs != 1:
+        # Duplicate independent scenes while retaining catalog geometry, which
+        # has an object axis rather than an environment axis.
+        for owner in (state, object_data, robot.data, env, env.action_manager):
+            for name, value in list(vars(owner).items()):
+                if isinstance(value, torch.Tensor) and value.shape[0] == 1:
+                    setattr(owner, name, value.repeat(num_envs, *([1] * (value.ndim - 1))))
+        env.scene.env_origins = torch.zeros((num_envs, 3))
+        env.num_envs = num_envs
     _, _, center, _, _, _ = mdp._physical_objects(env, state)
     state.previous_center[:] = state.initial_center[:] = center
     return env
@@ -321,6 +335,81 @@ class TransitionTests(unittest.TestCase):
         moved = mdp.policy_observation(env)[0, :10]
         self.assertGreater(float(torch.linalg.vector_norm(moved[:3] - observed[0, :3])), .029)
         torch.testing.assert_close(env.initial_object_geometry, original, equal_nan=True)
+
+
+class PreviousStepTests(unittest.TestCase):
+    def setUp(self):
+        self.env = make_tensor_env(num_envs=2)
+        contacts = torch.zeros((2, 17), dtype=torch.bool)
+        sensors = SimpleNamespace(tactile_contacts=lambda env: contacts,
+                                  tactile_valid=lambda env: torch.ones_like(contacts))
+        self.patches = (patch.dict(sys.modules, {"contact_rearrangement.src.sensors": sensors}),
+                        patch.object(mdp_observations, "corrected_wrench", lambda env: torch.zeros((2, 6))))
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+        mdp.reset_mdp(self.env)
+
+    def advance(self, joint_position, previous_action):
+        self.env.scene["robot"].data.joint_pos[:, 0] = joint_position
+        self.env.action_manager.action[:, 0] = previous_action
+        self.env.sim.current_time += self.env.step_dt
+        return mdp.update_mdp(self.env)
+
+    def test_only_current_and_previous_samples_survive_and_actions_match_their_transitions(self):
+        self.advance(.1, .2)
+        self.advance(.3, .4)
+        state = self.advance(.5, .6)
+        expected_q = torch.tensor([.5, .3]) / self.env.cfg.mdp.joint_position_scale
+        torch.testing.assert_close(state.history[:, :, 0], expected_q.expand(2, -1))
+        # At decision t the newest sample carries a[t-1]; the previous
+        # sample carries a[t-2]. The t-2 state itself has been discarded.
+        torch.testing.assert_close(state.history[:, :, -18], torch.tensor([[.6, .4], [.6, .4]]))
+        self.assertEqual(tuple(state.history.shape), (2, 2, 89))
+        self.assertTrue(bool(state.history_valid.all()))
+        self.assertEqual(tuple(mdp.policy_observation(self.env).shape), (2, 700))
+
+    def test_repeated_manager_reads_do_not_shift_previous_sample(self):
+        state = self.advance(.1, .2)
+        original_history, original_valid = state.history.clone(), state.history_valid.clone()
+        for _ in range(3):
+            mdp.policy_observation(self.env)
+            mdp.reward_rate(self.env)
+            mdp.success(self.env)
+            mdp.failure(self.env)
+        torch.testing.assert_close(state.history, original_history)
+        torch.testing.assert_close(state.history_valid, original_valid)
+
+    def test_full_reset_invalidates_previous_sample_and_zeroes_stale_action(self):
+        self.advance(.1, .2)
+        state = self.advance(.3, .4)
+        self.env.action_manager.action[:] = .9
+        mdp.reset_mdp(self.env)
+        torch.testing.assert_close(state.history_valid, torch.tensor([[True, False], [True, False]]))
+        torch.testing.assert_close(state.history[:, 1], torch.zeros((2, 89)))
+        torch.testing.assert_close(state.history[:, 0, -18:], torch.zeros((2, 18)))
+        original_history = state.history.clone()
+        mdp.policy_observation(self.env)
+        torch.testing.assert_close(state.history, original_history)
+        self.advance(.5, .6)
+        torch.testing.assert_close(state.history[:, 1, -18:], torch.zeros((2, 18)))
+        torch.testing.assert_close(state.history[:, 1, 0], torch.full((2,), .3 / math.pi))
+
+    def test_partial_reset_clears_only_selected_episode_and_retains_other_previous_sample(self):
+        self.advance(.1, .2)
+        state = self.advance(.3, .4)
+        continuing_history = state.history[1].clone()
+        continuing_valid = state.history_valid[1].clone()
+        self.env.action_manager.action[:] = .9
+        mdp.reset_mdp(self.env, torch.tensor([0]))
+        torch.testing.assert_close(state.history_valid[0], torch.tensor([True, False]))
+        torch.testing.assert_close(state.history[0, 1], torch.zeros(89))
+        torch.testing.assert_close(state.history[0, 0, -18:], torch.zeros(18))
+        torch.testing.assert_close(state.history[1], continuing_history)
+        torch.testing.assert_close(state.history_valid[1], continuing_valid)
+        self.advance(.5, .6)
+        torch.testing.assert_close(state.history[0, 1, -18:], torch.zeros(18))
+        torch.testing.assert_close(state.history[1, 1], continuing_history[0])
 
 
 class WrenchTests(unittest.TestCase):

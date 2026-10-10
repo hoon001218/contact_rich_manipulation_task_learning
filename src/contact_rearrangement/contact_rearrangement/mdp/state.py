@@ -15,7 +15,7 @@ import torch
 
 @dataclass
 class MdpCfg:
-    history_length: int = 16
+    history_length: int = 2
     max_objects: int = 40
     w_clear: float = 1.0
     w_rearr: float = 1.0
@@ -55,8 +55,8 @@ class MdpCfg:
     observation_torque_scale: float = 5.0
 
     def __post_init__(self):
-        if self.history_length != 16 or self.max_objects != 40:
-            raise ValueError("The current policy interface uses 16 history steps and 40 object slots.")
+        if self.history_length != 2 or self.max_objects != 40:
+            raise ValueError("The policy interface uses current and previous samples and 40 object slots.")
         for name, value in vars(self).items():
             if not isinstance(value, (float, int)) or not math.isfinite(value):
                 raise ValueError(f"MDP parameter {name} must be finite.")
@@ -177,7 +177,12 @@ def object_geometry(actor_pose, lower, upper, upright):
 
 
 class MdpState:
-    """Episode-local accumulators. Scene topology is never modified here."""
+    """Episode-local accumulators with samples ordered as current, previous.
+
+    The two samples are one completed control transition apart. Repeated
+    observation, reward, and termination reads do not advance this window.
+    Scene topology is never modified here.
+    """
 
     def __init__(self, env):
         from ..src.assets import ARM_JOINT_NAMES, HAND_JOINT_NAMES, FORCE_TORQUE_BODY_NAME, TCP_BODY_NAME

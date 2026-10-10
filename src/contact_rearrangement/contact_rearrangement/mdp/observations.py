@@ -1,8 +1,12 @@
-"""Policy observations: initial geometry in EEF coordinates and sensor history.
+"""Policy observations: initial geometry in EEF coordinates and two samples.
 
 The immutable initial scene is estimated from accepted RGB-D. Live robot
 proprioception changes its reference frame; current object ground truth never
 updates actor geometry. Compensated F/T stays in the physical sensor frame.
+The dynamic window contains the current sample and the immediately previous
+sample. Each includes the action that produced it: observation at t contains
+action a[t-1], and the previous observation at t-1 contains action a[t-2].
+After reset the current sample has zero action and the previous sample is invalid.
 """
 
 from __future__ import annotations

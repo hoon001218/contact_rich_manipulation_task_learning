@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the initial-scene graph / 16-step sensing policy with PPO."""
+"""Train the initial-scene graph with current/previous-step sensing and PPO."""
 
 from __future__ import annotations
 
@@ -54,11 +54,17 @@ from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementP
 from contact_rearrangement.src.visualization import RoleObbVisualizer
 
 
-def validate_transition(env, before_geometry, observation, reward, terminated, truncated, extra, action):
+def validate_transition(env, before_geometry, observation, reward, terminated, truncated, extra, action,
+                        before_history):
     """Check completed transitions before/after the SDK's selective auto-reset."""
     state = env.mdp_state
-    if observation.shape != (env.num_envs, 1960) or not torch.isfinite(observation).all():
-        raise AssertionError("Policy observation must be finite [N,1960].")
+    object_width = env.cfg.mdp.max_objects * 13
+    history_steps = env.cfg.mdp.history_length
+    expected_width = object_width + history_steps * 90
+    if observation.shape != (env.num_envs, expected_width) or not torch.isfinite(observation).all():
+        raise AssertionError(f"Policy observation must be finite [N,{expected_width}].")
+    if history_steps != 2:
+        raise AssertionError("Policy sensing must contain exactly current and previous samples.")
     done = terminated | truncated
     continuing = ~done
     torch.testing.assert_close(env.initial_object_geometry[continuing], before_geometry[continuing], rtol=0, atol=0)
@@ -71,10 +77,16 @@ def validate_transition(env, before_geometry, observation, reward, terminated, t
         if not (state.history_valid[done].sum(-1) == 1).all():
             raise AssertionError("Reset must leave exactly one fresh history sample.")
         torch.testing.assert_close(state.history[done, 0, -18:], torch.zeros_like(action[done]), rtol=0, atol=0)
-        if not (extra["terminal_observation"][done, -16:].sum(-1) >= 2).all():
+        torch.testing.assert_close(state.history[done, 1], torch.zeros_like(state.history[done, 1]), rtol=0, atol=0)
+        if state.history_valid[done, 1].any():
+            raise AssertionError("Reset previous sample must be invalid.")
+        if not (extra["terminal_observation"][done, -history_steps:].sum(-1) == 2).all():
             raise AssertionError("PPO requires the completed episode's final history, before reset.")
     if continuing.any():
         torch.testing.assert_close(state.history[continuing, 0, -18:], action[continuing], rtol=0, atol=0)
+    final_history = extra["terminal_observation"][:, object_width:-history_steps].reshape(env.num_envs, 2, 89)
+    torch.testing.assert_close(final_history[:, 0, -18:], action, rtol=0, atol=0)
+    torch.testing.assert_close(final_history[:, 1], before_history[:, 0], rtol=0, atol=0)
     robot = env.scene["robot"]
     arm = [robot.joint_names.index(name) for name in ARM_JOINT_NAMES]
     hand = [robot.joint_names.index(name) for name in HAND_JOINT_NAMES]
@@ -152,9 +164,11 @@ def validate_control_hold(env):
     force_torque_peak = torch.zeros(2, device=env.device)
     for _ in range(steps):
         before = env.initial_object_geometry.clone()
+        before_history = env.mdp_state.history.clone()
         with torch.no_grad():
             observations, reward, terminated, truncated, extra = env.step(action)
-        validate_transition(env, before, observations["policy"], reward, terminated, truncated, extra, action)
+        validate_transition(env, before, observations["policy"], reward, terminated, truncated, extra, action,
+                            before_history)
         if terminated.any() or truncated.any():
             raise AssertionError(f"Unloaded hold terminated: {extra['failure_reasons'].tolist()}")
         wrench = extra["compensated_wrench"]
@@ -203,7 +217,11 @@ def main():
         if args.resume is not None:
             trainer = PPOTrainer.load(args.resume, device=env.device)
             if trainer.model.cfg != model_cfg:
-                raise ValueError("Checkpoint interface does not match this environment.")
+                raise ValueError(
+                    f"Checkpoint model settings do not match this environment: "
+                    f"history_steps={trainer.model.cfg.history_steps}, expected={model_cfg.history_steps}. "
+                    "Start a new training run for the current/previous-step policy."
+                )
             if args.rollout_steps is not None:
                 trainer.cfg.rollout_steps = args.rollout_steps
         else:
@@ -232,6 +250,7 @@ def main():
                 wrench_peak = torch.zeros(2, device=env.device)
                 for _ in range(trainer.cfg.rollout_steps):
                     before_geometry = env.initial_object_geometry.clone() if args.validate else None
+                    before_history = env.mdp_state.history.clone() if args.validate else None
                     with torch.no_grad():
                         action, log_prob, value = model.act(obs)
                         following, reward, terminated, truncated, extra = env.step(action)
@@ -240,7 +259,8 @@ def main():
                     if visualizer is not None:
                         visualizer.update()
                     if args.validate:
-                        validate_transition(env, before_geometry, next_obs, reward, terminated, truncated, extra, action)
+                        validate_transition(env, before_geometry, next_obs, reward, terminated, truncated, extra, action,
+                                            before_history)
                         if terminated.any() and diagnostic_failures < 3:
                             print("TERMINAL_DIAGNOSTIC " + json.dumps(dict(
                                 reasons=extra["failure_reasons"][terminated].tolist(),

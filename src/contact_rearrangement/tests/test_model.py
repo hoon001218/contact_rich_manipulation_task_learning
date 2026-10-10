@@ -22,7 +22,9 @@ def observation(cfg: ModelCfg, batch: int = 3) -> torch.Tensor:
     roles[:, 0, 0], roles[:, 1, 1] = 1, 1
     history = torch.randn(batch, cfg.history_steps, cfg.step_features)
     history_valid = torch.ones(batch, cfg.history_steps)
-    history_valid[:, -2:] = 0
+    # Include both continuing episodes and a reset with no previous sample.
+    if cfg.history_steps > 1:
+        history_valid[-1, 1:] = 0
     return torch.cat((geometry.flatten(1), valid, roles.flatten(1), history.flatten(1), history_valid), dim=-1)
 
 
@@ -38,8 +40,8 @@ class ModelTests(unittest.TestCase):
         self.observation = observation(self.cfg)
 
     def test_default_observation_layout(self):
-        self.assertEqual(ModelCfg().observation_dim, 1960)
-        self.assertEqual(asdict(ModelCfg())["history_steps"], 16)
+        self.assertEqual(ModelCfg().observation_dim, 700)
+        self.assertEqual(asdict(ModelCfg())["history_steps"], 2)
 
     def test_object_slot_permutation_preserves_policy_and_value(self):
         perm = torch.tensor([4, 2, 0, 3, 1])
@@ -76,18 +78,38 @@ class ModelTests(unittest.TestCase):
         scene = self.model.scene_encoder(geometry, valid, roles)
         torch.testing.assert_close(scene, torch.zeros_like(scene))
 
-    def test_history_is_ordered_and_complete_window_reaches_encoder(self):
+    def test_current_previous_order_matters_and_previous_reaches_newest_representation(self):
         _, _, _, history, valid = self.model._split(self.observation)
+        self.assertEqual(history.shape[1], 2)
         valid[:] = True
         baseline = self.model.history_encoder(history, valid)
         reversed_history = self.model.history_encoder(history.flip(1), valid)
         self.assertGreater(float((baseline - reversed_history).abs().max()), 1e-4)
         changed = history.clone()
         changed[:, -1] += 10.0
-        oldest_changed = self.model.history_encoder(changed, valid)
-        # The newest representation itself must receive the oldest valid step,
+        previous_changed = self.model.history_encoder(changed, valid)
+        # The newest representation itself must receive the previous valid step,
         # not merely an order-independent pooling contribution.
-        self.assertGreater(float((baseline[:, :16] - oldest_changed[:, :16]).abs().max()), 1e-5)
+        width = self.cfg.temporal_dim
+        self.assertGreater(float((baseline[:, :width] - previous_changed[:, :width]).abs().max()), 1e-5)
+        changed = history.clone()
+        changed[:, 0] += 10.0
+        current_changed = self.model.history_encoder(changed, valid)
+        self.assertGreater(float((baseline[:, :width] - current_changed[:, :width]).abs().max()), 1e-5)
+
+    def test_reset_padding_discards_previous_episode_but_observes_current_sample(self):
+        _, _, _, history, valid = self.model._split(self.observation)
+        valid[:, 0] = True
+        valid[:, 1] = False
+        expected = self.model.history_encoder(history, valid)
+        poisoned = history.clone()
+        poisoned[:, 1] = float("nan")
+        actual = self.model.history_encoder(poisoned, valid)
+        torch.testing.assert_close(expected, actual, atol=0, rtol=0)
+        poisoned[:, 0] += 10.0
+        changed = self.model.history_encoder(poisoned, valid)
+        self.assertTrue(torch.isfinite(changed).all())
+        self.assertGreater(float((expected - changed).abs().max()), 1e-5)
 
     def test_action_bounds_and_tanh_log_probability_agree(self):
         actions, log_probs, values = self.model.act(self.observation)

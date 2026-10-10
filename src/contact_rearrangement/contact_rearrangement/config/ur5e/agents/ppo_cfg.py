@@ -14,7 +14,8 @@ import math
 @dataclass
 class ModelCfg:
     max_objects: int = 40
-    history_steps: int = 16
+    # Newest first: the current sample and the immediately preceding sample.
+    history_steps: int = 2
     action_dim: int = 18
     node_features: int = 10
     step_features: int = 89

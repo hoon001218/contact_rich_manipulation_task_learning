@@ -159,7 +159,7 @@ class EmptyManagerCfg:
 
 @configclass
 class ShelfRearrangementEnvCfg(ManagerBasedRLEnvCfg):
-    """Initial vision, 16-step sensing, and 18D variable-stiffness manipulation."""
+    """Initial vision, current/previous sensing, and 18D variable-stiffness manipulation."""
 
     scene: ShelfRearrangementSceneCfg = ShelfRearrangementSceneCfg(
         num_envs=4, env_spacing=2.5, replicate_physics=True

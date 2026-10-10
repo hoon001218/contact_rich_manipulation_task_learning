@@ -21,7 +21,7 @@ class LearningTests(unittest.TestCase):
 
     def test_runner_owns_independent_policy_and_algorithm_defaults(self):
         first, second = ContactRearrangementPPORunnerCfg(), ContactRearrangementPPORunnerCfg()
-        self.assertEqual(first.policy.observation_dim, 1960)
+        self.assertEqual(first.policy.observation_dim, 700)
         self.assertEqual(first.algorithm.rollout_steps, 32)
         self.assertEqual(first.max_iterations, 1000)
         self.assertEqual(first.save_interval, 50)

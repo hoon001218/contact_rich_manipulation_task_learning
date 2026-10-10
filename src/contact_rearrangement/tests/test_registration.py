@@ -47,7 +47,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(result["kwargs"]["ppo_cfg_entry_point"],
                          "contact_rearrangement.config.ur5e.agents.ppo_cfg:ContactRearrangementPPORunnerCfg")
         self.assertTrue(result["checker_disabled"])
-        self.assertEqual(result["history_length"], 16)
+        self.assertEqual(result["history_length"], 2)
         self.assertEqual(result["simulator_modules"], [])
 
     def test_registered_runner_resolves_to_model_and_optimizer_with_matching_mdp_interface(self):
@@ -95,12 +95,12 @@ class RegistrationTests(unittest.TestCase):
                                   optimizer_groups=len(trainer.optimizer.param_groups),
                                   simulator_modules=simulator_modules)))
         """)
-        self.assertEqual(result["observation_dim"], 1960)
-        self.assertEqual(result["actor_input_shape"], [2, 1960])
+        self.assertEqual(result["observation_dim"], 700)
+        self.assertEqual(result["actor_input_shape"], [2, 700])
         self.assertEqual(result["action_shape"], [2, 18])
         self.assertTrue(result["finite"])
         self.assertEqual(result["max_objects"], 40)
-        self.assertEqual(result["history_steps"], 16)
+        self.assertEqual(result["history_steps"], 2)
         self.assertEqual(result["rollout_steps"], 32)
         self.assertEqual(result["gamma"], .99)
         self.assertEqual(result["optimizer_groups"], 1)
