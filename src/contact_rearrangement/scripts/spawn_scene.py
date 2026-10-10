@@ -19,7 +19,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "IsaacLab/source/isaaclab"))
 
 from isaaclab.app import AppLauncher
-from contact_rearrangement.catalog import ASSET_SPECS, MAX_ACTIVE_OBJECTS, OBJECT_NAMES, OBJECT_SPECS
+from contact_rearrangement.src.catalog import ASSET_SPECS, MAX_ACTIVE_OBJECTS, OBJECT_NAMES, OBJECT_SPECS
 
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -81,12 +81,12 @@ from dataclasses import replace
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 
-from contact_rearrangement.assets import ARM_JOINT_NAMES, HAND_JOINT_NAMES, TACTILE_BODY_NAMES
-from contact_rearrangement.env_cfg import ContactRearrangementEnvCfg
-from contact_rearrangement.sampling import scene_metrics, validate_sample
-from contact_rearrangement.spawn import validate_robot_start_state
-from contact_rearrangement.sensors import TACTILE_SENSOR_NAMES, tactile_contacts, tactile_valid
-from contact_rearrangement.visualization import RoleObbVisualizer
+from contact_rearrangement.src.assets import ARM_JOINT_NAMES, HAND_JOINT_NAMES, TACTILE_BODY_NAMES
+from contact_rearrangement.config.ur5e.osc_env_cfg import ContactRearrangementEnvCfg
+from contact_rearrangement.src.sampling import scene_metrics, validate_sample
+from contact_rearrangement.mdp.events import validate_robot_start_state
+from contact_rearrangement.src.sensors import TACTILE_SENSOR_NAMES, tactile_contacts, tactile_valid
+from contact_rearrangement.src.visualization import RoleObbVisualizer
 
 
 def validate_reset_state(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:

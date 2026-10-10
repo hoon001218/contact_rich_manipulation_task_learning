@@ -39,8 +39,8 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from contact_rearrangement.assets import FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
-from contact_rearrangement.sensors import InitialVisionCfg, InitialVisionSensor, tool_wrench, tool_wrench_valid
+from contact_rearrangement.src.assets import FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
+from contact_rearrangement.src.sensors import InitialVisionCfg, InitialVisionSensor, tool_wrench, tool_wrench_valid
 
 
 def validate_invalid_ranges():

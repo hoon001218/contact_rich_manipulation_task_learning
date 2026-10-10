@@ -7,6 +7,15 @@ import os
 from dataclasses import dataclass
 
 
+FORBIDDEN_CONTACT_BODY_NAMES = (
+    "base_link", "shoulder_link", "upper_arm_link", "forearm_link",
+    "wrist_1_link", "wrist_2_link", "wrist_3_link",
+    "SensorMountProximal", "ToolForceTorqueLink",
+)
+FORBIDDEN_CONTACT_SENSOR_NAMES = tuple(f"forbidden_{name}" for name in FORBIDDEN_CONTACT_BODY_NAMES)
+
+
+
 NUCLEUS_ROOT = os.environ.get("CONTACT_REARRANGEMENT_NUCLEUS_ROOT", "omniverse://192.168.0.13").rstrip("/")
 DEFAULT_SHELF_USD_PATH = f"{NUCLEUS_ROOT}/Library/Shelf/Arena/Collected_speedrack_shape/speedrack_shape.usd"
 SHELF_POSITION = (-0.7, 0.0, 0.0)

@@ -12,7 +12,19 @@
 
 ## 1. 현재 위치와 상태 구분
 
-**현재 개발 단계는 로봇·선반·물체 스폰과 reset이다.**
+**스폰·센서 위에 학습용 MDP와 모델·PPO를 구현하고 짧은 통합 검증을 완료했다.**
+장면 확인용 `ManagerBasedEnv`와 학습용 `ManagerBasedRLEnv`를 구분한다. 사용자가
+최근 **16 step의 센서·로봇 상태·행동 이력**을 선택했으며 18D OSC/hand action,
+Reward v2·종료 조건, 초기 장면 GNN·역할 조건부 attention·유한 이력 encoder,
+공동학습 PPO를 구현했다. 물체 입력은 승인한 초기 RGB-D에서 추정한 기하만
+사용한다. 초기 기하를 robot base에 저장하고 매 policy step에 **현재 EEF
+좌표계로 재표현**하며 현재 실제 물체 pose를 actor에 넣지 않는다. 제어 기준
+좌표계는 `examples`의 sweeping 프로젝트처럼 robot root/base다. 아래의
+스폰·센서 GPU 검증을 새 MDP의 학습 성공이나 제어 검증으로 확대하지 않는다.
+Reward·제어 수치는 provisional default이며 정책 성능은 아직 입증하지 않았다.
+코드 구조는 `examples`의 `sweeping_policy`를 따라 공통 환경 설정,
+`config/ur5e`의 로봇·학습 설정, `mdp`의 manager 함수, `src`의 장면 지원 구현으로
+정리했다. 학습은 `Isaac-Contact-Rearrangement-UR5e-v0`의 등록된 설정으로 실행한다.
 새 패키지 `src/contact_rearrangement`는 **10종 asset 중 4–10종을 선택하고
 전체 선반 밀도에 필요한 수의 instance를 배치**한다. 이전에 4–10종을
 active instance 4–10개로 해석한 것은 잘못이며 종류 수와 개수를 분리했다.
@@ -63,13 +75,13 @@ Nucleus USD·authored mass·contact 속성·physics material·active gravity는 
 이전 정확히 10개 instance 버전에서는 이 collider로 **4개 GPU 환경·10초**의
 정착·전체/부분 reset 검사가 통과했다. 이 결과와 이전 실패·비채택 approximation,
 새 종류/instance 분리 benchmark는 8절에서 구분한다.
-판단·행동 정책과 PPO 학습은 아직 구현되지 않았다.
+판단·행동 모델과 PPO 코드는 추가했으며 학습 성능은 아직 확인하지 않았다.
 사용자 요청으로 장면 확인 스크립트에 **Target 초록색·Blocker 빨간색 OBB**의
 debug draw 표시를 추가했다. 물리·USD asset을 수정하지 않는 확인용 표시이며
 2개 CUDA 환경의 headless reset 검사와 1개 GUI 환경의 실제 표시 검사가 통과했다.
-사용자가 파일이 지나치게 나뉜 구조를 정리하도록 요청해 구현을 책임별 **6개
-모듈**로 통합했다. `catalog`·`assets`·`env_cfg`·`spawn`·`sampling`·`visualization`
-구조이며 스폰 규칙·기본값·실행 명령을 유지했다. 통합 후 unit test **23개**와
+2026-10-09에는 사용자가 파일이 지나치게 나뉜 구조를 정리하도록 요청해
+구현을 책임별 **6개 모듈**로 통합했다. 당시 `catalog`·`assets`·`env_cfg`·`spawn`·
+`sampling`·`visualization` 구조였으며 스폰 규칙·기본값·실행 명령을 유지했다. 통합 후 unit test **23개**와
 일반 모드 **4개 GPU 환경·151 step·5.03초** 검사가 통과했으며 초기·자동 reset
 뒤 8개 장면 설명이 통합 전과 같았다. 아래 기존 실행 결과와 구분해 기록한다.
 사용자는 **Blocker 앞의 충돌 없는 hand 시작 영역 randomization과
@@ -111,6 +123,13 @@ normal force norm **>0.01 N**을 binary contact로 제공한다. 2개 GPU 환경
 코드의 실제 동작은 해당 코드와 실행 결과로 확인한다. 연구 설계와 코드가 다르면
 어떤 부분이 구현 전인지, 이전 실험의 설정인지 명시한다.
 
+현재 코드 구조는 사용자의 후속 요청에 따라
+`examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy`를 기준으로 정리했다.
+공통 환경 설정, `config/ur5e`의 로봇별 설정·Gym task 등록·agent 설정,
+`mdp`의 manager 함수, `src`의 장면 지원 구현을 분리한다. Shared transition은
+`mdp/state.py`가 한 번만 갱신하며 물리·관측·reward·18D action 명세를 유지한다.
+현재 파일 위치와 task registry 기반 실행은 7절과 패키지 README에 정리한다.
+
 ## 2. 연구 목적과 범위
 
 근사적인 초기 물체 기하와 촉각·힘/토크 피드백을 이용해, 명시적 Blocker 종착
@@ -136,27 +155,43 @@ pose 없이 Target 접근 공간을 확보하는 신속한 비파지 재배치 �
 
 최신 방향은 **초기 vision을 사용하고, 이후 robot state·F/T·tactile·행동 이력으로
 이번 episode의 환경 변화를 해석하는 것**이다. 지속적인 vision 갱신을 기다리는
-의존성을 줄여 촉각·힘 피드백의 빠른 대응을 살리려는 의도다. 초기 관측 시점,
-history 길이와 주기, 시간적 기억의 구현은 미정이다.
+의존성을 줄여 촉각·힘 피드백의 빠른 대응을 살리려는 의도다. 사용자가 최근
+**16 policy step**의 유한 window부터 구현하도록 선택했다. Policy는 30 Hz,
+physics는 120 Hz이며 window는 약 0.53초다. 현재 이력을 newest-first로 저장하고
+reset한 환경의 이전 이력을 비운다. Episode를 넘어 유지하는 GRU/LSTM은 보류한다.
 
-| 입력 | 현재 의미 | 미정 사항 |
+| 입력 | 현재 구현 | 후속 교정 |
 |---|---|---|
-| 초기 물체 기하 | 물체별 위치 3D + quaternion 4D + OBB extent 3D = 10D | 단일 카메라의 관측 범위, 초기 기하 오차와 가림 처리 |
-| 역할과 유효성 | Target·Blocker 지정, K개 물체 슬롯과 padding | K, role/valid mask 전달 형식 |
-| Robot state | Arm·hand 관절 위치/속도 24D + base 기준 EEF pose 7D | 관절 선택·정규화·시간 이력 연결 |
-| Wrist F/T | Sensor frame의 힘 3D + 토크 3D, 중력·bias 보정 | Filtering과 동기화 |
-| Tactile | 17개 위치의 binary contact | 0.01 N은 변경 가능한 초기 threshold |
-| Previous action | 직전 action 18D | 더 긴 행동 history의 사용 여부 |
+| 초기 물체 기하 | 물체별 위치 3D + quaternion(wxyz) 4D + OBB extent 3D = 10D, 현재 EEF 기준 | 단일 시점 visible depth의 근사 오차와 실기 detector |
+| 역할과 유효성 | K=40 슬롯, valid 1D와 Target·Blocker role 2D를 별도로 전달 | 실기에서의 identity/role association |
+| Robot state | Arm 6개·hand 독립 6개 관절의 q/dq 24D + base 기준 EEF pose 7D = 31D | 실제 구동 관절 정규화·동기화 |
+| Wrist F/T | Sensor frame의 중력·bias 보정 force/torque 6D | Filtering·실제 질량과 bias 교정 |
+| Tactile | 접촉 17D + channel validity 17D | 0.01 N은 변경 가능한 초기 threshold |
+| Previous action | 해당 관측 직전 적용한 normalized action 18D | Policy/control 주기 교정 |
 
 K는 Target·Blocker를 포함한 전체 최대 슬롯 수다. 같은 물체 기하를 역할별로
 중복 계산하지 않는다. 모든 가려진 물체를 초기 vision으로 알고 있다는 가정도 하지 않는다.
 관절 관측 차원은 URDF의 전체 물리 관절 수와 독립 구동 관절 수를 구분해 구현해야 한다.
 
-초기 EEF frame에서 얻은 물체 pose를 현재 EEF 기준 pose처럼 취급하면 안 된다.
-초기 EEF pose를 보존하거나 base frame으로 변환하는 방법은 후보이며 미채택이다.
-과거의 한 step 입력 차원은 explicit valid mask 포함 시 `72 + 11K`, raw zero
-padding에서 mask를 내부 생성하면 `72 + 10K`였다. 이를 미정인 temporal input의
-최종 차원으로 확정하지 않는다.
+초기 기하는 승인한 camera snapshot의 instance mask 안에 있는 visible depth를
+back-project하고 PCA OBB로 근사한다. Simulator instance ID는 물체별 분할과
+외부 Target/Blocker 역할의 association에 사용하므로 이 부분은 oracle이다.
+USD의 전체 bounds나 현재 실제 물체 pose를 geometry feature로 복사하지 않는다.
+관측하지 못한 물체는 invalid padding이다. 가림으로 extent가 작게 추정될 수 있으며
+완전한 물체 형상을 복원했다고 해석하지 않는다.
+
+Camera extrinsic으로 변환한 초기 geometry의 canonical copy를 robot base에
+저장한다. 매 policy step마다 현재 EEF pose의 역변환을 적용해 위치·orientation을
+현재 EEF 기준으로 표현하고 extent는 유지한다. 이는 world에 고정한 **초기
+추정 장면의 재표현**이다. 조작 후의 실제 물체 이동을 vision으로 갱신하거나
+정답으로 대체하지 않는다. 제어·robot EEF pose는 base, 물체 입력은 현재 EEF,
+F/T 입력은 sensor frame을 각각 사용한다.
+
+한 history sample은 `31 + 6 + 17 + 17 + 18 = 89D`다. Actor flat observation은
+`geometry 40×10 + valid 40 + roles 40×2 + history 16×89 + history_valid 16`
+순서로 **1960D**다. Role·valid·history_valid는 별도 mask로 유지하고 padding을
+encoder에서 제외한다. 관절 q/dq는 π·2 rad/s, force/torque는 50 N·5 N·m로
+정규화하는 초기 설정이다. 과거 `72 + 11K`의 current-only 입력안은 이력 구조로 대체했다.
 
 Actor가 현재 실제 object pose·velocity를 받기로 한 것은 아니다. 시뮬레이터
 정답을 reward·검증·학습 label에 쓰는 것과 actor 실행 입력에 쓰는 것은 구분한다.
@@ -164,14 +199,16 @@ History를 외부 상태 추정기로 해석한 뒤 추정 상태를 actor에 �
 
 ### 관계 처리와 학습
 
-현재 구조 작업안은 다음과 같다.
+현재 구현 구조는 다음과 같다.
 
 ```text
-물체별 기하와 역할
-  → 공유 처리 / GNN
+초기 물체 기하(현재 EEF 재표현)와 역할·valid
+  → 공유 node encoder / dense GNN 2 rounds
   → Target·Blocker 조건부 masked attention readout
-  → scene feature와 robot state·F/T·tactile·previous action 결합
-  → actor의 18D action
+최근 16 step의 robot state·F/T·tactile·action와 history_valid
+  → window 전체를 받는 causal convolution
+두 encoder feature 결합
+  → bounded Gaussian actor의 18D action + shared critic
 ```
 
 - 슬롯 나열 순서를 바꿔도 같은 장면에 대해 같은 판단을 하도록 집합을 처리한다. 실제 공간 배치는 입력에 남아야 한다.
@@ -179,7 +216,10 @@ History를 외부 상태 추정기로 해석한 뒤 추정 상태를 actor에 �
 - 로봇에 대한 물체 위치를 판별할 정보가 필요하다. 물체 간 상대 관계만 남기는 구조로 단순화하지 않는다.
 - Role mask와 valid mask는 목적이 다르다. Zero padding에서 valid를 만들면 noise·정규화 전에 생성하고 message passing과 attention에서 padding을 제외한다.
 - GNN의 같은 forward 내 message-passing 반복과 episode의 시간적 기억은 다르다.
-- PPO와 custom encoder 공동학습 및 Isaac Lab 연계를 계획한다. Query·edge 구성·층 수·feature dimension, critic의 privileged input, actor/critic 공유 범위는 미정이다.
+- Node 64D, message passing 2 rounds의 dense valid edge를 사용하며 self/padding edge를 제외한다. Edge feature는 초기 물체 간 상대 위치·extent 차이다. Role-conditioned query는 Target·Blocker embedding에서 만들며 두 attention readout과 role/global feature를 결합한다.
+- History encoder는 64D causal convolution이며 최근 16개 전체가 최신 feature에 영향을 줄 수 있다. Padding을 매 layer에서 제거하고 유효 이력만 pooling한다. Fused latent는 128D이며 기본 모델은 286,053개 parameter다.
+- Custom PPO가 scene/history encoder와 actor/critic을 공동학습한다. Actor와 critic은 같은 1960D 입력과 encoder를 공유하며 privileged critic·현재 물체 GT 입력·보조 예측 head/loss는 추가하지 않았다.
+- Tanh-Gaussian action의 log probability에는 변환 Jacobian을 반영한다. GAE는 실제 terminal state에서 bootstrap하지 않고, timeout에서는 auto-reset 이전 실제 final observation의 value로 bootstrap하며 다음 episode의 advantage를 이어 붙이지 않는다.
 
 ### Action과 제어
 
@@ -191,14 +231,57 @@ History를 외부 상태 추정기로 해석한 뒤 추정 상태를 actor에 �
 
 총 **18D action**이며 arm의 12D 출력은 OSC를 통해 관절 토크로 연결한다.
 목표를 이전 명령에 계속 누적하지 않는 방향을 유지한다. 직전 action을 관측하는
-것과 목표 누적은 별개다. 증분 기준 frame·scale·강성/감쇠 범위·정책 주기·실기
-UR5e 인터페이스는 미정이다. 현재 스폰용 PD hold는 이 학습용 제어 구현과 구분한다.
+것과 목표 누적은 별개다. Examples의 robot-root reference 구현을 따라 증분은
+**base 기준**이며 매 policy step의 실제 TCP pose에서 position과 orientation
+목표를 새로 만든다. 회전 증분은 base 축 기준으로 현재 quaternion에 left-multiply한다.
+기본 scale은 위치 축별 ±15 mm·회전 축별 ±0.08 rad, 강성은 병진 100–800 N/m·
+회전 5–40 N·m/rad, damping ratio는 1이다. 현재 inertia decoupling은 꺼진
+설정만 지원하며 이를 물리 Cartesian stiffness로 사용한다. Arm의 기존
+PD/mimic PD hold를 비활성화하고 OSC torque를 적용하며 hand의 독립 6개
+관절만 position target으로 제어한다.
+Hand의 authored mimic constraint는 유지한다. TCP Jacobian의 COM→link origin 이동과
+world→base 변환, native effort limit clamp를 적용한다. 이 수치는 실기 허용치나
+검증된 제어 gain이 아니며, spawn-only 스크립트의 PD hold와 학습 제어를 구분한다.
+
+SDK의 unit-mass `2√K` explicit damping은 실제 가벼운 wrist rotational inertia에서
+120 Hz 이산화와 맞지 않아 새 제어의 기준으로 사용하지 않는다. Native arm
+mass matrix `M`과 TCP Jacobian `J`로 coupled task inertia
+`Λ=(J M⁻¹ Jᵀ)⁻¹`를 구하고 inverse-inertia eigenvalue floor `1e−6`을 적용한다.
+대각 물리 stiffness `K`에 대해 coupled critical damping matrix를 계산한다.
+
+$$
+D=2\zeta\Lambda^{1/2}
+\left(\Lambda^{-1/2}K\Lambda^{-1/2}\right)^{1/2}\Lambda^{1/2},
+\qquad \zeta=1.
+$$
+
+매 physics substep의 `dt=1/120 s`에 spring/damper를 backward Euler로 계산한다.
+`e`는 측정 TCP와 latch한 목표 사이의 base-frame pose error, `v`는 같은
+TCP origin/base 축의 twist다.
+
+$$
+v_{next}=(\Lambda+dtD+dt^2K)^{-1}(\Lambda v+dtKe),
+\qquad \tau=J^T\left[Ke-(D+dtK)v_{next}\right]+G.
+$$
+
+SDK OSC의 spring·gravity 계산에서 explicit damping을 제외하고 위 보정항을
+적용한 뒤 native effort limit로 clamp한다. `damping_ratio=1`은 관성 반영
+critical matrix의 비율이며 unit-mass scalar `2√K`를 뜻하지 않는다. 이 선형
+substep 계산의 안정화와 실제 접촉·비선형 task의 성능 검증은 구분한다.
+
+Hand 6D는 soft limit 안의 **원하는 절대 관절 목표**다. 실제 PD target은 매
+physics substep의 측정 q에서 `min(native velocity limit, hand_target_rate)`×dt만큼
+목표 방향으로 제한한다. 기본 `hand_target_rate=1 rad/s`이며 reset 직후 큰
+목표 위치 오차가 한 번에 적용되지 않게 한다. `hand_command`와 rate-bounded
+`hand_applied_command`는 별도다. Policy action의 차원·의미는 바꾸지 않는다.
 
 ## 4. Reward 기준점과 사용자 교정
 
-**Formulation v2는 현재 작업안이며 새 환경에는 아직 구현되지 않았다.**
+**Formulation v2를 새 학습 환경에 구현했으며 수치는 초기 실행 기본값이다.**
 Transition `s_t → s_{t+1}`에 대해 계산한다. 상위 weight는 비음수, scale과
-`Δt`는 양수다. 실제 weight·scale·soft threshold·종료 허용오차와 학습 충분성은 미정이다.
+`Δt`는 양수다. 최종 weight·scale·soft threshold·종료 허용오차와 학습 충분성은 미정이다.
+`MdpCfg`의 현재 상위 weight 4개는 모두 1, `d_0=0.5 m`, `T_ref=10 s`,
+성공 bonus 500·실패 penalty 100이다. Episode timeout 8초는 별도 초기 설정이다.
 
 $$
 r_t=w_{\mathrm{clear}}r_t^{\mathrm{clear}}
@@ -258,7 +341,11 @@ $$
 네 그룹 사이의 내부 λ는 두지 않는다. 다른 reward와의 비중은 상위 `w_motion`으로
 조절한다. 가속도와 wrench 변화율은 `Δt`로 차분한다. Wrench는 중력·bias 보정
 후 같은 좌표축·토크 기준점에서 비교해야 한다. Actor의 sensor-frame 입력과
-reward 계산 좌표계를 혼동하지 않는다.
+reward 계산 좌표계를 혼동하지 않는다. Actor에는 움직이는 sensor center의
+sensor-frame 보정 wrench를 제공한다. 중력 support와 downstream COM의 moment를
+빼고 명시적 tare에서 남은 bias만 보정하며 관성·접촉 신호는 남긴다. Reward에는
+이를 world 축으로 회전하고 **episode 시작 sensor center라는 고정 기준점**으로
+moment를 옮긴 값을 사용하므로 sensor 회전·이동 자체가 wrench rate로 섞이지 않는다.
 
 ### 시간과 종료
 
@@ -274,8 +361,10 @@ $$
 종료 보상은 한 번 지급한다.
 
 - 성공은 접근영역의 **전체 non-target 차단 면적**이 허용오차 이하이고 Target 보호·안정 조건을 만족하는 것이다. 지정 Blocker만 치우고 다른 물체가 막은 상태를 성공으로 처리하지 않는다.
-- 실패 범주는 낙하·전도·workspace 이탈·금지 접촉·hard-force limit 등이다. 구체적인 threshold는 미정이며 성공과 실패가 동시에 검출되면 실패를 우선한다.
-- Timeout의 과업 실패와 학습용 truncation 구분, 실기에서 초기 vision만으로 성공을 판별하는 방법은 미정이다.
+- 성공의 초기 기준은 전체 non-target 겹침 합 ≤1e−5 m², Target 이동 ≤2 cm·회전 ≤0.15 rad이며 모든 active 물체가 선속도 ≤0.015 m/s·각속도 ≤0.10 rad/s로 5 policy step 연속 안정한 상태다.
+- 실패의 초기 기준은 낙하 6 cm, 지지면에서 4 cm 초과 들어올림, shelf workspace 여유 1.5 cm 이탈, upright 대비 tilt 50° 초과, 보정 force 80 N·torque 4 N·m 초과 또는 금지 접촉이다. 성공과 실패를 동시에 검출하면 실패를 우선한다.
+- 학습 scene에만 UR arm 7개 body와 원통 2개 half의 ContactSensor **9개**를 둔다. 선반·물체·ground의 각 partner와의 normal force norm **>1 N**을 금지 접촉으로 보는 provisional 기준이다. GPU contact filter는 동적/kinematic body의 자식 mesh가 아닌 RigidBodyAPI prim을 사용한다. 기본 pool 100개와 선반 1개의 **101 rigid-body filter**, rigid body가 없는 static ground의 collision-shape filter를 각각 지정한다. 최근 4 physics substep 중 하나라도 초과하면 실패하며 서로 다른 partner의 반대 방향 force를 합산해 상쇄하지 않는다. Hand 접촉이나 hand–Target 접촉 자체는 이 판정에서 금지하지 않는다. Target 이동/회전은 별도 보호 조건으로 판정한다.
+- 8초 time limit는 PPO의 truncation으로 처리하며 성공/실패는 termination이다. 실기에서 초기 vision만으로 성공을 판별하는 방법은 미정이다.
 
 ### 구현과 검증에서 남은 문제
 
@@ -286,7 +375,8 @@ $$
 
 로컬 Isaac Lab [RewardManager](../IsaacLab/source/isaaclab/isaaclab/managers/reward_manager.py)는
 각 term에 `weight * dt`를 곱한다. Policy-step 수식을 그대로 옮길 때 시간 벌점의
-`Δt`와 one-shot 종료 보상을 포함해 시간 scale을 중복 적용하지 않도록 명세를 정해야 한다.
+`Δt`와 one-shot 종료 보상을 포함해 시간 scale을 중복 적용하지 않도록,
+구현은 완성한 discrete transition reward를 `dt`로 나눈 값을 manager에 반환한다.
 위 reward를 잘 받는다는 사실만으로 내부 상태 이해의 정확성을 인증할 수는 없다.
 
 ## 5. 환경 변화 이해와 미채택 제안
@@ -305,9 +395,9 @@ Current-only, 유한 window, 지속 hidden state를 갖는 recurrent policy는 �
 상호작용 정보를 담는다. GNN round 수와 history 길이, hidden state 유지 기간과
 학습 sequence 길이도 구분한다. **LSTM/GRU 도입은 아직 승인되지 않았다.**
 
-현재 미채택 후보는 다음과 같다.
+현재 task reward만 사용하는 finite-window baseline을 먼저 구현했다. 다음은
+아직 미채택 후보이며 baseline에 포함하지 않는다.
 
-- 시간적 구조를 명확히 한 정책을 기존 task reward만으로 학습하는 baseline.
 - 정책의 공유 표현에서 물체 이동·회전·차단비율 등을 예측하는 학습용 head와 `L_train = L_PPO + λ L_pred` 추가. Label·정규화·loss·λ는 미정이며 실행 시 head를 제거할 수 있다는 제안이다.
 - GT 상태 label 대신 action-conditioned latent forward dynamics 사용.
 - 초기 scene encoder와 recurrent temporal encoder 결합, sensor-conditioned query와 복수 readout.
@@ -361,10 +451,14 @@ Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. �
 ## 7. 현재 Isaac Lab 구현
 
 새 환경의 위치는 [src/contact_rearrangement](../src/contact_rearrangement/README.md)다.
-`ManagerBasedEnv`를 사용하는 스폰·센서 단계다. Action manager는 비어 있으며
-observation manager의 `sensors` group은 raw F/T·17채널 tactile과 valid mask·초기 RGB-D·역할
-mask·camera pose를 반환한다. 아직 학습 정책용 기하·시간 이력 encoder는 없다.
-Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history는 후속 구현 범위다.
+장면 확인용 `ManagerBasedEnv`는 빈 action manager와 PD hold를 사용하며
+`sensors` group에서 raw F/T·17채널 tactile/valid·초기 RGB-D·역할 mask·camera
+pose를 반환한다. 학습용 `ContactRearrangementRLEnv`는 별도 설정으로 18D
+OSC/hand action·Reward v2·종료 조건과 1960D `policy` group을 사용한다.
+초기 visible-depth 기하·현재 EEF 재표현·16-step 이력, GNN/attention/temporal
+encoder와 shared actor/critic·custom PPO를 구현했다. `train.py`는
+`--task Isaac-Contact-Rearrangement-UR5e-v0`의 registry에서 환경·agent 설정을
+읽으며 `env.py`가 auto-reset 이전 final observation을 PPO에 보존한다.
 
 ### 장면과 초기 설정
 
@@ -385,7 +479,8 @@ Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history�
 - 장면 확인용 `spawn_scene.py`는 기본적으로 시뮬레이션 시간 5초마다 전체 환경을 reset해 새 배치를 생성한다. 실제 `env.step_dt`로 간격을 계산하며 현재 설정에서는 150 step이다. `--reset_interval N`으로 step 간격을 지정하고 0이면 자동 reset을 끈다. 이 설정은 실행 스크립트의 확인 주기이며 학습 episode timeout을 확정하는 것은 아니다.
 - `RoleObbVisualizer`는 Target 초록색·Blocker 빨간색 OBB를 표시한다. 각 역할의 12개 모서리를 현재 body link pose·local bounds에서 계산해 YCB upright·root offset·합성 scale을 반영하고 매 step과 전체/부분 reset 뒤 갱신한다. Debug draw만 사용하며 USD prim·collider·material·physics state를 쓰지 않는다. GUI·livestream에서 기본 표시하고 `--disable_role_obb`로 끈다. 일반 headless에서는 생략하며 `--headless --validate`에서 viewport 없이 overlay 검사를 실행한다. 제한된 headless·GUI 검사 결과는 8절에 기록한다.
 - Reset은 물체 sample 뒤 Blocker 앞의 robot 시작 후보를 찾고 실제 앞쪽 camera 렌더로 초기 가시성을 승인한다. Camera 32개 후보가 실패하면 같은 역할·종류·active ID·개수로 pose를 다시 제안하며 최대 8개 layout을 검사한다. 승인된 pose·A₀·robot 시작 metadata와 initial snapshot을 해당 환경에 저장하고 후보 실패 시 기존 physical pose·metadata로 복구한다. Render는 physics/settling step을 추가하지 않으며 pool의 simulation/native gravity와 inactive parking/countergravity를 유지한다.
-- 17개 tactile link에 각각 독립 ContactSensor를 붙이고 binary contact·valid mask를 관측한다. 중앙 fixed-joint raw F/T도 구현한다. Sensor-frame 중력·bias 보정·filtering과 실제 하드웨어 threshold 교정은 후속 단계다.
+- 17개 tactile link에 각각 독립 ContactSensor를 붙이고 binary contact·valid mask를 관측한다. 중앙 fixed-joint raw F/T를 유지하고 학습 actor에는 sensor-frame 중력·bias 보정값을 제공한다. Filtering·실제 하드웨어 threshold/질량 교정은 후속 단계다.
+- 학습 `UR5eHandLearningSceneCfg`에만 arm/spacer의 9개 금지 접촉 sensor를 추가한다. 설정 factory는 `src/sensors.py`, 최근 4-substep/각 partner >1 N 판정은 `mdp/actions.py`, threshold는 `ContactRearrangementRLEnvCfg.forbidden_contact_threshold`에 둔다. Hand 조작 접촉을 이 판정에 포함하지 않으며 Target의 실제 이동 보호는 MDP가 맡는다. 이 접촉 분류·threshold는 초기 task 기본값이다.
 
 ### Blocker 앞의 robot 시작 randomization
 
@@ -495,8 +590,9 @@ depth `480×640×1` m, Target/Blocker 순서의
 실제 instance mask `480×640×2`, camera world position+ROS quaternion(wxyz) 7D를
 반환한다. RGB/depth/mask/camera pose는 승인한 초기 snapshot의 cache를 읽으며
 episode 중 image를 갱신하지 않는다. 비가림 reference·가시성 비율은 reset의
-acceptance metadata이며 observation으로 제공하지 않는다. 초기 10D 물체 기하
-추정·GNN·history·보정 F/T는 아직 구현하지 않았다.
+acceptance metadata이며 observation으로 제공하지 않는다. 학습용 `policy` group은
+이 초기 snapshot의 visible depth에서 추정한 OBB10과 robot/sensor/action 이력을
+별도로 구성한다. Raw sensor dictionary와 actor의 중력·bias 보정 F/T를 구분한다.
 
 ### 기존 hand link의 독립 tactile 17채널
 
@@ -577,27 +673,51 @@ Camera는 로컬 `InitialCamera` subclass를 쓴다. Isaac Lab 2.3.2의 첫 Fabr
 
 | 파일 | 역할 |
 |---|---|
-| [catalog.py](../src/contact_rearrangement/contact_rearrangement/catalog.py) | Simulator 없이 읽는 10종 metadata, 100개 pool, upright·parking·asset 경로 |
-| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | UR5e/RH56E2·중앙 F/T 조립/raw reader·tactile CAD slot collider·FK/IK·물체/pool |
-| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | Scene·카메라·ManagerBased·센서 observation, 주기·복제·seed·SpawnRules·RobotStartRules |
-| [spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py) | USD 측정·역할/reset·robot 후보·camera acceptance retry·state와 metadata commit/rollback |
-| [sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py) | 순수 장면 구성·density·SE(2) 경로, robot 시작 영역/elbow/3D OBB helpers |
-| [sensors.py](../src/contact_rearrangement/contact_rearrangement/sensors.py) | 초기 camera/reference render·snapshot·raw F/T·17개 독립 tactile cache/관측 |
-| [visualization.py](../src/contact_rearrangement/contact_rearrangement/visualization.py) | 현재 pose·local bounds의 Target/Blocker OBB debug draw |
-| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 실행, 역할 OBB 표시, 스폰·상태·reset 검증 |
+| [shelf_rearrangement_env_cfg.py](../src/contact_rearrangement/contact_rearrangement/shelf_rearrangement_env_cfg.py) | 공통 scene·camera·MDP manager term과 환경 기본값 |
+| [config/ur5e/osc_env_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/osc_env_cfg.py) | UR5e/RH56E2 장면 확인·학습 설정, OSC용 actuator |
+| [config/ur5e/__init__.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/__init__.py) | Gym task와 env/agent entry point 등록 |
+| [env.py](../src/contact_rearrangement/contact_rearrangement/env.py) | Auto-reset 전 실제 terminal observation 보존 |
+| [mdp/actions.py](../src/contact_rearrangement/contact_rearrangement/mdp/actions.py) | Base 기준 18D OSC/hand action과 arm/spacer 금지 접촉 이력 판정 |
+| [mdp/state.py](../src/contact_rearrangement/contact_rearrangement/mdp/state.py) | MdpCfg·기하·부분 reset·한 transition에 한 번 갱신하는 이력/누적량 |
+| [mdp/observations.py](../src/contact_rearrangement/contact_rearrangement/mdp/observations.py) | 초기 기하의 현재 EEF 재표현·16-step 이력·sensor-frame F/T 보정 |
+| [mdp/rewards.py](../src/contact_rearrangement/contact_rearrangement/mdp/rewards.py) | Reward v2와 dt 보정 |
+| [mdp/terminations.py](../src/contact_rearrangement/contact_rearrangement/mdp/terminations.py) | 성공·실패 판정 |
+| [mdp/events.py](../src/contact_rearrangement/contact_rearrangement/mdp/events.py) | USD 측정·역할/reset·robot 후보·camera retry·commit/rollback·MDP reset |
+| [src/catalog.py](../src/contact_rearrangement/contact_rearrangement/src/catalog.py) | Simulator 없이 읽는 10종 metadata·100개 pool·upright·parking·asset 경로 |
+| [src/assets.py](../src/contact_rearrangement/contact_rearrangement/src/assets.py) | 로봇/F/T 조립·raw reader·tactile CAD slot·FK/IK·물체/pool |
+| [src/sampling.py](../src/contact_rearrangement/contact_rearrangement/src/sampling.py) | 순수 density·SE(2) 경로·robot 시작 영역/elbow/3D OBB helpers |
+| [src/sensors.py](../src/contact_rearrangement/contact_rearrangement/src/sensors.py) | 초기 RGB-D/PCA 기하·raw F/T·17채널 tactile·금지 접촉 sensor factory |
+| [src/visualization.py](../src/contact_rearrangement/contact_rearrangement/src/visualization.py) | Target/Blocker OBB debug draw |
+| [agents/model.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/model.py) | 공유 GNN·역할 attention·유한 temporal encoder·actor/critic |
+| [agents/ppo.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo.py) | 공동학습 PPO·terminal/timeout GAE·checkpoint |
+| [agents/ppo_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo_cfg.py) | Model/PPO와 runner 기본값 |
+| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 장면 실행·5초 reset·역할 OBB·검증 |
+| [train.py](../src/contact_rearrangement/scripts/train.py) | Task 선택·학습 rollout·PPO update·checkpoint |
 
-현재 센서 책임을 모은 `sensors.py`를 더해 package는 7개 모듈이다. 이전 6개
-모듈 통합의 이력은 유지한다. 실행은 **catalog·CLI → camera 활성화 AppLauncher →
-scene/reference/camera 생성 → USD 측정/reset·pixel acceptance → physics step·
-F/T 갱신·OBB 표시** 순서다. Metadata와 순수 sampling은 simulator 없이 읽으며
-simulator 의존 모듈은 AppLauncher 뒤에 로드한다. `spawn.py`는 실제 geometry를
-`sampling.py`에 전달하고 그 결과를 state로 적용한다. `assets.py`의 pool은 매
-substep countergravity를 적용한다. `__init__.py`는 비어 있으며 package tree와
-`tests/test_sampling.py` 위치는 [README](../src/contact_rearrangement/README.md)에 있다.
+구조는 [sweeping_policy](../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy)의
+공통 `shelf_sweep_env_cfg.py`, `config/ur5e`의 concrete 환경과 등록,
+`mdp`의 manager 함수, `config/ur5e/agents`의 runner 설정에 대응한다.
+`Isaac-Contact-Rearrangement-UR5e-v0`의 `env_cfg_entry_point`와
+`ppo_cfg_entry_point`를 통해 설정을 불러오며 model·algorithm·기본 iteration·
+저장 간격은 `ContactRearrangementPPORunnerCfg`에 둔다. GNN·16-step 모델과
+custom PPO 구현을 유지하므로 예제의 RSL-RL 설정을 그대로 채택하지 않는다.
+장면 지원의 asset·sensor·sampling 구현은 각각 하나의 모듈로 유지한다.
+이전 flat 모듈을 다시 import하는 wrapper는 만들지 않는다.
 
-이전 `layout.py`는 `catalog.py`, `object_pool.py`·`object_spawner.py`와 물체 factory는
-`assets.py`, `scene_cfg.py`는 `env_cfg.py`, `geometry.py`·`mdp/events.py`는 `spawn.py`로
-통합했다. 이전 모듈·`mdp/`는 compatibility wrapper 없이 제거했다.
+스폰 실행은 **catalog·CLI → camera 활성화 AppLauncher → scene/reference/camera
+생성 → USD 측정/reset·pixel acceptance → physics step·F/T 갱신·OBB 표시** 순서다.
+Metadata와 순수 sampling은 simulator 없이 읽으며 simulator 의존 모듈은
+AppLauncher 뒤에 로드한다. `mdp/events.py`는 실제 geometry를 sampler에 전달하고
+그 결과를 state로 적용한다. Pool은 매 substep countergravity를 적용한다.
+학습에서는 초기 pixel acceptance 후 visible-depth geometry를 저장하고
+history/reward 누적량을 reset한 뒤 OSC→physics→센서→transition reward/종료→policy
+관측 순서로 진행한다. `mdp/state.py`가 공통 transition을 한 번만 갱신해
+manager 호출에 따른 누적량·history 중복 갱신을 막는다. Package tree와 실행·
+수정 위치는 [README](../src/contact_rearrangement/README.md)에 있다.
+
+2026-10-09의 6개 모듈 통합 기록과 해당 검사 결과는 8절에 보존한다. 이후
+학습 코드가 추가되고 sweeping example 구조로 재배치되었으며 현재 위치는 위
+표를 기준으로 읽는다.
 
 Asset 기본 경로는 `omniverse://192.168.0.13`이며
 `CONTACT_REARRANGEMENT_*` 환경변수로 override할 수 있다. 손은 저장소의
@@ -608,14 +728,19 @@ Asset 기본 경로는 `omniverse://192.168.0.13`이며
 Examples와 `roas_sweeping`에서 shelf·6개 물체 종류와 배치를,
 `hand_rl`에서 RH56E2 오른손 조립을, Isaac Lab의
 `scripts/tutorials/03_envs/create_cartpole_base_env.py`에서 base environment
-생명주기를 참고했다. `sweep_jh`의 OSC·가상 F/T는 후속 구현 참고 후보이며 새 환경에 통합되지 않았다.
+생명주기를 참고했다. 새 제어의 기준 frame은 examples의 sweeping 프로젝트에서
+`subtract_frame_transforms(root_pose_w, object_or_ee_pose_w)`와 `base_link` source
+frame을 사용하는 방식을 참조한다. 구체적인 참조는
+[Sweeping observations.py](../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/mdp/observations.py)의
+`object_position_in_robot_root_frame`와 EEF pose 변환이다. `sweep_jh`의 기존 goal/reward나 가상 F/T를
+새 MDP의 실제 센서로 대체하지 않는다.
 기존 환경의 목표 pose·reaching IK·sweep reward·단일 active-object reset을
 새 연구 명세로 그대로 사용하지 않는다. 오래된 `docs/hand_rl`의 왼손 설명보다
 현재 오른손 코드를 확인해야 한다.
 
 ## 8. 개발과 검증 기록
 
-과거 기록의 모듈 이름은 당시 구조다. 현재 위치는 위 7개 모듈 표를 따르며,
+과거 기록의 모듈 이름은 당시 구조다. 현재 위치는 위 모듈 표를 따르며,
 통합 전 검사 결과를 통합 후 runtime 검사의 통과로 사용하지 않는다.
 
 ### 2026-10-09 초기 고정 6개 장면 스폰과 reset — 이전 버전
@@ -1349,17 +1474,97 @@ camera visibility·OBB 무변경도 통과했으며 FK 오차는 4.96e−7 m였�
 `outputs/contact_rearrangement/tactile_gpu_validation.log`다. Probe는 검증 스크립트에만
 있으며 기본 task geometry에는 추가하지 않는다. Compile·diff check도 통과했다.
 
+### 2026-10-10 학습용 MDP·초기 장면/16-step 모델·PPO
+
+사용자가 설계했던 MDP/모델 구현을 요청했고 최근 16 step 이력부터 시작하도록
+선택했다. 기준 frame은 examples를 참조하고 물체 기하는 현재 EEF 기준으로
+입력한다. 초기 geometry의 base copy와 현재 EEF pose로 재표현하며 현재 object
+GT를 actor에 제공하지 않는다. Initial RGB-D의 visible point cloud PCA OBB,
+valid/role mask, sensor-frame 보정 F/T, 18D OSC/hand action과 Reward v2·성공/실패,
+true-final-observation timeout bootstrap을 구현했다. GRU·privileged critic·
+보조 prediction loss는 도입하지 않는다. Model/PPO의 **14개 CPU 검사**에서
+슬롯 순열 불변성, NaN padding/all-invalid, 16-step 전체 반영, bounded/saturated
+action log-probability, 양 encoder gradient, terminal/timeout GAE 분리와 inference-mode
+rollout update, model/optimizer checkpoint 복원이 통과했다.
+
+**통합 검증:** 전체 CPU 검사 **89개**(sampling 32, action/contact/implicit control 22,
+MDP 21, model/PPO 14)와 compile/diff 검사가 통과했다. 실제 GPU에서
+`train.py --headless --num_envs 2 --iterations 2 --rollout_steps 16
+--episode_length_s 0.8 --validate`가 exit code 0으로 완료했다.
+열린 손의 unloaded OSC hold 16 step에서 EEF 위치 drift는 최대 **0.0914 mm**,
+orientation drift는 최대 **0.00195 rad**, 보정 F/T norm peak는 **0.0108 N /
+0.00138 N·m**였다. 실제 Blocker를 proximal cylinder와 겹치게 만든 검증 fixture에서
+filtered arm/spacer contact failure가 ON임을 확인했다. 이 fixture는 검증 옵션에서만
+실행하며 학습 시작 전에 장면을 다시 reset한다.
+
+학습 rollout은 **64 transition**, PPO optimizer update **2회**를 완료했다.
+첫 rollout에서 양 환경의 history 16개가 모두 유효했고 다음 rollout에서는
+timeout **2회**의 실제 final observation을 auto-reset 이전에 보존했다.
+학습 rollout의 failure는 0회, 보정 wrench peak는 **1.407 N / 0.1885 N·m**였다.
+Geometry가 episode 동안 고정된 canonical 초기 값임을 확인하고, 현재 EEF 입력을
+SDK frame transform으로 다시 base에 옮겨 원본 초기 기하와 일치함을 검사했다.
+Terminal reward의 dt 적용, reset history/action 분리, native arm/mimic PD 비활성,
+finite effort, 실제 parameter update 및 GPU checkpoint 복원도 통과했다.
+로그는 `outputs/contact_rearrangement/learning_gpu_validation.log`, checkpoint는
+`outputs/contact_rearrangement/learning_smoke/model_latest.pt`다. 0.8초 time limit는
+reset 검증용이며 기본 학습 limit는 8초다. 이 검증은 구현 연결과 짧은 제어 안정성을
+보여주며 재배치 task 성공·정책 수렴·실기 성능을 입증하지 않는다.
+
+초기 진단에서는 SDK unit-mass explicit damping이 손을 열린 채 유지해도 팔을
+진동시켰다. Native damping mode의 `dt×eigenvalue`가 최대 **51.78**이었다.
+Hard-load 기준을 높이지 않고 coupled mass-aware damping과 backward-Euler 계산으로
+수정했다. 또한 GPU에서 child collision mesh filter가 지원되지 않아 rigid-body
+partner 경로로 교체했고, manager 초기화 시 이름이 겹치는 hand base 90 g을 포함해
+F/T 중력 보상 대상 **33개 body**를 정확히 선택했다. 이 진단의 실패 결과를 위의
+최종 통합 검증과 혼합하지 않는다. 기본 학습 출력은
+`outputs/contact_rearrangement/learning/<시작 시각>/`에 저장한다.
+
+### 2026-10-10 sweeping_policy 기준 코드 구조 정리
+
+사용자가 `examples`의 `sweeping_policy` 구조를 참고하도록 요청했다.
+공통 scene·MDP 설정은 `shelf_rearrangement_env_cfg.py`, 로봇별 설정과 Gym
+등록은 `config/ur5e`, 모델·PPO·runner 설정은 `config/ur5e/agents`, manager
+함수와 공통 transition 상태는 `mdp`, 장면 지원 구현은 `src`로 옮겼다.
+장면·센서·샘플러를 작은 helper 파일로 추가 분해하지 않으며 이전 flat 경로의
+wrapper도 남기지 않는다. `train.py`는 등록된 task의 환경·agent 설정을 읽는다.
+물체의 현재 EEF 기준 재표현, F/T sensor frame, 최근 16-step 이력, 18D action과
+Reward v2 명세는 유지한다. 이전 통합 검증 수치를 이번 구조 변경의 검증 결과로
+사용하지 않는다.
+
+**구조 변경 후 실제 검증:** Isaac Lab 2.3.2·Isaac Sim 5.1·RTX 3090·기존
+Nucleus asset에서 CPU 검사 **92개**가 **33.203초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 21, model 9, PPO/runner 6, Gym registration 2다.
+새 Gym ID의 env/agent entry point를 실제로 읽어 환경을 생성하고 이전
+`learning_smoke/model_latest.pt`를 이어서 학습했다. **2환경·64 transition·추가
+PPO update 2회(누적 4회)**, failure 0회·timeout 2회, 16-step history·부분 reset,
+EEF 초기 기하의 SDK transform 대조, 실제 arm/spacer 접촉 실패 판정,
+reward dt·native actuator 설정·parameter 갱신·GPU checkpoint 복원이 통과했다.
+Hold drift 최대 **0.0914 mm**, 학습 중 보정 wrench peak는
+**1.3860 N / 0.1841 N·m**였다. 실행 옵션은
+`train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless --num_envs 2
+--iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--resume outputs/contact_rearrangement/learning_smoke/model_latest.pt
+--log_dir outputs/contact_rearrangement/structure_learning_smoke --validate`이며
+로그는 `outputs/contact_rearrangement/structure_learning_validation.log`다.
+
+장면 확인 환경도 `spawn_scene.py --headless --num_envs 2 --max_steps 151
+--validate`로 exit code 0을 확인했다. **151 step·5.03초** 동안 150-step 자동
+reset과 정착, 역할·밀도·elbow-up 시작, 전체/부분 reset, raw F/T·17채널 tactile
+observation, OBB 표시의 USD/PhysX 불변 검사를 통과했다. 로그는
+`outputs/contact_rearrangement/structure_spawn_validation.log`다. 이 구조 변경
+검증을 재배치 정책의 수렴이나 task 성공률로 해석하지 않는다.
+
 ## 9. 다음 구체화와 구현에서 정할 사항
 
 아래는 미결 사항이며 다음 작업의 순서가 확정된 것은 아니다.
 
 1. 실제 학습 분포 구체화. 종류별 채택률·실패율, settle 이후 기하 조건 유지, 밀집도 수치와 sampler bias, 로봇의 실제 접촉·접근 가능성을 확인한다.
-2. 구현한 tactile 17채널과 raw F/T의 실기 threshold·filtering·동기화 교정, F/T 중력·bias 보정 및 실제 센서 질량 교정.
-3. 18D OSC/hand 제어의 frame·scale·강성/감쇠·정책 주기 및 실기 제어 경로.
-4. 초기 vision snapshot의 좌표계·보존 시점, 관측 가능한 물체·padding mask, history 또는 hidden state의 reset.
-5. 고정 접근영역·footprint·전체 차단 계산과 Target 보호·비파지 조건·성공/실패·timeout의 정확한 정의.
-6. Reward v2의 수치·시간 scale·누적량 갱신 주기, 대기 보상 악용과 안정성/속도 trade-off 검증.
-7. GNN·attention·temporal 표현·actor/critic·PPO의 공동학습 구조.
+2. 구현한 tactile 17채널과 raw F/T의 실기 threshold·filtering·동기화 교정, 구현한 F/T 중력·bias 보정의 실제 센서 질량 교정.
+3. Base 기준 18D OSC/hand 제어의 gain·workspace·effort limit와 접촉 안정성 검증, 실기 제어 경로.
+4. Visible-depth 초기 PCA OBB의 가림·부분 형상 오차, oracle instance-ID association을 대체할 실기 perception, 16-step window 밖 정보 손실 평가.
+5. 구현한 전체 차단·Target 보호·비파지 조건·성공/실패·timeout과 arm/spacer 금지 접촉 기본값의 task 적합성.
+6. Reward v2의 초기 수치 조정, 대기 보상 악용과 안정성/속도 trade-off 검증.
+7. 구현한 GNN·attention·finite temporal encoder·shared actor/critic·PPO의 학습 수렴과 일반화, 필요 시 구조 변경.
 8. 환경 변화 이해를 무엇으로 평가할지와 task reward만의 baseline, 추가 reward/보조 loss 비교의 채택 여부.
 
 연구 논의를 이어갈 핵심 사례는 같은 초기 OBB와 같은 명령에 대해 마찰·접촉

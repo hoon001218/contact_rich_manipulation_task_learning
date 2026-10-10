@@ -18,7 +18,7 @@
 Blocker 앞 reserve·camera gate 추가 전 균형 구성의 기하 sample 40개와 일반
 모드 4개 GPU 환경·151 step 검사가
 통과했다. 연구의 최종 난이도 수치는 별도이며 검증 범위는 11절에 기록한다.
-책임별 6개 모듈로 통합한 뒤에도 아래 규칙과 기본값을 유지했다. 통합 후
+2026-10-09에 책임별 6개 모듈로 통합한 뒤에도 아래 규칙과 기본값을 유지했다. 통합 후
 23개 unit test와 일반 모드 4개 GPU 환경·151 step 검사가 통과했으며
 기존 균형 구성 실행의 초기·reset 뒤 8개 장면 설명과 정확히 같았다.
 
@@ -47,9 +47,9 @@ norm >0.01 N을 bool 17채널로 관측한다. 해당 실제 GPU 접촉·reset �
 
 연구 배경과 변경 이유는 [CONTEXT.md](CONTEXT.md), 실행 방법은
 [환경 README](../src/contact_rearrangement/README.md)에 있다. 이 문서는 현재
-[sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py),
-[spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py)의 USD 측정·reset,
-[assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py)의 pool 처리를 바탕으로
+[src/sampling.py](../src/contact_rearrangement/contact_rearrangement/src/sampling.py),
+[mdp/events.py](../src/contact_rearrangement/contact_rearrangement/mdp/events.py)의 USD 측정·reset,
+[src/assets.py](../src/contact_rearrangement/contact_rearrangement/src/assets.py)의 pool 처리를 바탕으로
 판정과 제안 분포를 구체적으로 설명한다.
 
 ![35% 전체 선반 점유율의 종류 수와 instance 수 예시](assets/dense_shelf_examples.svg)
@@ -172,7 +172,7 @@ panel과 기둥의 bounds를 읽어 작업층을 정한다. 현재 기본 speedr
 `X=[-0.885,-0.515]`, `Y=[-0.440,+0.440] m`이다. 물체 중심만 선반 안에 있다고
 통과시키지 않는다. 회전된 footprint 전체가 이 안에 있어야 한다.
 
-`spawn.py`는 X 폭 25 cm 초과·Y 폭 50 cm 초과·두께 6 cm 미만인 collision
+`mdp/events.py`는 X 폭 25 cm 초과·Y 폭 50 cm 초과·두께 6 cm 미만인 collision
 부분을 수평 panel 후보로 보고, 설정한 작업층 높이에 가장 가까운 상면을 고른다.
 그 위의 겹치는 panel 중 가장 낮은 하단을 ceiling으로 쓴다. Y 범위는 작업층과
 겹치는 가는 수직 기둥의 안쪽 경계로 줄인다. 해당 기둥을 찾지 못한 custom shelf는
@@ -214,7 +214,7 @@ root_z = shelf_top - lower.z
 ### YCB 003·004의 flat-box collision
 
 두 scanned box의 초기 낙하·흔들림을 줄이기 위해
-[assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py)의
+[src/assets.py](../src/contact_rearrangement/contact_rearrangement/src/assets.py)의
 `FlatBoxUsdCfg`를 **003 cracker box와 004 sugar box에만** 사용한다. 기존의
 visible scanned mesh는 유지하고 그 mesh의 collision을 끈 다음, 같은 single
 rigid body 아래에 invisible `UsdGeom.Cube` collider를 추가한다.
@@ -272,7 +272,7 @@ YCB 003·004·005·006 모두 상하가 뒤집혀 있었다. 상자·캔의 라�
 수정 후에도 같은 원본 USD를 양쪽에서 8장 렌더링해 003·004의 라벨,
 005의 라벨과 여는 고리, 006의 뚜껑이 정상 방향임을 확인했다. 이미지와 quaternion
 manifest는 `outputs/contact_rearrangement/ycb_orientation/{before,corrected}/`에 있다.
-현재 회전값은 [catalog.py](../src/contact_rearrangement/contact_rearrangement/catalog.py)에 있다.
+현재 회전값은 [src/catalog.py](../src/contact_rearrangement/contact_rearrangement/src/catalog.py)에 있다.
 
 Sampler의 XY 위치는 **회전된 footprint 중심**이다. 이를 root pose로 쓸 때는
 회전된 local bounding center를 빼서 보정한다.
@@ -503,7 +503,7 @@ active ID/mask·Target/Blocker ID·초기 state·A₀·sample metadata를 저장
 
 사용자는 Blocker 앞쪽 영역에서 다른 물체와 충돌 없이 hand 시작을 무작위로
 정하고 elbow-down은 허용하지 않도록 요청했다. 구현 설정은
-`env_cfg.robot_start`의 `RobotStartRules`이며 기본 `enabled=True`다.
+`cfg.robot_start`의 `RobotStartRules`이며 기본 `enabled=True`다.
 다음 수치는 현재 구현 기본값이며 이후 제어·학습 분포에 맞춰 조정할 수 있다.
 
 | 기준 | 현재 값 |
@@ -561,7 +561,7 @@ Reset 검증에서는 실제 PhysX TCP의 전체 회전과 이 목표 사이 ang
 두 비교의 수치 허용 오차는 1e−5다. TCP 위치·영역 검증만으로 tool 방향을
 판정하지 않는다.
 
-`assets.py`의 `RobotPoseModel`은 실제 조립 USD의 joint frame·axis·scale과
+`src/assets.py`의 `RobotPoseModel`은 실제 조립 USD의 joint frame·axis·scale과
 41개 link의 fixed/revolute 연결을 읽어 FK를 구성하고 SciPy의 bounded IK로
 UR arm 해를 찾는다. Finger q는 기존 열린 손의 기본값을 유지한다. Elbow-up은
 관절각 부호로 분류하지 않는다. Shoulder-lift·elbow·wrist-1 joint center를 S/E/W로
@@ -845,7 +845,7 @@ native gravity는 유지하며 live disable-simulation/disable-gravity flag를
 전환하지 않는다. USD visibility를 수정해 숨기는 방식도 사용하지 않는다.
 현재 작업층 camera ROI 밖에 두는 공간 분리와 active mask가 역할을 구분한다.
 
-[TaskObjectPool](../src/contact_rearrangement/contact_rearrangement/assets.py)이
+[TaskObjectPool](../src/contact_rearrangement/contact_rearrangement/src/assets.py)이
 매 physics write/substep에서 inactive body의 실제 world COM에 `-m*g` 힘을
 적용해 중력을 상쇄한다. Root pivot에 힘을 가해 불필요한 torque가 생기지 않도록
 COM 위치를 명시한다. Active body에는 이 추가 힘이 0이므로 native gravity와
@@ -948,25 +948,39 @@ settle 이후 물체의 자세·위치 안정성을 보장할 수 없다. 상세
 
 ## 12. 관련 구현 위치
 
+현재 구조는 `examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy`를 따라
+공통 환경 설정·로봇별 설정, `mdp`의 manager 함수, `src`의 장면 지원 구현을
+분리한다. 모델과 학습 설정을 포함한 전체 구조는
+[README](../src/contact_rearrangement/README.md)에 있다.
+
 | 파일 | 이 문서와 연결되는 역할 |
 |---|---|
-| [catalog.py](../src/contact_rearrangement/contact_rearrangement/catalog.py) | Simulator 없이 읽는 10종 catalog, upright 회전, 10-copy pool, parking 위치 |
-| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | 로봇·중앙 F/T 조립/raw reader·USD FK/IK, 물체 생성·countergravity·Cube collider |
-| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | Scene·camera·센서 observation·ManagerBased, SpawnRules·RobotStartRules·seed·주기 |
-| [spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py) | USD bounds·역할/reset·robot 후보·camera acceptance retry·state/metadata commit/rollback |
-| [sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py) | 순수 장면 샘플링·SAT·SE(2) 경로, robot 영역/elbow/3D OBB helpers |
-| [sensors.py](../src/contact_rearrangement/contact_rearrangement/sensors.py) | Camera/reference render·snapshot·F/T·17개 독립 tactile cache/관측 |
-| [visualization.py](../src/contact_rearrangement/contact_rearrangement/visualization.py) | 현재 pose의 역할 OBB debug draw |
-| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | CLI와 실제 스폰·settle·전체/부분 reset 검증 |
+| [src/catalog.py](../src/contact_rearrangement/contact_rearrangement/src/catalog.py) | 10종 catalog·upright·10-copy pool·parking 위치 |
+| [src/assets.py](../src/contact_rearrangement/contact_rearrangement/src/assets.py) | 로봇/F/T 조립·USD FK/IK·물체 생성·countergravity·Cube collider |
+| [shelf_rearrangement_env_cfg.py](../src/contact_rearrangement/contact_rearrangement/shelf_rearrangement_env_cfg.py) | 공통 shelf/camera·manager 연결·SpawnRules·RobotStartRules·seed·주기 |
+| [config/ur5e/osc_env_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/osc_env_cfg.py) | UR5e/RH56E2·object pool·17채널 tactile·장면 확인/학습 설정 |
+| [mdp/events.py](../src/contact_rearrangement/contact_rearrangement/mdp/events.py) | USD bounds·역할/reset·robot 후보·camera retry·commit/rollback |
+| [src/sampling.py](../src/contact_rearrangement/contact_rearrangement/src/sampling.py) | 순수 density·SAT·SE(2) 경로·robot 영역/elbow/3D OBB helpers |
+| [src/sensors.py](../src/contact_rearrangement/contact_rearrangement/src/sensors.py) | Camera/reference render·pixel acceptance·snapshot·raw F/T·tactile |
+| [src/visualization.py](../src/contact_rearrangement/contact_rearrangement/src/visualization.py) | 현재 pose의 역할 OBB debug draw |
+| [mdp/state.py](../src/contact_rearrangement/contact_rearrangement/mdp/state.py) | 학습 환경의 history·reward 누적량 reset과 transition 상태 |
+| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | CLI·5초 reset·실제 스폰/settle·전체/부분 reset 검증 |
 
-`catalog.py`의 metadata와 순수 `sampling.py`를 바탕으로 AppLauncher 이후
-`env_cfg.py`·`assets.py`가 scene을 만든다. Reset에서는 `spawn.py`가 측정 geometry를
-sampler에 전달해 state를 적용하고 `sensors.py`의 실제 render acceptance를 거쳐
-initial snapshot을 commit한다. Step에서는 raw F/T·pool countergravity·OBB 표시를
-갱신한다. 밀도·선정·clearance 수치는 `SpawnRules`/`sampling.py`, 실제 geometry
-처리는 `spawn.py`에서 찾는다. 이전 `layout.py`, `scene_cfg.py`, `geometry.py`,
-`object_pool.py`, `object_spawner.py`, `mdp/events.py`는 위 책임으로 통합하고
-compatibility wrapper 없이 제거했다. 이전 6개 모듈 통합 당시 모든 모듈의 문법·CLI help 검사,
-simulator 없는 catalog/sampling import, 23개 unit test와 4개 GPU 환경·5.03초의
-전체/부분 reset·OBB 불변 검사도 통과했다. 물리 guard는 유지했다. 11절의
-이전 결과와 통합 후 검사 조건·로그는 [CONTEXT.md](CONTEXT.md)에서 구분한다.
+Simulator 없이 읽는 catalog와 순수 sampler를 바탕으로 AppLauncher 이후
+공통 환경 설정과 UR5e concrete 설정이 asset·sensor scene을 만든다. Reset에서는
+`mdp/events.py`가 실제 USD geometry를 측정하고 역할·종류·active ID·개수를 정한
+뒤 sampler로 배치와 robot 후보를 승인한다. 선택한 환경의 native state를 적용한
+후 `src/sensors.py`가 실제 렌더의 pixel acceptance를 검사한다. Camera 후보가
+실패하면 같은 composition으로 layout을 재시도하며 성공한 pose·metadata·초기
+snapshot을 함께 commit한다. 정해진 retry가 모두 실패하면 이전 선택 환경의
+physical state·metadata·sensor snapshot을 복구한다. 이 과정에 settling이나
+추가 physics step을 삽입하지 않는다. 학습 환경은 장면 reset 성공 뒤
+`mdp/state.py`의 history·reward 누적량도 reset한다.
+
+Step에서는 raw F/T·tactile·pool countergravity·OBB 표시를 갱신한다.
+밀도·선정·clearance 수치는 `SpawnRules`와 `src/sampling.py`, 실제 USD geometry와
+reset 적용은 `mdp/events.py`에서 찾는다. 이전 flat 경로의 wrapper는 남기지 않는다.
+2026-10-09의 6개 모듈 통합 때는 문법·CLI help, simulator 없는 catalog/sampling
+import, 23개 unit test와 4개 GPU 환경·5.03초의 전체/부분 reset·OBB 불변 검사가
+통과했다. 물리 guard는 유지했다. 이 결과를 현재 구조 변경의 검증으로 사용하지
+않으며 이전 조건·로그와 후속 검증은 [CONTEXT.md](CONTEXT.md)에서 구분한다.

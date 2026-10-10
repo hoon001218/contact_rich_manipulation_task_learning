@@ -39,8 +39,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.sensors import ContactSensor
 
-from contact_rearrangement.assets import TACTILE_BODY_NAMES
-from contact_rearrangement.sensors import (
+from contact_rearrangement.src.assets import TACTILE_BODY_NAMES
+from contact_rearrangement.src.sensors import (
     BinaryTactileSensor, InitialVisionSensor, TACTILE_SENSOR_NAMES, TactileCfg,
     tactile_contacts, tactile_valid,
 )

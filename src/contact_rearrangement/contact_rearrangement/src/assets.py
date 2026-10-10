@@ -69,7 +69,7 @@ DEFAULT_UR5E_USD_PATH = (
     f"{NUCLEUS_ROOT}/NVIDIA/Assets/Isaac/5.0/"
     "Isaac/Robots/UniversalRobots/ur5e/ur5e.usd"
 )
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_HAND_URDF_PATH = (
     REPOSITORY_ROOT
     / "assets/robots/Roas_provided_inspire_urdf/RH56E2 URDF/"

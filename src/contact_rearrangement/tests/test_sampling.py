@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from contact_rearrangement.sampling import (
+from contact_rearrangement.src.sampling import (
     ObjectGeometry,
     PlanarMotion,
     PlanarPose,

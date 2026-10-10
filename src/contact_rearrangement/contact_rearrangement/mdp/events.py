@@ -1,6 +1,6 @@
 """Inspect spawned USD geometry and apply seeded episode resets to the scene.
 
-Sampling stays simulator-independent in sampling.py. This module bridges those
+Sampling stays simulator-independent in src/sampling.py. This module bridges those
 rules to USD measurements, current role metadata, and PhysX object state.
 """
 
@@ -18,10 +18,11 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 import isaaclab.envs.mdp as mdp
 
-from .catalog import OBJECT_SPECS
-from .assets import RobotPoseModel, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
-from .sensors import initialize_sensors, InitialVisionRejected
-from .sampling import (
+from .state import reset_mdp
+from ..src.catalog import OBJECT_SPECS
+from ..src.assets import RobotPoseModel, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
+from ..src.sensors import initialize_sensors, InitialVisionRejected
+from ..src.sampling import (
     ROBOT_START_TCP_ROTATION, ObjectGeometry, SpawnRules,
     oriented_box_separated, robot_start_region, sample_scene,
 )
@@ -463,6 +464,8 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
              "initial_camera_attempts", "spawn_initial_state", "spawn_seeds",
              "spawn_reset_counts", "robot_initial_joint_pos", "robot_start_tcp_pos_w", "robot_start_region",
              "robot_start_elbow_height", "robot_start_attempts")
+    if hasattr(env.cfg, "mdp"):
+        names += ("initial_object_geometry", "initial_object_valid", "initial_object_roles", "initial_observed_object_ids")
     saved = {name: getattr(env, name)[selected_ids].clone() for name in names}
     previous_samples = [env.spawn_samples[index] for index in selected_ids]
     camera = env.scene["initial_camera"]
