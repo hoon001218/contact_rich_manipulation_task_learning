@@ -1,12 +1,42 @@
-"""Base environment for inspecting the scene before specifying the learning MDP."""
+"""Scene and manager configuration for the shelf rearrangement environment."""
 
+import os
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.envs import ManagerBasedEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
-from .mdp import reset_spawn_scene
-from .scene_cfg import ContactRearrangementSceneCfg
-from .sampling import SpawnRules
+from .assets import make_object_collection_cfg, make_ur5e_hand_cfg
+from .catalog import DEFAULT_SHELF_USD_PATH, SHELF_POSITION
+from .sampling import RobotStartRules, SpawnRules
+from .spawn import reset_spawn_scene
+
+
+@configclass
+class ContactRearrangementSceneCfg(InteractiveSceneCfg):
+    """Shared asset pool; reset provides seeded poses, active masks, and roles."""
+
+    ground = AssetBaseCfg(
+        prim_path="/World/Ground",
+        spawn=sim_utils.GroundPlaneCfg(),
+    )
+    light = AssetBaseCfg(
+        prim_path="/World/Light",
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
+    )
+    shelf = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Shelf",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=os.environ.get("CONTACT_REARRANGEMENT_SHELF_USD_PATH", DEFAULT_SHELF_USD_PATH),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=SHELF_POSITION),
+    )
+    robot = make_ur5e_hand_cfg()
+    objects = make_object_collection_cfg()
 
 
 @configclass
@@ -46,6 +76,7 @@ class ContactRearrangementEnvCfg(ManagerBasedEnvCfg):
     events: EventsCfg = EventsCfg()
     seed: int = 0
     spawn_rules: SpawnRules = SpawnRules()
+    robot_start: RobotStartRules = RobotStartRules()
     target_asset: str | None = None
     blocker_asset: str | None = None
     initial_vision: InitialVisionCfg = InitialVisionCfg()

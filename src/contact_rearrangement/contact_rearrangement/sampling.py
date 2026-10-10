@@ -17,6 +17,7 @@ from itertools import combinations
 from typing import Sequence
 
 Point = tuple[float, float]
+Point3 = tuple[float, float, float]
 Polygon = tuple[Point, ...]
 Region = tuple[float, float, float, float]
 _EPS = 1.0e-9
@@ -37,7 +38,9 @@ class SpawnRules:
     shelf_top: float = 1.05
     ceiling: float = 1.35
     min_objects: int = 4
-    max_objects: int = 10
+    max_objects: int = 40
+    min_asset_types: int = 4
+    max_asset_types: int = 10
     all_asset_types: bool = False
     edge_margin: float = 0.015
     gap: float = 0.003
@@ -47,8 +50,29 @@ class SpawnRules:
     min_x_coverage: float = 0.55
     min_y_coverage: float = 0.65
     neighbor_distance: float = 0.04
-    min_neighbor_fraction: float = 0.50
+    min_neighbor_fraction: float = 0.75
+    min_shelf_occupancy: float = 0.35
+    region_grid: tuple[int, int] = (2, 3)
+    min_region_occupancy: float = 0.10
     max_attempts: int = 300
+
+
+@dataclass(frozen=True)
+class RobotStartRules:
+    """Bounded, collision-checked hand starts in front of the episode Blocker.
+
+    Distances describe the palm TCP, not the closest finger surface. Full robot
+    collision geometry must be checked after IK, using ``collision_clearance``.
+    """
+
+    front_distance_range: tuple[float, float] = (0.12, 0.40)
+    shelf_front_clearance: float = 0.06
+    lateral_half_width: float = 0.08
+    height_above_shelf: tuple[float, float] = (0.20, 0.28)
+    min_elbow_height: float = 0.05
+    collision_clearance: float = 0.015
+    max_attempts: int = 80
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -77,6 +101,7 @@ class SceneMetrics:
     y_coverage: float
     shelf_occupancy: float
     local_neighbor_fraction: float
+    region_occupancies: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -107,6 +132,143 @@ def footprint_polygon(geometry: ObjectGeometry, center_xy: Point, yaw: float) ->
         (center_xy[0] + cosine * x - sine * y, center_xy[1] + sine * x + cosine * y)
         for x, y in ((-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy))
     )
+
+
+def robot_start_region(
+    sample: SceneSample,
+    geometries: Sequence[ObjectGeometry],
+    spawn_rules: SpawnRules,
+    robot_start: RobotStartRules,
+) -> tuple[float, float, float, float, float, float]:
+    """Return local TCP bounds (xmin, xmax, ymin, ymax, zmin, zmax).
+
+    The near edge satisfies both the rotated Blocker front offset and clearance
+    from the shelf front. An empty intersection fails explicitly rather than
+    moving the Blocker or silently relaxing the requested distances.
+    """
+    values = (
+        *robot_start.front_distance_range, robot_start.shelf_front_clearance,
+        robot_start.lateral_half_width, *robot_start.height_above_shelf,
+        robot_start.min_elbow_height, robot_start.collision_clearance,
+        *spawn_rules.x_range, spawn_rules.shelf_top,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Robot start rules and shelf bounds must be finite.")
+    if any(value < 0.0 for value in (
+        *robot_start.front_distance_range, robot_start.shelf_front_clearance,
+        robot_start.lateral_half_width, *robot_start.height_above_shelf,
+        robot_start.min_elbow_height, robot_start.collision_clearance,
+    )):
+        raise ValueError("Robot start distances, heights and clearances must be nonnegative.")
+    if robot_start.front_distance_range[0] >= robot_start.front_distance_range[1]:
+        raise ValueError("Robot start front distance range must have positive width.")
+    if robot_start.height_above_shelf[0] >= robot_start.height_above_shelf[1]:
+        raise ValueError("Robot start height range must have positive width.")
+    if robot_start.lateral_half_width <= 0.0:
+        raise ValueError("Robot start lateral half width must be positive.")
+    if not isinstance(robot_start.max_attempts, int) or isinstance(robot_start.max_attempts, bool) or robot_start.max_attempts <= 0:
+        raise ValueError("Robot start max_attempts must be a positive integer.")
+    if spawn_rules.x_range[0] >= spawn_rules.x_range[1]:
+        raise ValueError("Shelf X range must have positive width.")
+    if not 0 <= sample.blocker_id < len(geometries) or sample.blocker_id not in sample.active_ids:
+        raise ValueError("Robot start Blocker must index an active catalog object.")
+    blocker = sample.blocker_id
+    if blocker not in sample.positions or blocker not in sample.yaws:
+        raise ValueError("Robot start requires the Blocker pose.")
+    position, yaw = sample.positions[blocker], sample.yaws[blocker]
+    geometry = geometries[blocker]
+    if not all(math.isfinite(value) for value in (*position, yaw, *geometry.lower, *geometry.upper)):
+        raise ValueError("Robot start Blocker pose and geometry must be finite.")
+    if any(high <= low for low, high in zip(geometry.lower, geometry.upper)):
+        raise ValueError("Robot start Blocker geometry must have positive extent.")
+    front = max(x for x, _ in footprint_polygon(geometry, position[:2], yaw))
+    minimum_x = max(front + robot_start.front_distance_range[0],
+                    spawn_rules.x_range[1] + robot_start.shelf_front_clearance)
+    maximum_x = front + robot_start.front_distance_range[1]
+    if minimum_x >= maximum_x:
+        raise ValueError("Robot start front region is empty after shelf clearance.")
+    return (
+        minimum_x, maximum_x,
+        position[1] - robot_start.lateral_half_width,
+        position[1] + robot_start.lateral_half_width,
+        spawn_rules.shelf_top + robot_start.height_above_shelf[0],
+        spawn_rules.shelf_top + robot_start.height_above_shelf[1],
+    )
+
+
+def elbow_above_chord(shoulder: Sequence[float], elbow: Sequence[float], wrist: Sequence[float]) -> float:
+    """Return elbow height above its closest point on the shoulder–wrist chord.
+
+    Positive values identify the high-elbow branch geometrically, independent
+    of joint angle signs, wrapping, and the robot's base orientation.
+    """
+    if any(len(point) != 3 for point in (shoulder, elbow, wrist)) or not all(
+        math.isfinite(value) for point in (shoulder, elbow, wrist) for value in point
+    ):
+        raise ValueError("Shoulder, elbow and wrist must be finite three-dimensional points.")
+    chord = tuple(wrist[index] - shoulder[index] for index in range(3))
+    length_squared = sum(value * value for value in chord)
+    if length_squared <= 1.0e-18:
+        raise ValueError("Shoulder and wrist must define a nonzero chord.")
+    fraction = sum((elbow[index] - shoulder[index]) * chord[index] for index in range(3)) / length_squared
+    fraction = min(1.0, max(0.0, fraction))
+    return elbow[2] - shoulder[2] - fraction * chord[2]
+
+
+def oriented_box_separated(
+    center_a: Sequence[float],
+    rotation_a: Sequence[Sequence[float]],
+    half_a: Sequence[float],
+    center_b: Sequence[float],
+    rotation_b: Sequence[Sequence[float]],
+    half_b: Sequence[float],
+    clearance: float = 0.0,
+) -> bool:
+    """Test 3D box separation on the complete 15-axis SAT, with an AABB shortcut.
+
+    Rotation matrices have the local unit axes in their columns. ``clearance``
+    requires that gap along a normalized separating axis; it is conservative
+    for diagonal corner gaps. Touching separates when clearance is zero.
+    """
+    if any(len(vector) != 3 for vector in (center_a, half_a, center_b, half_b)) or any(
+        len(rotation) != 3 or any(len(row) != 3 for row in rotation)
+        for rotation in (rotation_a, rotation_b)
+    ):
+        raise ValueError("Oriented boxes require 3D centers/extents and 3×3 rotations.")
+    values = (
+        *center_a, *half_a, *center_b, *half_b, clearance,
+        *(value for rotation in (rotation_a, rotation_b) for row in rotation for value in row),
+    )
+    if not all(math.isfinite(value) for value in values) or any(value < 0.0 for value in (*half_a, *half_b, clearance)):
+        raise ValueError("Oriented boxes must be finite, with nonnegative half extents and clearance.")
+    delta = tuple(center_b[index] - center_a[index] for index in range(3))
+    # A world-axis gap also separates the full boxes, even if it is not one of
+    # their face/cross axes. This cheaply rejects most distant shelf colliders.
+    for index in range(3):
+        radius = sum(abs(rotation_a[index][axis]) * half_a[axis] +
+                     abs(rotation_b[index][axis]) * half_b[axis] for axis in range(3))
+        if abs(delta[index]) + _EPS >= radius + clearance:
+            return True
+    axes_a = tuple(tuple(rotation_a[row][column] for row in range(3)) for column in range(3))
+    axes_b = tuple(tuple(rotation_b[row][column] for row in range(3)) for column in range(3))
+    axes = (*axes_a, *axes_b, *(
+        (first[1] * second[2] - first[2] * second[1],
+         first[2] * second[0] - first[0] * second[2],
+         first[0] * second[1] - first[1] * second[0])
+        for first in axes_a for second in axes_b
+    ))
+    for axis in axes:
+        length_squared = sum(value * value for value in axis)
+        if length_squared <= 1.0e-18:
+            continue  # Parallel box edges do not define a separating axis.
+        length = math.sqrt(length_squared)
+        distance = abs(sum(delta[index] * axis[index] for index in range(3)))
+        radius = sum(half_a[index] * abs(sum(axes_a[index][j] * axis[j] for j in range(3))) +
+                     half_b[index] * abs(sum(axes_b[index][j] * axis[j] for j in range(3)))
+                     for index in range(3))
+        if distance + _EPS * length >= radius + clearance * length:
+            return True
+    return False
 
 
 def polygon_area(polygon: Polygon) -> float:
@@ -252,6 +414,21 @@ def polygon_distance(first: Polygon, second: Polygon) -> float:
                for point in points for start, end in zip(edges, edges[1:] + edges[:1]))
 
 
+def shelf_regions(rules: SpawnRules) -> tuple[Region, ...]:
+    """Equal usable-support cells, X-major then Y-major, including reserved space."""
+    nx, ny = rules.region_grid
+    xmin, xmax = rules.x_range[0] + rules.edge_margin, rules.x_range[1] - rules.edge_margin
+    ymin, ymax = rules.y_range[0] + rules.edge_margin, rules.y_range[1] - rules.edge_margin
+    dx, dy = (xmax - xmin) / nx, (ymax - ymin) / ny
+    return tuple((xmin + ix * dx, xmin + (ix + 1) * dx, ymin + iy * dy, ymin + (iy + 1) * dy)
+                 for ix in range(nx) for iy in range(ny))
+
+
+def _regional_occupancies(polygons: Sequence[Polygon], rules: SpawnRules) -> tuple[float, ...]:
+    return tuple(sum(overlap_area(polygon, rectangle_polygon(region)) for polygon in polygons)
+                 / ((region[1] - region[0]) * (region[3] - region[2])) for region in shelf_regions(rules))
+
+
 def _scene_measurements(polygons: Sequence[Polygon], rules: SpawnRules) -> SceneMetrics:
     points = tuple(point for polygon in polygons for point in polygon)
     usable_x = rules.x_range[1] - rules.x_range[0] - 2 * rules.edge_margin
@@ -264,6 +441,7 @@ def _scene_measurements(polygons: Sequence[Polygon], rules: SpawnRules) -> Scene
         (max(y for _, y in points) - min(y for _, y in points)) / usable_y,
         sum(polygon_area(polygon) for polygon in polygons) / (usable_x * usable_y),
         neighbors / len(polygons),
+        _regional_occupancies(polygons, rules),
     )
 
 
@@ -332,15 +510,21 @@ def _path_supported_clear(geometry: ObjectGeometry, path: Sequence[PlanarMotion]
 def _check_inputs(geometries: Sequence[ObjectGeometry], rules: SpawnRules) -> None:
     values = (*rules.x_range, *rules.y_range, rules.shelf_top, rules.ceiling, rules.edge_margin,
               rules.gap, rules.hand_width, rules.approach_margin, rules.min_blocked_ratio,
-              rules.min_x_coverage, rules.min_y_coverage, rules.neighbor_distance, rules.min_neighbor_fraction)
+              rules.min_x_coverage, rules.min_y_coverage, rules.neighbor_distance, rules.min_neighbor_fraction,
+              rules.min_shelf_occupancy, rules.min_region_occupancy)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("Spawn rules must have finite dimensions and thresholds.")
     if not 2 <= rules.min_objects <= rules.max_objects <= len(geometries):
         raise ValueError("Active object limits must satisfy 2 <= min <= max <= catalog size.")
+    if not 2 <= rules.min_asset_types <= rules.max_asset_types <= len({_asset_type(geometry) for geometry in geometries}):
+        raise ValueError("Asset type limits must satisfy 2 <= min <= max <= catalog type count.")
+    if len(rules.region_grid) != 2 or any(not isinstance(value, int) or value < 1 for value in rules.region_grid):
+        raise ValueError("Region grid must contain two positive integer cell counts.")
     if rules.max_attempts < 1 or not 0.0 < rules.min_blocked_ratio <= 1.0:
         raise ValueError("max_attempts must be positive and min_blocked_ratio must be in (0, 1].")
     if any(not 0.0 <= value <= 1.0 for value in
-           (rules.min_x_coverage, rules.min_y_coverage, rules.min_neighbor_fraction)):
+           (rules.min_x_coverage, rules.min_y_coverage, rules.min_neighbor_fraction,
+            rules.min_shelf_occupancy, rules.min_region_occupancy)):
         raise ValueError("Coverage and neighbor fraction thresholds must be in [0, 1].")
     if min(rules.edge_margin, rules.gap, rules.approach_margin, rules.neighbor_distance) < 0 or rules.hand_width <= 0:
         raise ValueError("Margins, neighbor distance and gap must be nonnegative; hand_width must be positive.")
@@ -396,11 +580,12 @@ def validate_sample(sample: SceneSample, geometries: Sequence[ObjectGeometry], r
     target_type = _asset_type(geometries[sample.target_id])
     if sum(_asset_type(geometries[index]) == target_type for index in ids) != 1:
         raise ValueError("Target asset type must occur exactly once among active objects.")
+    active_types = {_asset_type(geometries[index]) for index in ids}
+    if not rules.min_asset_types <= len(active_types) <= rules.max_asset_types:
+        raise ValueError("Active asset type count must respect asset type limits.")
     if rules.all_asset_types and { _asset_type(geometries[index]) for index in ids } != {
             _asset_type(geometry) for geometry in geometries}:
         raise ValueError("All-asset-types scenes must contain every catalog asset type.")
-    if rules.all_asset_types and len(ids) != len({_asset_type(geometry) for geometry in geometries}):
-        raise ValueError("All-asset-types scenes must contain exactly one instance per type.")
     if set(sample.positions) != set(ids) or set(sample.yaws) != set(ids):
         raise ValueError("Sampled positions and yaws must contain exactly the active objects.")
     polygons: dict[int, Polygon] = {}
@@ -456,6 +641,10 @@ def validate_sample(sample: SceneSample, geometries: Sequence[ObjectGeometry], r
         raise ValueError("Active footprints do not meet whole-shelf coverage thresholds.")
     if metrics.local_neighbor_fraction < rules.min_neighbor_fraction - _EPS:
         raise ValueError("Too few active footprints have a nearby clutter neighbor.")
+    if metrics.shelf_occupancy < rules.min_shelf_occupancy - _EPS:
+        raise ValueError("Whole-shelf footprint occupancy is below the required density.")
+    if min(metrics.region_occupancies) < rules.min_region_occupancy - _EPS:
+        raise ValueError("A shelf region footprint occupancy is below the required density.")
 
 
 def _clearance_candidates(geometry: ObjectGeometry, initial: PlanarPose, access: Region,
@@ -489,8 +678,10 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
                  target_id: int | None = None, blocker_id: int | None = None) -> SceneSample:
     """Choose episode roles/count once, then sample whole-shelf clutter around them.
 
-    The Target species appears only once. Other species may repeat unless
-    all_asset_types requests exactly one of every type. A conservative finite
+    The Target species appears only once. The requested count describes asset
+    types; non-Target types are duplicated as needed to meet whole-shelf density,
+    even in all_asset_types mode. Types, instance IDs and count stay fixed across
+    layout retries. A conservative finite
     SE(2) witness reserves rearrangement room but is not an actor goal or proof
     of reachable physical manipulation. Camera visibility must be checked by
     future rendered instance masks; planar blockage is not a visibility test.
@@ -517,26 +708,62 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     if _asset_type(geometries[blocker_id]) == target_type:
         raise ValueError("Target asset type cannot also be the Blocker or a surrounding object.")
     target, blocker = target_id, blocker_id
-    surrounding_pool = tuple(index for index in non_target if index != blocker)
+    groups = {asset: tuple(index for index, geometry in enumerate(geometries) if _asset_type(geometry) == asset)
+              for asset in sorted(types)}
+    role_types = {target_type, _asset_type(geometries[blocker])}
     if rules.all_asset_types:
-        active_count = len(types)
-        if not rules.min_objects <= active_count <= rules.max_objects:
-            raise ValueError("All-asset-types count must satisfy active object limits.")
-        remaining_types = sorted(types - {target_type, _asset_type(geometries[blocker])})
+        type_count = len(types)
+        if not rules.min_asset_types <= type_count <= rules.max_asset_types:
+            raise ValueError("All-asset-types count must satisfy asset type limits.")
+        selected_types = types
     else:
-        active_count = rng.randint(rules.min_objects, rules.max_objects)
-        if active_count > len(non_target) + 1:
-            raise ValueError("Target uniqueness leaves too few eligible instances for the episode count.")
-        remaining_types = []
+        type_count = rng.randint(rules.min_asset_types, rules.max_asset_types)
+        selected_types = role_types | set(rng.sample(sorted(types - role_types), type_count - len(role_types)))
+    selected_ids = [target, blocker]
+    for asset in sorted(selected_types - role_types):
+        selected_ids.append(rng.choice(groups[asset]))
+    # Footprint area is invariant to yaw. Pick the episode's composition once,
+    # before trying positions, until its summed area meets the requested density.
+    # Add copies of the least-represented non-Target types, breaking ties at
+    # random. Large footprints must not dominate the episode's composition.
+    area = lambda index: ((geometries[index].upper[0] - geometries[index].lower[0])
+                          * (geometries[index].upper[1] - geometries[index].lower[1]))
+    remaining = {
+        asset: [index for index in groups[asset] if index not in selected_ids]
+        for asset in sorted(selected_types - {target_type})
+    }
+    counts = {asset: sum(_asset_type(geometries[index]) == asset for index in selected_ids)
+              for asset in remaining}
+    for copies in remaining.values():
+        rng.shuffle(copies)
+    usable_area = ((rules.x_range[1] - rules.x_range[0] - 2 * rules.edge_margin)
+                   * (rules.y_range[1] - rules.y_range[0] - 2 * rules.edge_margin))
+    # Every equal-area cell meeting its minimum also requires that minimum
+    # across the whole shelf. Honor this bound before fixing the composition.
+    required_occupancy = max(rules.min_shelf_occupancy, rules.min_region_occupancy)
+    required_area = required_occupancy * usable_area
+    active_area = sum(area(index) for index in selected_ids)
+    while len(selected_ids) < rules.min_objects or active_area < required_area - _EPS:
+        available = [asset for asset, copies in remaining.items() if copies]
+        if not available or len(selected_ids) >= rules.max_objects:
+            raise RuntimeError("Selected asset types cannot meet whole-shelf density within the fixed instance cap. "
+                               f"types={sorted(selected_types)}, instances={len(selected_ids)}, "
+                               f"occupancy={active_area / usable_area:.4f}, "
+                               f"required={required_occupancy:.4f}.")
+        minimum = min(counts[asset] for asset in available)
+        asset = rng.choice([asset for asset in available if counts[asset] == minimum])
+        index = remaining[asset].pop()
+        selected_ids.append(index)
+        counts[asset] += 1
+        active_area += area(index)
+    if len(selected_ids) > rules.max_objects:
+        raise ValueError("Selected asset type count exceeds the active instance cap.")
+    # Larger footprints are placed first, preserving the two designated roles.
+    ids = (target, blocker, *sorted(selected_ids[2:], key=area, reverse=True))
+    regions = shelf_regions(rules)
+    region_polygons = tuple(rectangle_polygon(region) for region in regions)
+    cell_area = usable_area / len(regions)
     for _ in range(rules.max_attempts):
-        if rules.all_asset_types:
-            surrounding_ids = [rng.choice(tuple(index for index in surrounding_pool
-                                               if _asset_type(geometries[index]) == asset))
-                               for asset in remaining_types]
-            rng.shuffle(surrounding_ids)
-        else:
-            surrounding_ids = rng.sample(surrounding_pool, active_count - 2)
-        ids = (target, blocker, *surrounding_ids)
         yaws = {index: rng.uniform(-math.pi, math.pi) for index in ids}
         extents = {index: _half_extents(geometries[index], yaws[index]) for index in ids}
         if any(rules.shelf_top + geometries[index].upper[2] - geometries[index].lower[2]
@@ -574,28 +801,41 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         if path is None:
             continue
         sweeps = _path_sweeps(geometries[blocker], path)
-        for order, index in enumerate(ids[2:]):
+        region_areas = [sum(overlap_area(polygon, region) for polygon in polygons.values())
+                        for region in region_polygons]
+        for index in ids[2:]:
             hx, hy = extents[index]
             placed = False
-            for placement_attempt in range(160):
-                # Early stratified proposals seek both shelf sides; later trials
-                # can use the entire support. Additional objects often form pairs.
-                global_proposal = order < 2 or rng.random() < 0.35
-                if global_proposal:
-                    x_low, x_high = rules.x_range[0] + rules.edge_margin + hx, rules.x_range[1] - rules.edge_margin - hx
-                    y_low, y_high = rules.y_range[0] + rules.edge_margin + hy, rules.y_range[1] - rules.edge_margin - hy
-                    if x_low > x_high or y_low > y_high:
-                        break
-                    if order < 2 and placement_attempt < 100:
-                        fraction = rng.uniform(0.0, 0.25) if order == 0 else rng.uniform(0.75, 1.0)
-                        y = y_low + fraction * (y_high - y_low)
-                        # Opposing X bands also encourage depth-wide coverage.
-                        fraction_x = rng.uniform(0.0, 0.40) if order == 0 else rng.uniform(0.60, 1.0)
-                        x = x_low + fraction_x * (x_high - x_low)
-                    else:
-                        x, y = rng.uniform(x_low, x_high), rng.uniform(y_low, y_high)
+            x_low, x_high = rules.x_range[0] + rules.edge_margin + hx, rules.x_range[1] - rules.edge_margin - hx
+            y_low, y_high = rules.y_range[0] + rules.edge_margin + hy, rules.y_range[1] - rules.edge_margin - hy
+            if x_low > x_high or y_low > y_high:
+                break
+            best = None
+            best_score = -math.inf
+            valid_proposals = 0
+            for placement_attempt in range(180):
+                # Coverage is created by filling underoccupied cells throughout
+                # the shelf, rather than placing two privileged far-away objects.
+                minimum = min(region_areas)
+                deficient = [cell for cell, value in enumerate(region_areas)
+                             if value / cell_area < rules.min_region_occupancy + _EPS]
+                candidates = deficient or [cell for cell, value in enumerate(region_areas)
+                                           if value <= minimum + 0.05 * cell_area]
+                cell = rng.choice(candidates)
+                region = regions[cell]
+                if rng.random() < 0.60:
+                    cell_xlow, cell_xhigh = max(x_low, region[0]), min(x_high, region[1])
+                    cell_ylow, cell_yhigh = max(y_low, region[2]), min(y_high, region[3])
+                    if cell_xlow > cell_xhigh or cell_ylow > cell_yhigh:
+                        continue
+                    x, y = rng.uniform(cell_xlow, cell_xhigh), rng.uniform(cell_ylow, cell_yhigh)
                 else:
-                    anchor = rng.choice(tuple(positions))
+                    # Prefer anchors adjacent to the deficient cell, but keep
+                    # all anchors eligible so local clusters can grow naturally.
+                    cx, cy = (region[0] + region[1]) / 2, (region[2] + region[3]) / 2
+                    anchors = sorted(positions, key=lambda other: math.hypot(positions[other][0] - cx,
+                                                                            positions[other][1] - cy))
+                    anchor = rng.choice(anchors[:max(2, len(anchors) // 2)])
                     ax, ay, _ = positions[anchor]
                     ahx, ahy = extents[anchor]
                     axis, sign = rng.randrange(2), rng.choice((-1, 1))
@@ -611,10 +851,24 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
                     continue
                 if any(not polygons_separated(polygon, other, rules.gap) for other in polygons.values()):
                     continue
+                increments = tuple(overlap_area(polygon, region) for region in region_polygons)
+                deficiency_gain = sum(min(increment, max(0.0, rules.min_region_occupancy * cell_area - before))
+                                      for increment, before in zip(increments, region_areas)) / area(index)
+                near = any(polygon_distance(polygon, other) <= rules.neighbor_distance for other in polygons.values())
+                balance = sum(increment / (before + cell_area * 0.10)
+                              for increment, before in zip(increments, region_areas))
+                score = 3.0 * deficiency_gain + 0.75 * near + 0.1 * balance
+                if score > best_score:
+                    best, best_score = (x, y, polygon, increments), score
+                valid_proposals += 1
+                if valid_proposals >= 6:
+                    break
+            if best is not None:
+                x, y, polygon, increments = best
                 positions[index] = (x, y, rules.shelf_top - geometries[index].lower[2])
                 polygons[index] = polygon
+                region_areas = [before + increment for before, increment in zip(region_areas, increments)]
                 placed = True
-                break
             if not placed:
                 break
         if len(positions) != len(ids):
@@ -623,6 +877,10 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         if metrics.x_coverage < rules.min_x_coverage or metrics.y_coverage < rules.min_y_coverage:
             continue
         if metrics.local_neighbor_fraction < rules.min_neighbor_fraction:
+            continue
+        if metrics.shelf_occupancy < rules.min_shelf_occupancy - _EPS:
+            continue
+        if min(metrics.region_occupancies) < rules.min_region_occupancy - _EPS:
             continue
         kind = "pivot" if any(motion.pivot is not None for motion in path) else (
             "rotate_translate" if any(abs(motion.end.yaw - motion.start.yaw) > _EPS for motion in path)

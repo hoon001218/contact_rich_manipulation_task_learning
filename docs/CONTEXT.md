@@ -13,39 +13,67 @@
 ## 1. 현재 위치와 상태 구분
 
 **현재 개발 단계는 로봇·선반·물체 스폰과 reset이다.**
-새 패키지 `src/contact_rearrangement`는 **10종 asset 중 4–10개 instance를
-선반 전체에 배치하는 밀집 장면**을 만든다. `--all_asset_types`는 10종을 하나씩
-모두 사용한다. **Target 종류는 active 장면에 한 번만 등장**하고 Blocker·주변
-물체 후보에서 같은 종류의 모든 복사본을 제외한다. 나머지 종류의 중복은 허용한다.
-10종 × 10개 복사본의 100-body pool 중 선택된 4–10개만 작업층의 active 물체로
-취급한다. Pool 전체의 rigid-body simulation과 native gravity를 켜 두고,
+새 패키지 `src/contact_rearrangement`는 **10종 asset 중 4–10종을 선택하고
+전체 선반 밀도에 필요한 수의 instance를 배치**한다. 이전에 4–10종을
+active instance 4–10개로 해석한 것은 잘못이며 종류 수와 개수를 분리했다.
+`--all_asset_types`는 10종 모두 선택하고 non-target 복사본을 추가할 수 있다.
+**Target 종류는 active 장면에 한 번만 등장**하고 Blocker·주변 후보에서 같은
+종류의 모든 복사본을 제외한다. 종류마다 최소 한 instance를 선택한 뒤 footprint
+면적에 따라 개수를 정한다. 추가 가능한 non-target 종류 중 active 개수가 가장
+적은 종류를 고르고 동률은 무작위로 정해 중복 편중을 줄이는 구성으로 변경했다.
+Blocker도 해당 종류의 첫 instance로 센다. Target은 항상 하나이며 현재 동일
+pool capacity에서는 non-target 종류별 개수 차이가 최대 1이다. 별도 종류별
+최대값은 없고 pool의 10-copy·전체 cap 40을 유지한다. 작은 물체 위주 종류
+집합은 같은 면적을 채우려면 더 많은 instance가 필요할 수 있다.
+기본 instance 최소 4·최대 40은 safety limit이다.
+10종 × 10개 복사본의 100-body pool을 유지한다. Pool 전체의 rigid-body
+simulation과 native gravity를 켜 두고,
 나머지는 높은 격리 위치에 주차해 매 physics substep마다 COM에 `-m*g` 외력을
 적용한다. Active 물체에는 추가 힘을 주지 않아 원래 중력과 접촉을 유지한다.
-Episode의 Target·Blocker를 먼저 지정하고 배치 재시도에서도 같은 instance 쌍을
-유지한다.
+Episode의 Target·Blocker를 먼저 지정하고 **종류 수·집합, 전체 active instance
+ID와 개수**를 pose sampling 전에 고정한다. Retry에서는 yaw와 위치만 바꾼다.
 Target은 Blocker가 앞에 들어갈 수 있는 전체 X 범위에서 선택한다. 기존 뒤쪽
 10 cm 제한과 38 cm cluster·35% tight-rectangle fill 조건은 폐기했다.
-선반 전반의 X/Y coverage와 국소 이웃 간격을 따로 검사하고, 병진·평면 pivot·
-회전 후 이동 등의 다단계 clearance witness 중 하나를 확보한다.
+현재 구현은 전체 usable shelf 점유율 **35% 이상**, X 2 × Y 3의 **6개 구역
+각각 10% 이상**, 4 cm footprint 이웃을 가진 active 비율 **75% 이상**을 hard
+acceptance 조건으로 요구한다. X/Y coverage와 병진·평면 pivot·회전 후 이동의
+다단계 clearance witness도 검사한다. 사용자는 구현 가능한 범위를 먼저 측정해
+밀도를 정하도록 요청했고, 25–45% 비교에서 생성 속도와 성공률을 고려해 35%를
+초기 기본값으로 선택했다. 사용자가 직접 정한 최종 연구 난이도 수치는 아니다.
 앞쪽 +X camera의 실제 초기 영상에서 Target 가시 비율 **40% 이상**을 요구하기로
 했다. 분모는 같은 camera·같은 pose에서 가림 없이 렌더링한 전체 Target
 silhouette 픽셀 수다. **Camera와 영상 acceptance gate는 아직 구현 전**이며
 스폰 직후 visibility는 미검증(`False`, fraction `NaN`)으로 남긴다.
 YCB 003·004·005·006의 초기 회전을 **X축 −90°**로 교정하고, 원본 USD의
 수정 전·후 각 8장 렌더에서 라벨·캔 고리·병뚜껑으로 상하를 확인했다.
-전체 선반 규칙의 초기 버전은 실제 USD에서 측정한 bounds로 일반 100 seed·10종 전체 30 seed에서
-배치·Target 유일성·coverage·국소 밀집도·다양한 해소 경로 조건을 통과했다.
-전체 선반 규칙의 이전 버전에서 unit test 20개와 100-body pool의 4개 GPU
-환경의 일반/10종 전체 반복·부분 reset 검사가 통과했다. 각 layout은 한 step만
-진행한 검사이며, 10종 전체 장면의 별도 4초 settle 검사는 003 이동으로 실패했다.
-현재는 **전물체의 2 mm 낙하 여유를 제거**하고 003·004에만 visible mesh를 유지한
+이전 큰 footprint 우선 복사본 구성의 35% 규칙은 실제 USD 측정 bounds로 일반·all-types 각각 seed 0–19,
+**총 40개 기하 sample**을 통과했다. 일반 모드는 4–10종·10–24 instance,
+all-types는 10종·14 instance였다. 일반·all-types 각각 **4개 GPU 환경·10초**의
+정착·전체/부분 reset 검사도 통과했다. 각 모드의 8개 layout을 각각 5초 진행한
+범위이며 기하 benchmark와 물리 검사를 구분한다. 당시 unit test 21개도 통과했다.
+이 분포와 통과 결과를 현재 균형 구성의 결과로 사용하지 않는다. 현재 균형
+구성도 기하 sample **40/40개**와 일반 모드 **4개 GPU 환경·151 step·5.03초**의
+정착·전체/부분 reset 검사를 통과했다. 당시 unit test **23개**도 통과했으며
+현재 구성의 별도 all-types GPU 실행은 완료한 것으로 기록하지 않는다.
+**전물체의 2 mm 낙하 여유를 제거**하고 003·004에만 visible mesh를 유지한
 **명시적 Cube collision proxy**를 적용해 초기 흔들림을 줄였다. 원본
 Nucleus USD·authored mass·contact 속성·physics material·active gravity는 유지한다.
-새 높이에 맞춘 unit fixture 수정 후 20개 테스트와 이 collider 버전의 **4개 GPU
-환경·10종 전체·10초** 정착·전체/부분 reset 검사가 통과했다. 초기+첫 reset 후
-총 8개 layout을 각각 5초 진행한 범위다. 이전 실패·비채택 approximation과
-박스의 정량 이동 측정은 8절에서 구분한다.
+이전 정확히 10개 instance 버전에서는 이 collider로 **4개 GPU 환경·10초**의
+정착·전체/부분 reset 검사가 통과했다. 이 결과와 이전 실패·비채택 approximation,
+새 종류/instance 분리 benchmark는 8절에서 구분한다.
 판단·행동 정책과 PPO 학습은 아직 구현되지 않았다.
+사용자 요청으로 장면 확인 스크립트에 **Target 초록색·Blocker 빨간색 OBB**의
+debug draw 표시를 추가했다. 물리·USD asset을 수정하지 않는 확인용 표시이며
+2개 CUDA 환경의 headless reset 검사와 1개 GUI 환경의 실제 표시 검사가 통과했다.
+사용자가 파일이 지나치게 나뉜 구조를 정리하도록 요청해 구현을 책임별 **6개
+모듈**로 통합했다. `catalog`·`assets`·`env_cfg`·`spawn`·`sampling`·`visualization`
+구조이며 스폰 규칙·기본값·실행 명령을 유지했다. 통합 후 unit test **23개**와
+일반 모드 **4개 GPU 환경·151 step·5.03초** 검사가 통과했으며 초기·자동 reset
+뒤 8개 장면 설명이 통합 전과 같았다. 아래 기존 실행 결과와 구분해 기록한다.
+현재 사용자는 **Blocker 앞의 충돌 없는 hand 시작 영역 randomization과
+elbow-down 금지**를 요청했다. RobotStartRules·실제 USD FK/IK·초기 collision
+판정을 구현했고 최종 24개 시작·반복 reset·5초 물리 검사와 unit test **29개**가
+통과했다. 이전 모듈 통합·스폰 검사와 이 새 기능의 검사를 구분한다.
 
 | 상태 | 의미 |
 |---|---|
@@ -284,6 +312,11 @@ history 제거·교란 시 성능 변화, 비슷한 현재 관측과 서로 다�
 | 2026-10-09 YCB 상하 방향 교정 | 사용자가 006의 뒤집힘 수정 및 다른 YCB 확인을 요청했다. 실제 렌더에서 003·004·005도 뒤집혀 있어 4종 모두 X +90°에서 −90°로 교정했다. 수정 후 양쪽 렌더와 기본 8개 환경 물리·reset 검사가 통과했으며 별도 고정 pair의 5.5 cm drift 실패도 기록한다. 상세 배치 기준은 `SPAWN_RULES.md`에 분리했다. |
 | 2026-10-09 선반 전체·Target 유일성·초기 가시성 구체화 | 사용자가 10종 전체 사용 허용, Target 종류 중복 금지, 앞쪽 Target, 선반 전반의 배치와 이동 여유, pivot/회전+밀기 경로를 요청했다. 4–10개·100-body pool·all-types 모드, coverage/국소 밀집도 분리, 다양한 평면 path로 변경한다. Camera의 40% 기준은 전체 비가림 silhouette 대비 실제 픽셀 수로 선택했으며 실제 camera 검사는 후속 구현이다. |
 | 2026-10-09 YCB 박스 초기 정착 수정 | 사용자가 스폰 직후 낙하·흔들림 수정을 요청했다. 전물체의 2 mm 여유 제거만으로 003의 흔들림이 남아 003·004에 명시적 AABB Cube collider를 적용했다. 원본 visible mesh·Nucleus USD·mass/contact/material·active gravity는 유지한다. 4개 환경·10종 전체·10초 정착 및 reset 검사가 통과했다. |
+| 2026-10-09 종류 수·instance 수와 선반 전체 밀도 교정 | 사용자가 4–10은 종류 선정 기준이었다고 교정했다. 이전 4–10 instance 제한·all-types 정확히 10개를 대체해 종류 4–10, 면적 기반 instance 수·cap 40으로 분리했다. 전체 점유율과 6개 구역 하한을 hard 조건으로 적용하며, 25–45% 생성 비교로 global 35%·구역 10%·이웃 75%를 현재 구현 기본값으로 선택했다. |
+| 2026-10-09 역할 OBB 표시 | 사용자가 Target은 초록색, Blocker는 빨간색 OBB로 표시하도록 요청했다. 현재 pose의 debug draw 표시를 스크립트에 추가했고 USD·물리 상태 무변경, headless reset 갱신과 실제 GUI 표시를 제한된 실행에서 확인했다. |
+| 2026-10-09 중복 종류 편중 교정 | 사용자가 한 종류가 공간을 과하게 채우는 문제를 지적했다. 큰 footprint 우선 복사본 선택을 폐기하고 선택된 non-target 종류의 최소 active 개수를 우선하는 균형 구성으로 변경했다. 종류·역할·density·clearance 조건을 유지하고 현재 source의 기하 40개와 일반 모드 4개 GPU 환경·5.03초 검사가 통과했다. |
+| 2026-10-09 책임별 모듈 통합 | 사용자가 과하게 세분화된 패키지 구조를 정리하도록 요청했다. Metadata·asset 생성·환경 설정·spawn/reset·순수 sampling·visualization의 6개 모듈로 통합하고 기본값·동작을 유지했다. 이전 모듈은 wrapper 없이 제거했다. 통합 후 23개 unit test·simulator 없는 import·CLI와 4개 GPU 환경·5.03초 검사가 통과했다. |
+| 2026-10-09 Blocker 앞 hand 시작 randomization | 사용자가 충돌 없는 hand 시작 영역 randomization과 elbow-down 금지를 요청했다. USD FK·SciPy IK·scene collision과 별도 robot seed를 구현했다. 초기 151-step 검사 뒤 callback·실패 시 state 유지·COM cache·arm 이웃 OBB 처리를 보강했고 최종 24개 시작·5초 stress와 29개 unit test가 통과했다. |
 
 Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. 논문의 성과를 우리
 과업의 성공·속도·상태 이해 결과로 기록하지 않는다.
@@ -306,10 +339,12 @@ Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history�
 
 - UR5e + RH56E2 **오른손**을 fixed joint로 하나의 articulation에 조립한다. 손의 fixed link와 mimic 관계를 유지하고 contact-report API를 활성화한다. 손 mount 회전은 tool frame 기준 `(0,-90,0)` deg다.
 - Kinematic speedrack shelf와 **기존 6종 + YCB 4종 = 10종** asset을 사용한다. YCB는 `NVIDIA/Assets/Isaac/5.1/Isaac/Props/YCB/Axis_Aligned_Physics`의 `003_cracker_box`, `004_sugar_box`, `005_tomato_soup_can`, `006_mustard_bottle`이다. 해당 폴더에서 확인한 4개 USD는 rigid body와 collision이 이미 authoring되어 있다.
-- 장면당 **4–10개 active instance**를 사용한다. `all_asset_types=True`는 catalog 10종에서 하나씩 총 10개를 사용한다. 각 종류의 복사본 10개씩, 환경당 100개 rigid body를 미리 로드하고 reset에서 선택한 instance만 작업층으로 옮긴다. 나머지는 `z=4.0/4.4/4.8/5.2 m`의 격리 위치에 주차하고 속도를 0으로 설정한다. Parking은 작업층 camera ROI 밖에 두며 USD visibility를 수정해 숨기지 않는다. **Pool의 모든 body는 simulation enabled와 native gravity를 유지**해 topology를 바꾸지 않는다. Active mask로 task 물체를 구분하며 이후 actor·reward·종료 계산에도 이를 적용해야 한다. Observation 최대 슬롯 K를 100으로 확정하는 뜻은 아니다.
+- 장면당 **4–10종**을 선택하고 종류별 최소 하나씩 사용한다. 요구 면적에 도달할 때까지 추가 가능한 non-target 종류 중 active 개수가 가장 적은 종류에 복사본을 추가하며 동률은 무작위로 정한다. Blocker도 해당 종류의 첫 instance로 센다. 현재 같은 pool capacity에서는 non-target 개수 차이가 최대 1이다. Target은 정확히 1개이며 별도 종류별 고정 최대값을 추가하지 않는다. `all_asset_types=True`는 catalog 10종을 모두 선택하고 같은 균형 원칙으로 중복을 추가한다. Instance 최소 4·cap 40, 종류당 10-copy·환경당 100-body pool은 별도 값이다. 공간 배치는 packing을 위해 큰 footprint부터 진행하며 복사본 종류 선택 순서와 구별한다. Inactive는 `z=4.0/4.4/4.8/5.2 m`에 주차하고 속도를 0으로 설정한다. Parking은 작업층 camera ROI 밖에 두며 USD visibility를 수정해 숨기지 않는다. **Pool의 모든 body는 simulation enabled와 native gravity를 유지**해 topology를 바꾸지 않는다. 후속 actor·reward·종료에는 active mask를 적용한다. Observation K를 100으로 확정하는 뜻은 아니다.
 - `TaskObjectPool`은 매 physics write/substep에서 inactive body에만 world force `-m*g`를 추가해 중력을 상쇄한다. PhysX `apply_forces_and_torques_at_position`에 실제 **world COM 위치**를 명시해 asset root pivot과 COM의 차이로 불필요한 토크가 생기지 않도록 한다. Active body의 추가 힘은 0이며 native gravity와 접촉 동역학을 유지한다. Live CPU simulation/gravity flag나 USD visibility를 매 reset마다 바꾸지 않는다.
-- **Target 종류는 active 장면에 정확히 한 번** 등장한다. 해당 종류는 Blocker·주변 물체에서 제외하고, 다른 종류의 중복은 허용한다. 역할은 서로 다른 instance ID에 지정한다. 초기 baseline은 Target 1개와 Blocker 1개이며 episode 시작에 쌍을 먼저 선택한다. 배치 rejection/retry가 발생해도 쌍과 active 개수를 유지하고 주변 instance·yaw·위치만 다시 뽑는다. 제한 횟수 안에 배치하지 못하면 다른 역할로 교체하지 않고 실패를 보고한다.
+- `TaskObjectPool.write_object_link_pose_to_sim`은 상위 writer 호출 뒤 `_object_com_pose_w.timestamp=-1.0`으로 COM cache를 무효화한다. Physics step 없이 같은 timestamp에서 연속 reset해도 다음 COM 읽기를 갱신하며 countergravity의 적용점을 최신 COM으로 유지한다. 추가 physics step이나 simulation/native gravity flag 변경은 없다.
+- **Target 종류는 active 장면에 정확히 한 번** 등장한다. 해당 종류는 Blocker·주변 물체에서 제외하고, 선택한 다른 종류의 중복은 허용한다. 초기 baseline은 Target 1개와 Blocker 1개이며 episode 시작에 쌍을 먼저 선택한다. 종류 수·집합, 전체 active instance ID와 개수를 pose retry 전에 고정하며 yaw·위치만 다시 뽑는다. Cap·복사본 수 안에서 면적을 충족하지 못하거나 300 layout 시도에서 배치하지 못하면 구성을 교체하거나 조건을 낮추지 않고 실패한다.
 - `cfg.target_asset`·`cfg.blocker_asset`과 CLI의 `--target_asset`·`--blocker_asset`으로 역할의 종류를 고정할 수 있다. 기본 `None`은 episode 역할을 처음에 한 번 추출한다. 두 옵션에 같은 종류를 지정하면 Target 유일성에 위배되어 오류다. Blocker 종류만 고정한 경우 Target 후보에서도 그 종류를 제외한다. 이는 외부 역할 지정이며 Blocker의 최종 목표 pose를 제공하는 것이 아니다.
+- CLI `--min_asset_types`·`--max_asset_types`는 종류 수, `--min_objects`·`--max_objects`는 instance 최소값·cap이다. `--min_shelf_occupancy`·`--min_region_occupancy`는 global/구역 하한을 지정한다. 종류와 instance 개수를 혼용하지 않는다.
 - 로봇 base는 환경 로컬 `(0, 0, 0.79505)`, quaternion `(w,x,y,z)=(0,0,0,1)`, 선반은 `(-0.7,0,0)`에 놓인다. Quaternion 표기는 Isaac Lab 순서다.
 - 기존 2×3 고정 배열과 `cup_1` Target/`mug_2` Blocker는 초기 구현 이력이다. 현재는 환경별 seed와 reset 횟수로 episode 역할을 먼저 정하고 그 역할에 맞는 upright yaw·배치를 뽑는다. 선택되지 않은 환경의 reset sequence는 유지한다. 종류·역할별 배치 실패율은 따로 확인하며, 역할을 placement 성공률에 따라 바꿔 분포를 감추지 않는다.
 - 물체의 spawned rigid-body local bounds를 읽고 canonical upright rotation을 적용한다. YCB 4종은 local −Y를 world +Z로 옮기는 X축 −90° 회전 후 world Z yaw를 적용한다. 수정 전 양쪽 렌더에서 003·004·005의 라벨과 006의 뚜껑이 모두 아래를 향해 기존 +90°를 교정했다. Root pivot과 bounding center를 구분해 XY를 보정하고, 실제 lower Z bound로 선반 위 높이를 정한다.
@@ -317,8 +352,48 @@ Gym 학습 task ID·Reward v2·종료 조건·18D OSC action·PPO·GNN·history�
 - 실제 shelf collision에서 support와 상부 panel을 읽는다. 현재 기본 asset의 작업층은 환경 로컬 `x=[-0.9,-0.5]`, `y=[-0.455,0.455]`, 상면 `z=1.05 m`, 위쪽 panel 하단 `z=1.48 m`이며 물체 footprint에 edge margin과 상부 여유를 적용한다. Asset override에서는 해당 geometry를 다시 측정한다.
 - 기본 물리 주기는 `1/120 s`, decimation은 4로 환경 step은 `1/30 s`다. 기본 환경 수 1, 간격 2.5 m다.
 - 장면 확인용 `spawn_scene.py`는 기본적으로 시뮬레이션 시간 5초마다 전체 환경을 reset해 새 배치를 생성한다. 실제 `env.step_dt`로 간격을 계산하며 현재 설정에서는 150 step이다. `--reset_interval N`으로 step 간격을 지정하고 0이면 자동 reset을 끈다. 이 설정은 실행 스크립트의 확인 주기이며 학습 episode timeout을 확정하는 것은 아니다.
-- Reset은 선택한 환경의 robot state·PD 관절 목표를 복원하고, 새 active mask·역할·초기 state·고정 접근영역을 기록한다. 물체의 pose/velocity에는 각 `env_origins`를 적용한다. 모든 body의 simulation/native gravity flag는 유지하고 inactive body의 parking pose·zero velocity와 countergravity mask를 갱신한다. 새 flat-box 버전도 4개 환경·10종 전체의 10초 실행에서 전체·부분 reset을 통과했다.
+- `RoleObbVisualizer`는 Target 초록색·Blocker 빨간색 OBB를 표시한다. 각 역할의 12개 모서리를 현재 body link pose·local bounds에서 계산해 YCB upright·root offset·합성 scale을 반영하고 매 step과 전체/부분 reset 뒤 갱신한다. Debug draw만 사용하며 USD prim·collider·material·physics state를 쓰지 않는다. GUI·livestream에서 기본 표시하고 `--disable_role_obb`로 끈다. 일반 headless에서는 생략하며 `--headless --validate`에서 viewport 없이 overlay 검사를 실행한다. 제한된 headless·GUI 검사 결과는 8절에 기록한다.
+- Reset은 물체 sample 뒤 Blocker 앞의 robot 시작 후보를 찾는다. 선택한 모든 환경의 CPU 후보 승인 뒤 elbow-up joint position·zero joint velocity와 동일 PD target, active mask·역할·초기 state·A₀·robot 시작 metadata를 해당 환경에만 쓴다. 후보 실패 시 기존 physical pose와 metadata를 유지하며 추가 physics/settling step은 없다. Pool의 simulation/native gravity와 inactive parking/countergravity를 유지한다. 이전 composition·모듈 통합 검사는 최종 robot randomization의 24개 pose·5초 stress와 구분한다.
 - 17개 tactile용 링크와 독립 구동 관절의 존재는 확장 버전에서도 검증했다. 새 환경의 `ContactSensorCfg`, binary tactile observation, wrist F/T 신호·보정은 아직 구현되지 않았다.
+
+### Blocker 앞의 robot 시작 randomization — GPU stress 검사 통과
+
+`cfg.robot_start`에 `RobotStartRules`를 둔다. 기본 제안 영역은 Blocker의
+**회전 footprint +X 최전방보다 12–40 cm 앞**, 동시에 **선반 앞 경계에서
+6 cm 이상 밖**, Blocker bounding center의 **Y ±8 cm**, shelf top 위
+**20–28 cm**다. 거리 기준은 palm TCP `right_plam_force_sensor`이며 손가락
+표면이 아니다. 손가락 local +Y는 world −Z, palm normal local +Z는 world −X를
+향하게 고정한다. 구체적인 영역 식은 [SPAWN_RULES.md](SPAWN_RULES.md)에 있다.
+
+`assets.py`의 `RobotPoseModel`은 실제 조립 USD의 39-link joint frame·axis·scale로
+FK를 구성하고 SciPy bounded IK로 arm 해를 찾는다. Finger q는 기존 열린 손의
+기본값을 유지한다. Elbow-up은 관절각 부호로 결정하지 않고 elbow joint center가
+shoulder–wrist-1 chord의 가장 가까운 점보다 **world Z로 5 cm 이상 위**인지
+검사한다. Elbow-down/낮은 elbow 해는 채택하지 않는다.
+현재 실제 pose에서 모델 FK를 대조하므로 default 자세로 선행 reset하지 않는다.
+`accept_candidate` callback으로 한 TCP의 IK 해가 scene collision에서 탈락하면
+같은 TCP의 다른 seed/branch도 탐색한다. 모든 branch의 완전 탐색을 의미하지 않는다.
+
+모든 enabled arm/hand collision OBB를 모든 active object(역할 포함)·선반 개별
+enabled collider·ground와 **15 mm 여유**로 검사한다. UR arm 7개 link의 21쌍 중
+두 arm joint 이내의 11쌍은 제외하고 거리 3 이상인 10쌍을 2 mm 여유로 검사한다.
+손 자체의 모든 self pair를 검사하지 않으므로 손 전체의 self collision 안전성을
+검증했다고 기록하지 않는다.
+이 판정은 초기 pose의 보수적인 OBB 조건이며 실제 mesh 거리·접촉·재배치 경로의
+도달성이나 swept collision을 보장하지 않는다.
+
+물체 sample을 고정한 뒤 `episode_seed XOR 0x5D2EA91C`의 독립 RNG로 최대
+**80개** robot 시작 후보를 찾는다. 실패하면 이유를 포함해 명시적으로 중단하며
+elbow-down fallback이나 물체 배치 재선정으로 조건을 완화하지 않는다.
+`robot_initial_joint_pos`·`robot_start_tcp_pos_w`·`robot_start_region`·
+`robot_start_elbow_height`·`robot_start_attempts`를 기록한다. 부분 reset에서는
+선택하지 않은 환경의 state·목표·reset sequence를 유지한다.
+선택된 모든 환경의 물체·robot 후보가 CPU에서 성공한 뒤 default reset과
+실제 state/PD target·metadata 적용을 진행한다. 후보 실패 시에는 기존 선택
+환경의 physical pose·metadata도 유지한다.
+`cfg.robot_start.enabled=False`이면 기존 기본 자세를 사용한다. 수치는 후속
+제어·학습 분포에 맞춰 조정할 수 있다. 최종 24개 시작과 반복 reset·5초 물리
+검사가 통과했으며 조건·범위는 8절에 기록한다.
 
 ### 밀집 배치와 해소 가능성의 초기 조건
 
@@ -337,16 +412,20 @@ Blocker의 Y도 ±30 mm로 제한하지 않고 footprint가 A₀와 겹칠 수 �
 
 현재 구현 기본값은 최소 footprint gap **3 mm**, edge margin **15 mm**,
 margin을 뺀 shelf 범위 대비 footprint 집합의 **X span 55%·Y span 65% 이상**이다.
-별도로 active 물체의 **50% 이상이 4 cm 이내 footprint 이웃**을 갖도록 한다.
-두 조건으로 선반 전반의 분포와 국소 clutter를 구분한다. 전체 shelf footprint
-occupancy는 기록하지만 최소 35%를 요구하지 않는다. 모든 수치는 사용자 요구를
-구현하기 위한 현재 기본값이며 최종 연구 명세나 동역학 안정성 보장이 아니다.
+별도로 active 물체의 **75% 이상이 4 cm 이내 footprint 이웃**을 갖도록 한다.
+전체 footprint 면적 합/전체 usable floor는 **35% 이상**이고, X 2 × Y 3의
+각 구역은 footprint 교차 면적 합/구역 면적이 **10% 이상**이어야 한다. 면적
+기준이 미달이면 넓은 X/Y span만으로 채택하지 않는다. 35%는 실제 측정 bounds의
+25–45% 생성 비교에서 선택한 초기 구현값이며 최종 연구 명세가 아니다. Reserved
+path는 점유 면적으로 계산하지 않는다. 정확한 mesh 점유율·동역학 안정성·영상
+가시성을 보장하는 수치도 아니다.
 
 **Clearance witness**는 병진·footprint 모서리의 평면 pivot·중심 회전 후 병진·
 작은 앞쪽 이동 후 회전/병진 등의 후보에서 하나를 찾는다. Pivot은 고정점 주변의
 원호로 검사하고 회전 구간을 최대 5°씩 나눠 arc sagitta로 확장한 보수적 swept
 polygon을 사용한다. 전체 경로가 support 안에 있고 Target·주변 물체와 떨어져야
-한다. 경로를 예약한 뒤 주변 물체를 선반 전체에 분산하며 가까운 이웃도 제안한다.
+한다. 경로를 예약한 뒤 부족한 6개 구역을 우선 채우는 위치·이웃 proposal을
+평가해 주변 물체를 놓는다. Episode 구성은 유지하고 최종 hard threshold를 모두 검사한다.
 
 Witness는 생성·검증용 privileged metadata다. Actor에 Blocker의 최종 goal pose로
 입력하는 것이 아니며 정책이 이 병진 해법만 수행하도록 결정한 것도 아니다.
@@ -368,22 +447,30 @@ Target mask 픽셀 수를 분자로 사용한다. 다른 물체뿐 아니라 she
 현재 task camera는 없고 `target_visibility_validated=False`,
 `target_visible_fraction=NaN`이다. 향후 **고정 역할/개수 → pose 제안 → settle와
 안정성 검사 → RGB·instance mask·reference → 40% 조건 검사** 순으로 초기
-장면을 승인한다. 실패 시 같은 역할/개수의 pose만 재시도한다. 승인된 초기
+장면을 승인한다. 실패 시 같은 역할·종류·instance 조합·개수의 pose만 재시도한다. 승인된 초기
 vision과 같은 settled pose로 A₀를 정한 뒤 episode 내에서는 고정해야 한다.
 현재 A₀는 spawn pose 기준이며 이 후속 gate를 구현한 것으로 취급하지 않는다.
 
 | 파일 | 역할 |
 |---|---|
-| [layout.py](../src/contact_rearrangement/contact_rearrangement/layout.py) | 10종 catalog, 100개 instance pool, upright 회전·주차 위치·asset 경로 |
-| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | UR5e/RH56E2 조립, 관절·링크 이름, 초기 자세·PD hold |
-| [scene_cfg.py](../src/contact_rearrangement/contact_rearrangement/scene_cfg.py) | 선반·로봇·물체 pool·ground/light 구성 |
-| [object_pool.py](../src/contact_rearrangement/contact_rearrangement/object_pool.py) | `TaskObjectPool`, 매 physics substep의 inactive COM countergravity 적용 |
-| [object_spawner.py](../src/contact_rearrangement/contact_rearrangement/object_spawner.py) | 003·004 visible scanned mesh 유지, body-local AABB Cube collision override |
-| [geometry.py](../src/contact_rearrangement/contact_rearrangement/geometry.py) | Spawn된 body bound·authored physics 검사, shelf support/ceiling 측정 |
-| [sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py) | Seeded 4–10개/all-types 배치, Target 유일성·coverage·국소 밀집도·pivot/회전 path 검사 |
-| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | ManagerBasedEnv, 주기, 환경 복제, reset event, spawn rules, 후속 initial-vision 요구값 |
-| [mdp/events.py](../src/contact_rearrangement/contact_rearrangement/mdp/events.py) | Episode 역할 선지정, 전체/부분 resampling, active mask·초기 state, parking·countergravity mask 관리 |
-| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 실행, 스폰·상태·reset 검증 |
+| [catalog.py](../src/contact_rearrangement/contact_rearrangement/catalog.py) | Simulator 없이 읽는 10종 metadata, 100개 pool, upright·parking·asset 경로 |
+| [assets.py](../src/contact_rearrangement/contact_rearrangement/assets.py) | UR5e/RH56E2 조립·`RobotPoseModel` FK/IK·PD hold, FlatBoxUsdCfg·TaskObjectPool·물체 생성 |
+| [env_cfg.py](../src/contact_rearrangement/contact_rearrangement/env_cfg.py) | Scene·ManagerBased, 주기·복제·seed·SpawnRules·RobotStartRules·후속 vision 요구 |
+| [spawn.py](../src/contact_rearrangement/contact_rearrangement/spawn.py) | USD 측정·역할/reset·robot IK/충돌 후보 승인·state와 시작 metadata 적용 |
+| [sampling.py](../src/contact_rearrangement/contact_rearrangement/sampling.py) | 순수 장면 구성·density·SE(2) 경로, robot 시작 영역/elbow/3D OBB helpers |
+| [visualization.py](../src/contact_rearrangement/contact_rearrangement/visualization.py) | 현재 pose·local bounds의 Target/Blocker OBB debug draw |
+| [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 실행, 역할 OBB 표시, 스폰·상태·reset 검증 |
+
+실행은 **catalog·CLI → AppLauncher → scene/env 생성 → USD 측정/reset → physics
+step·OBB 갱신** 순서다. Metadata와 순수 sampling은 simulator 없이 읽으며
+simulator 의존 모듈은 AppLauncher 뒤에 로드한다. `spawn.py`는 실제 geometry를
+`sampling.py`에 전달하고 그 결과를 state로 적용한다. `assets.py`의 pool은 매
+substep countergravity를 적용한다. `__init__.py`는 비어 있으며 package tree와
+`tests/test_sampling.py` 위치는 [README](../src/contact_rearrangement/README.md)에 있다.
+
+이전 `layout.py`는 `catalog.py`, `object_pool.py`·`object_spawner.py`와 물체 factory는
+`assets.py`, `scene_cfg.py`는 `env_cfg.py`, `geometry.py`·`mdp/events.py`는 `spawn.py`로
+통합했다. 이전 모듈·`mdp/`는 compatibility wrapper 없이 제거했다.
 
 Asset 기본 경로는 `omniverse://192.168.0.13`이며
 `CONTACT_REARRANGEMENT_*` 환경변수로 override할 수 있다. 손은 저장소의
@@ -400,6 +487,9 @@ Examples와 `roas_sweeping`에서 shelf·6개 물체 종류와 배치를,
 현재 오른손 코드를 확인해야 한다.
 
 ## 8. 개발과 검증 기록
+
+과거 기록의 모듈 이름은 당시 구조다. 현재 위치는 위 6개 모듈 표를 따르며,
+통합 전 검사 결과를 통합 후 runtime 검사의 통과로 사용하지 않는다.
 
 ### 2026-10-09 초기 고정 6개 장면 스폰과 reset — 이전 버전
 
@@ -470,7 +560,7 @@ active→parking 전환 뒤 gravity-disable이 반영되지 않는 현상을 확
 입증한 것은 아니다.
 
 따라서 live simulation/gravity flag 전환을 피하고 **모든 pool body의 native
-gravity와 simulation을 유지**한다. 새 `object_pool.py`의 `TaskObjectPool`이
+gravity와 simulation을 유지**한다. 당시 `object_pool.py`(이후 `assets.py`에 통합)의 `TaskObjectPool`이
 inactive COM에만 매 substep world `-m*g` 외력을 적용한다. 높은 격리 parking으로
 작업층과 분리하고 USD visibility는 수정하지 않는다. COM 적용은 pivot 기준
 외력이 만드는 torque를 피하기 위한 선택이다.
@@ -574,6 +664,10 @@ Target·Blocker·active 종류, Y span 32.3 cm, footprint fill 36.2%를 재현�
 
 ### 2026-10-09 선반 전체 분포·10종 허용·Target 유일성·회전 경로 확장
 
+이 절은 당시 구현의 이력이다. **4–10종을 active instance 4–10개로 잘못 해석한
+설정**은 뒤의 종류/instance 분리 교정으로 대체했다. 당시 all-types의 정확히
+10개 검증을 현재 density 산정 개수의 검증으로 읽지 않는다.
+
 **사용자 교정:** 4–6개 제한을 확장해 10종 전체 사용을 허용한다. Target 종류는
 한 장면에 하나이며 중복하지 않는다. 앞에 Blocker가 들어갈 수 있으면 Target을
 앞쪽에도 놓는다. 좁은 cluster 대신 선반 전체에 분포시키되 해소 공간을 남긴다.
@@ -662,7 +756,7 @@ Headless CUDA 환경 1개를 `--max_steps 151`로 실행해 exit code 0으로 �
 | 원본 mesh의 `boundingCube` fitted approximation | 0.83°·XY 1.54 mm의 움직임이 남아 최종 방식으로 사용하지 않았다. |
 | 명시적 body-local AABB Cube proxy의 초기 진단 | 4개 환경·10종 전체·5초 동안 박스 8개를 120 Hz로 기록. 최대 XY 이동 0.007894 mm, 계산 정밀도 내 거의 직립. |
 
-**현재 구현:** `object_spawner.py`의 `FlatBoxUsdCfg`는 003·004의 visible scanned
+**구현:** 당시 `object_spawner.py`(현재 `assets.py`에 통합)의 `FlatBoxUsdCfg`는 003·004의 visible scanned
 mesh를 보존하고 원본 collider를 disabled로 바꾸며, 기존 single rigid body 아래에
 같은 unscaled body-local AABB 크기·offset의 invisible `UsdGeom.Cube`를 추가한다.
 Cube size 1·extent ±0.5를 명시하고 body·ancestor scale을 상속하며 spawn/clone
@@ -704,6 +798,226 @@ collider 1개, 원본 mesh collision disabled를 확인했다. 로그·JSON은
 완화하지 않았다. 전체/부분 reset과 bounded settle 검사가 통과한 범위이며,
 다른 seed·모든 배치·실제 robot push·camera visibility의 검증으로 확대하지 않는다.
 로그는 `outputs/contact_rearrangement/box_stable_reset_validation.log`다.
+
+### 2026-10-09 종류·instance 분리와 전체 선반 밀도 — 이전 면적 우선 구성의 검사
+
+아래 수치·실행·배치도는 큰 footprint부터 복사본을 고르던 **이전 구성**의
+기록이다. 현재 균형 구성의 instance 분포·생성 성능·정착 결과로 사용하지 않는다.
+
+사용자가 **4–10은 종류 선정 기준**이라고 교정했고 선반 전체의 density를
+충족하도록 요청했다. 이전 active 4–10개·all-types 정확히 10개 해석을 폐기했다.
+당시는 종류 4–10개를 고른 뒤 선택한 non-target 종류의 큰 footprint 복사본부터 더해 요구 면적을
+충족한다. Target 종류는 한 번만 사용하며 instance 최소 4·cap 40,
+10종 × 10-copy pool을 유지한다. 역할·종류 집합·전체 instance ID·N은 배치
+재시도 전에 고정한다. 구성에 필요한 면적 하한은
+`max(min_shelf_occupancy, min_region_occupancy) × usable_area`다.
+Global 면적과 X 2 × Y 3의 6개 구역 면적 하한을 모두 실제 배치에서 검사한다.
+
+**기하 benchmark와 수치 선택:** 실제 USD 측정 bounds와 현재 clearance 조건으로
+global 25–45%를 비교했다. 아래는 일반·all-types 두 모드의 고유 sample 수다.
+
+| Global 요구 | Seed·표본 | 생성 통과 |
+|---|---|---|
+| 25% | 각 모드 seed 0–4, 총 10개 | 10/10 |
+| 30% | 각 모드 seed 0–4, 총 10개 | 10/10 |
+| 35% | 각 모드 seed 0–19, 총 40개 | 40/40 |
+| 40% | 각 모드 seed 0–4·10–19, 총 30개 | 30/30 |
+| 45% | 각 모드 seed 0–4, 총 10개 | 3/10 — 일반 1/5, all-types 2/5 |
+
+35%·40%의 공통 seed 집합에서 평균 생성 시간은 각각 약 0.206초와
+0.99–1.00초였다. 45% 실패는 일반 모드의 capacity 1개·packing 3개,
+all-types의 packing 3개였다. 생성 성공률과 약 5배의 시간 차이를 고려해
+**global 35%·각 구역 10%·4 cm 이웃 비율 75%**를 초기 구현 기본값으로 선택했다.
+사용자가 직접 선택한 최종 연구 난이도 수치는 아니다.
+
+35%의 일반 모드는 4–10종·10–24 instance, all-types는 10종·14 instance였다.
+실제 global 점유율은 각각 35.39–38.68%·36.32–37.36%였고, 장면별 최소
+구역 점유율은 전체 sample에서 12.98–35.22%였다. 자료는
+`outputs/contact_rearrangement/density_calibration.json`의 초기 비교·독립
+확인·확장 기본값 확인에 저장했다. 같은 seed의 중복 검사를 표본 수에 합산하지
+않는다. 이는 geometry 생성 검사이며 물리 정착·camera·robot push 검사는 아니다.
+
+**당시 GPU 검사:** 다음 두 실행이 모두 exit code 0으로 통과했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_rearrangement/scripts/spawn_scene.py \
+  --num_envs 4 --headless --device cuda:0 --max_steps 300 --validate
+./IsaacLab/isaaclab.sh -p src/contact_rearrangement/scripts/spawn_scene.py \
+  --all_asset_types --num_envs 4 --headless --device cuda:0 --max_steps 300 --validate
+```
+
+각 실행은 기본 35%·seed 0·4개 GPU 환경·300 step·10.00초다. 기본 150-step
+간격으로 150·300 step의 전체 reset과 끝부분의 partial reset을 확인했다.
+각 모드에서 초기 4개·첫 reset 뒤 4개, **8개 layout을 각각 5초** 진행했고
+5 cm drift·15° tilt 기준을 완화하지 않았다. 마지막 reset에서 생성한 장면은
+추가 물리 step이 없어 정착 표본으로 세지 않는다. 로그는
+`outputs/contact_rearrangement/dense_shelf_default_validation.log`와
+`outputs/contact_rearrangement/dense_shelf_all_types_validation.log`다.
+미검사 seed·실제 로봇 밀기·camera visibility의 성공으로 확대하지 않는다.
+
+**당시 단위 검사:** 21개가 18.219초에 통과했고 `py_compile`·`git diff --check`도
+통과했다. Region 요구가 global보다 큰 경우의 composition 면적 하한 검사도
+포함하며 기본 35%/10% 동작은 같다.
+
+**당시 배치도:** 실제 측정 geometry의 4종·10개, 4종·24개, 10종·14개를
+비교했다. 해당 파일은 이후 아래의 현재 균형 구성 예시로 교체됐으며 이전
+개수의 그림을 현재 배치도로 연결하지 않는다.
+
+### 2026-10-09 Target·Blocker의 현재 OBB 표시
+
+사용자 요청에 따라 `visualization.py`의 `RoleObbVisualizer`를 장면 확인
+스크립트에 연결했다. Target은 초록색, Blocker는 빨간색으로 각 12개 edge를
+debug draw한다. 현재 body link pose와 upright frame bounds를 사용해 YCB 방향,
+중심과 다른 root 위치, 합성 scale을 반영하며 전체·부분 reset의 역할 ID도 갱신한다.
+USD prim·API·collider·material·physics state를 추가하거나 변경하지 않는다.
+GUI·livestream에서는 기본 표시하고 `--disable_role_obb`로 끈다. 일반 headless는
+생략하고 `--headless --validate`는 viewport 없이 같은 debug draw 경로를 검사한다.
+
+**제한된 실행 검사:** YCB 003 Target·006 Blocker를 지정한 2개 CUDA 환경에서
+151 step·5.03초의 headless `--validate`가 exit code 0으로 통과했다. 총 48개
+line과 draw 전후 USD prim/API 집합·PhysX pose/velocity·native flag 유지,
+150-step 자동 reset과 마지막 전체·부분 reset 갱신을 확인했다. 별도의 1개 GUI
+환경·45 step·1.5초 `--validate`도 exit code 0이었다. 실제 RTX viewport 렌더
+`outputs/contact_rearrangement/role_obb_preview.png`에서 초록 cracker box·빨간
+mustard bottle의 OBB가 물체를 감싸는 것을 확인했다. 이 검사는 역할 표시와
+무변경 동작의 범위이며 task camera의 Target 40% 가시성이나 로봇 조작 검사가 아니다.
+
+**독립 수치 검사:** 별도의 CPU 행렬 기준과 비교해 legacy·YCB upright, yaw/tilt,
+scaled/noncentered bounds, 두 환경의 world offset, 이동·기울어진 pose와 부분
+역할 교체를 확인했다. 48개 edge의 연결·초록/빨강 색상·3 px 두께, redraw/cleanup과
+body pose의 정확한 유지도 통과했다. 검사 스크립트는
+`/tmp/contact_rearrangement_obb_numerical_review.py`이며 `py_compile`과
+`git diff --check`도 통과했다.
+
+### 2026-10-09 non-target 복사본의 종류별 개수 균형
+
+사용자가 한 asset의 복사본이 공간을 지나치게 채우는 문제를 지적했다.
+이전 큰 footprint 우선 복사본 선택은 채울 면적에 필요한 instance 수를 줄이는
+대신 큰 종류에 중복을 집중시켰다. 현재는 추가 가능한 non-target 종류 중
+**active 개수가 가장 적은 종류**를 고르고 동률만 무작위로 정한다. 지정
+Blocker도 해당 종류의 첫 instance로 세며 모든 종류의 개수가 같아지면
+다음 회차를 시작한다. Target 종류는 항상 하나다.
+
+현재 같은 pool capacity에서는 non-target 종류별 개수 차이가 최대 1이다.
+종류별 새 고정 최대값은 두지 않고 기존 종류당 10-copy·전체 cap 40을 유지한다.
+작은 종류 위주 집합은 같은 global 점유율에 더 많은 instance가 필요할 수 있다.
+종류 4–10개, 역할·종류 집합·전체 instance ID·N의 retry 전 고정,
+global 35%·6개 구역 각 10%·이웃 75%와 clearance 조건은 유지한다.
+공간 배치는 packing을 위해 큰 footprint부터 진행하므로 **종류 선택과 위치
+배치의 순서는 별개**다. 이전 calibration·instance 분포·배치도를 현재 결과로
+사용하지 않으며 다음은 최종 source에서 별도로 확인한 결과다.
+
+**현재 기하 검사:** 실제 USD bounds로 일반·all-types 각각 seed 0–19,
+**40/40개**가 통과했다. 모든 장면에서 non-target 종류별 개수 차이가 최대 1이었다.
+일반 모드는 12–25 instance·global 35.05–38.48%·검사 전체의 최소 구역 22.86%,
+all-types는 15–18 instance·global 35.14–38.71%·최소 구역 24.75%였다.
+Source SHA를 포함한 자료는
+`outputs/contact_rearrangement/balanced_composition_benchmark.json`에 있다.
+이는 geometry 생성 검사이며 camera·robot push 검사와 구분한다.
+
+**현재 GPU 검사:** 다음 일반 모드 실행이 exit code 0으로 통과했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_rearrangement/scripts/spawn_scene.py \
+  --num_envs 4 --headless --device cuda:0 --max_steps 151 --validate
+```
+
+4개 CUDA 환경·151 step·5.03초에서 150-step 자동 reset과 마지막 전체·부분
+reset, 기존 정착 guard를 확인했다. 총 96개 역할 OBB line과 draw 전후 USD·
+PhysX 상태 유지도 검사했다. Reset sample 중 10종 장면이 있었지만 현재 구성의
+별도 `--all_asset_types` GPU 실행을 완료한 것으로 해석하지 않는다. 로그는
+`outputs/contact_rearrangement/balanced_composition_gpu_validation.log`다.
+미검사 seed·실제 로봇 밀기·camera visibility의 성공으로 확대하지 않는다.
+당시 unit test **23개**가 24.384초에 통과했으며 균형 선정·복사본 재고 소진
+회귀 검사를 포함한다.
+
+**현재 배치도:** [균형 구성 예시](assets/dense_shelf_examples.svg)는 일반 seed 0의
+4종·12개, 일반 seed 2의 4종·25개, all-types seed 1의 10종·17개를 보여준다.
+Target은 하나이며 non-target 종류별 개수는 각각 3/4/4, 8/8/8,
+1/1/2/2/2/2/2/2/2다. Console의 `[SPAWN]`에도 반복 목록 대신 종류별
+`asset_counts`를 출력해 편중을 확인할 수 있다.
+
+### 2026-10-09 책임별 6개 모듈 통합 — 동작 유지 검사 통과
+
+과하게 세분화된 파일을 `catalog.py`·`assets.py`·`env_cfg.py`·`spawn.py`·
+`sampling.py`·`visualization.py`로 통합하고 빈 `__init__.py`를 유지했다.
+이전 모듈·`mdp/`는 wrapper 없이 제거했다. 실행 진입점과 CLI, 스폰 규칙·
+기본값은 유지했으며 새 시뮬레이션·camera 기능을 추가하지 않았다.
+
+모든 모듈의 문법 검사가 통과했고 `catalog`·`sampling`을 simulator 없이
+import해 `isaaclab`·`isaacsim`·`pxr`·`torch`가 로드되지 않는 것을 확인했다.
+CLI `--help`는 exit code 0이었다. Unit test **23개**가 24.552초에 통과했다.
+6개 모듈의 의존관계에는 cycle이 없고 상대 Markdown 링크도 유효했다.
+
+일반 모드의 `--num_envs 4 --headless --device cuda:0 --max_steps 151 --validate`가
+exit code 0으로 통과했다. 4개 CUDA 환경·5.03초에서 150-step 자동 reset과
+마지막 전체/부분 reset, 역할 OBB 96개 line·draw 전후 USD/PhysX 상태 유지를
+검사했다. 물리 guard를 완화하지 않았다. 초기·150-step reset 뒤의 **8개 장면
+설명**은 이전 `balanced_composition_gpu_validation.log` 실행과 정확히 같았다.
+로봇·물체 18개 정의, USD 측정/reset 정의와 scene/env 설정의 AST도 통합 전과
+일치했다. 이 결과를 새 camera 가시성·로봇 조작의 검증으로 확대하지 않는다.
+로그는 `outputs/contact_rearrangement/refactor_cli_help.log`,
+`refactor_unit_tests.log`, `refactor_gpu_validation.log`에 남겼다.
+
+### 2026-10-09 Blocker 앞 hand 시작과 elbow-down 금지 — 최종 GPU stress 통과
+
+사용자 요청으로 기존 고정 robot 시작 pose를 episode별 Blocker 앞 영역의
+collision-checked elbow-up 시작으로 확장했다. 6개 모듈 구조를 유지하고
+`assets.py`가 USD FK/IK·collision geometry, `sampling.py`가 순수 영역/elbow/OBB
+계산, `spawn.py`가 독립 seed·후보 승인·state/PD target·metadata를 담당한다.
+물체 선정·배치 RNG를 유지하고 추가 physics step 없이 선택한 환경에만 적용한다.
+거리·높이·여유·80번 cap은 현재 구현 기본값이며 후속 제어·학습 분포에 맞춰
+조정할 수 있다.
+
+초기 구현은 4개 GPU 환경·151 step·5.03초의 검사에서 150-step·5초 자동 reset과
+마지막 전체/부분 reset, 선택하지 않은 환경의 q/velocity/PD target과 robot metadata
+유지를 통과했다. Robot collider 39개·shelf collider 17개와 모델 FK 대 실제 link
+position 오차 5.13e−7 m도 확인했다. 이후 solver에 같은 TCP의 다른 IK branch를
+scene 조건까지 검사하는 callback을 넣고 물체·robot 후보 모두 성공한 뒤
+reset/state를 적용하도록 보강했다. 초기 검사와 아래의 최종 변경본 검사를 구분한다.
+
+후속 stress에서 **4개 환경 × 6회 reset의 24개 robot 시작 pose**는 실제 PhysX
+조건을 통과했다. `min_elbow_height=2 m`·1회 시도로 실패를 강제해 joint q·object
+pose·PD target·reset count·역할·robot metadata 유지도 확인했다. 다만 physics 없이
+6번 reset한 뒤 150 step에서 parked body angular velocity가 32–71 rad/s로 증가했다.
+해당 경로의 상위 `RigidObjectCollection.write_object_link_pose_to_sim`이 별도 COM
+pose cache를 무효화하지 않아 같은 timestamp의 이전 COM을 읽는 것을 확인했다.
+Pool의 writer에서 그 cache를 무효화하도록 수정했다. 이후 UR arm의 가까운
+joint housing OBB가 충돌로 잡히는 false positive도 수정했다. 직렬 7-link arm의
+21쌍에서 두 arm joint 이내의 11쌍을 제외하고 거리 3 이상인 10쌍만 self 검사한다.
+전체 39개 robot collider 대 물체·17개 shelf collider·ground의 **15 mm 기준은
+완화하지 않았다.**
+
+**최종 변경본 검사:** 4개 GPU 환경 × 6회 reset의 **24개 초기 pose**가 실제
+PhysX 조건을 통과했고 8개는 10종 전체 장면이었다. 같은 timestamp에서 physics
+없이 6번 reset한 뒤 **150 step·5초**의 parked 안정성, 전체/부분 reset도 통과했다.
+`min_elbow_height=2 m`·1회 시도로 실패를 강제했을 때도 physical joint q·object
+pose·PD target·reset count·역할·TCP metadata가 유지됐다. 최종 FK position 오차는
+**2.8458e−7 m**, elbow chord 높이는 **11.49–16.07 cm**, 후보 시도는 **1–3회**였다.
+현재 10종의 enabled collider mesh points·primitive OBB가 측정한 물체 bounds 안에
+포함되는 것도 확인해 초기 scene obstacle OBB의 보수적인 형상을 대조했다.
+최종 unit test **29개**(기존 23개 + 영역/SAT/elbow 6개)가 **24.673초**에 통과했다.
+로그는 `outputs/contact_rearrangement/robot_randomization_unit_tests.log`다. Stress 자료는
+`outputs/contact_rearrangement/robot_randomization_benchmark.{json,log}`다.
+
+4환경 reset batch의 wall time은 물체 배치를 포함해 **1.420–7.601초**였다.
+현재 CPU 후보 계산 비용은 환경 수를 확대할 때 batch/vectorization 검토가 필요한
+한계다.
+
+**GUI 검사:** 45 step·1.5초의 실제 GUI 실행과 전체/부분 reset, COM cache를
+미리 읽은 뒤 reset하는 검사, OBB draw 전후 USD/PhysX 불변 조건도 통과했다.
+실제 렌더에서 손이 Blocker 앞 공간에서 선반을 향하고 elbow가 높게 위치한 것을
+확인했다. 자료는 `outputs/contact_rearrangement/robot_start_preview.{png,log}`다.
+Elbow 높이 계산은 `assets.py`의 FK와 `sampling.elbow_above_chord`를 공유한다.
+
+**최종 자동 reset 검사:** 현재 변경본의 일반 모드
+`--num_envs 4 --headless --device cuda:0 --max_steps 151 --validate`도 exit code 0으로
+통과했다. 151 step·5.03초에서 150 step·5.00초의 자동 reset, 부분 reset의
+미선택 환경 보존, COM cache를 미리 읽고 pose write 뒤 새로 읽는 검사,
+역할 OBB draw 전후 USD/PhysX 상태 유지를 확인했다. 로그는
+`outputs/contact_rearrangement/robot_randomization_gpu.log`다.
+위 통과를 손 전체 self collision·재배치 제어 성공·task camera 가시성의 보장으로
+확대하지 않는다.
 
 ## 9. 다음 구체화와 구현에서 정할 사항
 

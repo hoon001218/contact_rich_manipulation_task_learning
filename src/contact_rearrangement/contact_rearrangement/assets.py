@@ -1,23 +1,31 @@
-"""UR5e/RH56E2 assembly adapted from the existing hand_rl environment."""
+"""Robot assembly and shelf-object pool construction for the task scene."""
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from xml.etree import ElementTree
 
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+import numpy as np
+import torch
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, RigidObjectCfg, RigidObjectCollection, RigidObjectCollectionCfg
 from isaaclab.sim.spawners.spawner_cfg import RigidObjectSpawnerCfg
 from isaaclab.sim.utils import clone, get_current_stage
 from isaaclab.utils import configclass
 
-from .layout import NUCLEUS_ROOT
+from .catalog import NUCLEUS_ROOT, OBJECT_SPECS, parking_position
+from .sampling import elbow_above_chord
 
+
+# Robot assembly.
 
 ARM_JOINT_NAMES = (
     "shoulder_pan_joint",
@@ -351,4 +359,490 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
                 damping=1.0,
             ),
         },
+    )
+
+
+# Robot reset kinematics. Candidate poses are calculated on the CPU without
+# writing articulation state or advancing the simulation.
+
+
+@dataclass(frozen=True)
+class RobotColliderBox:
+    """Conservative bounds of an authored collider in its physical link frame."""
+
+    body_name: str
+    center_local: np.ndarray
+    rotation_local: np.ndarray
+    half_extents: np.ndarray
+    path: str
+
+
+@dataclass(frozen=True)
+class ShelfColliderBox:
+    """Authored shelf collider bounds in the env_0 world frame."""
+
+    center: np.ndarray
+    rotation: np.ndarray
+    half_extents: np.ndarray
+    path: str
+
+
+@dataclass(frozen=True)
+class _RobotJoint:
+    name: str
+    parent: str
+    child: str
+    frame0: np.ndarray
+    frame1_inverse: np.ndarray
+    axis: np.ndarray
+    index: int | None
+    reverse: bool = False
+
+
+def _rotation_wxyz(quaternion) -> np.ndarray:
+    """Convert a scalar-first quaternion to a column-vector rotation matrix."""
+    from scipy.spatial.transform import Rotation
+
+    quaternion = np.asarray(quaternion, dtype=np.float64)
+    return Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
+
+
+def _rigid_matrix(position, quaternion) -> np.ndarray:
+    matrix = np.eye(4)
+    matrix[:3, :3] = _rotation_wxyz(quaternion)
+    matrix[:3, 3] = position
+    return matrix
+
+
+def _gf_column(matrix: Gf.Matrix4d) -> np.ndarray:
+    """USD uses row-vector matrices; the kinematic model uses column vectors."""
+    return np.asarray(matrix, dtype=np.float64).T.copy()
+
+
+def _rotation_part(matrix: np.ndarray) -> np.ndarray:
+    left, _, right = np.linalg.svd(matrix[:3, :3])
+    rotation = left @ right
+    if np.linalg.det(rotation) < 0.0:
+        left[:, -1] *= -1.0
+        rotation = left @ right
+    return rotation
+
+
+def _joint_frame(position, quaternion, stretch: np.ndarray) -> np.ndarray:
+    matrix = _rigid_matrix(position, quaternion)
+    matrix[:3, 3] = stretch @ matrix[:3, 3]
+    # Articulation links have uniform asset scale. Keeping this conversion also
+    # handles orthogonal scale imported in a fixed hand link's local frame.
+    matrix[:3, :3] = _rotation_part(stretch @ matrix[:3, :3])
+    return matrix
+
+
+def _box_from_usd(prim: Usd.Prim, matrix: np.ndarray, cache: UsdGeom.BBoxCache):
+    """Bake collider and ancestor scale into a conservative oriented box."""
+    if prim.IsA(UsdGeom.Mesh):
+        # Collision meshes can inherit purpose=guide and have no authored
+        # extent. Read the actual vertices so visual purpose/visibility cannot
+        # silently remove collision geometry from the reset acceptance check.
+        points = np.asarray(UsdGeom.Mesh(prim).GetPointsAttr().Get(), dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+            raise ValueError(f"Collision mesh has no vertices: {prim.GetPath()}")
+        if not np.isfinite(points).all():
+            raise ValueError(f"Collision mesh has nonfinite vertices: {prim.GetPath()}")
+        lower, upper = points.min(axis=0), points.max(axis=0)
+    else:
+        bounds = cache.ComputeUntransformedBound(prim).ComputeAlignedRange()
+        if bounds.IsEmpty():
+            raise ValueError(f"Empty collision bounds: {prim.GetPath()}")
+        lower, upper = np.asarray(bounds.GetMin()), np.asarray(bounds.GetMax())
+    if not np.isfinite([lower, upper]).all() or np.any(upper < lower):
+        raise ValueError(f"Invalid collision bounds: {prim.GetPath()}")
+    rotation = _rotation_part(matrix)
+    corners = np.asarray(list(product(*zip(lower, upper))))
+    transformed = corners @ matrix[:3, :3].T + matrix[:3, 3]
+    aligned = transformed @ rotation
+    aligned_lower, aligned_upper = aligned.min(axis=0), aligned.max(axis=0)
+    center = rotation @ ((aligned_lower + aligned_upper) * 0.5)
+    half_extents = np.maximum((aligned_upper - aligned_lower) * 0.5, 1.0e-6)
+    return center, rotation, half_extents
+
+
+class RobotPoseModel:
+    """Exact USD joint-frame FK and bounded IK for the mounted open hand.
+
+    Body transforms and collider bounds use meters and column-vector matrices.
+    Environment origins are applied by the reset caller. This model is built
+    once from env_0; checking candidates never changes the simulation.
+    """
+
+    @classmethod
+    def from_env(cls, env) -> "RobotPoseModel":
+        model = cls()
+        robot = env.scene["robot"]
+        stage = env.scene.stage
+        origin_path = env.scene.env_prim_paths[0]
+        robot_path = robot.cfg.prim_path.format(ENV_REGEX_NS=origin_path).replace(
+            env.scene.env_regex_ns, origin_path, 1
+        )
+        root = stage.GetPrimAtPath(robot_path)
+        if not root.IsValid():
+            raise RuntimeError(f"Robot USD prim is missing: {robot_path}")
+        model.joint_names = tuple(robot.joint_names)
+        model.body_names = tuple(robot.body_names)
+        model.arm_ids = np.asarray([model.joint_names.index(name) for name in ARM_JOINT_NAMES])
+        model.default_joint_positions = robot.data.default_joint_pos[0].detach().cpu().numpy().astype(np.float64)
+        model.joint_limits = robot.data.joint_pos_limits[0].detach().cpu().numpy().astype(np.float64)
+        model.arm_limits = model.joint_limits[model.arm_ids]
+        model.tcp_body_name = TCP_BODY_NAME
+        # PhysX appends an index to duplicated link names (both assets have a
+        # base_link). Use full paths to retain the correct hand/base association.
+        link_paths = robot.root_physx_view.link_paths[0]
+        path_to_name = dict(zip(map(str, link_paths), model.body_names))
+        xforms = UsdGeom.XformCache(Usd.TimeCode.Default())
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy, UsdGeom.Tokens.guide],
+            useExtentsHint=False,
+            ignoreVisibility=True,
+        )
+        rigid_authored, stretches = {}, {}
+        for path, name in path_to_name.items():
+            prim = stage.GetPrimAtPath(path)
+            world = _gf_column(xforms.GetLocalToWorldTransform(prim))
+            rigid = np.eye(4)
+            rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
+            rigid_authored[name] = rigid
+            stretches[name] = rigid[:3, :3].T @ world[:3, :3]
+        raw_joints = []
+        for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+            if not prim.IsA(UsdPhysics.Joint):
+                continue
+            joint = UsdPhysics.Joint(prim)
+            if joint.GetJointEnabledAttr().Get() is False:
+                continue
+            body0, body1 = joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets()
+            if not body0 or not body1:
+                continue  # The fixed world/base joint is represented by root_pose.
+            name0, name1 = path_to_name.get(str(body0[0])), path_to_name.get(str(body1[0]))
+            if name0 is None or name1 is None:
+                raise RuntimeError(f"Joint {prim.GetPath()} references a body outside the articulation.")
+            def frame(position, quaternion, stretch):
+                q = quaternion.Get()
+                return _joint_frame(
+                    position.Get(), [q.GetReal(), *q.GetImaginary()], stretch
+                )
+            frame0 = frame(joint.GetLocalPos0Attr(), joint.GetLocalRot0Attr(), stretches[name0])
+            frame1 = frame(joint.GetLocalPos1Attr(), joint.GetLocalRot1Attr(), stretches[name1])
+            axis = np.zeros(3)
+            joint_id = None
+            if prim.IsA(UsdPhysics.RevoluteJoint):
+                token = UsdPhysics.RevoluteJoint(prim).GetAxisAttr().Get() or "X"
+                axis["XYZ".index(token)] = 1.0
+                if prim.GetName() not in model.joint_names:
+                    raise RuntimeError(f"Revolute joint {prim.GetName()} is missing from PhysX DOFs.")
+                joint_id = model.joint_names.index(prim.GetName())
+            elif not prim.IsA(UsdPhysics.FixedJoint):
+                raise RuntimeError(f"Unsupported robot joint type: {prim.GetTypeName()} {prim.GetPath()}")
+            raw_joints.append((prim.GetName(), name0, name1, frame0, frame1, axis, joint_id))
+        model.root_body_name = model.body_names[0]
+        root_pose = robot.data.body_link_state_w[0, 0, :7].detach().cpu().numpy()
+        model.root_transform = _rigid_matrix(root_pose[:3], root_pose[3:])
+        ordered, reached = [], {model.root_body_name}
+        pending = list(raw_joints)
+        while pending:
+            for row in pending:
+                name, body0, body1, frame0, frame1, axis, index = row
+                if (body0 in reached) == (body1 in reached):
+                    continue
+                reverse = body1 in reached
+                parent, child = (body1, body0) if reverse else (body0, body1)
+                ordered.append(_RobotJoint(name, parent, child, frame0, np.linalg.inv(frame1), axis, index, reverse))
+                reached.add(child)
+                pending.remove(row)
+                break
+            else:
+                raise RuntimeError("Robot joints must form a connected tree without closed loops.")
+        if reached != set(model.body_names):
+            raise RuntimeError(f"Robot bodies are not connected to the root: {set(model.body_names) - reached}")
+        model.joints = tuple(ordered)
+        model.body_parents = {joint.child: joint.parent for joint in ordered}
+        model._joint_by_name = {joint.name: joint for joint in ordered}
+        model._joint_for_child = {joint.child: joint for joint in ordered}
+        chain, body = [], model.tcp_body_name
+        while body != model.root_body_name:
+            joint = model._joint_for_child[body]
+            chain.append(joint)
+            body = joint.parent
+        model._tcp_chain = tuple(reversed(chain))
+        model.colliders = []
+        for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            if UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is False:
+                continue
+            body = prim
+            while body.IsValid() and str(body.GetPath()) not in path_to_name:
+                body = body.GetParent()
+            if not body.IsValid():
+                raise RuntimeError(f"Robot collider has no physical link: {prim.GetPath()}")
+            body_name = path_to_name[str(body.GetPath())]
+            relative = np.linalg.inv(rigid_authored[body_name]) @ _gf_column(xforms.GetLocalToWorldTransform(prim))
+            center, rotation, half_extents = _box_from_usd(prim, relative, cache)
+            model.colliders.append(RobotColliderBox(body_name, center, rotation, half_extents, str(prim.GetPath())))
+        shelf_path = env.scene.cfg.shelf.prim_path.format(ENV_REGEX_NS=origin_path).replace(
+            env.scene.env_regex_ns, origin_path, 1
+        )
+        model.shelf_boxes = []
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(shelf_path), Usd.TraverseInstanceProxies()):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            if UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is False:
+                continue
+            center, rotation, half_extents = _box_from_usd(
+                prim, _gf_column(xforms.GetLocalToWorldTransform(prim)), cache
+            )
+            model.shelf_boxes.append(ShelfColliderBox(center, rotation, half_extents, str(prim.GetPath())))
+        current_q = robot.data.joint_pos[0].detach().cpu().numpy()
+        predicted = model.forward(current_q)
+        physical_positions = robot.data.body_link_pos_w[0].detach().cpu().numpy()
+        physical_quaternions = robot.data.body_link_quat_w[0].detach().cpu().numpy()
+        position_error, rotation_error = 0.0, 0.0
+        for index, name in enumerate(model.body_names):
+            physical_rotation = _rotation_wxyz(physical_quaternions[index])
+            position_error = max(position_error, float(np.linalg.norm(predicted[name][:3, 3] - physical_positions[index])))
+            rotation_error = max(rotation_error, float(np.linalg.norm(predicted[name][:3, :3] - physical_rotation)))
+        model.fk_position_error, model.fk_rotation_error = position_error, rotation_error
+        if position_error > 1.0e-5 or rotation_error > 1.0e-5:
+            raise RuntimeError(
+                f"USD robot FK differs from PhysX links: position={position_error:.6g}m rotation={rotation_error:.6g}."
+            )
+        return model
+
+    @staticmethod
+    def _motion(joint: _RobotJoint, joint_positions: np.ndarray) -> np.ndarray:
+        transform = np.eye(4)
+        if joint.index is not None:
+            angle = float(joint_positions[joint.index])
+            x, y, z = joint.axis
+            cross = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+            transform[:3, :3] = np.eye(3) + math.sin(angle) * cross + (1.0 - math.cos(angle)) * (cross @ cross)
+        transform = joint.frame0 @ transform @ joint.frame1_inverse
+        return np.linalg.inv(transform) if joint.reverse else transform
+
+    def forward(self, joint_positions: np.ndarray) -> dict[str, np.ndarray]:
+        positions = np.asarray(joint_positions, dtype=np.float64)
+        if positions.shape != self.default_joint_positions.shape:
+            raise ValueError(f"Expected {len(self.joint_names)} joint positions, got {positions.shape}.")
+        transforms = {self.root_body_name: self.root_transform.copy()}
+        for joint in self.joints:
+            transforms[joint.child] = transforms[joint.parent] @ self._motion(joint, positions)
+        return transforms
+
+    def _tcp_transform(self, joint_positions: np.ndarray) -> np.ndarray:
+        matrix = self.root_transform.copy()
+        for joint in self._tcp_chain:
+            matrix = matrix @ self._motion(joint, joint_positions)
+        return matrix
+
+    def elbow_height(self, joint_positions) -> float:
+        """Elbow height above the shoulder-to-wrist chord, in world meters."""
+        transforms = joint_positions if isinstance(joint_positions, dict) else self.forward(joint_positions)
+        centers = []
+        for name in ("shoulder_lift_joint", "elbow_joint", "wrist_1_joint"):
+            joint = self._joint_by_name[name]
+            frame = np.linalg.inv(joint.frame1_inverse) if joint.reverse else joint.frame0
+            centers.append((transforms[joint.parent] @ frame)[:3, 3])
+        return elbow_above_chord(*centers)
+
+    def solve(self, tcp_position, tcp_rotation, rng, initial_seed=None, *, min_elbow_height=0.05,
+              accept_candidate: Callable[[dict[str, np.ndarray]], bool] | None = None) -> np.ndarray | None:
+        """Find a bounded elbow-up solution, trying other IK branches after rejection."""
+        from scipy.optimize import least_squares
+        from scipy.spatial.transform import Rotation
+
+        target_position = np.asarray(tcp_position, dtype=np.float64)
+        target_rotation = np.asarray(tcp_rotation, dtype=np.float64)
+        if target_position.shape != (3,) or target_rotation.shape != (3, 3):
+            raise ValueError("TCP target must be a 3-vector position and a 3x3 rotation.")
+        if not np.isfinite(target_position).all() or not np.isfinite(target_rotation).all():
+            raise ValueError("TCP target must be finite.")
+        full = self.default_joint_positions.copy()
+        lower, upper = self.arm_limits[:, 0], self.arm_limits[:, 1]
+        # Infinite continuous limits still need a finite optimization interval;
+        # +/- one complete turn includes all UR5e IK branches.
+        lower, upper = np.maximum(lower, -2.0 * math.pi), np.minimum(upper, 2.0 * math.pi)
+        if np.any(lower >= upper):
+            raise RuntimeError("Robot arm joint limits are empty.")
+        def residual(arm):
+            full[self.arm_ids] = arm
+            current = self._tcp_transform(full)
+            orientation = Rotation.from_matrix(target_rotation @ current[:3, :3].T).as_rotvec()
+            return np.concatenate((current[:3, 3] - target_position, 0.25 * orientation))
+        seeds = []
+        if initial_seed is not None:
+            initial = np.asarray(initial_seed, dtype=np.float64)
+            seeds.append(initial[self.arm_ids] if initial.shape == full.shape else initial)
+        default = self.default_joint_positions[self.arm_ids]
+        # Try the measured upper branch first. Acceptance still uses geometric
+        # elbow height rather than assuming that a joint-angle sign is enough.
+        for lift, elbow in ((-2.0, 1.8), (-1.6, 1.2), (-0.6, -1.8), (-1.0, -1.2)):
+            seed = default.copy()
+            seed[1:3] = lift, elbow
+            seed[3] = -lift - elbow
+            seeds.append(seed)
+        seeds.append(default.copy())
+        for _ in range(2):
+            seeds.append(np.asarray([rng.uniform(lo, hi) for lo, hi in zip(lower, upper)]))
+        for seed in seeds:
+            solution = least_squares(
+                residual, np.clip(seed, lower + 1.0e-8, upper - 1.0e-8),
+                bounds=(lower, upper), max_nfev=90, ftol=1.0e-7, xtol=1.0e-7, gtol=1.0e-7,
+            )
+            error = residual(solution.x)
+            if np.linalg.norm(error[:3]) > 5.0e-4 or np.linalg.norm(error[3:]) > 2.5e-3:
+                continue
+            result = self.default_joint_positions.copy()
+            result[self.arm_ids] = solution.x
+            transforms = self.forward(result)
+            if self.elbow_height(transforms) >= min_elbow_height and (
+                accept_candidate is None or accept_candidate(transforms)
+            ):
+                return result
+        return None
+
+
+# Shelf object pool.
+
+YCB_BOX_ASSETS = frozenset({"ycb_003_cracker_box", "ycb_004_sugar_box"})
+
+
+@clone
+def spawn_flat_box_from_usd(
+    prim_path: str,
+    cfg: "FlatBoxUsdCfg",
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Replace the scanned mesh collider with a body-axis-aligned box at spawn.
+
+    The outer clone decorator copies the completed collision override to every
+    environment before PhysX builds its views. No source USD file is modified.
+    """
+    root = sim_utils.spawn_from_usd(prim_path, cfg, translation, orientation, **kwargs)
+    for prim in Usd.PrimRange(root):
+        if prim.IsInstance():
+            prim.SetInstanceable(False)
+    bodies = [prim for prim in Usd.PrimRange(root) if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+    if len(bodies) != 1:
+        raise RuntimeError(f"Flat-box asset {prim_path} must contain exactly one rigid body.")
+    body = bodies[0]
+    colliders = [
+        prim for prim in Usd.PrimRange(body)
+        if prim.HasAPI(UsdPhysics.CollisionAPI)
+        and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is True
+    ]
+    if len(colliders) != 1 or not colliders[0].IsA(UsdGeom.Mesh):
+        raise RuntimeError(f"Flat-box asset {prim_path} must contain one enabled scanned mesh collider.")
+    original = colliders[0]
+    # Fit in the unscaled body frame. The proxy inherits body/ancestor scale;
+    # geometry inspection applies that scale and the upright rotation once.
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=False, ignoreVisibility=True,
+    )
+    bounds = cache.ComputeUntransformedBound(body).ComputeAlignedRange()
+    lower, upper = bounds.GetMin(), bounds.GetMax()
+    if bounds.IsEmpty() or any(
+        not math.isfinite(float(lo)) or not math.isfinite(float(hi)) or hi <= lo
+        for lo, hi in zip(lower, upper)
+    ):
+        raise RuntimeError(f"Flat-box asset {prim_path} has invalid local bounds.")
+    proxy = UsdGeom.Cube.Define(root.GetStage(), body.GetPath().AppendChild("FlatBoxCollision"))
+    proxy.CreateSizeAttr(1.0)
+    proxy.CreateExtentAttr([Gf.Vec3f(-0.5), Gf.Vec3f(0.5)])
+    proxy.AddTranslateOp().Set((lower + upper) * 0.5)
+    proxy.AddScaleOp().Set(Gf.Vec3f(*(upper - lower)))
+    proxy.CreatePurposeAttr(UsdGeom.Tokens.proxy)
+    proxy.MakeInvisible()
+    proxy_prim = proxy.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(proxy_prim).CreateCollisionEnabledAttr(True)
+    PhysxSchema.PhysxCollisionAPI.Apply(proxy_prim)
+    for attribute in original.GetAttributes():
+        if attribute.GetName().startswith("physxCollision:") and attribute.HasAuthoredValueOpinion():
+            proxy_prim.CreateAttribute(attribute.GetName(), attribute.GetTypeName()).Set(attribute.Get())
+    material, _ = UsdShade.MaterialBindingAPI(original).ComputeBoundMaterial(materialPurpose="physics")
+    if material and material.GetPrim().HasAPI(UsdPhysics.MaterialAPI):
+        UsdShade.MaterialBindingAPI.Apply(proxy_prim).Bind(material, materialPurpose="physics")
+    UsdPhysics.CollisionAPI(original).CreateCollisionEnabledAttr(False)
+    return root
+
+
+@configclass
+class FlatBoxUsdCfg(sim_utils.UsdFileCfg):
+    """Keep authored rigid-body properties and visuals, replacing only collision geometry."""
+
+    func: Callable = spawn_flat_box_from_usd
+
+
+class TaskObjectPool(RigidObjectCollection):
+    """Apply countergravity at parked bodies' COM in every physics substep.
+
+    Task objects retain native gravity and get zero countergravity. A live GPU
+    simulation/switch is avoided, and world COM application prevents torque on
+    assets with off-center pivots or COMs. Other external wrenches stay separate.
+    """
+
+    def __init__(self, cfg):
+        self.parked_mask: torch.Tensor | None = None
+        self.gravity: torch.Tensor | None = None
+        super().__init__(cfg)
+
+    def write_object_link_pose_to_sim(self, object_pose, env_ids=None, object_ids=None) -> None:
+        super().write_object_link_pose_to_sim(object_pose, env_ids=env_ids, object_ids=object_ids)
+        # Isaac Lab 2.3 updates link poses and any combined COM-state cache,
+        # but not the separate COM-pose cache. Repeated resets at one physics
+        # timestamp would otherwise apply countergravity at a stale point and
+        # spin parked bodies whose mass center differs from their link origin.
+        self._data._object_com_pose_w.timestamp = -1.0
+
+    def write_data_to_sim(self) -> None:
+        super().write_data_to_sim()
+        if self.parked_mask is None:
+            return
+        forces = -self.data.default_mass.to(self.device) * self.gravity * self.parked_mask[..., None]
+        self.root_physx_view.apply_forces_and_torques_at_position(
+            force_data=self.reshape_data_to_view(forces).contiguous(),
+            torque_data=None,
+            position_data=self.reshape_data_to_view(self.data.object_com_pos_w).contiguous(),
+            indices=torch.arange(self.root_physx_view.count, device=self.device, dtype=torch.int32),
+            is_global=True,
+        )
+
+
+def make_object_collection_cfg() -> RigidObjectCollectionCfg:
+    """Load the catalog once; reset activates a sampled subset on the working shelf."""
+    return RigidObjectCollectionCfg(
+        class_type=TaskObjectPool,
+        rigid_objects={
+            spec.name: RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{spec.name}",
+                spawn=(FlatBoxUsdCfg if spec.asset_name in YCB_BOX_ASSETS else sim_utils.UsdFileCfg)(
+                    usd_path=spec.usd_path,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        disable_gravity=False,
+                        kinematic_enabled=False,
+                        solver_position_iteration_count=16,
+                        solver_velocity_iteration_count=2,
+                        max_depenetration_velocity=1.0,
+                    ),
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=parking_position(index),
+                    rot=spec.upright_quat,
+                    lin_vel=(0.0, 0.0, 0.0),
+                    ang_vel=(0.0, 0.0, 0.0),
+                ),
+            )
+            for index, spec in enumerate(OBJECT_SPECS)
+        }
     )

@@ -1,4 +1,4 @@
-"""Asset catalog; task roles and supported poses are sampled independently on reset."""
+"""Simulator-independent asset catalog, upright poses, and reusable pool limits."""
 
 from __future__ import annotations
 
@@ -48,7 +48,8 @@ ASSET_SPECS = (
 )
 # Load a reusable pool so non-Target assets can occupy every surrounding slot,
 # identities can change on reset without rebuilding USD or PhysX topology.
-MAX_ACTIVE_OBJECTS = 10
+MAX_ACTIVE_OBJECTS = 40
+OBJECT_COPIES_PER_ASSET = 10
 OBJECT_SPECS = tuple(
     ObjectSpec(
         name=spec.name if copy_index == 0 else f"{spec.name}_copy_{copy_index + 1:02d}",
@@ -57,7 +58,7 @@ OBJECT_SPECS = tuple(
         asset_name=spec.name,
     )
     for spec in ASSET_SPECS
-    for copy_index in range(MAX_ACTIVE_OBJECTS)
+    for copy_index in range(OBJECT_COPIES_PER_ASSET)
 )
 OBJECT_NAMES = tuple(spec.name for spec in OBJECT_SPECS)
 
