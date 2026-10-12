@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-10, Asia/Seoul**.
+최종 갱신: **2026-10-12, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -14,6 +14,10 @@
 
 **스폰·센서 위에 학습용 MDP와 모델·PPO를 구현했으며, 시간 입력을 현재·직전
 두 sample로 변경했다.**
+사용자의 후속 교정에 따라 **mask는 observation 채널에 포함하지 않으며,
+모델 호출 전에 observation 정보만으로 생성**한다. 이어 역할 ID 대신
+**Target 슬롯 0·Blocker 슬롯 1을 고정**하도록 교정했다. 현재 policy observation은
+초기 물체 기하와 두 72D sample을 합친 **544D**다.
 장면 확인용 `ManagerBasedEnv`와 학습용 `ManagerBasedRLEnv`를 구분한다. 사용자가
 초기에는 최근 16 step 이력을 선택했으나 후속 요청에 따라 **현재 t와 직전 t−1의
 센서·로봇 상태·행동 두 sample**로 줄였다. 18D OSC/hand action,
@@ -167,10 +171,10 @@ Reset 직후 현재 sample만 valid, 직전 sample은 zero/invalid로 두며 그
 | 입력 | 현재 구현 | 후속 교정 |
 |---|---|---|
 | 초기 물체 기하 | 물체별 위치 3D + quaternion(wxyz) 4D + OBB extent 3D = 10D, 현재 EEF 기준 | 단일 시점 visible depth의 근사 오차와 실기 detector |
-| 역할과 유효성 | K=40 슬롯, valid 1D와 Target·Blocker role 2D를 별도로 전달 | 실기에서의 identity/role association |
+| 물체 역할 | K=40 중 슬롯 0=Target·1=Blocker·2–39=주변 물체. 역할 ID 채널 없이 고정 슬롯과 유효 기하로 mask 생성 | 실기에서의 identity/role association과 초기 정렬 |
 | Robot state | Arm 6개·hand 독립 6개 관절의 q/dq 24D + base 기준 EEF pose 7D = 31D | 실제 구동 관절 정규화·동기화 |
-| Wrist F/T | Sensor frame의 중력·bias 보정 force/torque 6D | Filtering·실제 질량과 bias 교정 |
-| Tactile | 접촉 17D + channel validity 17D | 0.01 N은 변경 가능한 초기 threshold |
+| Wrist F/T | Sensor frame의 자중·병진/회전 관성 보상 force/torque 6D, 선택적 residual bias tare | Filtering·실제 질량/관성·가속도 추정과 bias 교정 |
+| Tactile | 17D, 0=비접촉·1=접촉·−1=결측. 유효성 mask는 이 값으로 생성 | 0.01 N은 변경 가능한 초기 threshold |
 | Previous action | 해당 관측 직전 적용한 normalized action 18D | Policy/control 주기 교정 |
 
 K는 Target·Blocker를 포함한 전체 최대 슬롯 수다. 같은 물체 기하를 역할별로
@@ -191,12 +195,22 @@ Camera extrinsic으로 변환한 초기 geometry의 canonical copy를 robot base
 정답으로 대체하지 않는다. 제어·robot EEF pose는 base, 물체 입력은 현재 EEF,
 F/T 입력은 sensor frame을 각각 사용한다.
 
-한 history sample은 `31 + 6 + 17 + 17 + 18 = 89D`다. Actor flat observation은
-`geometry 40×10 + valid 40 + roles 40×2 + history 2×89 + history_valid 2`
-순서로 **700D**다. 현재 sample에는 해당 관측 직전 적용한 action aₜ₋₁,
+한 history sample은 `31 + 6 + 17 + 18 = 72D`다. Actor flat observation은
+`geometry 40×10 + history 2×72`
+순서로 **544D**다. 현재 sample에는 해당 관측 직전 적용한 action aₜ₋₁,
 직전 sample에는 aₜ₋₂를 포함한다. Reset 첫 현재 sample의 action은 0이다.
-Role·valid·history_valid는 별도 mask로 유지하고 padding을
-encoder에서 제외한다. 관절 q/dq는 π·2 rad/s, force/torque는 50 N·5 N·m로
+관측 생성 단계에서 외부 역할 association으로 Target·Blocker의 기하를 각각
+슬롯 0·1에 배치한다. 관측된 주변 물체는 기존 상대 순서대로 슬롯 2부터 채우고
+나머지는 0이다. 역할 물체가 미관측이면 예약 슬롯은 0으로 유지하며 다른 물체로
+대체하지 않는다. 역할 ID 채널은 observation에서 제거했다.
+`build_policy_masks(observation, cfg)`가 observation만으로 물체·역할·history·
+tactile mask를 생성한 뒤 `model.act(obs, masks=...)`로 별도 전달한다.
+물체 유효성은 finite 기하·양의 extent·0이 아닌 quaternion으로, history 유효성은
+finite robot/F/T/action·0이 아닌 EEF quaternion으로 판단한다. 미관측 물체와
+reset 직후의 직전 sample 슬롯은 zero padding, 결측 tactile은 −1이므로 추가 내부 정보가
+필요하지 않다. Reset 현재 tactile도 −1이다. Boolean mask는 learned feature로
+concat하지 않으며 결측 tactile은 encoder에 넣기 전에 0으로 필터링한다.
+관절 q/dq는 π·2 rad/s, force/torque는 50 N·5 N·m로
 정규화하는 초기 설정이다. 과거 `72 + 11K`의 current-only 입력안은 이력 구조로 대체했다.
 
 Actor가 현재 실제 object pose·velocity를 받기로 한 것은 아니다. 시뮬레이터
@@ -208,28 +222,35 @@ History를 외부 상태 추정기로 해석한 뒤 추정 상태를 actor에 �
 현재 구현 구조는 다음과 같다.
 
 ```text
-초기 물체 기하(현재 EEF 재표현)와 역할·valid
+Observation 기하의 고정 역할 슬롯·zero padding·tactile 결측값
+  → 모델 호출 전 물체·역할·history·tactile mask 생성
+초기 물체 기하(현재 EEF 재표현)
   → 공유 node encoder / dense GNN 2 rounds
   → Target·Blocker 조건부 masked attention readout
-현재 t·직전 t−1의 robot state·F/T·tactile·action와 history_valid
+현재 t·직전 t−1의 robot state·F/T·tactile·action
   → 두 sample을 받는 causal convolution
 두 encoder feature 결합
   → bounded Gaussian actor의 18D action + shared critic
 ```
 
-- 슬롯 나열 순서를 바꿔도 같은 장면에 대해 같은 판단을 하도록 집합을 처리한다. 실제 공간 배치는 입력에 남아야 한다.
+- Target·Blocker 슬롯 0·1은 역할을 나타내므로 고정한다. 주변 물체 슬롯 2 이상은 순서를 바꿔도 같은 장면에 대해 같은 판단을 하도록 집합을 처리한다. 실제 공간 배치는 입력에 남아야 한다.
 - GNN edge는 메시지 교환을 허용하는 연결이다. 접촉·방해 관계의 정답 label을 미리 제공하는 것으로 정하지 않았다.
 - 로봇에 대한 물체 위치를 판별할 정보가 필요하다. 물체 간 상대 관계만 남기는 구조로 단순화하지 않는다.
 - Role mask와 valid mask는 목적이 다르다. Zero padding에서 valid를 만들면 noise·정규화 전에 생성하고 message passing과 attention에서 padding을 제외한다.
 - GNN의 같은 forward 내 message-passing 반복과 episode의 시간적 기억은 다르다.
 - Node 64D, message passing 2 rounds의 dense valid edge를 사용하며 self/padding edge를 제외한다. Edge feature는 초기 물체 간 상대 위치·extent 차이다. Role-conditioned query는 Target·Blocker embedding에서 만들며 두 attention readout과 role/global feature를 결합한다.
-- History encoder는 64D causal convolution이며 기본 1개 layer로 현재·직전 두 sample을 처리한다. Padding을 제외하고 유효 sample만 pooling한다. Fused latent는 128D이며 기본 모델은 248,997개 parameter다. 더 오래된 sample이나 지속 hidden state는 제공하지 않는다.
-- Custom PPO가 scene/history encoder와 actor/critic을 공동학습한다. Actor와 critic은 같은 700D 입력과 encoder를 공유하며 privileged critic·현재 물체 GT 입력·보조 예측 head/loss는 추가하지 않았다.
+- Node encoder는 기하 10D, history projection은 sample 72D를 입력으로 받는다. Mask는 learned feature로 concat하지 않고 선택·필터링에 사용하며 역할 ID 채널도 없다.
+- History encoder는 64D causal convolution이며 기본 1개 layer로 현재·직전 두 sample을 처리한다. Padding을 제외하고 유효 sample만 pooling한다. Fused latent는 128D이며 기본 모델은 247,717개 parameter다. 더 오래된 sample이나 지속 hidden state는 제공하지 않는다.
+- Custom PPO가 scene/history encoder와 actor/critic을 공동학습한다. Actor와 critic은 같은 544D 입력과 encoder를 공유하며 privileged critic·현재 물체 GT 입력·보조 예측 head/loss는 추가하지 않았다. Rollout·PPO minibatch·timeout 마지막 관측에서 모두 observation만으로 mask를 다시 생성한다.
 - Tanh-Gaussian action의 log probability에는 변환 Jacobian을 반영한다. GAE는 실제 terminal state에서 bootstrap하지 않고, timeout에서는 auto-reset 이전 실제 final observation의 value로 bootstrap하며 다음 episode의 advantage를 이어 붙이지 않는다.
 
-이전 16-step 모델은 관측 1960D·286,053 parameter였다. 현재 2-sample 모델의
-관측·network 규격이 달라 그 checkpoint로 이어 학습할 수 없다. 아래의 기존
-16-step 검증 기록은 당시 모델의 결과이며 현재 규격의 검증과 구분한다.
+이전 16-step 모델은 관측 1960D·286,053 parameter, mask 채널을 포함했던
+2-sample 모델은 700D·248,997 parameter, 역할 ID를 사용하던 모델은
+584D·247,717 parameter였다. 현재 모델은 고정 슬롯 관측 규약
+`observation_layout="fixed_roles_v1"`을 checkpoint에 저장한다. 역할 ID 제거 전후
+network weight shape가 같아도 관측 규약을 검증하며 이전 checkpoint를 직접
+복원하지 않는다. 아래의 기존 검증 기록은
+각 당시 모델의 결과이며 현재 규격의 검증과 구분한다.
 
 ### Action과 제어
 
@@ -289,7 +310,7 @@ physics substep의 측정 q에서 `min(native velocity limit, hand_target_rate)`
 
 **Formulation v2를 새 학습 환경에 구현했으며 수치는 초기 실행 기본값이다.**
 Transition `s_t → s_{t+1}`에 대해 계산한다. 상위 weight는 비음수, scale과
-`Δt`는 양수다. 최종 weight·scale·soft threshold·종료 허용오차와 학습 충분성은 미정이다.
+`Δt`는 양수다. 최종 weight·정규화 scale·종료 허용오차와 학습 충분성은 미정이다.
 `MdpCfg`의 현재 상위 weight 4개는 모두 1, `d_0=0.5 m`, `T_ref=10 s`,
 성공 bonus 500·실패 penalty 100이다. Episode timeout 8초는 별도 초기 설정이다.
 
@@ -334,26 +355,42 @@ $$
 
 ### 운동과 접촉 안정성
 
-네 무차원 비용을 지수 점수로 바꾸어 동일 계수로 평균한다.
+최신 사용자 교정에 따라 **빠른 속도·큰 힘 자체를 비용으로 보지 않고,
+급격한 관절 가속도와 힘·토크 크기 증가**를 평가한다. 두 무차원 비용을
+지수 점수로 바꾸어 동일 계수로 평균한다.
 
 $$
-r_t^{\mathrm{motion}}=\frac14
-\sum_{j\in\{\mathrm{vel,acc,load,rate}\}}\exp(-x_{j,t})
+r_t^{\mathrm{motion}}=\frac12
+\left[\exp(-x_{\mathrm{acc},t})+\exp(-x_{\mathrm{inc},t})\right]
 $$
 
 | 비용 | 현재 계산 의미 |
 |---|---|
-| `x_vel` | 전체 물체의 평면 선속도·각속도의 soft 기준 초과분을 각각 ref로 나누고 제곱해 합산 |
-| `x_acc` | 전체 물체의 선가속도·각가속도를 각각 ref로 나누고 제곱해 합산 |
-| `x_load` | 보정 wrist force·moment norm의 soft 기준 초과분을 각각 ref로 나누어 합산. 현재 식은 제곱하지 않음 |
-| `x_rate` | 힘·토크 시간 변화율을 각각 ref로 나누고 제곱해 합산 |
+| `x_acc` | 같은 12관절의 속도 변화 / control dt를 가속도 ref로 정규화·제곱해 합산 |
+| `x_inc` | 힘·토크 norm의 증가분만 control dt와 rate ref로 나누고 제곱해 합산 |
 
-네 그룹 사이의 내부 λ는 두지 않는다. 다른 reward와의 비중은 상위 `w_motion`으로
-조절한다. 가속도와 wrench 변화율은 `Δt`로 차분한다. Wrench는 중력·bias 보정
+두 그룹 사이의 내부 λ는 두지 않는다. 다른 reward와의 비중은 상위 `w_motion`으로
+조절한다. Joint 가속도와 하중 증가율은 `Δt`로 차분한다. Acceleration 비용은
+`Σ_j(((q̇_j−q̇_previous,j)/dt)/a_ref,j)^2`이며 mimic 관절은 제외한다. Object 수나
+순서에 따라 Motion 비용이 바뀌지 않는다. Robot 속도는 실제 rad/s를 사용하고
+actor의 정규화 q̇를 비용 입력으로 재사용하지 않는다. Acceleration ref는
+arm 5·hand 10 rad/s²다. 증가율은 `max(||F_t||−||F_previous||,0)/dt` 및 torque의
+같은 식을 force 200 N/s·torque 10 N·m/s로 정규화해 제곱한다. 사용자가
+**크기의 급격한 증가만 비용 부여**를 선택했으므로 감소·동일 크기의 방향 변화는
+이 비용에 포함하지 않는다. Sensor 반력의 음수 부호에도 norm 증가를 평가한다.
+일정한 높은 q̇·일정한 큰 하중은 두 비용이 0이면 Motion 점수가 1이다.
+기존 속도·절대 하중 soft/ref 설정과 두 항은 제거했다. 정규화 ref는 비용 문턱이
+아니며 연구 최종 기준이나 hard limit가 아닌 실행 초기값이다. 두 항 평균이므로
+기존 네 항 평균에서 한 항이 포화될 때와 Motion 점수 감소 폭이 달라진다.
+Reset의 이전 q̇는 해당 환경의 실제
+초기 속도로 설정하고 매 완료 전이에서 한 번만 갱신한다. 물체 이동은 최소
+재배치 비용, 물체 속도는 안정성·종료 판정에 유지한다. Wrench는 자중·관성·bias 보정
 후 같은 좌표축·토크 기준점에서 비교해야 한다. Actor의 sensor-frame 입력과
 reward 계산 좌표계를 혼동하지 않는다. Actor에는 움직이는 sensor center의
-sensor-frame 보정 wrench를 제공한다. 중력 support와 downstream COM의 moment를
-빼고 명시적 tare에서 남은 bias만 보정하며 관성·접촉 신호는 남긴다. Reward에는
+sensor-frame 보정 wrench를 제공한다. 센서 뒤 33개 링크 각각의
+`m(a_COM−g)`와 COM lever arm에 의한 moment, `I_world α + ω×(I_world ω)`를
+합산해 raw에서 제거하고 명시적 tare에서 남은 bias만 보정한다. 외력·접촉 반력은
+원래 parent→child 부호로 유지한다. Reward에는
 이를 world 축으로 회전하고 **episode 시작 sensor center라는 고정 기준점**으로
 moment를 옮긴 값을 사용하므로 sensor 회전·이동 자체가 wrench rate로 섞이지 않는다.
 
@@ -382,6 +419,30 @@ $$
 성공 bonus를 **할인된 누적 대기 return**과 비교해야 한다. 안정성 항이 rapid
 동작을 과도하게 막는지, 물체 수에 따른 합산 scale 변화, 평면 면적이 실제 hand/arm
 접근 가능성을 충분히 나타내는지도 검증해야 한다.
+
+사용자는 성공 terminal **+500**이 다른 항보다 dominant해질 위험을 지적했다.
+이는 검증으로 정한 값이 아닌 구현 초기값이다. 현재 30 Hz·8초(240 step)·
+γ=0.99에서 dense step 최대는 `3−1/300≈2.9967`, 240-step 할인 누적 최대는
+**272.808**이다. 성공 bonus의 초기 상태 return 기여는 2초 성공 **276.342**,
+4초 **151.202**, 8초 **45.267**이다. 따라서 단일 성공 전이에서는 크지만,
+모든 성공 시점에서 전체 return을 반드시 지배한다고 해석하지 않는다.
+같은 시점에 성공하는 두 경로에서는 terminal 항이 같아 dense 품질 차이는 남는다.
+
+성공을 한 step 미루는 비교에서 즉시 성공은 `r_success+B`, 기다린 뒤 성공은
+`r_wait+γ(r_success+B)`다. 기다림이 유리한 조건은
+`r_wait>(1−γ)(r_success+B)`다. 매-step dense=2라는 예에서는 B가 **198보다
+작으면** 한 step 지연이 유리할 수 있다. Bonus를 낮추기만 하면 양의 지속 reward가
+대기/성공 지연을 유도할 수 있으므로 terminal과 dense baseline을 함께 설계해야 한다.
+
+현재 PPO는 advantage만 batch 정규화하고 return/critic target은 정규화하지 않는다.
+정규화가 terminal 대 다른 항의 상대적 비중을 제거하지 않으며, 큰 terminal TD
+오차는 actor/critic 공유 encoder와 global gradient clipping에 영향을 줄 수 있다.
+실제 dominant 학습 여부는 성공/실패별 discounted term return·완료 시간·actor/critic
+gradient 크기로 검증해야 한다. 기존 smoke 검증에는 task 성공이 없으므로 이 균형을
+입증한 결과로 사용하지 않는다. Quality 항을 zero 기준 비용으로 바꾸고 terminal
+비중을 비교하는 것은 **미채택 검토안**이다. 이 질의에서는 +500·−100이나 reward
+수식을 추가 변경하지 않았다. 전체 reward를 공통 배율로 나누는 것은 critic의 수치
+scale만 바꾸며 상대적 목적 가중치 문제의 해결과 구분한다.
 
 로컬 Isaac Lab [RewardManager](../IsaacLab/source/isaaclab/isaaclab/managers/reward_manager.py)는
 각 term에 `weight * dt`를 곱한다. Policy-step 수식을 그대로 옮길 때 시간 벌점의
@@ -447,6 +508,11 @@ history 제거·교란 시 성능 변화, 비슷한 현재 관측과 서로 다�
 | 2026-10-10 중앙 F/T·초기 vision | 원통 중앙 fixed-joint F/T와 앞쪽 camera를 추가한다. 원통의 두 25 mm rigid half를 통해 hand load가 중앙 joint를 지나게 하고 raw sensor-frame wrench를 읽는다. 실제 같은 pose의 비가림 silhouette로 Target ≥40%·Blocker 전체 가시성을 승인하고 초기 RGB-D를 보존한다. Nominal mount mass 0.20 kg는 구현값이며 실제 하드웨어 질량으로 확정하지 않는다. |
 | 2026-10-10 독립 tactile 17채널 | 기존 URDF tactile link 17개에 독립 ContactSensor를 연결하고 net normal force norm >0.01 N을 binary로 관측한다. Palm·finger pad-2의 원래 CAD slot을 메우던 부모 5개 convex hull을 convex decomposition으로 바꿔 접촉이 pad까지 닿게 한다. Source URDF·visual·mass/inertia·41 body·18 DOF·41 collider prim은 유지한다. 실제 sphere contact로 모든 채널 ON/OFF와 reset/다중 환경 cache 보존을 확인했다. |
 | 2026-10-10 시간 입력 축소 | 사용자가 16-step history를 previous step까지만 제공하도록 요청했다. 현재 t·직전 t−1의 두 sample로 줄여 기본 입력을 1960D에서 700D로 변경하고 temporal convolution을 1개 layer로 줄인다. GNN·역할 attention·18D action·좌표계·PPO rollout 길이는 유지한다. 기존 16-step checkpoint와 새 규격의 이어 학습은 호환되지 않는다. |
+| 2026-10-10 mask 전달 교정 | 사용자가 mask는 observation이 아니라 모델 입력 전에 별도로 생성하며 observation 정보만으로 만들 수 있어야 한다고 교정했다. Mask feature 채널을 제거하고 역할 ID·zero padding·tactile 결측 −1로부터 Boolean selector를 생성한다. Policy 입력은 584D, 각 sample은 72D, 모델은 247,717 parameter다. 이전 700D checkpoint는 호환되지 않는다. |
+| 2026-10-12 역할 슬롯 고정 | 사용자가 역할 ID 대신 Target·Blocker의 observation 위치를 고정하자고 요청했다. Target 슬롯 0·Blocker 슬롯 1·주변 물체 슬롯 2 이상으로 정렬하고 역할 ID 40D를 제거한다. Observation 544D이며 역할 mask는 고정 슬롯과 기하 유효성으로 생성한다. 두 sample·기하 encoder·247,717 parameter를 유지한다. |
+| 2026-10-12 F/T 관성 보상 | 자중만 제거하고 운동 관성이 남던 F/T에 관성 보상도 필요하다고 사용자가 요청했다. 센서 손쪽 33개 링크의 COM 병진 가속도·회전 가속도·각속도와 질량·관성으로 Newton–Euler 자체 반력을 계산해 제거한다. Observation·하중 reward·F/T 실패 판정에 공통 적용한다. |
+| 2026-10-12 Motion의 robot 기준 교정·tactile 검토 | 사용자가 Motion reward는 물체가 아닌 robot joint 속도 등의 기준이어야 한다고 교정하고 tactile의 역할을 검토하자고 요청했다. Motion의 속도·가속도 비용을 arm 6 + hand 독립 6관절로 바꾸며 F/T load/rate 네 항 구조를 유지한다. Tactile은 기존 observation으로 유지하고 신호 보존·reward 유인 문제를 검토하며 새 tactile reward는 채택하지 않았다. |
+| 2026-10-12 Motion의 급격한 변화 기준 교정 | 사용자가 빠른 속도·큰 힘 자체보다 급격한 가속·힘 증가를 억제하는 목적이라고 교정했다. 속도·절대 하중 reward 항과 soft 기준을 제거하고 joint acceleration·F/T norm 증가율 두 항만 평균한다. 후속 선택은 힘·토크 크기의 증가만 비용 부여이며 빠른 감소와 같은 크기의 방향 변화는 제외한다. 하드 안전 한계는 별도 유지한다. |
 
 Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. 논문의 성과를 우리
 과업의 성공·속도·상태 이해 결과로 기록하지 않는다.
@@ -465,7 +531,7 @@ Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. �
 장면 확인용 `ManagerBasedEnv`는 빈 action manager와 PD hold를 사용하며
 `sensors` group에서 raw F/T·17채널 tactile/valid·초기 RGB-D·역할 mask·camera
 pose를 반환한다. 학습용 `ContactRearrangementRLEnv`는 별도 설정으로 18D
-OSC/hand action·Reward v2·종료 조건과 700D `policy` group을 사용한다.
+OSC/hand action·Reward v2·종료 조건과 544D `policy` group을 사용한다.
 초기 visible-depth 기하·현재 EEF 재표현·현재/직전 두 sample, GNN/attention/temporal
 encoder와 shared actor/critic·custom PPO를 구현했다. `train.py`는
 `--task Isaac-Contact-Rearrangement-UR5e-v0`의 registry에서 환경·agent 설정을
@@ -490,7 +556,7 @@ encoder와 shared actor/critic·custom PPO를 구현했다. `train.py`는
 - 장면 확인용 `spawn_scene.py`는 기본적으로 시뮬레이션 시간 5초마다 전체 환경을 reset해 새 배치를 생성한다. 실제 `env.step_dt`로 간격을 계산하며 현재 설정에서는 150 step이다. `--reset_interval N`으로 step 간격을 지정하고 0이면 자동 reset을 끈다. 이 설정은 실행 스크립트의 확인 주기이며 학습 episode timeout을 확정하는 것은 아니다.
 - `RoleObbVisualizer`는 Target 초록색·Blocker 빨간색 OBB를 표시한다. 각 역할의 12개 모서리를 현재 body link pose·local bounds에서 계산해 YCB upright·root offset·합성 scale을 반영하고 매 step과 전체/부분 reset 뒤 갱신한다. Debug draw만 사용하며 USD prim·collider·material·physics state를 쓰지 않는다. GUI·livestream에서 기본 표시하고 `--disable_role_obb`로 끈다. 일반 headless에서는 생략하며 `--headless --validate`에서 viewport 없이 overlay 검사를 실행한다. 제한된 headless·GUI 검사 결과는 8절에 기록한다.
 - Reset은 물체 sample 뒤 Blocker 앞의 robot 시작 후보를 찾고 실제 앞쪽 camera 렌더로 초기 가시성을 승인한다. Camera 32개 후보가 실패하면 같은 역할·종류·active ID·개수로 pose를 다시 제안하며 최대 8개 layout을 검사한다. 승인된 pose·A₀·robot 시작 metadata와 initial snapshot을 해당 환경에 저장하고 후보 실패 시 기존 physical pose·metadata로 복구한다. Render는 physics/settling step을 추가하지 않으며 pool의 simulation/native gravity와 inactive parking/countergravity를 유지한다.
-- 17개 tactile link에 각각 독립 ContactSensor를 붙이고 binary contact·valid mask를 관측한다. 중앙 fixed-joint raw F/T를 유지하고 학습 actor에는 sensor-frame 중력·bias 보정값을 제공한다. Filtering·실제 하드웨어 threshold/질량 교정은 후속 단계다.
+- 17개 tactile link에 각각 독립 ContactSensor를 붙인다. 장면 확인 dictionary에는 binary contact·valid를 제공하며, 학습 policy에는 0/1 또는 결측 −1의 17개 측정값만 넣는다. 중앙 fixed-joint raw F/T를 유지하고 학습 actor에는 sensor-frame 자중·관성·선택적 bias 보정값을 제공한다. Filtering·실제 하드웨어 threshold/질량·관성·가속도 추정 교정은 후속 단계다.
 - 학습 `UR5eHandLearningSceneCfg`에만 arm/spacer의 9개 금지 접촉 sensor를 추가한다. 설정 factory는 `src/sensors.py`, 최근 4-substep/각 partner >1 N 판정은 `mdp/actions.py`, threshold는 `ContactRearrangementRLEnvCfg.forbidden_contact_threshold`에 둔다. Hand 조작 접촉을 이 판정에 포함하지 않으며 Target의 실제 이동 보호는 MDP가 맡는다. 이 접촉 분류·threshold는 초기 task 기본값이다.
 
 ### Blocker 앞의 robot 시작 randomization
@@ -603,7 +669,7 @@ depth `480×640×1` m, Target/Blocker 순서의
 episode 중 image를 갱신하지 않는다. 비가림 reference·가시성 비율은 reset의
 acceptance metadata이며 observation으로 제공하지 않는다. 학습용 `policy` group은
 이 초기 snapshot의 visible depth에서 추정한 OBB10과 robot/sensor/action 이력을
-별도로 구성한다. Raw sensor dictionary와 actor의 중력·bias 보정 F/T를 구분한다.
+별도로 구성한다. Raw sensor dictionary와 actor의 자중·관성·bias 보정 F/T를 구분한다.
 
 ### 기존 hand link의 독립 tactile 17채널
 
@@ -1569,11 +1635,11 @@ observation, OBB 표시의 USD/PhysX 불변 검사를 통과했다. 로그는
 `outputs/contact_rearrangement/structure_spawn_validation.log`다. 이 구조 변경
 검증을 재배치 정책의 수렴이나 task 성공률로 해석하지 않는다.
 
-### 2026-10-10 시간 입력을 현재·직전 관측으로 축소
+### 2026-10-10 시간 입력을 현재·직전 관측으로 축소 — mask 전달 교정 전 기록
 
 사용자가 previous step 정보까지만 제공하도록 요청해 관측 window를
 **현재 t와 직전 t−1의 두 sample**로 변경했다. `MdpCfg.history_length`와
-`ModelCfg.history_steps`는 2, actor/critic 입력은 **700D**, 기본 모델은
+당시 `ModelCfg.history_steps`는 2, actor/critic 입력은 **700D**, 기본 모델은
 **248,997 parameter**다. Temporal convolution은 두 sample에 맞춰 1개 layer로
 구성하며 초기 장면 GNN·역할 attention·18D action·Reward v2·좌표계를 유지한다.
 Reset 직후 현재 sample만 valid이고 직전 sample·현재 action은 0이다.
@@ -1599,12 +1665,287 @@ parameter 갱신·GPU checkpoint 복원을 확인했다. Rollout history는 두 
 `outputs/contact_rearrangement/previous_step_learning_smoke/model_latest.pt`다.
 짧은 통합 검증이며 정책 수렴이나 task 성공률을 입증하지 않는다.
 
+### 2026-10-10 observation만으로 모델 입력 전 mask 생성 — 역할 슬롯 고정 전 기록
+
+사용자가 mask를 observation에 포함한 구현을 교정하고 **observation 정보만으로
+생성해야 함**을 명시했다. Actor 관측은 초기 기하 400D·categorical 역할 ID
+40D·현재/직전 sample 각 72D를 합친 **584D**로 변경했다. 물체·history valid,
+one-hot 역할 mask, tactile valid의 별도 feature 채널을 제거했다.
+
+물체 zero padding의 extent·quaternion, history zero padding의 EEF quaternion,
+tactile 0/1과 결측 −1, 외부 역할 ID로 모든 policy mask를 생성한다.
+`build_policy_masks`는 simulator나 env를 인자로 받지 않는다. 내부 perception
+유효성과 `MdpState.history_valid`는 observation producer의 padding·reset 관리에
+사용하며 policy 호출의 mask는 packed observation에서 다시 계산한다.
+Reset 직후 현재 sample은 유효하고 이전 sample은 0, 현재 tactile은 −1이다.
+Model에 mask를 별도 keyword로 전달하며 node encoder는 기하 10D,
+history encoder는 측정 72D만 projection한다. 새 모델은 **247,717 parameter**다.
+PPO rollout·minibatch·timeout 마지막 관측 모두 같은 전처리를 사용한다.
+이전 700D·1960D checkpoint는 새 규격과 호환되지 않는다.
+
+**검증:** CPU **110개**가 **32.977초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 27, model 20, PPO/runner 7, registration 2다.
+Observation만으로 mask 생성, 접촉 OFF와 결측 구분, zero/NaN padding,
+reset 이력과 역할 선택, GNN 10D·history 72D projection, 순열 불변성·gradient,
+새 checkpoint 복원과 이전 89D sample checkpoint 거부를 검사했다.
+
+Isaac Lab 2.3.2·Isaac Sim 5.1·RTX 3090의 실제 GPU에서 **2환경·64 transition·
+PPO update 2회**, failure 0회·timeout 2회로 exit code 0을 확인했다.
+매 전이의 packed observation으로 생성한 mask를 내부 producer 기록과
+검증용으로 대조했다. 모델 호출은 같은 observation에서 생성한 mask만 받는다.
+Reset 뒤 이전 sample 제거·현재 tactile 결측, timeout 전 마지막 관측의
+history mask와 value bootstrap, EEF 좌표계·보상·실제 금지 접촉·parameter
+갱신·GPU checkpoint 복원이 통과했다. Rollout wrench peak는 **1.4037 N /
+0.1879 N·m**였다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--log_dir outputs/contact_rearrangement/observation_mask_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/observation_mask_learning_validation.log`,
+checkpoint는 `outputs/contact_rearrangement/observation_mask_learning_smoke/model_latest.pt`다.
+이 결과는 짧은 통합 검증이며 정책 수렴이나 재배치 성공률을 입증하지 않는다.
+
+### 2026-10-12 역할 ID를 제거하고 Target·Blocker 슬롯 고정
+
+사용자가 물체 역할 ID를 관측에 넣는 대신 Target·Blocker의 관측 위치를
+고정하자고 요청했다. Policy 관측에서 Target은 슬롯 0, Blocker는 슬롯 1,
+관측된 주변 물체는 슬롯 2부터 기존 상대 순서대로 배치한다. 남는 슬롯과
+관측되지 않은 역할 물체의 예약 슬롯은 0으로 채운다. 슬롯 0·1을 주변 물체로
+채우거나 missing role을 다른 물체로 대체하지 않는다.
+
+기하는 여전히 승인한 초기 RGB-D의 visible depth로 추정한 EEF-frame OBB이며
+현재 물체 GT로 대체하지 않는다. 외부 역할 association은 관측 정렬에 사용하고
+정책에는 별도 역할 ID를 전달하지 않는다. 초기 기하 400D와 두 72D sample의
+합인 **544D**로 줄인다. `build_policy_masks`는 고정 슬롯과 기하 유효성만으로
+Target·Blocker mask를 만들며, 모든 mask는 모델 호출 전에 observation만으로
+생성한다. 물체·history padding과 tactile 결측 −1 규칙을 유지한다.
+
+GNN node 입력 10D·시간 입력 72D·18D action·Reward v2·좌표계와
+**247,717 parameter**를 유지한다. Policy의 순열 불변성은 역할 슬롯을 고정한
+상태에서 주변 물체 슬롯의 순서에 적용한다. Network weight shape가 같아도
+서로 다른 관측 규약을 혼동하지 않도록 ModelCfg와 checkpoint에
+`observation_layout="fixed_roles_v1"`을 기록하고 이전 규약의 직접 복원을 거부한다.
+
+**검증:** CPU **122개**가 **32.329초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 34, model 23, PPO/runner 9, registration 2다.
+환경마다 다른 원본 role 위치의 고정 슬롯 정렬, 입력 메타데이터 무변경,
+미관측 역할 슬롯 유지, 주변 물체 순열 불변성, Target·Blocker 교체의 의미 변화,
+관측만으로 mask 생성, 새 checkpoint·optimizer 복원과 이전 규약 거부를 확인했다.
+
+Isaac Lab 2.3.2·Isaac Sim 5.1·RTX 3090의 실제 GPU에서 **2환경·64 transition·
+PPO update 2회**, failure 0회·timeout 2회로 exit code 0을 확인했다.
+기존 canonical 초기 기하와 역할 기록에서 독립적으로 정렬한 base-frame 기준을
+만들어 packed 관측의 slot·mask 및 EEF→base SDK 변환을 매 전이에서 대조했다.
+Reset 결측·현재/직전 action 정렬, timeout의 true final observation,
+실제 금지 접촉·보상·parameter 갱신·GPU checkpoint 복원이 통과했다.
+Rollout wrench peak는 **1.4038 N / 0.1879 N·m**였다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--log_dir outputs/contact_rearrangement/fixed_role_slots_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/fixed_role_slots_learning_validation.log`,
+checkpoint는 `outputs/contact_rearrangement/fixed_role_slots_learning_smoke/model_latest.pt`다.
+이 검증은 학습 코드 연결과 관측 규약의 확인이며 정책 성능 입증은 아니다.
+
+### 2026-10-12 F/T 자중과 운동 관성 보상
+
+사용자가 F/T의 자중·관성 보상 여부를 확인한 뒤 관성도 제거하도록 요청했다.
+기존 policy F/T는 자중만 제거하고 운동 관성을 남겼다. 이제 센서 손쪽 원통
+절반과 hand를 포함한 **33개 body**에 대해 자체 Newton–Euler 반력을 계산한다.
+링크별 질량 `m_i`, world COM 가속도 `a_i`, 각가속도 `α_i`, 각속도 `ω_i`,
+센서 중앙에서 COM까지의 world 벡터 `r_i`로 다음을 계산한다.
+
+$$
+F_{self}=\sum_i m_i(a_i-g),\qquad
+\tau_{self}=\sum_i\left[r_i\times m_i(a_i-g)
+    + I_i^w\alpha_i + \omega_i\times(I_i^w\omega_i)\right].
+$$
+
+World에서 합산한 힘·토크를 현재 sensor frame으로 변환해 raw에서 빼고
+선택적으로 residual bias를 제거한다. 이로써 무접촉 운동의 자중·관성은 제거하고
+외력·접촉의 반력을 raw parent→child 부호로 유지한다. 원통 distal 링크의
+actor origin인 센서 중앙을 torque 기준점으로 삼으며 센서 COM과 구분한다.
+
+PhysX `get_inertias()`는 COM 기준 actor/link-frame tensor를 column-major로
+반환하므로 reshape·transpose해 저장하고 **link quaternion**으로 회전한다.
+COM principal-axis quaternion으로 다시 회전하지 않는다. Native
+`body_com_acc_w`와 `body_com_ang_vel_w`는 raw 반력과 동일한 마지막 완료
+physics step의 world COM 운동을 읽는다. 손가락의 독립 운동과 COM 구심 가속도도
+포함하며 policy 30 Hz 속도 차분으로 근사하지 않는다.
+
+Invalid/reset F/T는 motion을 평가하지 않고 0을 반환한다. 관성용 temporal cache를
+추가하지 않아 부분 reset의 이전 운동이 이어지지 않는다. `tare_compensated_wrench`
+는 전체 자체 반력을 제거한 뒤의 residual만 기록하며 자동 tare는 하지 않는다.
+Raw sensor·물리 force·contact·544D observation 구조·센서 좌표계는 유지한다.
+보상·F/T 실패 판정에도 같은 `corrected_wrench`를 사용한다.
+시뮬레이션에서는 native 질량·관성·가속도를 사용하며 실기는 calibrated 동역학
+모델과 관절/IMU 기반 운동 추정·동기화가 필요하다.
+
+**검증:** 현재 소스로 전체 CPU **129개**가 **32.058초**에 통과했다.
+Sampling 32, action/contact/control 22, MDP 41, model 23, PPO/runner 9,
+registration 2다. 신규 7개 회귀 검사에서 병진 관성과 센서-center lever moment,
+비등방 회전 관성, 일정 각속도의 gyro, 독립적으로 움직이는 링크와 COM
+principal-axis/actor-frame 구분, reset stale NaN·부분 reset 격리·residual tare를 확인했다.
+
+별도 실제 GPU 센서 검사는 **2환경·151 environment step + 2 environment step +
+19 bench physics step**으로 완료했다. Wrist ±0.02 rad와 index +0.03 rad의
+무접촉 운동에서 자중만 제거한 피크 **1.2007 N / 0.140091 N·m**가 전체 보상 후
+**4.44494e−6 N / 0.000312104 N·m**로 줄었다. 알려진 각 축 3 N 힘·0.10 N·m
+토크의 외력 반력 보존 오차는 최대 **0.012221 N / 0.000850212 N·m**였다.
+독립 SciPy Newton–Euler raw 반력 대조와 반복 읽기의 물리 상태 무변경,
+초기 vision snapshot 보존·전체/부분 reset도 통과했다. 임시 bench의 force·joint
+target·MDP 상태·sensor cache를 복구하고 최종 정상 reset을 확인했다.
+로그는 `outputs/contact_rearrangement/inertia_sensor_validation.log`이며
+`check_sensors.py --num_envs 2 --seed 0`으로 실행했다.
+
+학습 환경 GPU에서는 **2환경·64 transition·PPO update 2회**, failure 0회·timeout
+2회로 exit code 0과 `LEARNING_VALIDATED`를 확인했다. Observation은 **544D**,
+모델은 **247,717 parameter**를 유지했다. Hold·실제 spacer 금지 접촉,
+정렬된 EEF 물체 기하·두 sample 정렬·reset·timeout 마지막 관측·reward 일관성,
+parameter 갱신과 GPU checkpoint 복원이 통과했다. Rollout의 보상된 wrench 피크는
+**4.90412e−6 N / 0.00239641 N·m**였다. 마지막 자세·속도/가속도와 physics-step
+평균 반력을 사용하는 이산화 차이 등의 작은 torque 잔차는 남는다.
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--log_dir outputs/contact_rearrangement/inertia_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/inertia_learning_validation.log`, checkpoint는
+`outputs/contact_rearrangement/inertia_learning_smoke/model_latest.pt`다.
+이는 시뮬레이션 보상·학습 연결 검증이며 실기 보상 정확도나 정책 성능의 입증은 아니다.
+
+### 2026-10-12 Motion reward의 로봇 관절 기준 교정 — 속도·절대 하중 항 제거 전 기록
+
+사용자가 Motion 항은 물체 운동보다 로봇 joint 운동을 평가해야 한다고 교정했다.
+`reward_components`의 velocity/acceleration 입력을 object velocity에서 native
+**UR5e 6 + hand 독립 6관절의 q̇**로 바꿨다. 물체가 정지해도 로봇이 움직이면
+Motion 비용이 발생할 수 있으며, 로봇이 정지한 채 물체가 움직이면 이 비용이
+바뀌지 않는다. 물체의 누적 XY 이동은 Rearrangement, 물체의 정착 속도는
+성공/안정성 판정에서 계속 평가한다. Mimic 관절은 중복 비용에 포함하지 않는다.
+
+Velocity 비용은 각 joint의 속도 절댓값에서 soft 기준을 뺀 양수 부분을 ref로
+정규화·제곱한 12관절 합이다. Acceleration 비용은 직전 q̇와 현재 q̇를 control
+dt로 차분한 값을 ref로 정규화·제곱한 합이다. 초기 soft/ref는 arm·hand 모두
+**0.5/1 rad/s**, acceleration ref는 **arm 5·hand 10 rad/s²**다.
+기존 자중·관성 보상 F/T load/rate 및 `mean(exp(−costs))`의 네 항을 유지한다.
+선택 reset에서만 `previous_joint_velocity`를 실제 초기 q̇로 초기화해 이전
+episode의 움직임을 acceleration 비용으로 이어 붙이지 않는다.
+
+`extras.motion_costs`는 검증·진단용이며 policy observation에 추가하지 않는다.
+Auto-reset된 전이에서도 reset 전 값을 보존한다. GPU 검증은 마지막 관측과
+직전 관측의 q̇를 rad/s로 복원해 속도·가속도 비용을 독립 계산하고
+`mean(exp(−costs))` 및 native continuing joint velocity를 대조한다.
+
+**검증:** CPU **136개**가 **32.501초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 48, model 23, PPO/runner 9, registration 2다.
+신규 검사는 로봇 운동/물체 정지와 로봇 정지/물체 이동의 비용 분리,
+관절 부호·arm/hand scale, control dt에 따른 acceleration 제곱 비용,
+mimic 제외·반복 manager 조회·부분 reset의 실제 초기 q̇를 포함한다.
+
+실제 GPU의 **2환경·64 transition·PPO update 2회**, failure 0회·timeout 2회가
+exit code 0과 `LEARNING_VALIDATED`로 통과했다. 매 전이의 native q̇와 관측 이력을
+비교하고, auto-reset 전 속도·가속도 비용과 Motion 점수를 독립 복원했다.
+544D observation·247,717 parameter·관성 보상 F/T·단계별 action/geometry,
+hold·실제 금지 접촉·terminal bootstrap·checkpoint 복원도 통과했다.
+Rollout별 평균 `[velocity,acceleration,load,rate]` 비용은 각각
+`[0.006463,11.19205,0,0.00001095]`,
+`[0.001345,13.84008,0,0.00001990]`였다. 이 무작위 초기 정책에서는 가속도 비용이
+큰 편이며 현재 ref의 최종 적합성이나 학습 성능을 입증하지 않는다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--log_dir outputs/contact_rearrangement/joint_motion_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/joint_motion_learning_validation.log`,
+checkpoint는 `outputs/contact_rearrangement/joint_motion_learning_smoke/model_latest.pt`다.
+
+### Tactile의 역할과 후속 검토 — 새 동작은 미채택
+
+사용자는 tactile에 대해 고민하자고 요청했다. 현재 **17개 binary pad**는
+observation으로 유지하며 tactile reward·새 observation 채널·sampling 규칙을
+추가한 것으로 기록하지 않는다. 각 pad의 실제 net normal force norm >0.01 N을
+접촉으로 판단하고 미측정은 −1로 구분한다. F/T는 손 전체의 합력·합모멘트,
+tactile은 어느 손 부위가 닿았는지를 알려준다. 서로 다른 pad의 접촉 힘이
+상쇄돼 F/T가 작아져도 tactile의 공간 패턴은 남을 수 있다. 한 pad 안의 여러
+접촉이 net force에서 상쇄되면 binary 자체가 OFF가 될 수 있으므로 접촉 개수를
+정확히 센다고 해석하지 않는다.
+
+Binary tactile만으로 압력 크기·마찰·slip 또는 접촉 상대가 Blocker/Target/선반인지
+판별할 수 없다. 현재·직전 sample에서 접촉 발생·해제·손가락별 패턴 변화는
+유도할 수 있으며 별도 16-step history가 필요하다고 결정하지 않는다.
+Current HistoryEncoder는 고정 pad 순서의 17채널을 입력으로 받으므로 pad identity를
+이미 보존한다. 별도 tactile branch/공간 encoder는 실험 후보이지 현재 필수 변경이 아니다.
+
+먼저 검토할 것은 **측정한 접촉을 정책이 놓치지 않는가**다. ContactSensor는
+120 Hz이고 `history_length=0`, policy는 30 Hz로 마지막 substep만 읽는다.
+앞의 세 substep에서 발생했다가 해제된 짧은 접촉은 현재/직전 관측 모두에서
+사라질 수 있다. 실제 밀기·pivoting 로그에서 누락과 threshold 경계 ON/OFF를
+측정한 뒤 구간 OR, onset/해제 event 보존 또는 hysteresis를 선택할 수 있다.
+구간 OR는 ‘현재 접촉’에서 ‘지난 control 구간에 접촉했음’으로 의미가 바뀌며
+관측 규약·reset·mask·학습에 같은 기준을 적용해야 한다. 아직 구현/채택하지 않았다.
+
+접촉 수·새 접촉·접촉 유지 자체의 reward는 현재 연구 목표의 대리 지표로
+단정하지 않는다. 많거나 잦은 접촉을 보상하면 불필요한 파지·주변 물체/선반
+접촉·반복 접촉을 유도할 수 있다. 항상 동일 접촉을 유지하도록 하거나 접촉
+변화에 벌점을 주면 필요한 pivoting·접촉점 전환을 방해할 수 있다. 우선 접근
+공간 확보·재배치 최소화·robot 가감속·F/T 증가 안정성을 reward로 두고 tactile을
+상호작용 피드백으로 활용하는 것을 권장한다. 새 tactile shaping은 실제 실패
+유형과 task progress를 확인해 구체화할 미결 사항이다.
+
+### 2026-10-12 급가감속과 F/T 크기 증가만 평가하는 Motion
+
+사용자가 “빠른 속도·큰 힘을 막으려는 것이 아니라 급격한 가속·힘 증가를
+막고 싶다”고 교정했다. 앞선 velocity/load 항은 목적과 달라 제거했으며,
+속도 0.5 rad/s soft 문턱·velocity ref·force/torque soft와 절대 크기 ref도 삭제했다.
+로봇 12개 독립 관절의 acceleration과 F/T 증가율만 비용으로 계산하고
+`(exp(−C_acc)+exp(−C_inc))/2`로 평균한다. 삭제한 항을 비용 0으로 남겨 네 항의
+평균을 취하지 않는다. Observation 544D·action 18D·모델·tactile은 유지한다.
+
+힘을 빠르게 빼는 경우의 처리에 대해 사용자는 **힘·토크 크기의 급격한 증가만
+비용 부여**를 선택했다. 증가율은 signed component 차이가 아니라
+`max(||F_t||−||F_previous||,0)/dt`와 같은 torque 식이다. 음수 반력의 크기 증가도
+비용에 포함하고 감소·동일 크기의 방향 변화는 제외한다. Frame·torque 기준점은
+기존 world 축·episode 시작 sensor center를 유지한다. Acceleration은 관절 속도
+차분이며 급가속과 급감속 모두 평가한다. Jerk를 추가한 것으로 해석하지 않는다.
+
+일정한 높은 속도·일정한 큰 하중에서는 Motion 비용이 0일 수 있다. 80 N·4 N·m
+F/T 실패와 actuator 제한·물체 안정 종료 기준은 별도의 물리/안전 조건으로 유지한다.
+비용 정규화 scale은 arm acceleration 5·hand 10 rad/s², force 증가율 200 N/s,
+torque 증가율 10 N·m/s의 기존 초기값이다. 정규화 scale은 soft 문턱이 아니다.
+
+`motion_costs`는 `[joint_acceleration,wrench_increase_rate]`의 **2D** 진단값이며
+policy 입력에 넣지 않는다. 비용 순서를 config·metrics에 함께 저장한다.
+Reset 전 `reward_wrench`를 진단 extras로 보존하고 직전 world wrench와 비교해
+timeout 자동 reset 후에도 해당 전이의 force/torque 증가 비용을 재검증한다.
+기존 544D checkpoint의 network 구조는 호환되지만 critic의 학습 reward는
+이전 규약일 수 있으므로 새 run의 reward metadata와 구분한다.
+
+**검증:** CPU **141개**가 **32.031초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 53, model 23, PPO/runner 9, registration 2다.
+일정한 고속·큰 하중에서 Motion 비용 0, 관절 가속도·힘/토크 증가율의 dt²
+스케일링, 음수 반력의 norm 증가, 빠른 하중 감소·같은 크기의 방향 변화 제외,
+두 항 평균·삭제된 soft/ref 설정·별도 하드 하중 실패와 reset 격리를 검사했다.
+
+실제 GPU의 **2환경·64 transition·PPO update 2회**, failure 0회·timeout 2회가
+exit code 0과 `LEARNING_VALIDATED`로 완료했다. 두 비용을 매 전이에서
+이전 joint 관측·이전 world wrench·reset 전 진단값으로 독립 재계산했으며,
+timeout에서도 phase가 섞이지 않는 것을 확인했다. Hold·실제 금지 접촉·EEF
+기하/역할/이력·reward·parameter 갱신·GPU checkpoint 복원이 통과했다.
+Observation 544D·action 18D·247,717 parameter를 유지한다.
+평균 `[joint_acceleration,wrench_increase_rate]` 비용은 rollout별로
+`[11.19205,0.0000032374]`, `[13.84075,0.0000031699]`였다.
+정규화 ref의 적합성과 정책 수렴은 이 짧은 검증에서 입증하지 않는다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 16 --episode_length_s 0.8
+--log_dir outputs/contact_rearrangement/smooth_motion_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/smooth_motion_learning_validation.log`,
+checkpoint는 `outputs/contact_rearrangement/smooth_motion_learning_smoke/model_latest.pt`다.
+
 ## 9. 다음 구체화와 구현에서 정할 사항
 
 아래는 미결 사항이며 다음 작업의 순서가 확정된 것은 아니다.
 
 1. 실제 학습 분포 구체화. 종류별 채택률·실패율, settle 이후 기하 조건 유지, 밀집도 수치와 sampler bias, 로봇의 실제 접촉·접근 가능성을 확인한다.
-2. 구현한 tactile 17채널과 raw F/T의 실기 threshold·filtering·동기화 교정, 구현한 F/T 중력·bias 보정의 실제 센서 질량 교정.
+2. 구현한 tactile 17채널과 raw F/T의 실기 threshold·filtering·동기화 교정, F/T 자중·관성·bias 보상에 필요한 질량·관성·가속도 추정 교정.
+   Tactile의 짧은 substep 접촉 누락·event 보존·hysteresis와 직접 reward의 행동 유인도 별도로 검토한다. 모두 미채택이며 17채널 binary 관측 명세를 바꾼 것으로 해석하지 않는다.
 3. Base 기준 18D OSC/hand 제어의 gain·workspace·effort limit와 접촉 안정성 검증, 실기 제어 경로.
 4. Visible-depth 초기 PCA OBB의 가림·부분 형상 오차, oracle instance-ID association을 대체할 실기 perception, 현재/직전 두 sample에 남지 않는 정보 손실 평가.
 5. 구현한 전체 차단·Target 보호·비파지 조건·성공/실패·timeout과 arm/spacer 금지 접촉 기본값의 task 적합성.

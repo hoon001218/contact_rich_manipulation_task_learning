@@ -59,7 +59,7 @@ class RegistrationTests(unittest.TestCase):
             import torch
             import contact_rearrangement
             from contact_rearrangement import mdp
-            from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy
+            from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy, build_policy_masks
             from contact_rearrangement.config.ur5e.agents.ppo import PPOTrainer
 
             entry = gym.spec("Isaac-Contact-Rearrangement-UR5e-v0").kwargs["ppo_cfg_entry_point"]
@@ -75,14 +75,16 @@ class RegistrationTests(unittest.TestCase):
                 torch.zeros((2, cfg.max_objects, 10)),
                 torch.zeros((2, cfg.max_objects), dtype=torch.bool),
                 torch.zeros((2, cfg.max_objects, 2)),
-                torch.zeros((2, cfg.history_length, 89)),
+                torch.zeros((2, cfg.history_length, 72)),
                 torch.zeros((2, cfg.history_length), dtype=torch.bool),
             )
             with torch.no_grad():
-                action, log_probability, value = model.act(actor_input, deterministic=True)
+                masks = build_policy_masks(actor_input, model.cfg)
+                action, log_probability, value = model.act(actor_input, deterministic=True, masks=masks)
             simulator_modules = [name for name in sys.modules
                                  if name.split(".")[0] in {"isaaclab", "isaacsim", "omni", "pxr"}]
             print(json.dumps(dict(observation_dim=model.cfg.observation_dim,
+                                  observation_layout=model.cfg.observation_layout,
                                   actor_input_shape=list(actor_input.shape),
                                   action_shape=list(action.shape),
                                   finite=bool(torch.isfinite(action).all()
@@ -93,10 +95,13 @@ class RegistrationTests(unittest.TestCase):
                                   rollout_steps=trainer.cfg.rollout_steps,
                                   gamma=trainer.cfg.gamma,
                                   optimizer_groups=len(trainer.optimizer.param_groups),
+                                  mask_dtypes=[str(item.dtype) for item in (
+                                      masks.object_valid, masks.roles, masks.history_valid, masks.tactile_valid)],
                                   simulator_modules=simulator_modules)))
         """)
-        self.assertEqual(result["observation_dim"], 700)
-        self.assertEqual(result["actor_input_shape"], [2, 700])
+        self.assertEqual(result["observation_dim"], 544)
+        self.assertEqual(result["observation_layout"], "fixed_roles_v1")
+        self.assertEqual(result["actor_input_shape"], [2, 544])
         self.assertEqual(result["action_shape"], [2, 18])
         self.assertTrue(result["finite"])
         self.assertEqual(result["max_objects"], 40)
@@ -104,6 +109,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(result["rollout_steps"], 32)
         self.assertEqual(result["gamma"], .99)
         self.assertEqual(result["optimizer_groups"], 1)
+        self.assertEqual(result["mask_dtypes"], ["torch.bool"] * 4)
         self.assertEqual(result["simulator_modules"], [])
 
 

@@ -23,16 +23,9 @@ class MdpCfg:
     w_time: float = 1.0
     displacement_ref: float = 0.5
     time_ref: float = 10.0
-    linear_velocity_soft: float = 0.03
-    angular_velocity_soft: float = 0.3
-    linear_velocity_ref: float = 0.1
-    angular_velocity_ref: float = 1.0
-    linear_acceleration_ref: float = 1.0
-    angular_acceleration_ref: float = 5.0
-    force_soft: float = 10.0
-    torque_soft: float = 0.75
-    force_ref: float = 20.0
-    torque_ref: float = 1.0
+    # Provisional scales: rad/s² for acceleration, N/s and N·m/s for load increase.
+    arm_joint_acceleration_ref: float = 5.0
+    hand_joint_acceleration_ref: float = 10.0
     force_rate_ref: float = 200.0
     torque_rate_ref: float = 10.0
     success_reward: float = 500.0
@@ -60,15 +53,13 @@ class MdpCfg:
         for name, value in vars(self).items():
             if not isinstance(value, (float, int)) or not math.isfinite(value):
                 raise ValueError(f"MDP parameter {name} must be finite.")
-            if name.startswith("w_") or name.endswith("_soft") or name.endswith("_tolerance"):
+            if name.startswith("w_") or name.endswith("_tolerance"):
                 if value < 0:
                     raise ValueError(f"MDP parameter {name} must be nonnegative.")
             elif value <= 0:
                 raise ValueError(f"MDP parameter {name} must be positive.")
         if self.stable_steps != int(self.stable_steps):
             raise ValueError("stable_steps must be a positive integer.")
-        if self.force_hard <= self.force_soft or self.torque_hard <= self.torque_soft:
-            raise ValueError("Hard force and torque limits must exceed their soft thresholds.")
 
 
 def quat_conjugate(q):
@@ -209,14 +200,21 @@ class MdpState:
         if len(self.downstream_ids) < 2:
             raise RuntimeError("Cannot identify the distal F/T link and its attached hand bodies.")
         self.masses = robot.root_physx_view.get_masses().to(device)[:, self.downstream_ids]
+        # Native tensors store COM inertia in actor/link coordinates, column
+        # major. Link orientation (not the COM principal-axis quaternion)
+        # maps this tensor to the world for Newton--Euler compensation.
+        inertias = robot.root_physx_view.get_inertias().to(device)[:, self.downstream_ids]
+        self.inertias = inertias.reshape(env.num_envs, len(self.downstream_ids), 3, 3).transpose(-1, -2).clone()
         self.lower = self.upper = self.upright = None
-        self.history = torch.zeros((*shape[:1], cfg.history_length, 89), device=device)
+        self.history = torch.zeros((*shape[:1], cfg.history_length, 72), device=device)
+        # Episode bookkeeping only: this mask is not a policy feature. Invalid
+        # samples are zero-padded by the observation producer.
         self.history_valid = torch.zeros((*shape[:1], cfg.history_length), device=device, dtype=torch.bool)
         self.last_time = torch.full(shape[:1], float(env.sim.current_time), device=device, dtype=torch.float64)
         self.previous_center = torch.zeros((*shape, 3), device=device)
         self.initial_center = torch.zeros_like(self.previous_center)
         self.initial_rotation = torch.zeros((*shape, 4), device=device)
-        self.previous_velocity = torch.zeros((*shape, 6), device=device)
+        self.previous_joint_velocity = torch.zeros((env.num_envs, len(self.joint_ids)), device=device)
         self.previous_wrench = torch.zeros((env.num_envs, 6), device=device)
         self.wrench_bias = torch.zeros_like(self.previous_wrench)
         self.initial_sensor_point = torch.zeros((env.num_envs, 3), device=device)
@@ -227,7 +225,7 @@ class MdpState:
         self.terminal_paid = torch.zeros_like(self.success)
         self.discrete_reward = torch.zeros(env.num_envs, device=device)
         self.components = torch.zeros((env.num_envs, 5), device=device)
-        self.motion_costs = torch.zeros((env.num_envs, 4), device=device)
+        self.motion_costs = torch.zeros((env.num_envs, 2), device=device)
         self.blocked_ratio = torch.zeros(env.num_envs, device=device)
         self.total_overlap = torch.zeros(env.num_envs, device=device)
         self.failure_reasons = torch.zeros((env.num_envs, 6), device=device, dtype=torch.bool)
@@ -280,11 +278,11 @@ def reset_mdp(env, env_ids=None):
 
     state = ensure_mdp(env)
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
-    _, _, center, _, rotation, velocity = _physical_objects(env, state)
+    _, _, center, _, rotation, _ = _physical_objects(env, state)
     state.last_time[ids] = float(env.sim.current_time)
     state.previous_center[ids] = state.initial_center[ids] = center[ids]
     state.initial_rotation[ids] = rotation[ids]
-    state.previous_velocity[ids] = velocity[ids]
+    state.previous_joint_velocity[ids] = env.scene["robot"].data.joint_vel[ids][:, state.joint_ids]
     state.previous_wrench[ids] = state.wrench_bias[ids] = 0
     state.initial_sensor_point[ids] = env.scene["robot"].data.body_link_pos_w[ids, state.sensor_id]
     state.path_length[ids] = 0
@@ -325,8 +323,9 @@ def update_mdp(env):
     total_overlap = (overlap * ~target * active).sum(-1)
     sensor_wrench = corrected_wrench(env)
     fixed_wrench = _fixed_wrench(env, state, sensor_wrench)
-    components, costs = reward_components(cfg, blocked, blocker_area, path, velocity,
-                                          state.previous_velocity, fixed_wrench, state.previous_wrench, active, dt)
+    joint_velocity = env.scene["robot"].data.joint_vel[:, state.joint_ids]
+    components, costs = reward_components(cfg, blocked, blocker_area, path, joint_velocity,
+                                          state.previous_joint_velocity, fixed_wrench, state.previous_wrench, dt)
     success_candidate, stable_count, reasons, failure = task_conditions(
         env, state, center, corners, rotation, velocity, active, target, total_overlap, sensor_wrench,
     )
@@ -341,7 +340,7 @@ def update_mdp(env):
     state.history[selected, 0] = dynamic[selected]
     state.history_valid[selected, 0] = True
     state.previous_center[selected] = center[selected]
-    state.previous_velocity[selected] = velocity[selected]
+    state.previous_joint_velocity[selected] = joint_velocity[selected]
     state.previous_wrench[selected] = fixed_wrench[selected]
     state.path_length[selected] = path[selected]
     state.stable_count[selected] = stable_count[selected]

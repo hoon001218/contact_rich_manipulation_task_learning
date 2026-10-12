@@ -50,23 +50,63 @@ from isaaclab.utils.math import combine_frame_transforms
 
 from contact_rearrangement.src.assets import ARM_JOINT_NAMES, HAND_JOINT_NAMES
 from contact_rearrangement.config.ur5e.agents.ppo import PPOTrainer
-from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy
+from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy, build_policy_masks
+from contact_rearrangement.config.ur5e.agents.ppo_cfg import ModelCfg
 from contact_rearrangement.src.visualization import RoleObbVisualizer
 
 
+def _initial_scene_validation_reference(env):
+    """Build an independent base-frame reference for the fixed policy slots.
+
+    This simulator metadata is a validation oracle, never a model input. Each
+    observation producer must place Target/Blocker first and retain the order
+    of the remaining visible objects while excluding unobserved padding.
+    """
+    geometry = torch.zeros_like(env.initial_object_geometry)
+    valid = torch.zeros_like(env.initial_object_valid)
+    roles = torch.zeros_like(env.initial_object_roles, dtype=torch.bool)
+    for env_id in range(env.num_envs):
+        source_valid = env.initial_object_valid[env_id]
+        source_roles = env.initial_object_roles[env_id].bool()
+        for role in range(2):
+            indices = torch.nonzero(source_valid & source_roles[:, role], as_tuple=False).flatten()
+            if indices.numel() > 1:
+                raise AssertionError("Initial perception contains duplicate role assignments.")
+            if indices.numel():
+                geometry[env_id, role] = env.initial_object_geometry[env_id, indices[0]]
+                valid[env_id, role] = True
+                roles[env_id, role, role] = True
+        distractors = torch.nonzero(source_valid & ~source_roles.any(-1), as_tuple=False).flatten()
+        if distractors.numel() > geometry.shape[1] - 2:
+            raise AssertionError("Initial perception exceeds the available distractor slots.")
+        end = 2 + distractors.numel()
+        geometry[env_id, 2:end] = env.initial_object_geometry[env_id, distractors]
+        valid[env_id, 2:end] = True
+    return geometry, valid, roles
+
+
 def validate_transition(env, before_geometry, observation, reward, terminated, truncated, extra, action,
-                        before_history):
+                        before_history, before_wrench):
     """Check completed transitions before/after the SDK's selective auto-reset."""
     state = env.mdp_state
-    object_width = env.cfg.mdp.max_objects * 13
+    object_width = env.cfg.mdp.max_objects * 10
     history_steps = env.cfg.mdp.history_length
-    expected_width = object_width + history_steps * 90
+    policy_cfg = ModelCfg(max_objects=env.cfg.mdp.max_objects, history_steps=history_steps)
+    expected_width = policy_cfg.observation_dim
     if observation.shape != (env.num_envs, expected_width) or not torch.isfinite(observation).all():
         raise AssertionError(f"Policy observation must be finite [N,{expected_width}].")
     if history_steps != 2:
         raise AssertionError("Policy sensing must contain exactly current and previous samples.")
     done = terminated | truncated
     continuing = ~done
+    masks = build_policy_masks(observation, policy_cfg)
+    terminal_masks = build_policy_masks(extra["terminal_observation"], policy_cfg)
+    # Simulator metadata is an independent validation oracle only. The policy
+    # gets the masks derived above solely from its observation values.
+    reference, reference_valid, reference_roles = _initial_scene_validation_reference(env)
+    torch.testing.assert_close(masks.object_valid, reference_valid)
+    torch.testing.assert_close(masks.roles, reference_roles)
+    torch.testing.assert_close(masks.history_valid, state.history_valid)
     torch.testing.assert_close(env.initial_object_geometry[continuing], before_geometry[continuing], rtol=0, atol=0)
     torch.testing.assert_close(extra["terminal_observation"][continuing], observation[continuing], rtol=0, atol=0)
     weights = reward.new_tensor((env.cfg.mdp.w_clear, env.cfg.mdp.w_rearr,
@@ -80,14 +120,40 @@ def validate_transition(env, before_geometry, observation, reward, terminated, t
         torch.testing.assert_close(state.history[done, 1], torch.zeros_like(state.history[done, 1]), rtol=0, atol=0)
         if state.history_valid[done, 1].any():
             raise AssertionError("Reset previous sample must be invalid.")
-        if not (extra["terminal_observation"][done, -history_steps:].sum(-1) == 2).all():
+        if masks.tactile_valid[done].any():
+            raise AssertionError("Reset tactile samples must remain unavailable until the next physics step.")
+        if not (terminal_masks.history_valid[done].sum(-1) == 2).all():
             raise AssertionError("PPO requires the completed episode's final history, before reset.")
     if continuing.any():
         torch.testing.assert_close(state.history[continuing, 0, -18:], action[continuing], rtol=0, atol=0)
-    final_history = extra["terminal_observation"][:, object_width:-history_steps].reshape(env.num_envs, 2, 89)
+    final_history = extra["terminal_observation"][:, object_width:].reshape(env.num_envs, 2, policy_cfg.step_features)
     torch.testing.assert_close(final_history[:, 0, -18:], action, rtol=0, atol=0)
     torch.testing.assert_close(final_history[:, 1], before_history[:, 0], rtol=0, atol=0)
     robot = env.scene["robot"]
+    # Independently reconstruct joint Motion costs from the sensor history,
+    # including terminal transitions whose articulation has already reset.
+    mdp_cfg = env.cfg.mdp
+    joint_velocity = final_history[:, 0, 12:24] * mdp_cfg.joint_velocity_scale
+    previous_joint_velocity = before_history[:, 0, 12:24] * mdp_cfg.joint_velocity_scale
+    acceleration_ref = joint_velocity.new_tensor([mdp_cfg.arm_joint_acceleration_ref] * 6
+                                                 + [mdp_cfg.hand_joint_acceleration_ref] * 6)
+    acceleration_cost = (((joint_velocity - previous_joint_velocity) / env.step_dt)
+                         / acceleration_ref).square().sum(-1)
+    wrench = extra["reward_wrench"]
+    force_increase = (wrench[:, :3].norm(dim=-1) - before_wrench[:, :3].norm(dim=-1)).clamp_min(0)
+    torque_increase = (wrench[:, 3:].norm(dim=-1) - before_wrench[:, 3:].norm(dim=-1)).clamp_min(0)
+    increase_cost = ((force_increase / (env.step_dt * mdp_cfg.force_rate_ref)).square()
+                     + (torque_increase / (env.step_dt * mdp_cfg.torque_rate_ref)).square())
+    if extra["motion_costs"].shape != (env.num_envs, 2):
+        raise AssertionError("Motion must contain only joint acceleration and wrench increase costs.")
+    torch.testing.assert_close(extra["motion_costs"][:, 0], acceleration_cost, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(extra["motion_costs"][:, 1], increase_cost, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(extra["reward_components"][:, 2], extra["motion_costs"].neg().exp().mean(-1),
+                               rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(joint_velocity[continuing], robot.data.joint_vel[continuing][:, state.joint_ids],
+                               rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(state.previous_joint_velocity, robot.data.joint_vel[:, state.joint_ids],
+                               rtol=1e-6, atol=1e-6)
     arm = [robot.joint_names.index(name) for name in ARM_JOINT_NAMES]
     hand = [robot.joint_names.index(name) for name in HAND_JOINT_NAMES]
     mimic = [i for i, name in enumerate(robot.joint_names) if i not in arm + hand]
@@ -105,8 +171,8 @@ def validate_transition(env, before_geometry, observation, reward, terminated, t
     tcp = term.measured_tcp_pose_b()[:, None].expand(-1, 40, -1)
     position, rotation = combine_frame_transforms(tcp[..., :3].reshape(-1, 3), tcp[..., 3:].reshape(-1, 4),
                                                  geometry[..., :3].reshape(-1, 3), geometry[..., 3:7].reshape(-1, 4))
-    valid = env.initial_object_valid
-    expected = env.initial_object_geometry
+    valid = reference_valid
+    expected = reference
     torch.testing.assert_close(position.reshape(env.num_envs, 40, 3)[valid], expected[..., :3][valid], atol=1e-6, rtol=0)
     alignment = (rotation.reshape(env.num_envs, 40, 4)[valid] * expected[..., 3:7][valid]).sum(-1).abs()
     torch.testing.assert_close(alignment, torch.ones_like(alignment), atol=1e-6, rtol=0)
@@ -165,10 +231,11 @@ def validate_control_hold(env):
     for _ in range(steps):
         before = env.initial_object_geometry.clone()
         before_history = env.mdp_state.history.clone()
+        before_wrench = env.mdp_state.previous_wrench.clone()
         with torch.no_grad():
             observations, reward, terminated, truncated, extra = env.step(action)
         validate_transition(env, before, observations["policy"], reward, terminated, truncated, extra, action,
-                            before_history)
+                            before_history, before_wrench)
         if terminated.any() or truncated.any():
             raise AssertionError(f"Unloaded hold terminated: {extra['failure_reasons'].tolist()}")
         wrench = extra["compensated_wrench"]
@@ -219,8 +286,9 @@ def main():
             if trainer.model.cfg != model_cfg:
                 raise ValueError(
                     f"Checkpoint model settings do not match this environment: "
-                    f"history_steps={trainer.model.cfg.history_steps}, expected={model_cfg.history_steps}. "
-                    "Start a new training run for the current/previous-step policy."
+                    f"observation_dim={trainer.model.cfg.observation_dim}, expected={model_cfg.observation_dim}; "
+                    f"checkpoint={trainer.model.cfg}, expected={model_cfg}. "
+                    "Start a new training run for the current observation schema."
                 )
             if args.rollout_steps is not None:
                 trainer.cfg.rollout_steps = args.rollout_steps
@@ -233,6 +301,10 @@ def main():
                              episode_length_s=cfg.episode_length_s, mdp=asdict(cfg.mdp),
                              model=asdict(model.cfg), ppo=asdict(trainer.cfg),
                              object_frame="current EEF", wrench_frame="physical sensor",
+                             wrench_compensation=("gravity, COM translational inertia, rotational inertia, "
+                                                  "gyroscopic torque; optional residual tare"),
+                             motion_cost_names=["joint_acceleration", "wrench_increase_rate"],
+                             masks="derived from observation values before model calls",
                              perception="initial depth OBB, simulation instance masks and role association")
         (log_dir / "config.json").write_text(json.dumps(configuration, indent=2) + "\n")
         print("LEARNING_READY " + json.dumps(dict(observation_dim=obs.shape[-1], action_dim=18,
@@ -248,19 +320,23 @@ def main():
                 previous_parameters = [p.detach().clone() for p in model.parameters()] if args.validate else None
                 failure_counts = torch.zeros(6, device=env.device, dtype=torch.long)
                 wrench_peak = torch.zeros(2, device=env.device)
+                motion_costs = []
                 for _ in range(trainer.cfg.rollout_steps):
                     before_geometry = env.initial_object_geometry.clone() if args.validate else None
                     before_history = env.mdp_state.history.clone() if args.validate else None
+                    before_wrench = env.mdp_state.previous_wrench.clone() if args.validate else None
                     with torch.no_grad():
-                        action, log_prob, value = model.act(obs)
+                        action, log_prob, value = model.act(obs, masks=build_policy_masks(obs, model.cfg))
                         following, reward, terminated, truncated, extra = env.step(action)
                         next_obs = following["policy"].detach().clone()
-                        next_value = model.value(extra["terminal_observation"])
+                        terminal_observation = extra["terminal_observation"]
+                        next_value = model.value(terminal_observation,
+                                                 masks=build_policy_masks(terminal_observation, model.cfg))
                     if visualizer is not None:
                         visualizer.update()
                     if args.validate:
                         validate_transition(env, before_geometry, next_obs, reward, terminated, truncated, extra, action,
-                                            before_history)
+                                            before_history, before_wrench)
                         if terminated.any() and diagnostic_failures < 3:
                             print("TERMINAL_DIAGNOSTIC " + json.dumps(dict(
                                 reasons=extra["failure_reasons"][terminated].tolist(),
@@ -268,6 +344,7 @@ def main():
                                 action=action[terminated].tolist())), flush=True)
                             diagnostic_failures += 1
                     wrench = extra["compensated_wrench"]
+                    motion_costs.append(extra["motion_costs"].detach())
                     wrench_peak = torch.maximum(wrench_peak, torch.stack((wrench[:, :3].norm(dim=-1).max(),
                                                                           wrench[:, 3:].norm(dim=-1).max())))
                     values = (obs, action, log_prob, reward, value, next_value, terminated, truncated)
@@ -286,6 +363,8 @@ def main():
                                history_samples=env.mdp_state.history_valid.sum(-1).tolist(),
                                failure_counts=failure_counts.tolist(), elapsed_s=time.monotonic() - started)
                 metrics["force_torque_peak"] = wrench_peak.tolist()
+                metrics["mean_motion_costs"] = torch.stack(motion_costs).mean(dim=(0, 1)).tolist()
+                metrics["motion_cost_names"] = configuration["motion_cost_names"]
                 metrics_file.write(json.dumps(metrics) + "\n")
                 print("PPO_UPDATE " + json.dumps(metrics), flush=True)
                 if trainer.update_count % runner_cfg.save_interval == 0:
@@ -295,7 +374,9 @@ def main():
             if args.validate:
                 restored = PPOTrainer.load(final_checkpoint, device=env.device)
                 with torch.no_grad():
-                    torch.testing.assert_close(restored.model.value(obs), model.value(obs), rtol=0, atol=0)
+                    masks = build_policy_masks(obs, model.cfg)
+                    torch.testing.assert_close(restored.model.value(obs, masks=masks),
+                                               model.value(obs, masks=masks), rtol=0, atol=0)
                 if restored.update_count != trainer.update_count:
                     raise AssertionError("Checkpoint did not preserve PPO update count.")
                 print("LEARNING_VALIDATED " + json.dumps(dict(transitions=transitions, terminated=total_terminated,

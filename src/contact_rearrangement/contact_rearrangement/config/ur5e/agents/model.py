@@ -1,22 +1,76 @@
 """Jointly trained initial-scene graph and finite sensor-history policy.
 
-This module deliberately has no Isaac Sim imports.  Inputs are the public actor
-observation only: initial camera geometry, object masks and roles, followed by
-the current and previous samples, newest first, and their validity mask. Both
-actor and critic use the same information; neither reads the current object
-poses from the simulator. Explicit checkpoint configurations retain their
-configured window length.
+This module deliberately has no Isaac Sim imports. The observation contains
+initial camera geometry, with target and blocker in reserved slots 0 and 1,
+and the current/previous robot and sensor samples. Callers derive masks from
+that observation before passing observation and masks separately to the model.
+Masks control padding, sensor filtering, and role selection; they are not learned features.
+Both actor and critic use the same observable information.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .ppo_cfg import ModelCfg
+
+
+@dataclass(frozen=True)
+class PolicyMasks:
+    """Boolean selectors derived from the public observation, outside the model."""
+
+    object_valid: Tensor
+    roles: Tensor
+    history_valid: Tensor
+    tactile_valid: Tensor
+
+
+def _split_observation(observation: Tensor, cfg: ModelCfg) -> tuple[Tensor, Tensor]:
+    if observation.ndim < 1 or observation.shape[-1] != cfg.observation_dim:
+        width = observation.shape[-1] if observation.ndim else 0
+        raise ValueError(f"Expected observation width {cfg.observation_dim}, got {width}.")
+    geometry, history = observation.split(
+        (cfg.max_objects * 10, cfg.history_steps * cfg.step_features), dim=-1,
+    )
+    leading = observation.shape[:-1]
+    return (
+        geometry.reshape(*leading, cfg.max_objects, 10),
+        history.reshape(*leading, cfg.history_steps, cfg.step_features),
+    )
+
+
+def build_policy_masks(observation: Tensor, cfg: ModelCfg) -> PolicyMasks:
+    """Derive every selector from observation values without simulator metadata.
+
+    An observed OBB has positive extents and a nonzero quaternion. A history
+    sample has a finite robot/force/action state and a nonzero TCP quaternion;
+    all-zero reset padding fails that check. Tactile 0/1 are measured values,
+    while -1 (or nonfinite input) means unavailable. Slots 0 and 1 always
+    represent target and blocker; their selectors remain false if the reserved
+    slots are unobserved. Later slots represent ordinary observed objects.
+    """
+    geometry, history = _split_observation(observation, cfg)
+    object_valid = (
+        torch.isfinite(geometry).all(-1)
+        & (geometry[..., 7:10] > 0).all(-1)
+        & (geometry[..., 3:7].square().sum(-1) > 1e-12)
+    )
+    roles = torch.zeros((*object_valid.shape, 2), dtype=torch.bool, device=observation.device)
+    roles[..., 0, 0] = object_valid[..., 0]
+    roles[..., 1, 1] = object_valid[..., 1]
+    history_valid = (
+        torch.isfinite(history[..., :37]).all(-1)
+        & torch.isfinite(history[..., 54:]).all(-1)
+        & (history[..., 27:31].square().sum(-1) > 1e-12)
+    )
+    tactile = history[..., 37:54]
+    tactile_valid = history_valid[..., None] & ((tactile == 0) | (tactile == 1))
+    return PolicyMasks(object_valid, roles, history_valid, tactile_valid)
 
 
 
@@ -39,7 +93,7 @@ class SceneGraphEncoder(nn.Module):
     def __init__(self, cfg: ModelCfg):
         super().__init__()
         width = cfg.node_dim
-        self.node_encoder = nn.Sequential(nn.Linear(12, width), nn.SiLU(), nn.Linear(width, width), nn.LayerNorm(width))
+        self.node_encoder = nn.Sequential(nn.Linear(cfg.node_features, width), nn.SiLU(), nn.Linear(width, width), nn.LayerNorm(width))
         self.messages = nn.ModuleList([
             nn.Sequential(nn.Linear(2 * width + 6, width), nn.SiLU(), nn.Linear(width, width))
             for _ in range(cfg.graph_layers)
@@ -56,7 +110,7 @@ class SceneGraphEncoder(nn.Module):
     def forward(self, geometry: Tensor, valid: Tensor, roles: Tensor) -> Tensor:
         geometry = torch.where(valid[..., None], geometry, torch.zeros_like(geometry))
         roles = torch.where(valid[..., None], roles, torch.zeros_like(roles))
-        hidden = self.node_encoder(torch.cat((geometry, roles), dim=-1)) * valid[..., None]
+        hidden = self.node_encoder(geometry) * valid[..., None]
         count = geometry.shape[-2]
         edges = valid[..., :, None] & valid[..., None, :]
         edges &= ~torch.eye(count, dtype=torch.bool, device=geometry.device)
@@ -72,8 +126,8 @@ class SceneGraphEncoder(nn.Module):
             messages = messages * edges[..., None]
             aggregated = messages.sum(-2) / edges.sum(-1, keepdim=True).clamp_min(1)
             hidden = (hidden + update(torch.cat((hidden, aggregated), dim=-1))) * valid[..., None]
-        target = _masked_mean(hidden, valid & (roles[..., 0] > 0.5))
-        blocker = _masked_mean(hidden, valid & (roles[..., 1] > 0.5))
+        target = _masked_mean(hidden, valid & roles[..., 0])
+        blocker = _masked_mean(hidden, valid & roles[..., 1])
         queries = self.role_queries(torch.cat((target, blocker), dim=-1)).reshape(*target.shape[:-1], 2, self.width)
         scores = torch.matmul(queries, self.keys(hidden).transpose(-2, -1)) / math.sqrt(self.width)
         attention = _masked_softmax(scores, valid[..., None, :].expand_as(scores))
@@ -86,7 +140,7 @@ class HistoryEncoder(nn.Module):
 
     def __init__(self, cfg: ModelCfg):
         super().__init__()
-        self.project = nn.Conv1d(cfg.step_features + 1, cfg.temporal_dim, kernel_size=1)
+        self.project = nn.Conv1d(cfg.step_features, cfg.temporal_dim, kernel_size=1)
         # The receptive field covers the complete requested window.  No hidden
         # state survives an episode, and invalid reset padding is zero at each layer.
         self.dilations = []
@@ -100,12 +154,18 @@ class HistoryEncoder(nn.Module):
             for dilation in self.dilations
         ])
 
-    def forward(self, history: Tensor, valid: Tensor) -> Tensor:
+    def forward(self, history: Tensor, valid: Tensor, tactile_valid: Tensor) -> Tensor:
+        # Filter unavailable tactile values before learned projection. Boolean
+        # validity selectors are never concatenated to the sample features.
+        history = torch.cat((history[..., :37],
+                             torch.where(tactile_valid, history[..., 37:54],
+                                         torch.zeros_like(history[..., 37:54])),
+                             history[..., 54:]), dim=-1)
         history = torch.where(valid[..., None], history, torch.zeros_like(history))
         # Public histories are newest first; convolutions run oldest to newest.
         valid = valid.flip(-1)
         history = history.flip(-2)
-        inputs = torch.cat((history, valid.to(history.dtype)[..., None]), dim=-1).transpose(-2, -1)
+        inputs = history.transpose(-2, -1)
         padding_mask = valid[:, None, :]
         hidden = F.silu(self.project(inputs)) * padding_mask
         for convolution, dilation in zip(self.convolutions, self.dilations):
@@ -136,32 +196,36 @@ class ContactRearrangementPolicy(nn.Module):
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
 
-    def _split(self, observation: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        if observation.shape[-1] != self.cfg.observation_dim:
-            raise ValueError(f"Expected observation width {self.cfg.observation_dim}, got {observation.shape[-1]}.")
-        objects, steps = self.cfg.max_objects, self.cfg.history_steps
-        geometry, valid, roles, history, history_valid = observation.split(
-            (objects * 10, objects, objects * 2, steps * self.cfg.step_features, steps), dim=-1
-        )
+    def _split(self, observation: Tensor) -> tuple[Tensor, Tensor]:
+        geometry, history = _split_observation(observation, self.cfg)
         return (
-            geometry.reshape(-1, objects, 10), valid.reshape(-1, objects) > 0.5,
-            roles.reshape(-1, objects, 2), history.reshape(-1, steps, self.cfg.step_features),
-            history_valid.reshape(-1, steps) > 0.5,
+            geometry.reshape(-1, self.cfg.max_objects, 10),
+            history.reshape(-1, self.cfg.history_steps, self.cfg.step_features),
         )
 
-    def encode(self, observation: Tensor) -> Tensor:
+    def encode(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
         leading = observation.shape[:-1]
-        geometry, valid, roles, history, history_valid = self._split(observation)
-        scene = self.scene_encoder(geometry, valid, roles)
-        temporal = self.history_encoder(history, history_valid)
+        geometry, history = self._split(observation)
+        expected_shapes = (
+            (*leading, self.cfg.max_objects), (*leading, self.cfg.max_objects, 2),
+            (*leading, self.cfg.history_steps), (*leading, self.cfg.history_steps, 17),
+        )
+        values = (masks.object_valid, masks.roles, masks.history_valid, masks.tactile_valid)
+        for value, shape in zip(values, expected_shapes):
+            if value.dtype != torch.bool or tuple(value.shape) != shape or value.device != observation.device:
+                raise ValueError(f"Policy masks must be Boolean tensors on the observation device with shape {shape}.")
+        scene = self.scene_encoder(geometry, masks.object_valid.reshape(-1, self.cfg.max_objects),
+                                   masks.roles.reshape(-1, self.cfg.max_objects, 2))
+        temporal = self.history_encoder(history, masks.history_valid.reshape(-1, self.cfg.history_steps),
+                                        masks.tactile_valid.reshape(-1, self.cfg.history_steps, 17))
         return self.fusion(torch.cat((scene, temporal), dim=-1)).reshape(*leading, self.cfg.latent_dim)
 
-    def forward(self, observation: Tensor) -> tuple[Tensor, Tensor]:
-        latent = self.encode(observation)
+    def forward(self, observation: Tensor, *, masks: PolicyMasks) -> tuple[Tensor, Tensor]:
+        latent = self.encode(observation, masks=masks)
         return self.actor(latent), self.critic(latent).squeeze(-1)
 
-    def value(self, observation: Tensor) -> Tensor:
-        return self.forward(observation)[1]
+    def value(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
+        return self.forward(observation, masks=masks)[1]
 
     def _distribution(self, mean: Tensor) -> torch.distributions.Normal:
         return torch.distributions.Normal(mean, self.log_std.clamp(-5.0, 2.0).exp().expand_as(mean))
@@ -189,15 +253,15 @@ class ContactRearrangementPolicy(nn.Module):
         elementwise = torch.where(actions <= -1.0 + 1e-6, lower, elementwise)
         return elementwise.sum(-1)
 
-    def act(self, observation: Tensor, deterministic: bool = False) -> tuple[Tensor, Tensor, Tensor]:
-        mean, value = self.forward(observation)
+    def act(self, observation: Tensor, deterministic: bool = False, *, masks: PolicyMasks) -> tuple[Tensor, Tensor, Tensor]:
+        mean, value = self.forward(observation, masks=masks)
         distribution = self._distribution(mean)
         unconstrained = mean if deterministic else distribution.rsample()
         actions = self._bounded_action(unconstrained)
         return actions, self._action_log_prob(distribution, actions), value
 
-    def evaluate_actions(self, observation: Tensor, actions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        mean, value = self.forward(observation)
+    def evaluate_actions(self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks) -> tuple[Tensor, Tensor, Tensor]:
+        mean, value = self.forward(observation, masks=masks)
         if actions.shape != mean.shape:
             raise ValueError(f"Actions must have shape {tuple(mean.shape)}, got {tuple(actions.shape)}.")
         distribution = self._distribution(mean)

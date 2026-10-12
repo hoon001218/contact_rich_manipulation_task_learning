@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .model import ContactRearrangementPolicy
+from .model import ContactRearrangementPolicy, build_policy_masks
 from .ppo_cfg import ModelCfg, PPOCfg
 
 
@@ -94,7 +94,11 @@ class PPOTrainer:
         for _ in range(self.cfg.epochs):
             order = torch.randperm(total, device=observations.device)
             for indices in order.tensor_split(min(total, self.cfg.minibatches)):
-                log_probs, entropy, values = self.model.evaluate_actions(observations[indices], actions[indices])
+                minibatch_observations = observations[indices]
+                masks = build_policy_masks(minibatch_observations, self.model.cfg)
+                log_probs, entropy, values = self.model.evaluate_actions(
+                    minibatch_observations, actions[indices], masks=masks,
+                )
                 log_ratio = log_probs - old_log_probs[indices]
                 ratio = log_ratio.exp()
                 policy_loss = -torch.minimum(
@@ -148,7 +152,16 @@ class PPOTrainer:
     @classmethod
     def load(cls, path: str | Path, device: str | torch.device = "cpu") -> "PPOTrainer":
         checkpoint = torch.load(path, map_location=device, weights_only=False)
-        model = ContactRearrangementPolicy(ModelCfg(**checkpoint["model_cfg"])).to(device)
+        model_cfg = checkpoint["model_cfg"]
+        # The previous role-ID observation had identical neural weight shapes.
+        # Requiring its serialized layout prevents silently changing what a
+        # restored policy considers its Target and Blocker.
+        if "observation_layout" not in model_cfg:
+            raise ValueError(
+                "Checkpoint uses a legacy observation schema. Fixed Target/Blocker slots require "
+                "observation_layout='fixed_roles_v1'; train a new checkpoint for this layout."
+            )
+        model = ContactRearrangementPolicy(ModelCfg(**model_cfg)).to(device)
         trainer = cls(model, PPOCfg(**checkpoint["ppo_cfg"]))
         trainer.model.load_state_dict(checkpoint["model"])
         trainer.optimizer.load_state_dict(checkpoint["optimizer"])

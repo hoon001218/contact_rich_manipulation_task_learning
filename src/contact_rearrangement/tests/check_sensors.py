@@ -7,9 +7,11 @@ The public scene script runs 151 environment steps with its default five-second
 reset and full/partial-reset validation. Additional checks preserve native
 physics state through render warmup/capture, freeze the accepted RGB-D snapshot
 between resets, preserve untouched sensor observations, and verify six-axis
-joint reactions against applied loads and measured rigid-body dynamics.
+joint reactions against applied loads and measured rigid-body dynamics. The
+runtime compensated observation is also checked during unloaded wrist/finger
+motion and all six directions of known external force/torque.
 
-The load bench adds two environment steps and seven physics steps, then resets
+The load bench adds two environment steps and 19 physics steps, then resets
 to a clean accepted episode. Camera rendering never advances physics time.
 """
 
@@ -39,7 +41,11 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from contact_rearrangement.src.assets import FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
+from contact_rearrangement.mdp.observations import corrected_wrench
+from contact_rearrangement.mdp.state import MdpCfg
+from contact_rearrangement.src.assets import (
+    ARM_JOINT_NAMES, HAND_JOINT_NAMES, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME,
+)
 from contact_rearrangement.src.sensors import InitialVisionCfg, InitialVisionSensor, tool_wrench, tool_wrench_valid
 
 
@@ -142,17 +148,42 @@ def verify_force_torque_load_response(env, sensor):
             break
         selected_names |= descendants
     ids = np.asarray([body_names.index(name) for name in selected_names])
-    masses = view.get_masses()[0].cpu().numpy()[ids]
+    all_masses = view.get_masses().to(env.device)[:, ids]
+    masses = all_masses[0].cpu().numpy()
     # The API defines column-major inertia at COM in the actor/body frame.
-    inertias = view.get_inertias()[0].cpu().numpy()[ids].reshape(-1, 3, 3).transpose(0, 2, 1)
+    all_inertias = view.get_inertias().to(env.device)[:, ids].reshape(env.num_envs, -1, 3, 3).transpose(-1, -2)
+    inertias = all_inertias[0].cpu().numpy()
     gravity = np.asarray(env.sim.cfg.gravity, dtype=np.float64)
     gravity_enabled = view.get_disable_gravities()[0].cpu().numpy()[ids] == 0
     assert gravity_enabled.all(), "This bench expects gravity enabled on every hand-side link."
-    print(f"[F/T BENCH]: {len(ids)} downstream links; total mass={masses.sum():.6f}kg", flush=True)
+    # The hand's base has a disambiguated name and must be included along with
+    # the fingers and distal spacer, rather than selecting only right_* links.
+    hand_base_ids = [index for index in ids if "/ROASRightHand/" in str(view.link_paths[0][index])
+                     and not body_names[index].startswith("right_")]
+    assert hand_base_ids, "The compensation bench omitted the attached hand base."
+    print(f"[F/T BENCH]: {len(ids)} downstream links; total mass={masses.sum():.6f}kg; hand base included", flush=True)
     dt = env.physics_dt
-    errors = []
+    errors, compensated_errors, unloaded_gravity_only, unloaded_compensated = [], [], [], []
+    original_targets = robot.data.joint_pos_target.clone()
+    missing = object()
+    original_mdp_cfg = getattr(env.cfg, "mdp", missing)
+    original_attributes = {
+        name: getattr(env, name, missing)
+        for name in ("mdp_state", "initial_object_geometry", "initial_object_valid", "initial_object_roles")
+    }
+    original_raw_wrench = sensor.data_raw_wrench.clone()
+    original_sensor_bias, original_sensor_valid = sensor.bias.clone(), sensor.valid.clone()
+    original_ft_timestamp = env.ft_last_update_time
+    # Exercise the production observation with actual tensor API values. The
+    # spawn preview has no training MDP, so provide only its physical caches.
+    env.mdp_state = SimpleNamespace(
+        sensor_id=sensor.body_index, downstream_ids=ids.tolist(), masses=all_masses,
+        inertias=all_inertias, wrench_bias=torch.zeros((env.num_envs, 6), device=env.device),
+    )
+    if original_mdp_cfg is missing:
+        env.cfg.mdp = MdpCfg()
 
-    def sample(force_s, torque_s):
+    def sample(force_s, torque_s, *, unloaded_motion=False):
         pose_before = view.get_link_transforms()[0, sensor.body_index].cpu().numpy()
         rotation_before = Rotation.from_quat(pose_before[3:]).as_matrix()
         force_w = rotation_before @ force_s
@@ -183,6 +214,31 @@ def verify_force_torque_load_response(env, sensor):
         expected = np.r_[rotation.T @ net_force_w, rotation.T @ net_torque_w]
         observed = sensor.read([0])[0].cpu().numpy()
         errors.append(observed - expected)
+        external_moment = np.cross(com_w[sensor.body_index] - point, force_w) + torque_w
+        expected_contact_reaction = -np.r_[rotation.T @ force_w, rotation.T @ external_moment]
+        compensated = corrected_wrench(env)[0].cpu().numpy()
+        assert np.isfinite(compensated).all(), "Compensated observation contains nonfinite values."
+        compensated_errors.append(compensated - expected_contact_reaction)
+        # Calls during a single completed physics step must be repeatable and
+        # may not advance dynamics, reset sensor validity, or rewrite raw data.
+        saved = physics_state(env)
+        torch.testing.assert_close(corrected_wrench(env)[0], torch.as_tensor(compensated, device=env.device),
+                                   atol=0, rtol=0)
+        torch.testing.assert_close(sensor.read([0])[0], torch.as_tensor(observed, device=env.device), atol=0, rtol=0)
+        assert_physics_preserved(env, saved, "Repeated compensated F/T read")
+        if unloaded_motion:
+            # The gravity-only baseline uses the independently computed SciPy
+            # transform, rather than the production compensation helper.
+            support = -masses[:, None] * gravity
+            gravity_force = support.sum(axis=0)
+            gravity_moment = np.cross(com_w[ids] - point, support).sum(axis=0)
+            gravity_sensor = np.r_[rotation.T @ gravity_force, rotation.T @ gravity_moment]
+            unloaded_gravity_only.append(observed - gravity_sensor)
+            unloaded_compensated.append(compensated)
+            for name in env.binary_tactile_sensor.sensors:
+                assert not bool((name.data.net_forces_w[0].norm(dim=-1) > env.cfg.tactile.force_threshold).any()), (
+                    "Unloaded inertia-compensation motion touched another collider."
+                )
 
     try:
         sample(np.zeros(3), np.zeros(3))
@@ -194,9 +250,38 @@ def verify_force_torque_load_response(env, sensor):
             torque = np.zeros(3)
             torque[axis] = 0.10
             sample(np.zeros(3), torque)
+        # Small opposing wrist targets create actual angular/COM acceleration;
+        # a finger target also moves articulated downstream links independently.
+        # Their millimetre-scale swept volume stays inside the accepted start.
+        wrist_id = robot.joint_names.index(ARM_JOINT_NAMES[-1])
+        finger_id = robot.joint_names.index(HAND_JOINT_NAMES[2])
+        for direction in (1.0, -1.0):
+            targets = original_targets[0:1].clone()
+            targets[:, wrist_id] += direction * 0.02
+            targets[:, finger_id] += 0.03 if direction > 0 else 0.0
+            robot.set_joint_position_target(targets, env_ids=[0])
+            for _ in range(6):
+                sample(np.zeros(3), np.zeros(3), unloaded_motion=True)
     finally:
         zero = torch.zeros((1, 1, 3), device=env.device)
         robot.set_external_force_and_torque(zero, zero, body_ids=[sensor.body_index], env_ids=[0], is_global=True)
+        robot.set_joint_position_target(original_targets)
+        sensor.data_raw_wrench.copy_(original_raw_wrench)
+        sensor.bias.copy_(original_sensor_bias)
+        sensor.valid.copy_(original_sensor_valid)
+        # Physics has advanced; restoring this pre-bench timestamp allows the
+        # next ordinary raw observation to refresh from the completed step.
+        env.ft_last_update_time = original_ft_timestamp
+        if original_mdp_cfg is missing:
+            del env.cfg.mdp
+        else:
+            env.cfg.mdp = original_mdp_cfg
+        for name, previous in original_attributes.items():
+            if previous is missing:
+                if hasattr(env, name):
+                    delattr(env, name)
+            else:
+                setattr(env, name, previous)
     errors = np.asarray(errors)
     # Pose/velocity are end-of-step values while reactions are step averages;
     # the tolerance includes this small discretization and native damping.
@@ -206,6 +291,25 @@ def verify_force_torque_load_response(env, sensor):
     assert torque_error < 0.015, f"Sensor-center torque balance mismatch: {torque_error}Nm"
     print(f"[F/T BENCH]: six-axis applied-load balance passed; "
           f"max_force_error={force_error:.6g}N max_torque_error={torque_error:.6g}Nm", flush=True)
+    compensated_errors = np.asarray(compensated_errors)
+    force_residual_error = np.linalg.norm(compensated_errors[:, :3], axis=-1).max()
+    torque_residual_error = np.linalg.norm(compensated_errors[:, 3:], axis=-1).max()
+    assert force_residual_error < 0.10, f"Compensated external-force mismatch: {force_residual_error}N"
+    assert torque_residual_error < 0.015, f"Compensated external-torque mismatch: {torque_residual_error}Nm"
+    gravity_only, compensated = np.asarray(unloaded_gravity_only), np.asarray(unloaded_compensated)
+    gravity_force_peak = np.linalg.norm(gravity_only[:, :3], axis=-1).max()
+    gravity_torque_peak = np.linalg.norm(gravity_only[:, 3:], axis=-1).max()
+    compensated_force_peak = np.linalg.norm(compensated[:, :3], axis=-1).max()
+    compensated_torque_peak = np.linalg.norm(compensated[:, 3:], axis=-1).max()
+    assert gravity_force_peak > 0.10 and gravity_torque_peak > 0.015, (
+        f"The unloaded motion did not exercise measurable inertia: {gravity_force_peak}N/{gravity_torque_peak}Nm"
+    )
+    assert compensated_force_peak < 0.30 * gravity_force_peak, "Force inertia was not removed from the observation."
+    assert compensated_torque_peak < 0.30 * gravity_torque_peak, "Torque inertia was not removed from the observation."
+    print(f"[F/T COMPENSATION]: PASS; external-load errors={force_residual_error:.6g}N/"
+          f"{torque_residual_error:.6g}Nm; unloaded gravity-only peaks={gravity_force_peak:.6g}N/"
+          f"{gravity_torque_peak:.6g}Nm -> full-compensation peaks={compensated_force_peak:.6g}N/"
+          f"{compensated_torque_peak:.6g}Nm", flush=True)
 
 
 original_render = InitialVisionSensor._render
@@ -300,7 +404,7 @@ def validate_with_load_bench(env, visualizer=None):
     frozen = snapshot(env)
     before_bench = env.sim.current_time_step_index
     verify_force_torque_load_response(env, env.tool_force_torque_sensor)
-    assert env.sim.current_time_step_index - before_bench == 7
+    assert env.sim.current_time_step_index - before_bench == 19
     # The bench explicitly updates the raw sensor while directly stepping
     # physics. Bring the observation callback's time marker to that same step.
     tool_wrench(env)
@@ -313,9 +417,10 @@ def validate_with_load_bench(env, visualizer=None):
     validate_snapshot(env, all_ids)
     assert not bool(env.tool_force_torque_sensor.valid.any())
     print(f"[SENSOR AUDIT]: PASS {env.num_envs} envs; "
-          f"public151steps+2envsteps+7benchphysicssteps; resets={audit['resets']} "
+          f"public151steps+2envsteps+19benchphysicssteps; resets={audit['resets']} "
           f"partial_resets={audit['partial_resets']} captures={audit['captures']} renders={audit['renders']}; "
-          "native geometry41body/18DOF/41collider; snapshots frozen; selected reset isolated; six-axis load verified",
+          "native geometry41body/18DOF/41collider; snapshots frozen; selected reset isolated; "
+          "six-axis load and dynamic compensation verified",
           flush=True)
 
 

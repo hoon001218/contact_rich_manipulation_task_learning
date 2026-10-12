@@ -27,6 +27,8 @@ class ContactRearrangementRLEnv(ManagerBasedRLEnv):
                 env_ids.clone(), task_mdp.policy_observation(self)[env_ids].clone(),
                 state.components[env_ids].clone(), state.failure_reasons[env_ids].clone(),
                 task_mdp.corrected_wrench(self)[env_ids].clone(),
+                state.motion_costs[env_ids].clone(),
+                state.previous_wrench[env_ids].clone(),
             )
         super()._reset_idx(env_ids)
 
@@ -39,16 +41,23 @@ class ContactRearrangementRLEnv(ManagerBasedRLEnv):
             self._collecting_step = False
         terminal_observation = observations["policy"].clone()
         components = self.mdp_state.components.clone()
+        motion_costs = self.mdp_state.motion_costs.clone()
+        reward_wrench = self.mdp_state.previous_wrench.clone()
         reasons = self.mdp_state.failure_reasons.clone()
         wrench = task_mdp.corrected_wrench(self)
         if self._terminal_capture is not None:
-            ids, final, final_components, final_reasons, final_wrench = self._terminal_capture
+            (ids, final, final_components, final_reasons, final_wrench,
+             final_motion_costs, final_reward_wrench) = self._terminal_capture
             terminal_observation[ids] = final
             components[ids] = final_components
             reasons[ids] = final_reasons
             wrench[ids] = final_wrench
+            motion_costs[ids] = final_motion_costs
+            reward_wrench[ids] = final_reward_wrench
         extras["terminal_observation"] = terminal_observation
         extras["reward_components"] = components
+        extras["motion_costs"] = motion_costs
+        extras["reward_wrench"] = reward_wrench
         extras["failure_reasons"] = reasons
         extras["compensated_wrench"] = wrench
         return observations, rewards, terminated, truncated, extras

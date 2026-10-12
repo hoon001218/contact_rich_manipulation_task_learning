@@ -9,7 +9,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contact_rearrangement.config.ur5e.agents.ppo import PPOTrainer, generalized_advantage_estimate
-from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy
+from contact_rearrangement.config.ur5e.agents.model import ContactRearrangementPolicy, build_policy_masks
 from contact_rearrangement.config.ur5e.agents.ppo_cfg import ContactRearrangementPPORunnerCfg, ModelCfg, PPOCfg
 from test_model import observation
 
@@ -21,7 +21,8 @@ class LearningTests(unittest.TestCase):
 
     def test_runner_owns_independent_policy_and_algorithm_defaults(self):
         first, second = ContactRearrangementPPORunnerCfg(), ContactRearrangementPPORunnerCfg()
-        self.assertEqual(first.policy.observation_dim, 700)
+        self.assertEqual(first.policy.observation_dim, 544)
+        self.assertEqual(first.policy.observation_layout, "fixed_roles_v1")
         self.assertEqual(first.algorithm.rollout_steps, 32)
         self.assertEqual(first.max_iterations, 1000)
         self.assertEqual(first.save_interval, 50)
@@ -68,8 +69,9 @@ class LearningTests(unittest.TestCase):
         # those tensors before saving inputs for autograd.
         with torch.inference_mode():
             observations = observation(cfg, batch=6).reshape(3, 2, -1)
-            actions, logs, values = model.act(observations)
-            next_values = model.value(observations) + 0.1
+            masks = build_policy_masks(observations, cfg)
+            actions, logs, values = model.act(observations, masks=masks)
+            next_values = model.value(observations, masks=masks) + 0.1
             rewards = torch.tensor([[0.1, 0.2], [-0.1, 0.3], [1.0, 0.1]])
             terminated = torch.tensor([[False, False], [False, True], [True, False]])
             truncated = torch.tensor([[False, False], [False, False], [False, True]])
@@ -88,8 +90,10 @@ class LearningTests(unittest.TestCase):
             self.assertEqual(loaded.cfg, trainer.cfg)
             self.assertEqual(loaded.model.cfg, model.cfg)
             with torch.no_grad():
-                expected = model.act(observations, deterministic=True)
-                actual = loaded.model.act(observations, deterministic=True)
+                expected = model.act(observations, masks=build_policy_masks(observations, model.cfg), deterministic=True)
+                actual = loaded.model.act(
+                    observations, masks=build_policy_masks(observations, loaded.model.cfg), deterministic=True,
+                )
             for first, second in zip(expected, actual):
                 torch.testing.assert_close(first, second, atol=0, rtol=0)
             first_states, second_states = trainer.optimizer.state_dict(), loaded.optimizer.state_dict()
@@ -104,7 +108,7 @@ class LearningTests(unittest.TestCase):
         trainer = PPOTrainer(model)
         observations = observation(cfg, 2).reshape(1, 2, -1)
         with torch.no_grad():
-            actions, logs, values = model.act(observations)
+            actions, logs, values = model.act(observations, masks=build_policy_masks(observations, cfg))
         actions[0, 0, 0] = 1.1
         before = [parameter.clone() for parameter in model.parameters()]
         with self.assertRaisesRegex(ValueError, "actions must be in"):
@@ -112,6 +116,44 @@ class LearningTests(unittest.TestCase):
                            torch.zeros(1, 2, dtype=torch.bool), torch.zeros(1, 2, dtype=torch.bool))
         for old, current in zip(before, model.parameters()):
             torch.testing.assert_close(old, current, atol=0, rtol=0)
+
+    def test_legacy_checkpoint_observation_schema_is_rejected(self):
+        cfg = ModelCfg(max_objects=5, node_dim=16, temporal_dim=16, latent_dim=24)
+        trainer = PPOTrainer(ContactRearrangementPolicy(cfg))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy_policy.pt"
+            trainer.save(path)
+            checkpoint = torch.load(path, weights_only=False)
+            checkpoint["model_cfg"]["step_features"] = 89
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "72 physical observation values"):
+                PPOTrainer.load(path)
+
+    def test_checkpoint_without_fixed_role_layout_is_rejected(self):
+        cfg = ModelCfg(max_objects=5, node_dim=16, temporal_dim=16, latent_dim=24)
+        trainer = PPOTrainer(ContactRearrangementPolicy(cfg))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "role_id_policy.pt"
+            trainer.save(path)
+            checkpoint = torch.load(path, weights_only=False)
+            # The old 584D schema has the same network weights and 72D samples;
+            # absence of the layout marker is the necessary compatibility check.
+            del checkpoint["model_cfg"]["observation_layout"]
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "legacy observation schema"):
+                PPOTrainer.load(path)
+
+    def test_checkpoint_with_unknown_layout_is_rejected(self):
+        cfg = ModelCfg(max_objects=5, node_dim=16, temporal_dim=16, latent_dim=24)
+        trainer = PPOTrainer(ContactRearrangementPolicy(cfg))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unknown_policy.pt"
+            trainer.save(path)
+            checkpoint = torch.load(path, weights_only=False)
+            checkpoint["model_cfg"]["observation_layout"] = "role_ids_v1"
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "observation_layout"):
+                PPOTrainer.load(path)
 
 
 if __name__ == "__main__":
