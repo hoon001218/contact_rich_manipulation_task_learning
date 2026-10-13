@@ -2851,3 +2851,65 @@ Robot/shelf 제외로 178/512개 시점의 승인이 달라졌다. 이는 관측
 Isaac Sim 내장 Warp 1.8.2의 관측 검사 11개가 모두 통과했다. CPU/CUDA ray·시점 결과 일치,
 GPU 시점 생성 중 host tensor 읽기 부재, 첫 통과 선택/큐 보충/시도 상한(4의 배수가 아닌 경우),
 요청 재정렬·후보 묶음 크기에 대한 재현성, 가려진 물체 및 시야 밖 역할 처리를 포함한다.
+
+### 2026-10-13 수정 후 이슈와 남은 최적화 검토
+
+사용자는 수정으로 발생한 이슈와 추가 최적화 가능성을 검토하도록 요청했다.
+실행 코드는 변경하지 않고 현재 코드, 직전 native 로그와 계측을 점검했다.
+기존 8 iteration 로그에서 Traceback/NaN/CUDA 오류는 확인되지 않았으며, 이 결과를 장시간
+학습이나 관측 모델의 실물 정확도 보장으로 해석하지 않는다.
+
+확인한 이슈/제약:
+
+- Checkpoint의 `research_metadata`는 model_cfg와 F/T profile만 포함한다
+  (`agents/ppo.py:construct_algorithm/save/load`). 따라서 같은 모델·F/T 설정이면
+  전체 메시/320×240/Python 시점 RNG로 만든 이전 checkpoint와 물체만/160×120/GPU RNG의
+  현재 관측 모델 차이를 checkpoint 호환성 검사에서 구분하지 못한다. Run의 env 설정과
+  별도로 perception 버전·가림 대상·해상도·RNG 방식 등을 checkpoint에 기록할 필요가 있다.
+  이전 모델의 의도적인 fine-tuning까지 무조건 막아야 한다는 뜻은 아니다.
+- 물체만의 가림 모델과 낮은 해상도는 의도한 근사다. 앞선 비교의 관측 5.4% 감소,
+  OBB 중심 p95 13.13mm/정렬 크기 최대 성분 p95 24.04mm 변화와 승인 판정 변화는
+  관측 품질의 실질적인 차이이며, 임계 픽셀 수를 무조건 낮춰 해결하지 않는다.
+  이전 seed와 같은 장면/시점/학습 궤적도 보장하지 않는다.
+- 조건 재시도가 전부 제거된 것은 아니다. 시점 실패 시 배치/IK부터 재시도하는 바깥
+  episode 루프와 CPU 역할/Blocker 경로 탐색이 남는다. 고정 4개 시점은 첫 후보가
+  통과해도 나머지 3개까지 검사할 수 있다. 단일/소수 환경 reset에서 1·2·4개 후보의
+  비용을 같은 후보열로 비교할 여지가 있다.
+
+추가로 실제 catalog의 1,024개 배치만 생성해 Python CPU 경로를 계측했다.
+`/tmp/contact_layout_review_profile.py`, `/tmp/contact_layout_review_profile.json`,
+`/tmp/contact_layout_review_cprofile.txt`. Isaac Sim 내장 Warp 1.8.2를 사용했으며
+1,024개 모두 생성됐다. cProfile과 CUDA event 삽입이 있어 아래 시간은 이전 무계측
+3.14초 또는 native 5.76초와 직접 비교하는 성능 수치가 아니다. 함수 호출 위치/빈도가 목적이다.
+
+- 계측 전체 5.706초. `_scene_proposals` 누적 2.931초(역할/경로 준비 및 결과 조립),
+  `_pack_layouts` 누적 2.755초(CPU 포장·GPU 실행·대기 포함).
+- `_clearance_candidates` 1,344회/누적 1.542초, `_path_supported_clear` 4,455회/1.023초.
+  `polygons_separated`는 두 경로 등을 합쳐 59,750회/누적 1.272초 호출됐다.
+  이 시간들은 서로 포함되므로 합산하지 않는다.
+- GPU layout kernel 호출 2,304회, CUDA event로 감싼 launch 구간 합 약 0.863초.
+  Tensor.cpu 호출 88회/호스트 소요 0.443초(전송뿐 아니라 GPU 완료 대기 포함).
+  CPU/GPU 시간은 중첩되며 GPU 구간 합을 전체 시간에서 빼서 순수 CPU 시간을 계산하지 않는다.
+
+다음 우선순위는 다음과 같다.
+
+1. Blocker의 translation/pivot/rotate-translate 경로 후보와 swept geometry를
+   `[환경, 후보, 구간, vertex/axis]` 형태로 묶어 준비하고 GPU에서 조건을 함께 판정한다.
+   물체 종류별 고정 footprint/회전 envelope를 재사용하고, 자세에 따라 달라지는 변환만
+   갱신한다. 기존 지지/충돌/경로 보장과 독립 scalar 검증을 유지한다.
+2. 생성 결과를 `_pack_layouts` GPU→NumPy→SceneSample dict→`pack_episode_states` GPU로
+   왕복시키는 연결을 tensor로 유지한다. IK도 NumPy 난수/충돌 box 준비와 최종 CPU 변환 후
+   재업로드가 남는다. Episode batch를 tensor로 계속 전달하고 debug 출력만 CPU로 가져온다.
+   짧은 layout kernel들의 반복 launch 및 임시 버퍼도 재사용/고정 크기 묶음을 검토한다.
+3. 대량 reset 이외의 step/PPO를 별도로 최적화한다. 직전 1024환경의 iteration 1–6은
+   평균 12.325초였다. 8번째 iteration은 배치 5.760초, IK 2.930초, vision 2.500초,
+   reset 제외 env.step 6.771초, PPO update 3.283초였다. Physics 3.051초와 action 적용
+   1.282초는 env.step 안에 포함되므로 다시 합산하지 않는다. Vision만 비용 0으로 만들어도
+   해당 22.45초 iteration에서 직접 줄일 수 있는 시간은 약 2.50초(11.1%)다.
+   Epoch 수·물리 dt 등 실험 정의 변경에 앞서 기존 tensor 연산의 할당/launch와 PPO
+   microbatch 크기를 확인한다. IK solve는 이미 CUDA graph를 사용하므로 그 재도입을
+   새 최적화로 제안하지 않는다.
+
+Vision→IK 순서 변경, 시점 후보 묶음 크기 변경, 추가 ray ROI/버퍼 최적화는 후순위다.
+실패 이유별 비용을 먼저 비교해야 하며, 앞 단계에서 다른 단계가 실패할 후보를 더 계산하는
+역효과도 있을 수 있다. 해상도를 더 낮추는 것은 현재 우선순위가 아니다.
