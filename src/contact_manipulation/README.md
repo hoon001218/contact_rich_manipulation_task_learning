@@ -189,6 +189,24 @@ reset(env_ids): 선택 환경마다 새 Target/Blocker·물체 배치 생성
 생성하며, 불가능한 종류 조합은 점유율을 낮추지 않고 제한된 횟수 안에서 다시 제안한다.
 Target 종류를 하나만 쓰므로 이 pool의 active 개수 상한은 37개이고 관측 capacity는 40개다.
 
+배치 생성은 CPU의 역할·물체 구성·조작 경로 준비와 Warp의 주변 물체 배치로 나눈다.
+Blocker는 footprint 차단율을 만족하는 Y 구간 안에서 샘플링한다. 물체 높이와 전체 점유율은
+구성 확정 시 확인하며, 주변 물체 위치는 해당 yaw에서 선반 안에 들어가는 중심 범위에서 만든다.
+
+CUDA 환경에서는 최대 512개 장면의 배치 상태를 GPU에 유지한다. 한 물체당 위치·yaw 후보
+64개를 병렬로 생성·검사·채점하고, 성공한 위치를 저장한다. 두 번 연속 후보가 없으면
+후보와 가장 많이 충돌한 주변 물체 하나만 빼고 현재 물체를 먼저 놓은 뒤 다시 채운다.
+Target·Blocker와 조작 경로는 이 부분 수정 동안 유지한다. 장면당 최대 16회 부분 수정 후에도
+해결되지 않으면 같은 물체 구성으로 역할 pose·경로를 다시 제안한다. 전체 탐색에도 상한이 있다.
+
+정밀 충돌 검사는 AABB로 가까운 장애물을 추린 뒤 수행한다. 경로 다각형의 축·투영 구간은
+한 번 계산해 재사용하고, 구역별 점유 면적·이웃 관계는 변경된 물체에 대해서만 갱신한다.
+GPU 기하는 float64/비융합 연산이며, CPU 환경도 같은 Warp 생성기를 사용한다.
+Pivot sweep/convex hull과 Blocker 허용 구간 계산은 Numba로 컴파일한다.
+생성 알고리즘이 바뀌었으므로 이전 버전과 같은 seed의 위치는 달라진다. 같은 버전·device에서는
+환경 순서와 batch 크기에 독립적인 seed 결과를 유지한다. CPU/GPU 사이의 완전한 좌표 일치는
+보장하지 않으며, 두 경로 모두 독립 다각형 검사로 연구 조건을 검증한다.
+
 Blocker의 이동·pivot·회전 후 이동을 포함하는 지지면 내 충돌 없는 경로를 하나 확보하고,
 그 경로와 hand 시작 영역을 비워 둔다. 이 경로는 배치 가능성을 확인하는 메타데이터이며
 policy에 제공하지 않는다. 로봇의 실제 collider OBB와 선반·물체를 검사하고,
@@ -203,14 +221,15 @@ Box는 평면 collision proxy를 사용하고 바닥 높이에 바로 놓으며
 초기 속도를 0으로 만든다. Reset 안에서 물리 simulation을 진행하는 settling loop는 없다.
 
 초기 관측에는 **실제 카메라·render product·annotator·참조 물체를 생성하지 않는다.**
-Isaac Lab `RayCaster`와 같은 Warp mesh query를 사용한다. 물체 10종의 시각 메시와 로봇 링크·
-선반의 표면을 한 번 읽어 BVH를 공유하고, 각 환경의 현재 pose로 광선을 변환한다. 물체 복제본마다
-메시를 다시 만들거나 움직일 때 BVH를 재구성하지 않는다. 로봇·선반의 가림도 검사한다.
-학습의 mesh BVH·ray query는 환경과 같은 CUDA device에서 실행한다. 시점 후보 생성과
-재시도 제어는 CPU에 남아 있다. 시야 밖 광선은 Target/Blocker 메시로 바로 연결하고,
-가시성 조건을 통과한 후보에만 관측 OBB를 계산한다.
+Isaac Lab `RayCaster`와 같은 Warp mesh query를 사용한다. 물체 10종의 시각 메시를 한 번
+읽어 종류별 BVH를 공유하고, 활성 물체만 검사한다. 물체 복제본마다 메시를 다시 만들거나
+움직일 때 BVH를 재구성하지 않는다. **로봇·선반에 의한 가림은 제외**한 관측 모델이다.
+이 제외는 ray 관측에만 적용하며, 물리 시뮬레이션과 로봇 초기 자세의 충돌 검사는 유지한다.
+시점 난수·카메라 자세 생성, ray query, 가시율과 후보 선택, OBB 추정은 환경과 같은 CUDA
+device에서 배치 처리한다. 물체·시점별 좌표 변환은 한 번 계산해 모든 픽셀이 공유한다.
+시야 밖 광선은 Target/Blocker 메시로 바로 연결한다.
 
-Reset마다 선반 앞 가상 시점의 위치·방향을 기존 범위에서 새로 샘플링한다. 기본 320×240 광선
+Reset마다 선반 앞 가상 시점의 위치·방향을 기존 범위에서 새로 샘플링한다. 기본 160×120 광선
 격자에서 가장 가까운 표면을 선택하고, Target·Blocker만 따로 조회한 고립 실루엣 대비
 **Target ≥40%, Blocker ≥95%**를 확인한다. 분모는 같은 자세·광선 간격의 2배 넓은 격자로
 계산하며, 실제 시야에서 잘린 role 물체는 거절한다. 이는 렌더링 픽셀 대신 **광선 표본 면적**으로
@@ -222,8 +241,14 @@ Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright
 사용한다. 물체별 count·moment·bounds는 tensor scatter 연산으로 함께 계산한다. 초기 기하는
 기존처럼 episode 중 고정되고 현재 EEF frame으로만 재표현한다. Actor 544D 규약은 유지한다.
 
-`initial_vision.ray_batch_size=8`은 동시에 처리하는 가상 시점 수의 상한이다. 환경별 독립 seed와
-새 장면은 유지하며, 실패한 후보만 다시 샘플링한다. RGB는 만들지 않는다. 디버깅 시
+`initial_vision.ray_batch_size=32`개 episode 요청을 처리하고, 완료한 자리에 다음 요청을 넣는다.
+`ray_candidates_per_env=4`개 시점을 환경마다 한꺼번에 평가하므로 기본 최대 128개 시점을
+동시에 검사한다. GPU에서 첫 통과 후보를 선택하고 그 후보에만 OBB를 계산한다. 환경별
+독립 seed/후보 번호로 난수를 생성하므로 요청 순서·묶음 크기에 따라 후보가 바뀌지 않는다.
+이전 Python 난수열과 같은 시점을 생성하지는 않는다. CPU에는 요청 포장·완료 큐 관리와
+결과 객체 조립이 남으며, 후보 묶음당 선택 인덱스 한 번과 큐 완료 후 통계만 CPU로 읽는다.
+시점 상한 32회, 가시율 40%/95%, 최소 실루엣 32픽셀·관측 16점은 유지한다.
+RGB는 만들지 않는다. 디버깅 시
 `capture_batch(..., retain_images=True)`는 합성 ray depth와 role mask만 반환한다.
 Headless 학습은 카메라 기능을 켜지 않고 reset에서도 render를 호출하지 않는다.
 GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 별도로 유지한다.
@@ -268,10 +293,10 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 저장한다. 물체 pose는 reward·종료 조건에만 사용하며 초기 vision을 대신하지 않는다.
 정적 USD 기하와 로봇 FK 모델은 최초 한 번만 검사한다. Reset 준비 연산은 다음과 같이 나눈다.
 
-- **물체 배치:** 환경별 독립 난수열을 유지하면서, 물체 하나의 후보 위치 180개를 NumPy 배열로
-  생성한다. Convex SAT·물체 간 거리·선반 영역 교집합은 Numba 커널로 계산한다. 회전 경로의
-  모든 sweep edge를 검사하고, 이미 계산한 충돌·영역 점유율 결과를 재사용한다. Numba는
-  `isaacsim-core`의 기존 의존성이고, 첫 호출의 컴파일 결과는 캐시한다.
+- **물체 배치:** 역할·구성·예약 경로는 CPU에서 준비하고, 환경×64개 후보의 위치·yaw 생성,
+  충돌 판정·채점·부분 재배치는 환경 device에서 처리한다. 배치 상태와 누적 면적/이웃 관계를
+  유지하며 16개 진행 단계마다 완료 여부만 CPU로 가져온다. 최종 전체 pairwise 기하 재검사는
+  학습 경로에 없고, `validate_sample()`은 별도 검증용으로 유지한다.
 - **로봇 자세:** 연속적인 TCP 후보와 IK branch를 텐서로 묶어 GPU에서 풀고, elbow 높이와
   전체 collider 충돌 조건도 배치로 검사한다. CUDA graph는 고정 반복 IK/FK만 재사용하며,
   매 episode의 목표·초기 관절값은 새로 넣는다. `robot_start.ik_batch_size=1024`는 한 번에
@@ -456,11 +481,12 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 ```
 
 기하 관측과 IK의 임시 메모리는 native Hydra 설정으로 조절할 수 있다. 다음 예시는
-동시에 8개 가상 시점을 처리하고 한 번의 IK 후보 수를 512로 제한한다.
+동시에 32개 요청의 시점 후보를 각각 4개씩 처리하고 한 번의 IK 후보 수를 512로 제한한다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless \
-  env.initial_vision.ray_batch_size=8 env.robot_start.ik_batch_size=512
+  env.initial_vision.ray_batch_size=32 env.initial_vision.ray_candidates_per_env=4 \
+  env.robot_start.ik_batch_size=512
 ```
 
 Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.

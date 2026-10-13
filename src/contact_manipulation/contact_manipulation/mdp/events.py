@@ -6,15 +6,18 @@ independent of manager call order. Only selected rows change on partial reset.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import random
 from itertools import combinations
-from typing import Sequence
+from typing import Generator, Sequence
 from types import SimpleNamespace
 
 import numpy as np
 
 import torch
+from numba import njit
+import warp as wp
 
 from .observations import (
     SI_200_8_RANGES, SI_200_8_RESOLUTION, calibrate_wrench, compensate_wrench,
@@ -957,6 +960,61 @@ def _convex_hull(points: Sequence[Point]) -> Polygon:
     return tuple(lower[:-1] + upper[:-1])
 
 
+@njit(cache=True)
+def _hull_vertices(points):
+    """The same monotone chain/EPS as _convex_hull, without Python containers."""
+    ordered = points.copy()
+    for i in range(1, len(ordered)):
+        x, y = ordered[i]
+        j = i - 1
+        while j >= 0 and (ordered[j, 0] > x or (ordered[j, 0] == x and ordered[j, 1] > y)):
+            ordered[j + 1] = ordered[j]
+            j -= 1
+        ordered[j + 1, 0], ordered[j + 1, 1] = x, y
+    count = 0
+    for i in range(len(ordered)):
+        if count == 0 or ordered[i, 0] != ordered[count - 1, 0] or ordered[i, 1] != ordered[count - 1, 1]:
+            ordered[count] = ordered[i]
+            count += 1
+    hull = np.empty((2 * count, 2))
+    written = 0
+    for reverse in range(2):
+        begin = written
+        for i in range(count):
+            point = ordered[i if reverse == 0 else count - 1 - i]
+            while written - begin >= 2:
+                a, b = hull[written - 2], hull[written - 1]
+                turn = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+                if turn > _EPS:
+                    break
+                written -= 1
+            hull[written] = point
+            written += 1
+        written -= 1
+    return hull[:written]
+
+
+@njit(cache=True)
+def _rotation_envelopes(footprints, padding):
+    """Compile the expensive two hulls per rotation interval together."""
+    # Keep room for all 8 endpoint corners expanded by 4 offsets. Near-collinear
+    # EPS decisions can retain more vertices than the ideal Minkowski bound.
+    vertices = np.zeros((len(footprints) - 1, 32, 2))
+    counts = np.zeros(len(vertices), dtype=np.int64)
+    offsets = ((-padding, -padding), (padding, -padding), (padding, padding), (-padding, padding))
+    for i in range(len(vertices)):
+        hull = _hull_vertices(np.concatenate((footprints[i], footprints[i + 1])))
+        expanded = np.empty((len(hull) * 4, 2))
+        for j in range(len(hull)):
+            for k in range(4):
+                expanded[j * 4 + k, 0] = hull[j, 0] + offsets[k][0]
+                expanded[j * 4 + k, 1] = hull[j, 1] + offsets[k][1]
+        envelope = _hull_vertices(expanded)
+        counts[i] = len(envelope)
+        vertices[i, :len(envelope)] = envelope
+    return vertices, counts
+
+
 def _swept_polygon(polygon: Polygon, displacement: Point) -> Polygon:
     translated = tuple((x + displacement[0], y + displacement[1]) for x, y in polygon)
     return _convex_hull(polygon + translated)
@@ -1088,16 +1146,10 @@ def motion_sweeps(geometry: ObjectGeometry, motion: PlanarMotion) -> tuple[Polyg
     radius = max(math.hypot(x - origin[0], y - origin[1]) for x, y in start_polygon)
     divisions = max(1, math.ceil(abs(delta) / math.radians(5.0)))
     padding = radius * (1.0 - math.cos(abs(delta) / (2 * divisions)))
-    envelopes = []
-    previous = start_polygon
-    for step in range(1, divisions + 1):
-        current = _pose_polygon(geometry, _motion_pose(motion, step / divisions))
-        hull = _convex_hull(previous + current)
-        envelopes.append(_convex_hull(tuple((x + dx, y + dy) for x, y in hull
-                                           for dx, dy in ((-padding, -padding), (padding, -padding),
-                                                          (padding, padding), (-padding, padding)))))
-        previous = current
-    return tuple(envelopes)
+    footprints = np.asarray([start_polygon, *(_pose_polygon(geometry, _motion_pose(motion, step / divisions))
+                                              for step in range(1, divisions + 1))])
+    vertices, counts = _rotation_envelopes(footprints, padding)
+    return tuple(tuple(map(tuple, polygon[:count].tolist())) for polygon, count in zip(vertices, counts))
 
 
 def _path_sweeps(geometry: ObjectGeometry, path: Sequence[PlanarMotion]) -> tuple[Polygon, ...]:
@@ -1105,7 +1157,7 @@ def _path_sweeps(geometry: ObjectGeometry, path: Sequence[PlanarMotion]) -> tupl
 
 
 def _path_supported_clear(geometry: ObjectGeometry, path: Sequence[PlanarMotion], obstacles: Sequence[Polygon],
-                          rules: SpawnRules) -> bool:
+                          rules: SpawnRules, *, return_sweeps=False):
     # Endpoint rejection is necessary (never sufficient) for a clear sweep.
     # It avoids constructing dozens of convex rotation envelopes for the many
     # candidate pivots that plainly end outside the shelf or inside Target.
@@ -1114,10 +1166,11 @@ def _path_supported_clear(geometry: ObjectGeometry, path: Sequence[PlanarMotion]
         if not _supported(polygon, rules) or any(
             not polygons_separated(polygon, obstacle, rules.gap) for obstacle in obstacles
         ):
-            return False
-    return all(_supported(polygon, rules) and all(polygons_separated(polygon, obstacle, rules.gap)
-                                                  for obstacle in obstacles)
-               for polygon in _path_sweeps(geometry, path))
+            return None if return_sweeps else False
+    sweeps = _path_sweeps(geometry, path)
+    clear = all(_supported(polygon, rules) and all(polygons_separated(polygon, obstacle, rules.gap)
+                                                  for obstacle in obstacles) for polygon in sweeps)
+    return (sweeps if clear else None) if return_sweeps else clear
 
 
 def _check_inputs(geometries: Sequence[ObjectGeometry], rules: SpawnRules) -> None:
@@ -1294,96 +1347,423 @@ def _clearance_candidates(geometry: ObjectGeometry, initial: PlanarPose, access:
     return candidates
 
 
-# Numba is already a required dependency of isaacsim-core. These serial CPU
-# kernels operate on bounded NumPy arrays; they do not create worker threads,
-# touch a CUDA context, or launch one operation per candidate in Python.
-from numba import njit
+# Layout state stays on the requested device across candidate/commit rounds.
+# Candidate geometry uses bounded local scratch; adjacency caches only pair flags.
+_LayoutQuad = wp.types.matrix(shape=(4, 2), dtype=wp.float64)
+_LayoutClip = wp.types.matrix(shape=(12, 2), dtype=wp.float64)
 
 
-@njit(cache=True)
-def _proposal_clear_kernel(centers, local_polygon, vertices, counts, gaps):
-    result = np.ones(len(centers), dtype=np.bool_)
-    # Every obstacle axis and translated-box radius is invariant to proposal.
-    max_axes = vertices.shape[1] + 2
-    axes = np.zeros((len(vertices), max_axes, 2))
-    limits = np.zeros((len(vertices), max_axes, 4))
-    valid = np.zeros((len(vertices), max_axes), dtype=np.bool_)
-    for obstacle in range(len(vertices)):
-        for axis in range(max_axes):
-            if axis < 2:
-                dx = local_polygon[axis + 1, 0] - local_polygon[axis, 0]
-                dy = local_polygon[axis + 1, 1] - local_polygon[axis, 1]
-            elif axis - 2 < counts[obstacle]:
-                edge = axis - 2
-                other = (edge + 1) % counts[obstacle]
-                dx = vertices[obstacle, other, 0] - vertices[obstacle, edge, 0]
-                dy = vertices[obstacle, other, 1] - vertices[obstacle, edge, 1]
-            else:
-                continue
-            length = math.sqrt(dx * dx + dy * dy)
-            if length <= _EPS:
-                continue
-            ax, ay = -dy / length, dx / length
-            axes[obstacle, axis, 0], axes[obstacle, axis, 1] = ax, ay
-            valid[obstacle, axis] = True
-            omin, omax, bmin, bmax = math.inf, -math.inf, math.inf, -math.inf
-            for point in range(counts[obstacle]):
-                value = vertices[obstacle, point, 0] * ax + vertices[obstacle, point, 1] * ay
-                omin, omax = min(omin, value), max(omax, value)
-            for point in range(4):
-                value = local_polygon[point, 0] * ax + local_polygon[point, 1] * ay
-                bmin, bmax = min(bmin, value), max(bmax, value)
-            limits[obstacle, axis, 0], limits[obstacle, axis, 1] = omin, omax
-            limits[obstacle, axis, 2], limits[obstacle, axis, 3] = bmin, bmax
-    for proposal in range(len(centers)):
-        for obstacle in range(len(vertices)):
-            separated = False
-            for axis in range(max_axes):
-                if not valid[obstacle, axis]:
-                    continue
-                center = centers[proposal, 0] * axes[obstacle, axis, 0] + centers[proposal, 1] * axes[obstacle, axis, 1]
-                omin, omax, bmin, bmax = limits[obstacle, axis]
-                if center + bmax + gaps[obstacle] <= omin + _EPS or omax + gaps[obstacle] <= center + bmin + _EPS:
-                    separated = True
-                    break
-            if not separated:
-                result[proposal] = False
+@wp.func
+def _layout_quad(x: wp.float64, y: wp.float64, angle: wp.float64, hx: wp.float64, hy: wp.float64):
+    result = _LayoutQuad()
+    c, s = wp.cos(angle), wp.sin(angle)
+    for k in range(4):
+        dx, dy = -hx, -hy
+        if k == 1 or k == 2:
+            dx = hx
+        if k >= 2:
+            dy = hy
+        result[k, 0] = x + c * dx - s * dy
+        result[k, 1] = y + s * dx + c * dy
+    return result
+
+
+@wp.func
+def _layout_area(p: _LayoutQuad, bounds: wp.vec4d):
+    vertices = _LayoutClip()
+    count = int(4)
+    for k in range(4):
+        vertices[k, 0] = p[k, 0]
+        vertices[k, 1] = p[k, 1]
+    for plane in range(4):
+        if count > 0:
+            output = _LayoutClip()
+            axis, sign = plane // 2, wp.float64(1.0)
+            if plane % 2 == 1:
+                sign = wp.float64(-1.0)
+            written = int(0)
+            previous = count - 1
+            for current in range(count):
+                pd = sign * (wp.float64(vertices[previous, axis]) - bounds[plane])
+                cd = sign * (wp.float64(vertices[current, axis]) - bounds[plane])
+                if (pd >= wp.float64(0.0)) != (cd >= wp.float64(0.0)):
+                    fraction = pd / (pd - cd)
+                    for component in range(2):
+                        output[written, component] = wp.float64(vertices[previous, component]) + fraction * (wp.float64(vertices[current, component]) - wp.float64(vertices[previous, component]))
+                    written += 1
+                if cd >= wp.float64(0.0):
+                    output[written, 0] = wp.float64(vertices[current, 0])
+                    output[written, 1] = wp.float64(vertices[current, 1])
+                    written += 1
+                previous = current
+            vertices, count = output, written
+    area = wp.float64(0.0)
+    for k in range(count):
+        j = (k + 1) % count
+        area += wp.float64(vertices[k, 0]) * wp.float64(vertices[j, 1]) - wp.float64(vertices[k, 1]) * wp.float64(vertices[j, 0])
+    return wp.abs(area) * wp.float64(0.5)
+
+
+@wp.func
+def _layout_distance(a: _LayoutQuad, b: _LayoutQuad):
+    distance = wp.float64(wp.inf)
+    for direction in range(2):
+        points, polygon = a, b
+        if direction == 1:
+            points, polygon = b, a
+        for i in range(4):
+            for j in range(4):
+                k = (j + 1) % 4
+                edge = wp.vec2d(polygon[k, 0] - polygon[j, 0], polygon[k, 1] - polygon[j, 1])
+                delta = wp.vec2d(points[i, 0] - polygon[j, 0], points[i, 1] - polygon[j, 1])
+                t = wp.clamp(wp.dot(delta, edge) / wp.dot(edge, edge), wp.float64(0.0), wp.float64(1.0))
+                delta -= t * edge
+                distance = wp.min(distance, wp.dot(delta, delta))
+    return wp.sqrt(distance)
+
+
+@wp.func
+def _layout_boxes_clear(x: wp.float64, y: wp.float64, c: wp.float64, s: wp.float64,
+                        hx: wp.float64, hy: wp.float64, ox: wp.float64, oy: wp.float64,
+                        oc: wp.float64, os: wp.float64, ohx: wp.float64, ohy: wp.float64, gap: wp.float64):
+    clear = bool(False)
+    for axis in range(4):
+        ax, ay = c, s
+        if axis == 1:
+            ax, ay = -s, c
+        elif axis == 2:
+            ax, ay = oc, os
+        elif axis == 3:
+            ax, ay = -os, oc
+        radius = hx * wp.abs(ax*c + ay*s) + hy * wp.abs(-ax*s + ay*c)
+        other = ohx * wp.abs(ax*oc + ay*os) + ohy * wp.abs(-ax*os + ay*oc)
+        if wp.abs((x-ox)*ax + (y-oy)*ay) >= radius + other + gap - wp.float64(1.e-9):
+            clear = True
+            break
+    return clear
+
+
+@wp.kernel(enable_backward=False)
+def _layout_candidates(poses: wp.array3d(dtype=wp.float64), half: wp.array3d(dtype=wp.float64),
+                       placed: wp.array2d(dtype=wp.int32), state: wp.array2d(dtype=wp.int32),
+                       seeds: wp.array(dtype=wp.int32), regions: wp.array2d(dtype=wp.float64),
+                       areas: wp.array2d(dtype=wp.float64), vertices: wp.array4d(dtype=wp.float64),
+                       axes: wp.array4d(dtype=wp.float64), boxes: wp.array3d(dtype=wp.float64),
+                       counts: wp.array2d(dtype=wp.int32), gaps: wp.array2d(dtype=wp.float64),
+                       bounds: wp.vec4d, gap: wp.float64, neighbor: wp.float64, region_min: wp.float64,
+                       cell_area: wp.float64, candidates: wp.array3d(dtype=wp.float64),
+                       scores: wp.array2d(dtype=wp.float64), collisions: wp.array2d(dtype=wp.int32)):
+    row, candidate = wp.tid()
+    scores[row, candidate] = wp.float64(-1.e30)
+    collisions[row, candidate] = -1
+    if state[row, 0] != 0:
+        return
+    slot = state[row, 1]
+    rng = wp.rand_init(seeds[row], state[row, 2] * scores.shape[1] + candidate)
+    angle = wp.float64(wp.randf(rng)) * wp.float64(2.0 * math.pi) - wp.float64(math.pi)
+    c, s = wp.cos(angle), wp.sin(angle)
+    hx, hy = wp.float64(half[row, slot, 0]), wp.float64(half[row, slot, 1])
+    ex, ey = wp.abs(c)*hx + wp.abs(s)*hy, wp.abs(s)*hx + wp.abs(c)*hy
+    xmin, xmax = bounds[0]+ex, bounds[1]-ex
+    ymin, ymax = bounds[2]+ey, bounds[3]-ey
+    if xmin > xmax or ymin > ymax:
+        return
+    # Sample directly inside the supported center interval. Deficient cells
+    # receive priority; near-neighbor proposals use intersected intervals too.
+    cell = int(0)
+    priority = wp.float64(wp.inf)
+    for j in range(regions.shape[0]):
+        value = wp.float64(areas[row, j]) / cell_area + wp.float64(wp.randf(rng)) * wp.float64(0.08)
+        if value < priority:
+            priority, cell = value, j
+    xlo, xhi = wp.max(xmin, wp.float64(regions[cell, 0])), wp.min(xmax, wp.float64(regions[cell, 1]))
+    ylo, yhi = wp.max(ymin, wp.float64(regions[cell, 2])), wp.min(ymax, wp.float64(regions[cell, 3]))
+    if xlo > xhi or ylo > yhi:
+        xlo, xhi, ylo, yhi = xmin, xmax, ymin, ymax
+    if wp.randf(rng) >= float(0.60):
+        anchor = wp.randi(rng, 0, state[row, 5])
+        for offset in range(state[row, 5]):
+            other = (anchor + offset) % state[row, 5]
+            if placed[row, other] != 0:
+                ac, ass = wp.cos(wp.float64(poses[row, other, 2])), wp.sin(wp.float64(poses[row, other, 2]))
+                aex = wp.abs(ac)*wp.float64(half[row, other, 0]) + wp.abs(ass)*wp.float64(half[row, other, 1])
+                aey = wp.abs(ass)*wp.float64(half[row, other, 0]) + wp.abs(ac)*wp.float64(half[row, other, 1])
+                direction = wp.randi(rng, 0, 4)
+                clearance = gap + wp.float64(0.001) + wp.float64(wp.randf(rng)) * wp.float64(0.024)
+                anchor_x, anchor_y = wp.float64(poses[row, other, 0]), wp.float64(poses[row, other, 1])
+                if direction < 2:
+                    sign = wp.float64(2*direction - 1)
+                    x = anchor_x + sign * (aex + ex + clearance)
+                    low, high = wp.max(ymin, anchor_y-aey-ey), wp.min(ymax, anchor_y+aey+ey)
+                    if x >= xmin and x <= xmax and low <= high:
+                        xlo, xhi, ylo, yhi = x, x, low, high
+                else:
+                    sign = wp.float64(2*(direction-2) - 1)
+                    y = anchor_y + sign * (aey + ey + clearance)
+                    low, high = wp.max(xmin, anchor_x-aex-ex), wp.min(xmax, anchor_x+aex+ex)
+                    if y >= ymin and y <= ymax and low <= high:
+                        xlo, xhi, ylo, yhi = low, high, y, y
                 break
-    return result
+    x = xlo + wp.float64(wp.randf(rng))*(xhi-xlo)
+    y = ylo + wp.float64(wp.randf(rng))*(yhi-ylo)
+    # Static reserved polygons: AABB broad phase, cached polygon axes, then
+    # the two candidate box axes. Distant sweep segments need no SAT.
+    for obstacle in range(counts.shape[1]):
+        count = counts[row, obstacle]
+        if count == 0:
+            break
+        margin = wp.float64(gaps[row, obstacle])
+        # sqrt(2) padding also bounds the SAT axis-gap convention at corners.
+        broad_margin = wp.float64(1.414213562373096) * margin
+        if (x+ex+broad_margin <= wp.float64(boxes[row, obstacle, 0]) or x-ex-broad_margin >= wp.float64(boxes[row, obstacle, 1])
+                or y+ey+broad_margin <= wp.float64(boxes[row, obstacle, 2]) or y-ey-broad_margin >= wp.float64(boxes[row, obstacle, 3])):
+            continue
+        clear = bool(False)
+        for axis in range(count):
+            ax, ay = wp.float64(axes[row, obstacle, axis, 0]), wp.float64(axes[row, obstacle, axis, 1])
+            radius = hx*wp.abs(ax*c + ay*s) + hy*wp.abs(-ax*s + ay*c)
+            center = x*ax + y*ay
+            if (center+radius+margin <= wp.float64(axes[row, obstacle, axis, 2]) + wp.float64(1.e-9)
+                    or wp.float64(axes[row, obstacle, axis, 3])+margin <= center-radius + wp.float64(1.e-9)):
+                clear = True
+                break
+        if not clear:
+            for axis in range(2):
+                ax, ay, radius = c, s, hx
+                if axis == 1:
+                    ax, ay, radius = -s, c, hy
+                lo, hi = wp.float64(wp.inf), wp.float64(-wp.inf)
+                for k in range(count):
+                    value = wp.float64(vertices[row, obstacle, k, 0])*ax + wp.float64(vertices[row, obstacle, k, 1])*ay
+                    lo, hi = wp.min(lo, value), wp.max(hi, value)
+                center = x*ax + y*ay
+                if center+radius+margin <= lo+wp.float64(1.e-9) or hi+margin <= center-radius+wp.float64(1.e-9):
+                    clear = True
+                    break
+        if not clear:
+            return
+    near = bool(False)
+    polygon = _layout_quad(x, y, angle, hx, hy)
+    for other in range(state[row, 5]):
+        if placed[row, other] == 0:
+            continue
+        ox, oy, oa = wp.float64(poses[row, other, 0]), wp.float64(poses[row, other, 1]), wp.float64(poses[row, other, 2])
+        oc, os = wp.cos(oa), wp.sin(oa)
+        ohx, ohy = wp.float64(half[row, other, 0]), wp.float64(half[row, other, 1])
+        oex, oey = wp.abs(oc)*ohx+wp.abs(os)*ohy, wp.abs(os)*ohx+wp.abs(oc)*ohy
+        dx, dy = wp.abs(x-ox)-ex-oex, wp.abs(y-oy)-ey-oey
+        if dx < wp.float64(1.414213562373096)*gap and dy < wp.float64(1.414213562373096)*gap:
+            if not _layout_boxes_clear(x,y,c,s,hx,hy,ox,oy,oc,os,ohx,ohy,gap):
+                collisions[row, candidate] = other
+                return
+        if not near and dx <= neighbor and dy <= neighbor:
+            near = _layout_distance(polygon, _layout_quad(ox,oy,oa,ohx,ohy)) <= neighbor
+    score = wp.float64(0.0)
+    for cell in range(regions.shape[0]):
+        region = wp.vec4d(wp.float64(regions[cell,0]), wp.float64(regions[cell,1]), wp.float64(regions[cell,2]), wp.float64(regions[cell,3]))
+        increment = _layout_area(polygon, region)
+        deficit = wp.max(wp.float64(0.0), region_min*cell_area-wp.float64(areas[row,cell]))
+        score += wp.float64(3.0)*wp.min(increment,deficit)/(wp.float64(4.0)*hx*hy)
+        score += wp.float64(0.1)*increment/(wp.float64(areas[row,cell])+cell_area*wp.float64(0.1))
+    if near:
+        score += wp.float64(0.75)
+    candidates[row,candidate,0] = x
+    candidates[row,candidate,1] = y
+    candidates[row,candidate,2] = angle
+    scores[row,candidate] = score
 
 
-def _proposal_clear_mask(centers: np.ndarray, local_polygon: np.ndarray,
-                         obstacles: Sequence[Polygon], gaps: np.ndarray) -> np.ndarray:
-    """Exact convex SAT, retaining every edge of every pivot sweep envelope."""
-    if not len(obstacles):
-        return np.ones(len(centers), dtype=bool)
-    counts = np.asarray([len(polygon) for polygon in obstacles], dtype=np.int64)
-    vertices = np.zeros((len(obstacles), int(counts.max()), 2))
-    for index, polygon in enumerate(obstacles):
-        vertices[index, :len(polygon)] = polygon
-    return _proposal_clear_kernel(centers, local_polygon, vertices, counts, gaps)
+@wp.kernel(enable_backward=False)
+def _layout_commit(poses: wp.array3d(dtype=wp.float64), half: wp.array3d(dtype=wp.float64),
+                   placed: wp.array2d(dtype=wp.int32), state: wp.array2d(dtype=wp.int32),
+                   regions: wp.array2d(dtype=wp.float64), areas: wp.array2d(dtype=wp.float64),
+                   adjacent: wp.array3d(dtype=wp.int32), candidates: wp.array3d(dtype=wp.float64),
+                   scores: wp.array2d(dtype=wp.float64), collisions: wp.array2d(dtype=wp.int32),
+                   bounds: wp.vec4d, neighbor: wp.float64, neighbor_min: wp.float64,
+                   region_min: wp.float64, cell_area: wp.float64, x_span: wp.float64, y_span: wp.float64):
+    row = wp.tid()
+    if state[row,0] != 0:
+        return
+    slot = state[row,1]
+    state[row,2] += 1
+    chosen, best = int(-1), wp.float64(-1.e29)
+    for k in range(scores.shape[1]):
+        if wp.float64(scores[row,k]) > best:
+            chosen, best = k, wp.float64(scores[row,k])
+    remove = int(-1)
+    if chosen >= 0:
+        for k in range(3):
+            poses[row,slot,k] = wp.float64(candidates[row,chosen,k])
+        placed[row,slot] = 1
+        state[row,3] = 0
+        p = _layout_quad(wp.float64(poses[row,slot,0]),wp.float64(poses[row,slot,1]),wp.float64(poses[row,slot,2]),wp.float64(half[row,slot,0]),wp.float64(half[row,slot,1]))
+        for cell in range(regions.shape[0]):
+            areas[row,cell] += _layout_area(p, wp.vec4d(wp.float64(regions[cell,0]),wp.float64(regions[cell,1]),wp.float64(regions[cell,2]),wp.float64(regions[cell,3])))
+        for other in range(state[row,5]):
+            if other != slot and placed[row,other] != 0:
+                q = _layout_quad(wp.float64(poses[row,other,0]),wp.float64(poses[row,other,1]),wp.float64(poses[row,other,2]),wp.float64(half[row,other,0]),wp.float64(half[row,other,1]))
+                value = int(_layout_distance(p,q) <= neighbor + wp.float64(1.e-9))
+                adjacent[row,slot,other] = value
+                adjacent[row,other,slot] = value
+        pending = int(-1)
+        for other in range(2,state[row,5]):
+            if placed[row,other] == 0:
+                pending = other
+                break
+        if pending >= 0:
+            state[row,1] = pending
+        else:
+            # Only cached summaries and a linear bounds scan; no pairwise
+            # geometry or clipping is repeated at completion.
+            valid, linked = bool(True), int(0)
+            xmin, xmax, ymin, ymax = wp.float64(wp.inf),wp.float64(-wp.inf),wp.float64(wp.inf),wp.float64(-wp.inf)
+            for other in range(state[row,5]):
+                has_neighbor = bool(False)
+                for j in range(state[row,5]):
+                    if adjacent[row,other,j] != 0:
+                        has_neighbor = True
+                        break
+                if has_neighbor:
+                    linked += 1
+                c,s = wp.cos(wp.float64(poses[row,other,2])),wp.sin(wp.float64(poses[row,other,2]))
+                ex = wp.abs(c)*wp.float64(half[row,other,0])+wp.abs(s)*wp.float64(half[row,other,1])
+                ey = wp.abs(s)*wp.float64(half[row,other,0])+wp.abs(c)*wp.float64(half[row,other,1])
+                xmin,xmax = wp.min(xmin,wp.float64(poses[row,other,0])-ex),wp.max(xmax,wp.float64(poses[row,other,0])+ex)
+                ymin,ymax = wp.min(ymin,wp.float64(poses[row,other,1])-ey),wp.max(ymax,wp.float64(poses[row,other,1])+ey)
+            valid = wp.float64(linked) >= neighbor_min*wp.float64(state[row,5])
+            valid = valid and xmax-xmin >= x_span*(bounds[1]-bounds[0]) and ymax-ymin >= y_span*(bounds[3]-bounds[2])
+            for cell in range(regions.shape[0]):
+                valid = valid and wp.float64(areas[row,cell]) >= region_min*cell_area - wp.float64(1.e-9)
+            if valid:
+                state[row,0] = 1
+            else:
+                state[row,0] = -1
+    else:
+        state[row,3] += 1
+        if state[row,3] >= 2:
+            # Retain the failed slot and all unrelated objects. Reinsert the
+            # displaced neighbor after this slot has found room.
+            most = int(0)
+            for other in range(2,state[row,5]):
+                hits = int(0)
+                if placed[row,other] != 0:
+                    for k in range(collisions.shape[1]):
+                        hits += int(collisions[row,k] == other)
+                if hits > most:
+                    most, remove = hits, other
+            if remove < 0 or state[row,4] >= 16:
+                state[row,0] = -1
+            state[row,3] = 0
+    if remove >= 0 and state[row,0] == 0:
+        state[row,4] += 1
+        placed[row,remove] = 0
+        p = _layout_quad(wp.float64(poses[row,remove,0]),wp.float64(poses[row,remove,1]),wp.float64(poses[row,remove,2]),wp.float64(half[row,remove,0]),wp.float64(half[row,remove,1]))
+        for cell in range(regions.shape[0]):
+            areas[row,cell] -= _layout_area(p,wp.vec4d(wp.float64(regions[cell,0]),wp.float64(regions[cell,1]),wp.float64(regions[cell,2]),wp.float64(regions[cell,3])))
+        for other in range(state[row,5]):
+            adjacent[row,remove,other] = 0
+            adjacent[row,other,remove] = 0
 
 
-@njit(cache=True)
-def _footprint_boundary_distances(first: np.ndarray, second: np.ndarray) -> np.ndarray:
-    """Pairwise exact boundary distances; callers have already separated boxes."""
-    result = np.empty((len(first), len(second)))
-    for a in range(len(first)):
-        for b in range(len(second)):
-            best = math.inf
-            for direction in range(2):
-                points = first[a] if direction == 0 else second[b]
-                polygon = second[b] if direction == 0 else first[a]
-                for point in range(len(points)):
-                    for edge in range(len(polygon)):
-                        other = (edge + 1) % len(polygon)
-                        dx, dy = polygon[other, 0] - polygon[edge, 0], polygon[other, 1] - polygon[edge, 1]
-                        px, py = points[point, 0] - polygon[edge, 0], points[point, 1] - polygon[edge, 1]
-                        fraction = max(0., min(1., (px * dx + py * dy) / (dx * dx + dy * dy)))
-                        ex, ey = px - fraction * dx, py - fraction * dy
-                        best = min(best, ex * ex + ey * ey)
-            result[a, b] = math.sqrt(best)
-    return result
+# Isaac Sim 5.1 bundles Warp 1.8.2; use options supported there and standalone.
+wp.set_module_options({"fuse_fp": False})
+
+
+def _pack_layouts(plans, geometries, rules, device, statistics=None):
+    """Fill independent role/path plans without host round-trips per object.
+
+    A plan is (IDs, role positions/yaws, access region, path, reserved sweeps,
+    seed). Role/path geometry is transferred once; only progress polls and
+    final poses return to the host during packing.
+    """
+    wp.init()
+    n, width = len(plans), max(len(plan[0]) for plan in plans)
+    reserved = [[rectangle_polygon(plan[3]), *plan[5]] for plan in plans]
+    for plan, polygons in zip(plans, reserved):
+        if rules.reserve_blocker_front:
+            blocker = footprint_polygon(geometries[plan[0][1]], plan[1][plan[0][1]][:2], plan[2][plan[0][1]])
+            polygons.append(rectangle_polygon(_blocker_front_region(blocker, rules)))
+    obstacles = max(map(len,reserved))
+    vertices_width = max(len(p) for polygons in reserved for p in polygons)
+    poses, half = np.zeros((n,width,3)), np.zeros((n,width,2))
+    # State columns: status (0 pending, 1 accepted, -1 exhausted), current
+    # slot, round counter, consecutive misses, repair count, active count.
+    placed, state = np.zeros((n,width),np.int32), np.zeros((n,6),np.int32)
+    regions = np.asarray(shelf_regions(rules))
+    areas, adjacent = np.zeros((n,len(regions))), np.zeros((n,width,width),np.int32)
+    vertices = np.zeros((n,obstacles,vertices_width,2))
+    axes = np.zeros((n,obstacles,vertices_width,4))
+    boxes, counts = np.zeros((n,obstacles,4)), np.zeros((n,obstacles),np.int32)
+    gaps, seeds = np.full((n,obstacles),rules.gap), np.empty(n,np.int32)
+    for row, (plan, polygons) in enumerate(zip(plans,reserved)):
+        ids, positions, yaws, *_ = plan
+        seeds[row] = plan[-1] & 0x7fffffff
+        state[row,1], state[row,5] = 2,len(ids)
+        for slot,index in enumerate(ids):
+            g = geometries[index]
+            half[row,slot] = ((g.upper[0]-g.lower[0])/2,(g.upper[1]-g.lower[1])/2)
+            if slot < 2:
+                poses[row,slot] = (*positions[index][:2],yaws[index])
+        placed[row,:2] = 1
+        role_polygons = np.asarray([footprint_polygon(geometries[i],positions[i][:2],yaws[i]) for i in ids[:2]])
+        areas[row] = _footprint_region_areas(role_polygons,regions).sum(axis=0)
+        adjacent[row,0,1] = adjacent[row,1,0] = polygon_distance(tuple(map(tuple,role_polygons[0])),tuple(map(tuple,role_polygons[1]))) <= rules.neighbor_distance + _EPS
+        if len(ids) == 2:
+            metrics = _scene_measurements(tuple(tuple(map(tuple,p)) for p in role_polygons), rules)
+            state[row,0] = 1 if (metrics.x_coverage >= rules.min_x_coverage
+                and metrics.y_coverage >= rules.min_y_coverage
+                and metrics.local_neighbor_fraction >= rules.min_neighbor_fraction
+                and min(metrics.region_occupancies) >= rules.min_region_occupancy - _EPS) else -1
+        for column, polygon in enumerate(polygons):
+            p = np.asarray(polygon)
+            k = len(p)
+            vertices[row,column,:k], counts[row,column] = p,k
+            boxes[row,column] = (p[:,0].min(),p[:,0].max(),p[:,1].min(),p[:,1].max())
+            delta = np.roll(p,-1,axis=0)-p
+            normals = np.stack((-delta[:,1],delta[:,0]),axis=1)
+            lengths = np.linalg.norm(normals,axis=1)
+            normals /= np.maximum(lengths[:,None],1.e-30)
+            # Scalar SAT ignores degenerate edges. Give them an unbounded
+            # interval so they cannot accidentally certify separation.
+            degenerate = lengths <= _EPS
+            normals[degenerate] = 0.
+            projections = normals @ p.T
+            axes[row,column,:k] = np.column_stack((normals,projections.min(axis=1),projections.max(axis=1)))
+            axes[row,column,:k,2][degenerate] = -np.inf
+            axes[row,column,:k,3][degenerate] = np.inf
+        if rules.reserve_blocker_front:
+            gaps[row,len(polygons)-1] = 0.
+    device = str(device)
+    buffers = [torch.as_tensor(a,device=device) for a in
+               (poses,half,placed,state,seeds,regions,areas,vertices,axes,boxes,counts,gaps,adjacent)]
+    p,h,on,st,seed,reg,ar,v,ax,box,co,ga,adj = [wp.from_torch(t) for t in buffers]
+    candidates = wp.empty((n,64,3),dtype=wp.float64,device=device)
+    scores = wp.empty((n,64),dtype=wp.float64,device=device)
+    collisions = wp.empty((n,64),dtype=wp.int32,device=device)
+    bounds = wp.vec4d(rules.x_range[0]+rules.edge_margin,rules.x_range[1]-rules.edge_margin,
+                      rules.y_range[0]+rules.edge_margin,rules.y_range[1]-rules.edge_margin)
+    cell_area = ((rules.x_range[1]-rules.x_range[0]-2*rules.edge_margin)
+                 * (rules.y_range[1]-rules.y_range[0]-2*rules.edge_margin)/len(regions))
+    stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if torch.device(device).type == 'cuda' else None
+    # Poll only once per 16 resident rounds. Finished rows are masked in both
+    # kernels, independent of batch ordering or how slowly another row packs.
+    for begin in range(0, 4*width+32, 16):
+        for _ in range(16):
+            wp.launch(_layout_candidates,dim=(n,64),inputs=[p,h,on,st,seed,reg,ar,v,ax,box,co,ga,bounds,
+                rules.gap,rules.neighbor_distance,rules.min_region_occupancy,cell_area,candidates,scores,collisions],device=device,stream=stream)
+            wp.launch(_layout_commit,dim=n,inputs=[p,h,on,st,reg,ar,adj,candidates,scores,collisions,bounds,
+                rules.neighbor_distance,rules.min_neighbor_fraction,rules.min_region_occupancy,cell_area,
+                rules.min_x_coverage,rules.min_y_coverage],device=device,stream=stream)
+        status = buffers[3].cpu().numpy().copy()
+        if np.all(status[:,0] != 0):
+            break
+    if statistics is not None:
+        statistics['plans'] = statistics.get('plans',0)+n
+        statistics['candidate_rounds'] = statistics.get('candidate_rounds',0)+int(status[:,2].sum())
+        statistics['evictions'] = statistics.get('evictions',0)+int(status[:,4].sum())
+        statistics['rejected_plans'] = statistics.get('rejected_plans',0)+int((status[:,0]!=1).sum())
+    result = buffers[0].cpu().numpy()
+    return [result[row,:len(plan[0])].copy() if status[row,0] == 1 else None for row,plan in enumerate(plans)]
 
 
 @njit(cache=True)
@@ -1430,38 +1810,134 @@ def _footprint_region_areas(polygons: np.ndarray, regions: np.ndarray) -> np.nda
     return areas
 
 
-def _placement_proposals(rng: np.random.Generator, regions: np.ndarray, region_areas: np.ndarray,
-                         positions: np.ndarray, extents: np.ndarray, half: Point,
-                         bounds: Region, rules: SpawnRules, cell_area: float) -> np.ndarray:
-    """Generate the same cell/near-neighbor proposal mixture in one NumPy batch."""
-    count = 180
-    deficient = np.flatnonzero(region_areas / cell_area < rules.min_region_occupancy + _EPS)
-    cells = deficient if len(deficient) else np.flatnonzero(region_areas <= region_areas.min() + .05 * cell_area)
-    selected = rng.choice(cells, size=count)
-    selected_regions = regions[selected]
-    low = np.maximum(selected_regions[:, (0, 2)], np.asarray(bounds)[[0, 2]])
-    high = np.minimum(selected_regions[:, (1, 3)], np.asarray(bounds)[[1, 3]])
-    centers = low + rng.random((count, 2)) * (high - low)
-    centers[(low > high).any(axis=1)] = np.nan
-    cell_centers = .5 * (regions[:, (0, 2)] + regions[:, (1, 3)])
-    order = np.argsort(np.sum((cell_centers[:, None] - positions[None]) ** 2, axis=-1), axis=1)
-    anchors = order[selected, rng.integers(max(2, len(positions) // 2), size=count)]
-    axes = rng.integers(2, size=count)
-    signs = rng.choice(np.asarray((-1., 1.)), size=count)
-    clearances = rng.uniform(rules.gap + .001, rules.gap + .025, size=count)
-    near_centers = positions[anchors].copy()
-    near_centers += rng.uniform(-1., 1., size=(count, 2)) * np.maximum(extents[anchors], half)
-    rows = np.arange(count)
-    near_centers[rows, axes] = (positions[anchors, axes]
-                               + signs * (extents[anchors, axes] + np.asarray(half)[axes] + clearances))
-    use_neighbor = rng.random(count) >= .60
-    centers[use_neighbor] = near_centers[use_neighbor]
-    return centers
+@njit(cache=True)
+def _blocker_y_interval(polygon, access, low, high, threshold):
+    """Exact piecewise-quadratic overlap interval for a vertically shifted box.
+
+    Breakpoints occur where a vertex (including an X-clipped edge) crosses a
+    horizontal access boundary. Solve each quadratic once instead of rejecting
+    entire role plans for insufficient footprint blockage.
+    """
+    heights = list(polygon[:, 1])
+    for k in range(4):
+        j = (k + 1) % 4
+        for x in (access[0], access[1]):
+            a, b = polygon[k, 0], polygon[j, 0]
+            if min(a,b) < x < max(a,b):
+                heights.append(polygon[k,1] + (x-a)/(b-a)*(polygon[j,1]-polygon[k,1]))
+    knots = [low, high]
+    for height in heights:
+        for y in (access[2]-height, access[3]-height):
+            if low < y < high:
+                knots.append(y)
+    knots.sort()
+    samples = np.empty((3*(len(knots)-1),4,2))
+    for interval in range(len(knots)-1):
+        for part in range(3):
+            shift = knots[interval]+(knots[interval+1]-knots[interval])*part/2
+            for k in range(4):
+                samples[3*interval+part,k,0] = polygon[k,0]
+                samples[3*interval+part,k,1] = polygon[k,1]+shift
+    values = _footprint_region_areas(samples, access.reshape(1,4))[:,0]-threshold
+    lower, upper = math.inf, -math.inf
+    for interval in range(len(knots)-1):
+        f0,fm,f1 = values[3*interval:3*interval+3]
+        a = 2*(f1+f0-2*fm)
+        b, c = f1-f0-a, f0
+        points = [0.,1.]
+        if abs(a) < 1.e-13:
+            if abs(b) > 1.e-13:
+                root = -c/b
+                if 0 < root < 1:
+                    points.append(root)
+        else:
+            discriminant = b*b-4*a*c
+            if discriminant >= 0:
+                for root in ((-b-math.sqrt(discriminant))/(2*a),(-b+math.sqrt(discriminant))/(2*a)):
+                    if 0 < root < 1:
+                        points.append(root)
+        points.sort()
+        for k in range(len(points)-1):
+            middle = (points[k]+points[k+1])/2
+            if (a*middle+b)*middle+c >= -1.e-14:
+                length = knots[interval+1]-knots[interval]
+                lower = min(lower,knots[interval]+points[k]*length)
+                upper = max(upper,knots[interval]+points[k+1]*length)
+    # Avoid a roundoff-only crossing of a required-area boundary.
+    if upper-lower > 2.e-8:
+        lower += 1.e-8
+        upper -= 1.e-8
+    return lower,upper
+
+
+@lru_cache(maxsize=8)
+def _catalog_layout_data(geometries):
+    types = {_asset_type(geometry) for geometry in geometries}
+    groups = {asset: tuple(i for i, geometry in enumerate(geometries) if _asset_type(geometry) == asset)
+              for asset in sorted(types)}
+    areas = tuple((g.upper[0] - g.lower[0]) * (g.upper[1] - g.lower[1]) for g in geometries)
+    return types, groups, areas
 
 
 def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: random.Random,
                  target_id: int | None = None, blocker_id: int | None = None,
                  active_ids: Sequence[int] | None = None) -> SceneSample:
+    """Single CPU scene using the same constructive packer as batched resets."""
+    generator = _scene_proposals(geometries, rules, rng, target_id, blocker_id, active_ids)
+    value = None
+    while True:
+        try:
+            plan = generator.send(value)
+        except StopIteration as done:
+            return done.value
+        value = _pack_layouts([plan], geometries, rules, 'cpu')[0]
+
+
+def sample_scenes(geometries, rules, streams, roles, active_ids, *, device="cpu", batch_size=512,
+                  statistics=None):
+    """Independent role/path plans with resident, batched clutter construction.
+
+    Only failed plans return to the CPU. Candidate generation, selection and
+    bounded neighbor repair share device state. RNG depends on each plan's seed,
+    never its row or the completion order of another environment.
+    """
+    if not (len(streams) == len(roles) == len(active_ids)) or batch_size < 1:
+        raise ValueError("Layout requests need aligned seeds/roles/compositions and a positive batch size.")
+    _check_inputs(geometries, rules)
+    def generate(row):
+        for _ in range(32):
+            try:
+                return (yield from _scene_proposals(geometries, rules, streams[row], *roles[row],
+                                                    active_ids[row], checked=True))
+            except RuntimeError:
+                if active_ids[row] is not None:
+                    raise
+        raise RuntimeError("No feasible composition after 32 proposals.")
+    results = [None] * len(streams)
+    for begin in range(0, len(streams), batch_size):
+        pending = list(range(begin, min(begin + batch_size, len(streams))))
+        generators = {row: generate(row) for row in pending}
+        values = {row: None for row in pending}
+        while pending:
+            rows, plans = [], []
+            for row in pending:
+                try:
+                    plans.append(generators[row].send(values[row]))
+                    rows.append(row)
+                except StopIteration as done:
+                    results[row] = done.value
+                except RuntimeError as error:
+                    results[row] = error
+            if rows:
+                packed = _pack_layouts(plans, geometries, rules, device, statistics)
+                values = dict(zip(rows, packed))
+            pending = rows
+    return results
+
+
+def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: random.Random,
+                 target_id: int | None = None, blocker_id: int | None = None,
+                 active_ids: Sequence[int] | None = None, *, checked=False) -> Generator[tuple, np.ndarray | None, SceneSample]:
     """Choose episode roles/count once, then sample whole-shelf clutter around them.
 
     The Target species appears only once. The requested count describes asset
@@ -1473,10 +1949,11 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     A conservative finite
     SE(2) witness reserves rearrangement room but is not an actor goal or proof
     of reachable physical manipulation. Camera visibility must be checked by
-    future rendered instance masks; planar blockage is not a visibility test.
+    initial geometric perception; planar blockage is not a visibility test.
     """
-    _check_inputs(geometries, rules)
-    types = {_asset_type(geometry) for geometry in geometries}
+    if not checked:
+        _check_inputs(geometries, rules)
+    types, groups, areas = _catalog_layout_data(tuple(geometries))
     fixed_ids = tuple(active_ids) if active_ids is not None else None
     if fixed_ids is not None:
         if target_id is None or blocker_id is None:
@@ -1509,8 +1986,6 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     if _asset_type(geometries[blocker_id]) == target_type:
         raise ValueError("Target asset type cannot also be the Blocker or a surrounding object.")
     target, blocker = target_id, blocker_id
-    groups = {asset: tuple(index for index, geometry in enumerate(geometries) if _asset_type(geometry) == asset)
-              for asset in sorted(types)}
     role_types = {target_type, _asset_type(geometries[blocker])}
     if fixed_ids is not None:
         if sum(_asset_type(geometries[index]) == target_type for index in fixed_ids) != 1:
@@ -1538,8 +2013,7 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
     # before trying positions, until its summed area meets the requested density.
     # Add copies of the least-represented non-Target types, breaking ties at
     # random. Large footprints must not dominate the episode's composition.
-    area = lambda index: ((geometries[index].upper[0] - geometries[index].lower[0])
-                          * (geometries[index].upper[1] - geometries[index].lower[1]))
+    area = areas.__getitem__
     remaining = {
         asset: [index for index in groups[asset] if index not in selected_ids]
         for asset in sorted(selected_types - {target_type})
@@ -1576,17 +2050,12 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         raise ValueError("Selected asset type count exceeds the active instance cap.")
     # Larger footprints are placed first, preserving the two designated roles.
     ids = (target, blocker, *sorted(selected_ids[2:], key=area, reverse=True))
-    regions = shelf_regions(rules)
-    region_polygons = tuple(rectangle_polygon(region) for region in regions)
-    cell_area = usable_area / len(regions)
-    proposal_rng = np.random.default_rng(rng.getrandbits(64))
-    region_array = np.asarray(regions)
+    if any(rules.shelf_top + geometries[index].upper[2] - geometries[index].lower[2]
+           > rules.ceiling - rules.gap for index in ids):
+        raise RuntimeError("Selected composition exceeds shelf ceiling clearance.")
     for _ in range(rules.max_attempts):
-        yaws = {index: rng.uniform(-math.pi, math.pi) for index in ids}
-        extents = {index: _half_extents(geometries[index], yaws[index]) for index in ids}
-        if any(rules.shelf_top + geometries[index].upper[2] - geometries[index].lower[2]
-               > rules.ceiling - rules.gap for index in ids):
-            continue
+        yaws = {index: rng.uniform(-math.pi, math.pi) for index in (target, blocker)}
+        extents = {index: _half_extents(geometries[index], yaws[index]) for index in (target, blocker)}
         target_hx, target_hy = extents[target]
         blocker_hx, blocker_hy = extents[blocker]
         pair_gap = rng.uniform(rules.gap + 0.002, rules.gap + 0.012)
@@ -1603,112 +2072,45 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
         blocker_ymax = min(rules.y_range[1] - rules.edge_margin - blocker_hy, target_y + half_width + blocker_hy)
         if blocker_ymin > blocker_ymax:
             continue
-        blocker_y = rng.uniform(blocker_ymin, blocker_ymax)
         access_region = (target_x + target_hx + rules.approach_margin, rules.x_range[1],
                          target_y - half_width, target_y + half_width)
         if access_region[0] >= access_region[1]:
             continue
-        access = rectangle_polygon(access_region)
+        local = np.asarray(footprint_polygon(geometries[blocker], (blocker_x, 0.), yaws[blocker]))
+        blocker_ymin, blocker_ymax = _blocker_y_interval(local, np.asarray(access_region),
+            blocker_ymin, blocker_ymax, rules.min_blocked_ratio * area(blocker))
+        if blocker_ymin > blocker_ymax:
+            continue
+        blocker_y = rng.uniform(blocker_ymin, blocker_ymax)
         positions = {target: (target_x, target_y, rules.shelf_top - geometries[target].lower[2]),
                      blocker: (blocker_x, blocker_y, rules.shelf_top - geometries[blocker].lower[2])}
         polygons = {index: footprint_polygon(geometries[index], positions[index][:2], yaws[index])
                     for index in (target, blocker)}
-        if overlap_area(polygons[blocker], access) / planar_polygon_area(polygons[blocker]) < rules.min_blocked_ratio:
-            continue
-        blocker_front = (rectangle_polygon(_blocker_front_region(polygons[blocker], rules))
-                         if rules.reserve_blocker_front else None)
         initial = PlanarPose(blocker_x, blocker_y, yaws[blocker])
-        path = next((candidate for candidate in _clearance_candidates(geometries[blocker], initial, access_region, rules, rng)
-                     if _path_supported_clear(geometries[blocker], candidate, (polygons[target],), rules)), None)
+        path, sweeps = None, None
+        for candidate in _clearance_candidates(geometries[blocker], initial, access_region, rules, rng):
+            sweeps = _path_supported_clear(geometries[blocker], candidate, (polygons[target],), rules,
+                                           return_sweeps=True)
+            if sweeps is not None:
+                path = candidate
+                break
         if path is None:
             continue
-        sweeps = _path_sweeps(geometries[blocker], path)
-        region_areas = [sum(overlap_area(polygon, region) for polygon in polygons.values())
-                        for region in region_polygons]
-        for index in ids[2:]:
-            hx, hy = extents[index]
-            placed = False
-            x_low, x_high = rules.x_range[0] + rules.edge_margin + hx, rules.x_range[1] - rules.edge_margin - hx
-            y_low, y_high = rules.y_range[0] + rules.edge_margin + hy, rules.y_range[1] - rules.edge_margin - hy
-            if x_low > x_high or y_low > y_high:
-                break
-            best = None
-            best_score = -math.inf
-            centers = _placement_proposals(
-                proposal_rng, region_array, np.asarray(region_areas),
-                np.asarray([position[:2] for position in positions.values()]),
-                np.asarray([extents[other] for other in positions]), (hx, hy),
-                (x_low, x_high, y_low, y_high), rules, cell_area,
-            )
-            supported = ((centers[:, 0] >= x_low - _EPS) & (centers[:, 0] <= x_high + _EPS)
-                         & (centers[:, 1] >= y_low - _EPS) & (centers[:, 1] <= y_high + _EPS))
-            centers = centers[supported]
-            local_polygon = np.asarray(footprint_polygon(geometries[index], (0., 0.), yaws[index]))
-            obstacles = [access, *sweeps, *polygons.values()]
-            gaps = np.full(len(obstacles) + (blocker_front is not None), rules.gap)
-            if blocker_front is not None:
-                obstacles.append(blocker_front)
-                gaps[-1] = 0.
-            centers = centers[_proposal_clear_mask(centers, local_polygon, obstacles, gaps)][:6]
-            candidate_polygons = centers[:, None] + local_polygon[None]
-            neighbor_flags = (_footprint_boundary_distances(candidate_polygons, np.asarray(tuple(polygons.values())))
-                              <= rules.neighbor_distance).any(axis=1)
-            candidate_increments = _footprint_region_areas(candidate_polygons, region_array)
-            for center, candidate_polygon, near, increments in zip(
-                centers, candidate_polygons, neighbor_flags, candidate_increments
-            ):
-                x, y = map(float, center)
-                polygon = tuple(tuple(map(float, point)) for point in candidate_polygon)
-                increments = tuple(map(float, increments))
-                deficiency_gain = sum(min(increment, max(0.0, rules.min_region_occupancy * cell_area - before))
-                                      for increment, before in zip(increments, region_areas)) / area(index)
-                balance = sum(increment / (before + cell_area * 0.10)
-                              for increment, before in zip(increments, region_areas))
-                score = 3.0 * deficiency_gain + 0.75 * near + 0.1 * balance
-                if score > best_score:
-                    best, best_score = (x, y, polygon, increments), score
-            if best is not None:
-                x, y, polygon, increments = best
-                positions[index] = (x, y, rules.shelf_top - geometries[index].lower[2])
-                polygons[index] = polygon
-                region_areas = [before + increment for before, increment in zip(region_areas, increments)]
-                placed = True
-            if not placed:
-                break
-        if len(positions) != len(ids):
+        packed = yield (ids, positions, yaws, access_region, path, sweeps, rng.getrandbits(32))
+        if packed is None:
             continue
-        # Construction has already established nonoverlap and accumulated cell
-        # intersection areas. Reuse those exact results rather than clipping and
-        # checking every polygon pair a second time in the scalar debug oracle.
-        polygon_array = np.asarray(tuple(polygons.values()))
-        distances = _footprint_boundary_distances(polygon_array, polygon_array)
-        np.fill_diagonal(distances, np.inf)
-        spans = polygon_array.max(axis=(0, 1)) - polygon_array.min(axis=(0, 1))
-        metrics = SceneMetrics(
-            float(spans[0] / (rules.x_range[1] - rules.x_range[0] - 2 * rules.edge_margin)),
-            float(spans[1] / (rules.y_range[1] - rules.y_range[0] - 2 * rules.edge_margin)),
-            active_area / usable_area,
-            float((distances <= rules.neighbor_distance + _EPS).any(axis=1).mean()),
-            tuple(value / cell_area for value in region_areas),
-        )
-        if metrics.x_coverage < rules.min_x_coverage or metrics.y_coverage < rules.min_y_coverage:
-            continue
-        if metrics.local_neighbor_fraction < rules.min_neighbor_fraction:
-            continue
-        if metrics.shelf_occupancy < rules.min_shelf_occupancy - _EPS:
-            continue
-        if min(metrics.region_occupancies) < rules.min_region_occupancy - _EPS:
-            continue
+        for slot, index in enumerate(ids):
+            positions[index] = (float(packed[slot, 0]), float(packed[slot, 1]),
+                                rules.shelf_top - geometries[index].lower[2])
+            yaws[index] = float(packed[slot, 2])
         kind = "pivot" if any(motion.pivot is not None for motion in path) else (
             "rotate_translate" if any(abs(motion.end.yaw - motion.start.yaw) > _EPS for motion in path)
             else "translation")
         sample = SceneSample(fixed_ids if fixed_ids is not None else ids,
                              target, blocker, positions, yaws, access_region,
                              (path[-1].end.x, path[-1].end.y), path, kind)
-        # All predicates are enforced while constructing this proposal: support
-        # and exact SAT before insertion, role blockage and clearance sweeps,
-        # then whole-shelf metrics above. Keep validate_sample as an independent
-        # test/debug oracle instead of repeating the full search geometry here.
+        # Construction enforces support, collision margins and cached global
+        # metrics. validate_sample remains an independent test/debug oracle.
         return sample
     raise RuntimeError(
         f"Could not sample a whole-shelf, supported, collision-free, initially blocked and geometrically clearable scene "
@@ -2138,8 +2540,8 @@ def _check_physical_robot_start(env, sample, expected, poses, origin):
 def _build_episode_batch(env, runtime, ids):
     """Prepare distinct episodes for selected rows without rendering.
 
-    Layout proposals use compiled CPU geometry, while IK/collision acceptance,
-    pose conversion and PhysX writes are batched. Only rejected rows retry.
+    Layouts retain independent role/path seeds and device-resident clutter
+    packing/repair. IK, pose conversion and PhysX writes are batched.
     Initial perception uses bounded geometric ray batches without integrating
     physics; unselected environments are never used as a staging area.
     """
@@ -2190,25 +2592,16 @@ def _build_episode_batch(env, runtime, ids):
             for attempt in range(env.cfg.initial_vision.max_layout_attempts):
                 candidates, samples = [], []
                 # print(f"[Episode reset] sampling {len(pending)} independent episodes, proposal {attempt + 1}", flush=True)
-                for row in pending:
-                    try:
-                        sample = None
-                        for _ in range(32):
-                            try:
-                                sample = sample_scene(
-                                    env.spawn_geometries, env.spawn_rules, streams[row],
-                                    target_id=roles[row][0], blocker_id=roles[row][1], active_ids=fixed_ids[row])
-                                break
-                            except RuntimeError:
-                                if fixed_ids[row] is not None:
-                                    raise
-                        if sample is None:
-                            raise RuntimeError("No feasible composition after 32 proposals.")
-                        fixed_ids[row] = sample.active_ids
-                        candidates.append(row)
-                        samples.append(sample)
-                    except RuntimeError as error:
-                        errors[row] = str(error)
+                proposals = sample_scenes(
+                    env.spawn_geometries, env.spawn_rules, [streams[row] for row in pending],
+                    [roles[row] for row in pending], [fixed_ids[row] for row in pending], device=env.device)
+                for row, sample in zip(pending, proposals):
+                    if isinstance(sample, RuntimeError):
+                        errors[row] = str(sample)
+                        continue
+                    fixed_ids[row] = sample.active_ids
+                    candidates.append(row)
+                    samples.append(sample)
                 if not candidates:
                     continue
                 starts = _sample_robot_starts(env, samples, [seeds[row] + 7_919 * (attempt + 1) for row in candidates])

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import random
 
 import torch
 
@@ -17,9 +16,10 @@ from .observations import quat_apply, quat_conjugate
 
 @dataclass
 class InitialVisionCfg:
-    ray_width: int = 320
-    ray_height: int = 240
-    ray_batch_size: int = 8
+    ray_width: int = 160
+    ray_height: int = 120
+    ray_batch_size: int = 32  # Concurrent episode requests, refilled as they finish.
+    ray_candidates_per_env: int = 4
     min_target_visible_fraction: float = 0.40
     min_blocker_visible_fraction: float = 0.95
     min_silhouette_pixels: int = 32
@@ -36,7 +36,7 @@ class InitialVisionCfg:
     max_layout_attempts: int = 32
 
     def __post_init__(self):
-        for name in ('ray_width', 'ray_height', 'ray_batch_size'):
+        for name in ('ray_width', 'ray_height', 'ray_batch_size', 'ray_candidates_per_env'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'{name} must be a positive integer.')
@@ -102,7 +102,7 @@ def fit_visible_obbs(points: torch.Tensor, object_ids: torch.Tensor, capacity: i
     Ideal geometric rays have no depth outliers, so bounds use surface extrema.
     """
     batch, rays, _ = points.shape
-    stride = capacity + 1  # Extra reduction bucket for background/robot/shelf.
+    stride = capacity + 1  # Extra reduction bucket for background.
     labels = torch.where(object_ids >= 0, object_ids.long(), capacity)
     groups = (labels + torch.arange(batch, device=points.device)[:, None] * stride).flatten()
     flat = points.reshape(-1, 3)
@@ -321,12 +321,60 @@ import warp as wp
 
 
 @wp.kernel(enable_backward=False)
-def _initial_surface_rays(
-    meshes: wp.array(dtype=wp.uint64),
+def _initial_viewpoints(
+    seeds: wp.array(dtype=wp.int64),
+    role_positions: wp.array2d(dtype=wp.vec3),
+    bounds: wp.array(dtype=wp.vec4),
+    tops: wp.array(dtype=wp.float32),
+    front: wp.vec2, height: wp.vec2, lateral: float, aim_y: float, aim_z: float, roll: wp.vec2,
+    eyes: wp.array2d(dtype=wp.vec3),
+    rotations: wp.array2d(dtype=wp.quat),
+):
+    env, attempt = wp.tid()
+    # Episode/candidate counters make sampling independent of queue/batch order.
+    state = wp.rand_init(int(seeds[env] & wp.int64(4294967295)), attempt ^ int(seeds[env] >> wp.int64(32)))
+    target, blocker = role_positions[env, 0], role_positions[env, 1]
+    region = bounds[env]
+    eye = wp.vec3(region[1] + wp.randf(state, front[0], front[1]),
+                  wp.clamp(blocker[1] + wp.randf(state, -lateral, lateral), region[2], region[3]),
+                  tops[env] + wp.randf(state, height[0], height[1]))
+    aim = (target + blocker) * 0.5
+    aim[1] += wp.randf(state, -aim_y, aim_y)
+    aim[2] = tops[env] + 0.1 + wp.randf(state, -aim_z, aim_z)
+    forward = wp.normalize(aim - eye)
+    # ROS camera: +Z forward, +Y down. Positive front distance avoids a vertical view.
+    right = wp.normalize(wp.cross(forward, wp.vec3(0.0, 0.0, 1.0)))
+    down = wp.cross(forward, right)
+    matrix = wp.mat33(right[0], down[0], forward[0], right[1], down[1], forward[1],
+                      right[2], down[2], forward[2])
+    rotation = wp.quat_from_matrix(matrix)
+    eyes[env, attempt] = eye
+    rotations[env, attempt] = rotation * wp.quat_from_axis_angle(
+        wp.vec3(0.0, 0.0, 1.0), wp.randf(state, roll[0], roll[1]))
+
+
+@wp.kernel(enable_backward=False)
+def _initial_ray_frames(
     poses: wp.array2d(dtype=wp.transform),
-    enabled: wp.array2d(dtype=wp.int32),
+    active_ids: wp.array2d(dtype=wp.int32),
     eyes: wp.array(dtype=wp.vec3),
     orientations: wp.array(dtype=wp.quat),
+    frames: wp.array2d(dtype=wp.transform),
+):
+    view, slot = wp.tid()
+    body = active_ids[view, slot]
+    if body >= 0:
+        # Shared by every pixel; no inverse pose or local-origin work in the ray loop.
+        frames[view, slot] = wp.transform_multiply(wp.transform_inverse(poses[view, body]),
+                                                  wp.transform(eyes[view], orientations[view]))
+
+
+@wp.kernel(enable_backward=False)
+def _initial_surface_rays(
+    meshes: wp.array(dtype=wp.uint64),
+    frames: wp.array2d(dtype=wp.transform),
+    active_ids: wp.array2d(dtype=wp.int32),
+    role_slots: wp.array2d(dtype=wp.int32),
     directions: wp.array(dtype=wp.vec3),
     roles: wp.array2d(dtype=wp.int32),
     width: int, height: int, far: float,
@@ -335,8 +383,6 @@ def _initial_surface_rays(
     silhouettes: wp.array3d(dtype=wp.int32),
 ):
     env, ray = wp.tid()
-    origin = eyes[env]
-    direction = wp.quat_rotate(orientations[env], directions[ray])
     x = ray % (2 * width)
     y = ray // (2 * width)
     in_image = x >= width // 2 and x < width // 2 + width and y >= height // 2 and y < height // 2 + height
@@ -345,28 +391,31 @@ def _initial_surface_rays(
     # Each ray owns its outputs: no competing atomic depth/label writes.
     # Outside the image only the two isolated role silhouettes are needed.
     # Route directly to those meshes instead of scanning every scene body.
-    body_count = meshes.shape[0]
+    body_count = active_ids.shape[1]
     if not in_image:
         body_count = 2
-    for slot in range(body_count):
-        body = slot
+    for candidate in range(body_count):
+        slot = candidate
         if not in_image:
-            body = roles[env, slot]
+            slot = role_slots[env, candidate]
+        if slot < 0:
+            continue
+        body = active_ids[env, slot]
+        if body < 0:
+            break  # Compact active IDs followed by padding.
         is_target = body == roles[env, 0]
         is_blocker = body == roles[env, 1]
-        if enabled[env, body] != 0 and (in_image or is_target or is_blocker):
-            inverse = wp.transform_inverse(poses[env, body])
-            start = wp.transform_point(inverse, origin)
-            local_direction = wp.transform_vector(inverse, direction)
-            query = wp.mesh_query_ray(meshes[body], start, local_direction, far)
-            if query.result and query.t > 0.02:
-                if is_target:
-                    silhouettes[env, ray, 0] = 1
-                if is_blocker:
-                    silhouettes[env, ray, 1] = 1
-                if in_image and query.t < best:
-                    best = query.t
-                    owner = body
+        frame = frames[env, slot]
+        local_direction = wp.transform_vector(frame, directions[ray])
+        query = wp.mesh_query_ray(meshes[body], wp.transform_get_translation(frame), local_direction, far)
+        if query.result and query.t > 0.02:
+            if is_target:
+                silhouettes[env, ray, 0] = 1
+            if is_blocker:
+                silhouettes[env, ray, 1] = 1
+            if in_image and query.t < best:
+                best = query.t
+                owner = body
     if in_image:
         pixel = (y - height // 2) * width + x - width // 2
         depths[env, pixel] = best
@@ -449,21 +498,17 @@ class InitialVisionSensor:
         self.cfg.__post_init__()
         self.capacity = self.cfg.ray_batch_size
         self.meshes, identifiers = [], []
-        self.body_indices = []
         self.specs = OBJECT_SPECS
         stage, device = env.scene.stage, env.device
         origin_path = env.scene.env_prim_paths[0]
         cache = {}
         xforms = UsdGeom.XformCache(Usd.TimeCode.Default())
-        def add(root, key, *, local_origin=None):
+        def add(root, key):
             if key in cache:
                 return cache[key]
             world = _gf_column(xforms.GetLocalToWorldTransform(root))
             rigid = np.eye(4)
-            if local_origin is None:
-                rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
-            else:
-                rigid[:3, 3] = local_origin
+            rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
             triangles = _visual_triangles(root, np.linalg.inv(rigid))
             if triangles is None:
                 return 0
@@ -484,17 +529,6 @@ class InitialVisionSensor:
                 raise RuntimeError(f'No visible surface for object {spec.name}.')
             identifiers.append(identifier)
         self.object_count = len(identifiers)
-        for index, path in enumerate(env.scene['robot'].root_physx_view.link_paths[0]):
-            identifier = add(stage.GetPrimAtPath(str(path)), str(path))
-            if identifier:
-                identifiers.append(identifier)
-                self.body_indices.append(index)
-        self.shelf_index = len(identifiers)
-        identifier = add(stage.GetPrimAtPath(f'{origin_path}/Shelf'), 'shelf',
-                         local_origin=env.scene.env_origins[0].cpu().numpy())
-        if not identifier:
-            raise RuntimeError('No visible shelf surface for geometric occlusion.')
-        identifiers.append(identifier)
         self.mesh_ids = wp.array(identifiers, dtype=wp.uint64, device=device)
         width, height = self.cfg.ray_width, self.cfg.ray_height
         self.intrinsics = torch.tensor([[.75 * width, 0., width * .5],
@@ -523,12 +557,9 @@ class InitialVisionSensor:
 
     @torch.no_grad()
     def capture_batch(self, requests, *, retain_images=False):
-        results = []
-        for begin in range(0, len(requests), self.capacity):
-            results.extend(self._capture_pool(requests[begin:begin + self.capacity], retain_images))
-        return results
+        return self._capture_pool(requests, retain_images) if requests else []
 
-    def _trace(self, poses, enabled, eyes, orientations, roles):
+    def _trace(self, poses, active_ids, eyes, orientations, roles):
         width, height = self.cfg.ray_width, self.cfg.ray_height
         count, device = len(eyes), eyes.device
         depths = torch.empty((count, width * height), device=device)
@@ -537,15 +568,21 @@ class InitialVisionSensor:
         # Warp uses xyzw; policy and Isaac Lab tensors use wxyz.
         poses = poses[..., [0, 1, 2, 4, 5, 6, 3]].contiguous()
         quaternions = orientations[:, [1, 2, 3, 0]].contiguous()
-        launch = dict(kernel=_initial_surface_rays, dim=(count, 4 * width * height), inputs=[
-            self.mesh_ids, wp.from_torch(poses, dtype=wp.transform), wp.from_torch(enabled),
+        frames = torch.empty((*active_ids.shape, 7), device=device)
+        matches = active_ids[..., None] == roles[:, None]
+        role_slots = torch.where(matches.any(1), matches.int().argmax(1), -1).int().contiguous()
+        execution = (dict(stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
+                     if device.type == 'cuda' else dict(device='cpu'))
+        wp.launch(kernel=_initial_ray_frames, dim=active_ids.shape, inputs=[
+            wp.from_torch(poses, dtype=wp.transform), wp.from_torch(active_ids),
             wp.from_torch(eyes.contiguous(), dtype=wp.vec3), wp.from_torch(quaternions, dtype=wp.quat),
+            wp.from_torch(frames, dtype=wp.transform)], **execution)
+        launch = dict(kernel=_initial_surface_rays, dim=(count, 4 * width * height), inputs=[
+            self.mesh_ids, wp.from_torch(frames, dtype=wp.transform), wp.from_torch(active_ids),
+            wp.from_torch(role_slots),
             wp.from_torch(self.directions, dtype=wp.vec3), wp.from_torch(roles), width, height, 2.5,
             wp.from_torch(depths), wp.from_torch(labels), wp.from_torch(silhouettes)])
-        if device.type == 'cuda':
-            wp.launch(**launch, stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
-        else:
-            wp.launch(**launch, device='cpu')
+        wp.launch(**launch, **execution)
         full = silhouettes.reshape(count, 2 * height, 2 * width, 2)
         crop = full[:, height // 2:height // 2 + height, width // 2:width // 2 + width]
         denominator = full.sum((1, 2))
@@ -559,9 +596,26 @@ class InitialVisionSensor:
                  & (fractions[:, 1] >= self.cfg.min_blocker_visible_fraction))
         return depths, labels, denominator, visible, fractions, valid
 
+    def _viewpoints(self, requests, role_positions):
+        """Generate all bounded candidate poses on-device, once per episode request."""
+        cfg, device = self.cfg, role_positions.device
+        shape = (len(requests), cfg.max_camera_attempts)
+        eyes = torch.empty((*shape, 3), device=device)
+        rotations = torch.empty((*shape, 4), device=device)
+        seeds = torch.tensor([r['seed'] for r in requests], device=device, dtype=torch.int64)
+        bounds = role_positions.new_tensor([r['workspace_bounds'] for r in requests])
+        tops = role_positions.new_tensor([r['shelf_top'] for r in requests])
+        execution = (dict(stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
+                     if device.type == 'cuda' else dict(device='cpu'))
+        wp.launch(kernel=_initial_viewpoints, dim=shape, inputs=[
+            wp.from_torch(seeds), wp.from_torch(role_positions.contiguous(), dtype=wp.vec3),
+            wp.from_torch(bounds, dtype=wp.vec4), wp.from_torch(tops),
+            wp.vec2(*cfg.front_distance_range), wp.vec2(*cfg.height_above_shelf), cfg.lateral_half_width,
+            cfg.aim_y_jitter, cfg.aim_z_jitter, wp.vec2(*(math.radians(x) for x in cfg.roll_degrees)),
+            wp.from_torch(eyes, dtype=wp.vec3), wp.from_torch(rotations, dtype=wp.quat)], **execution)
+        return eyes, rotations[..., [3, 0, 1, 2]].contiguous()
+
     def _capture_pool(self, requests, retain_images):
-        from isaaclab.utils.math import (quat_from_matrix, create_rotation_matrix_from_view,
-            convert_camera_frame_orientation_convention, quat_mul)
         env, cfg = self.env, self.cfg
         ids = [int(request['env_id']) for request in requests]
         objects = env.scene['object_collection'].data.object_link_pose_w[ids]
@@ -570,75 +624,78 @@ class InitialVisionSensor:
         # Compute in environment-local coordinates to avoid large-grid precision loss.
         objects = objects.clone()
         objects[..., :3] -= origins[:, None]
-        robot_poses = robot.body_link_state_w[ids][:, self.body_indices, :7].clone()
-        robot_poses[..., :3] -= origins[:, None]
-        shelf_pose = torch.zeros((len(ids), 1, 7), device=env.device)
-        shelf_pose[..., 3] = 1
-        poses = torch.cat((objects, robot_poses, shelf_pose), 1)
-        enabled = torch.ones(poses.shape[:2], device=env.device, dtype=torch.int32)
-        enabled[:, :self.object_count] = 0
+        width = max(len(request['active_ids']) for request in requests)
+        active_ids = np.full((len(ids), width), -1, dtype=np.int32)
         for row, request in enumerate(requests):
             active = request['active_ids']
             if (request['target_id'] == request['blocker_id'] or request['target_id'] not in active
-                    or request['blocker_id'] not in active or len(active) > env.cfg.mdp.max_objects):
+                    or request['blocker_id'] not in active or len(active) > env.cfg.mdp.max_objects
+                    or len(set(active)) != len(active)
+                    or any(index < 0 or index >= self.object_count for index in active)):
                 raise ValueError('Initial perception needs distinct active Target/Blocker within capacity.')
-            enabled[row, list(active)] = 1
+            active_ids[row, :len(active)] = sorted(active)  # Preserve ID order for equal-depth ties.
+        active_ids = torch.as_tensor(active_ids, device=env.device)
         roles = torch.tensor([[r['target_id'], r['blocker_id']] for r in requests], device=env.device, dtype=torch.int32)
-        role_poses = objects.gather(1, roles.long()[..., None].expand(-1, -1, 7)).tolist()
-        generators = [random.Random(request['seed']) for request in requests]
-        results, pending = [None] * len(ids), list(range(len(ids)))
-        tensor = objects.new_tensor
-        for attempt in range(1, cfg.max_camera_attempts + 1):
-            if not pending:
-                break
-            eyes, aims, rolls = [], [], []
-            for row in pending:
-                rng, request = generators[row], requests[row]
-                target, blocker = role_poses[row]
-                bounds, top = request['workspace_bounds'], request['shelf_top']
-                midpoint = [(a + b) * .5 for a, b in zip(target[:3], blocker[:3])]
-                eyes.append((bounds[1] + rng.uniform(*cfg.front_distance_range),
-                             max(bounds[2], min(bounds[3], blocker[1] + rng.uniform(-cfg.lateral_half_width, cfg.lateral_half_width))),
-                             top + rng.uniform(*cfg.height_above_shelf)))
-                aims.append((midpoint[0], midpoint[1] + rng.uniform(-cfg.aim_y_jitter, cfg.aim_y_jitter),
-                             top + .10 + rng.uniform(-cfg.aim_z_jitter, cfg.aim_z_jitter)))
-                half_roll = math.radians(rng.uniform(*cfg.roll_degrees)) * .5
-                rolls.append((math.cos(half_roll), 0., 0., math.sin(half_roll)))
-            eyes = tensor(eyes)
-            orientation = quat_from_matrix(create_rotation_matrix_from_view(eyes, tensor(aims), 'Z', device=env.device))
-            orientation = convert_camera_frame_orientation_convention(orientation, origin='opengl', target='ros')
-            orientation = quat_mul(orientation, tensor(rolls))
+        role_positions = objects.gather(1, roles.long()[..., None].expand(-1, -1, 3))
+        candidate_eyes, candidate_rotations = self._viewpoints(requests, role_positions)
+        roots = robot.root_pos_w[ids] - origins
+        inverse_roots = quat_conjugate(robot.root_quat_w[ids])
+        results, outputs = [None] * len(ids), [None] * len(ids)
+        metadata = objects.new_zeros((len(ids), 6))
+        next_attempt = [0] * len(ids)
+        next_request = min(self.capacity, len(ids))
+        pending = list(range(next_request))
+        candidates_per_env = min(cfg.ray_candidates_per_env, cfg.max_camera_attempts)
+        offsets = torch.arange(candidates_per_env, device=env.device)
+        observed_slots = torch.arange(env.cfg.mdp.max_objects, device=env.device)
+        while pending:
+            rows = torch.tensor(pending, device=env.device, dtype=torch.long)
+            attempts = torch.tensor([next_attempt[row] for row in pending], device=env.device)[:, None] + offsets
+            view_rows = rows.repeat_interleave(candidates_per_env)
+            view_attempts = attempts.clamp_max(cfg.max_camera_attempts - 1).flatten()
+            eyes = candidate_eyes[view_rows, view_attempts]
+            orientation = candidate_rotations[view_rows, view_attempts]
             depth, labels, full, visible, fractions, accepted = self._trace(
-                poses[pending], enabled[pending], eyes, orientation, roles[pending])
-            candidates = [index for index, okay in enumerate(accepted.tolist()) if okay]
-            if not candidates:
-                continue
-            rows = [pending[index] for index in candidates]
-            depth, labels = depth[candidates], labels[candidates]
-            eyes, orientation = eyes[candidates], orientation[candidates]
-            full, visible, fractions = full[candidates], visible[candidates], fractions[candidates]
-            # Fit observed geometry only after the viewpoint passes visibility.
-            local_points = quat_apply(orientation[:, None].expand(-1, depth.shape[1], -1),
-                                      depth[..., None] * self.crop_directions) + eyes[:, None]
-            roots = robot.root_pos_w[ids][rows] - origins[rows]
-            points_b = quat_apply(quat_conjugate(robot.root_quat_w[ids][rows])[:, None].expand(-1, depth.shape[1], -1),
-                                  local_points - roots[:, None])
-            labels = torch.where(labels < self.object_count, labels, -1)
-            geometry, valid = fit_visible_obbs(points_b, labels, env.cfg.mdp.max_objects, cfg.min_depth_pixels)
-            decisions = valid.gather(1, roles[rows].long()).all(-1).tolist()
-            counts = torch.stack((visible, full), -1).tolist()
-            ratios = fractions.tolist()
-            for index, row in enumerate(rows):
-                if not decisions[index]:
-                    continue
-                observed = torch.arange(env.cfg.mdp.max_objects, device=env.device)
-                observed = torch.where(valid[index], observed, -1)
-                height, width = cfg.ray_height, cfg.ray_width
-                results[row] = VisionSnapshot(
-                    geometry[index].clone(), valid[index].clone(), observed,
-                    None, depth[index].reshape(height, width, 1).clone() if retain_images else None,
-                    (labels[index, :, None] == roles[row]).reshape(height, width, 2).clone() if retain_images else None,
-                    torch.cat((eyes[index] + origins[row], orientation[index])), self.intrinsics.clone(),
-                    tuple(ratios[index]), tuple(tuple(pair) for pair in counts[index]), attempt)
-            pending = [row for row in pending if results[row] is None]
+                objects[view_rows], active_ids[view_rows], eyes, orientation, roles[view_rows])
+            accepted = accepted.reshape(len(pending), candidates_per_env) & (attempts < cfg.max_camera_attempts)
+            # One bounded host transfer per proposal group, never one per candidate/pixel/object.
+            first = torch.where(accepted, offsets, candidates_per_env).amin(-1).tolist()
+            chosen = [slot for slot, candidate in enumerate(first) if candidate < candidates_per_env]
+            if chosen:
+                accepted_rows = [pending[slot] for slot in chosen]
+                rows = torch.tensor(accepted_rows, device=env.device, dtype=torch.long)
+                selected = torch.tensor([slot * candidates_per_env + first[slot] for slot in chosen],
+                                        device=env.device, dtype=torch.long)
+                depth, labels = depth[selected], labels[selected]
+                eyes, orientation = eyes[selected], orientation[selected]
+                # Fit once, for the first passing view only. Role point counts were already checked.
+                local_points = quat_apply(orientation[:, None], depth[..., None] * self.crop_directions) + eyes[:, None]
+                points_b = quat_apply(inverse_roots[rows, None], local_points - roots[rows, None])
+                geometry, valid = fit_visible_obbs(points_b, labels, env.cfg.mdp.max_objects, cfg.min_depth_pixels)
+                observed = torch.where(valid, observed_slots, -1)
+                camera_poses = torch.cat((eyes + origins[rows], orientation), -1)
+                metadata[rows] = torch.cat((fractions[selected], torch.stack((visible[selected], full[selected]), -1)
+                                           .flatten(1)), -1)
+                for index, (slot, row) in enumerate(zip(chosen, accepted_rows)):
+                    outputs[row] = (geometry[index], valid[index], observed[index],
+                        depth[index].reshape(cfg.ray_height, cfg.ray_width, 1) if retain_images else None,
+                        (labels[index, :, None] == roles[row]).reshape(cfg.ray_height, cfg.ray_width, 2)
+                        if retain_images else None, camera_poses[index], next_attempt[row] + first[slot] + 1)
+            remaining = []
+            for slot, row in enumerate(pending):
+                next_attempt[row] += candidates_per_env
+                if first[slot] == candidates_per_env and next_attempt[row] < cfg.max_camera_attempts:
+                    remaining.append(row)
+            end = min(len(ids), next_request + self.capacity - len(remaining))
+            pending = remaining + list(range(next_request, end))
+            next_request = end
+        # Diagnostic tuples cross to the host once, after the entire request queue finishes.
+        summaries = metadata.tolist()
+        for row, output in enumerate(outputs):
+            if output is not None:
+                geometry, valid, observed, depth, masks, camera, attempt = output
+                summary = summaries[row]
+                results[row] = VisionSnapshot(geometry, valid, observed, None, depth, masks, camera,
+                    self.intrinsics.clone(), tuple(summary[:2]),
+                    ((int(summary[2]), int(summary[3])), (int(summary[4]), int(summary[5]))), attempt)
         return results

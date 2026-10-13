@@ -15,6 +15,7 @@ import numpy as np
 from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 import torch
+import warp as wp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contact_manipulation.mdp import events as task, observations as obs, rewards, terminations
@@ -1108,7 +1109,33 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(state.history.shape, (32, 2, 72))
         self.assertEqual(env.extras["terminal_observation"].shape, (32, 544))
 
+@wp.kernel(enable_backward=False)
+def _layout_math_probe(data: wp.array2d(dtype=wp.float64), regions: wp.array2d(dtype=wp.float64),
+                       gap: wp.float64, result: wp.array2d(dtype=wp.float64)):
+    row = wp.tid()
+    x,y,a,hx,hy = data[row,0],data[row,1],data[row,2],data[row,3],data[row,4]
+    ox,oy,oa,ohx,ohy = data[row,5],data[row,6],data[row,7],data[row,8],data[row,9]
+    first = task._layout_quad(x,y,a,hx,hy)
+    second = task._layout_quad(ox,oy,oa,ohx,ohy)
+    result[row,0] = wp.float64(task._layout_boxes_clear(x,y,wp.cos(a),wp.sin(a),hx,hy,
+        ox,oy,wp.cos(oa),wp.sin(oa),ohx,ohy,gap))
+    result[row,1] = task._layout_distance(first,second)
+    result[row,2] = task._layout_area(first,wp.vec4d(regions[row,0],regions[row,1],regions[row,2],regions[row,3]))
+
+
 class EpisodeLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.cache = tempfile.TemporaryDirectory(prefix='contact_layout_tests_')
+        cls.previous_cache = task.wp.config.kernel_cache_dir
+        task.wp.config.kernel_cache_dir = cls.cache.name
+
+    @classmethod
+    def tearDownClass(cls):
+        task.wp.config.kernel_cache_dir = cls.previous_cache
+        cls.cache.cleanup()
+
     @staticmethod
     def catalog():
         sizes = ((.05, .05, .14), (.085, .06, .19), (.075, .10, .12),
@@ -1177,39 +1204,143 @@ class EpisodeLayoutTests(unittest.TestCase):
         self.assertTrue(any(not task.polygons_separated(sweep, obstacle)
                             for sweep in task.motion_sweeps(bar, motion)))
 
-    def test_vectorized_proposal_sat_matches_independent_scalar_polygon_oracle(self):
-        rng = np.random.default_rng(704)
-        geometry = task.ObjectGeometry("box", (-.06, -.03, 0.), (.06, .03, .1))
-        centers = rng.uniform(-.25, .25, size=(180, 2))
-        for yaw in (0., .43, math.pi/2):
-            local = np.asarray(task.footprint_polygon(geometry, (0., 0.), yaw))
-            motion = task.PlanarMotion(task.PlanarPose(.03, -.02, .2),
-                                     task.PlanarPose(.03, -.02, 1.3))
-            # Unequal polygon widths exercise every edge of curved sweep bounds.
-            obstacles = [task.rectangle_polygon((-.02, .03, -.05, .08)),
-                         *task.motion_sweeps(geometry, motion)[::3]]
-            gaps = rng.choice((0., .003, .017), size=len(obstacles))
-            expected = np.asarray([
-                all(task.polygons_separated(tuple(tuple(map(float, point)) for point in local + center),
-                                            obstacle, gap)
-                    for obstacle, gap in zip(obstacles, gaps))
-                for center in centers
-            ])
-            np.testing.assert_array_equal(task._proposal_clear_mask(centers, local, obstacles, gaps), expected)
-        self.assertEqual(task._proposal_clear_mask(centers[:0], local, obstacles, gaps).shape, (0,))
-        np.testing.assert_array_equal(task._proposal_clear_mask(centers, local, (), np.empty(0)), True)
-
-    def test_vectorized_neighbor_distances_match_scalar_euclidean_oracle(self):
+    def test_device_geometry_matches_independent_scalar_oracles_and_gap_boundaries(self):
         rng = np.random.default_rng(88)
-        geometry = task.ObjectGeometry("box", (-.06, -.03, 0.), (.06, .03, .1))
-        left = [task.footprint_polygon(geometry, (-.3, float(y)), float(a))
-                for y, a in rng.uniform(-1., 1., size=(7, 2))]
-        right = [task.footprint_polygon(geometry, (.3, float(y)), float(a))
-                 for y, a in rng.uniform(-1., 1., size=(11, 2))]
-        expected = np.asarray([[task.polygon_distance(first, second) for second in right] for first in left])
-        actual = task._footprint_boundary_distances(np.asarray(left), np.asarray(right))
-        np.testing.assert_allclose(actual, expected, rtol=2.e-15, atol=2.e-15)
-        self.assertEqual(task._footprint_boundary_distances(np.empty((0, 4, 2)), np.asarray(right)).shape, (0, 11))
+        data = rng.uniform(-1.,1.,(128,10))
+        data[:,[3,4,8,9]] = rng.uniform(.01,.14,(128,4))
+        data[:4] = [0.,0.,0.,.03,.01,.06,0.,0.,.03,.01]
+        data[:4,5] += np.array([-.00001,0.,.003,.003-2.e-9])
+        regions = np.tile([-.3,.3,-.3,.3],(len(data),1))
+        pairs=[]
+        for row in data:
+            a=task.ObjectGeometry('a',(-row[3],-row[4],0.),(row[3],row[4],.1))
+            b=task.ObjectGeometry('b',(-row[8],-row[9],0.),(row[8],row[9],.1))
+            pairs.append((task.footprint_polygon(a,tuple(row[:2]),float(row[2])),
+                          task.footprint_polygon(b,tuple(row[5:7]),float(row[7]))))
+        for device in ['cpu']+(['cuda:0'] if torch.cuda.is_available() else []):
+            for gap in (0.,.003,.017):
+                output=wp.empty((len(data),3),dtype=wp.float64,device=device)
+                wp.launch(_layout_math_probe,dim=len(data),inputs=[wp.array(data,dtype=wp.float64,device=device),
+                    wp.array(regions,dtype=wp.float64,device=device),gap,output],device=device)
+                actual=output.numpy()
+                expected=np.array([[task.polygons_separated(a,b,gap),task.polygon_distance(a,b),
+                    task.overlap_area(a,task.rectangle_polygon(region))] for (a,b),region in zip(pairs,regions)])
+                np.testing.assert_array_equal(actual[:,0],expected[:,0])
+                # Distance helper is used only after collision separation.
+                separated=actual[:,0].astype(bool)
+                np.testing.assert_allclose(actual[separated,1],expected[separated,1],atol=1.e-12,rtol=1.e-12)
+                np.testing.assert_allclose(actual[:,2],expected[:,2],atol=1.e-12,rtol=1.e-12)
+
+    def test_local_repair_preserves_roles_and_all_constraints(self):
+        import random
+        catalog,rules=self.catalog(),task.SpawnRules()
+        stats={}
+        result=task.sample_scenes(catalog,rules,[random.Random(50+i) for i in range(8)],
+                                 [(0,4)]*8,[None]*8,statistics=stats)
+        self.assertGreater(stats['evictions'],0)
+        for sample in result:
+            self.assertEqual((sample.target_id,sample.blocker_id),(0,4))
+            task.validate_sample(sample,catalog,rules)
+
+    def test_degenerate_sweep_edges_do_not_change_packing(self):
+        import random
+        catalog, rules = self.catalog(), task.SpawnRules()
+        reference = task.sample_scene(catalog,rules,random.Random(1))
+        plans=[]
+        for seed in range(4):
+            generator=task._scene_proposals(catalog,rules,random.Random(seed),reference.target_id,
+                reference.blocker_id,reference.active_ids)
+            plans.append(next(generator))
+            generator.close()
+        modified=[]
+        for plan in plans:
+            sweeps=[]
+            for polygon in plan[5]:
+                start, following=np.asarray(polygon[:2])
+                tiny=tuple(start+(following-start)*1.e-10)
+                sweeps.append((polygon[0],polygon[0],tiny,*polygon[1:]))
+            modified.append((*plan[:5],tuple(sweeps),plan[-1]))
+        for device in ['cpu']+(['cuda:0'] if torch.cuda.is_available() else []):
+            result=task._pack_layouts(plans+modified,catalog,rules,device)
+            self.assertTrue(any(row is not None for row in result[:4]))
+            for before,after in zip(result[:4],result[4:]):
+                if before is None:
+                    self.assertIsNone(after)
+                else:
+                    np.testing.assert_array_equal(before,after)
+
+    def test_compiled_rotation_envelopes_match_scalar_hulls(self):
+        box = task.ObjectGeometry('box', (-.10, -.02, 0.), (.10, .02, .1))
+        for angle in (-math.pi / 2, math.pi / 4, math.pi):
+            for pivot in (None, (.10, -.02)):
+                motion = task.PlanarMotion(task.PlanarPose(.01, -.03, .2),
+                                          task.PlanarPose(.04, .07, .2 + angle), pivot)
+                previous = task._pose_polygon(box, motion.start)
+                origin = pivot or (motion.start.x, motion.start.y)
+                radius = max(math.hypot(x - origin[0], y - origin[1]) for x, y in previous)
+                count = math.ceil(abs(angle) / math.radians(5.))
+                padding = radius * (1. - math.cos(abs(angle) / (2 * count)))
+                expected = []
+                for step in range(1, count + 1):
+                    current = task._pose_polygon(box, task._motion_pose(motion, step / count))
+                    hull = task._convex_hull(previous + current)
+                    expected.append(task._convex_hull(tuple((x + dx, y + dy) for x, y in hull
+                        for dx, dy in ((-padding, -padding), (padding, -padding),
+                                       (padding, padding), (-padding, padding)))))
+                    previous = current
+                self.assertEqual(task.motion_sweeps(box, motion), tuple(expected))
+
+    def test_blocker_interval_matches_dense_independent_polygon_clipping(self):
+        rng = np.random.default_rng(172)
+        box = task.ObjectGeometry('blocker',(-.08,-.04,0.),(.08,.04,.1))
+        access = np.array([-.02,.4,-.06,.06])
+        for yaw in rng.uniform(-math.pi,math.pi,32):
+            polygon = np.asarray(task.footprint_polygon(box,(.07,0.),float(yaw)))
+            required = task.planar_polygon_area(tuple(map(tuple,polygon)))*.3
+            low,high = task._blocker_y_interval(polygon,access,-.2,.2,required)
+            self.assertLess(low,high)
+            for y in np.linspace(low,high,15):
+                actual = task.overlap_area(tuple(map(tuple,polygon+np.array([0.,y]))),task.rectangle_polygon(access))
+                self.assertGreaterEqual(actual,required-1.e-9)
+            for y in (-.2,low-1.e-5,high+1.e-5,.2):
+                if -.2 <= y <= .2 and (y < low-1.e-7 or y > high+1.e-7):
+                    actual = task.overlap_area(tuple(map(tuple,polygon+np.array([0.,y]))),task.rectangle_polygon(access))
+                    self.assertLess(actual,required+1.e-9)
+        low,high = task._blocker_y_interval(polygon,access,-.2,.2,1.)
+        self.assertGreater(low,high)
+
+    def test_resident_layouts_preserve_each_random_stream_and_subset_order(self):
+        import random
+        catalog, rules = self.catalog(), task.SpawnRules()
+        def generate(indices, batch_size, device='cpu'):
+            streams = [random.Random(50+i) for i in indices]
+            result = task.sample_scenes(catalog,rules,streams,[(0,4)]*len(indices),
+                                        [None]*len(indices),device=device,batch_size=batch_size)
+            return result,[rng.getstate() for rng in streams]
+        expected,states = generate(list(range(8)),1)
+        actual,final_states = generate(list(reversed(range(8))),8)
+        self.assertEqual(actual,expected[::-1])
+        self.assertEqual(final_states,states[::-1])
+        for sample in actual:
+            task.validate_sample(sample,catalog,rules)
+        if torch.cuda.is_available():
+            gpu,_ = generate(list(range(8)),8,'cuda:0')
+            for sample in gpu:
+                task.validate_sample(sample,catalog,rules)
+            # Independent device math may choose a different tied candidate;
+            # within each device, ordering and batching cannot affect a seed.
+            reversed_gpu,_ = generate(list(reversed(range(8))),3,'cuda:0')
+            self.assertEqual(reversed_gpu,gpu[::-1])
+
+    def test_two_object_configuration_and_fixed_composition_are_supported(self):
+        import random
+        catalog=self.catalog()[:1]+self.catalog()[4:5]
+        rules=task.SpawnRules(min_objects=2,max_objects=2,min_asset_types=2,max_asset_types=2,
+            min_shelf_occupancy=0.,min_region_occupancy=0.,min_x_coverage=0.,min_y_coverage=0.,
+            min_neighbor_fraction=0.)
+        sample=task.sample_scene(catalog,rules,random.Random(44),0,1,(0,1))
+        task.validate_sample(sample,catalog,rules)
+        self.assertEqual(sample.active_ids,(0,1))
 
     def test_compiled_regional_overlap_matches_scalar_clipping_oracle(self):
         rng = np.random.default_rng(805)
@@ -1343,6 +1474,11 @@ def episode_reset_fixture(batch=5, selected=2):
 
 
 class EpisodeResetTests(unittest.TestCase):
+    @staticmethod
+    def batch_fixture(geometries, rules, streams, roles, active_ids, **kwargs):
+        return [task.sample_scene(geometries,rules,rng,target_id=t,blocker_id=b,active_ids=ids)
+                for rng,(t,b),ids in zip(streams,roles,active_ids)]
+
     @staticmethod
     def builder_fixture():
         """Real proposal/commit buffers with rendering and collision search substituted."""
@@ -1553,6 +1689,7 @@ class EpisodeResetTests(unittest.TestCase):
 
         env._episode_reset.vision.capture_batch.side_effect = lambda requests: [capture(**request) for request in requests]
         with patch.object(task, 'sample_scene', side_effect=sample_scene) as propose, \
+             patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
              patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
              patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
             episodes = task._build_episode_batch(env, env._episode_reset, ids)
@@ -1588,6 +1725,7 @@ class EpisodeResetTests(unittest.TestCase):
 
         env._episode_reset.vision.capture_batch.side_effect = lambda requests: [capture(**request) for request in requests]
         with patch.object(task, 'sample_scene', side_effect=sample_scene), \
+             patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
              patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
              patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
             with self.assertRaisesRegex(RuntimeError, 'Independent episode preparation exhausted retries'):
@@ -2055,8 +2193,9 @@ class GeometricVisionTests(unittest.TestCase):
         exec(compile(numerical, str(path), 'exec'), module.__dict__)
         nodes = [node for node in ast.parse(path.read_text()).body
                  if isinstance(node, (ast.FunctionDef, ast.ClassDef))
-                 and node.name in ('_initial_surface_rays', 'InitialVisionSensor')]
-        module.__dict__.update(wp=wp)
+                 and node.name in ('_initial_viewpoints', '_initial_ray_frames', '_initial_surface_rays',
+                                   'InitialVisionSensor')]
+        module.__dict__.update(wp=wp, np=np)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), module.__dict__)
         cls.module = module
 
@@ -2065,32 +2204,39 @@ class GeometricVisionTests(unittest.TestCase):
         cls.wp.config.kernel_cache_dir = cls.old_cache_dir
         cls.cache_dir.cleanup()
 
-    def fixture(self, batch=1):
+    def fixture(self, batch=1, device='cpu'):
         wp = self.wp
-        # Two actual triangle surfaces and one optional shelf/robot occluder.
+        # Two role surfaces and one optional distractor surface.
         # Avoid tangent rays exactly on an edge: float32 rigid transforms can
         # classify that measure-zero boundary on either side of the triangle.
         points = np.array([[-.2937, -.2937, 0], [.2937, -.2937, 0],
                            [.2937, .2937, 0], [-.2937, .2937, 0]], np.float32)
-        mesh = wp.Mesh(points=wp.array(points, dtype=wp.vec3, device='cpu'),
-                       indices=wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device='cpu'))
+        mesh = wp.Mesh(points=wp.array(points, dtype=wp.vec3, device=device),
+                       indices=wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device=device))
         sensor = self.module.InitialVisionSensor.__new__(self.module.InitialVisionSensor)
         sensor.cfg = self.module.InitialVisionCfg(ray_width=80, ray_height=60)
+        sensor.capacity = sensor.cfg.ray_batch_size
+        sensor.object_count = 3
         sensor.meshes = [mesh]
-        sensor.mesh_ids = wp.array([mesh.id] * 3, dtype=wp.uint64, device='cpu')
+        sensor.mesh_ids = wp.array([mesh.id] * 3, dtype=wp.uint64, device=device)
         rows, columns = torch.meshgrid(torch.arange(120), torch.arange(160), indexing='ij')
         sensor.directions = torch.stack(((columns + .5 - 80) / 60,
                                          (rows + .5 - 60) / 60, torch.ones_like(rows)), -1).float().reshape(-1, 3)
+        sensor.crop_directions = sensor.directions.reshape(120, 160, 3)[30:90, 40:120].reshape(-1, 3).contiguous()
+        sensor.intrinsics = torch.tensor([[60., 0., 40.], [0., 60., 30.], [0., 0., 1.]])
         poses = torch.zeros(batch, 3, 7)
         poses[..., 3] = 1
         poses[:, 0, 2] = 1.4
         poses[:, 1, 2] = .8
         poses[:, 2, 2] = .5
-        enabled = torch.tensor([[1, 1, 0]], dtype=torch.int32).expand(batch, -1).clone()
+        enabled = torch.tensor([[0, 1, -1]], dtype=torch.int32).expand(batch, -1).clone()
         eyes = torch.zeros(batch, 3)
         rotation = torch.tensor([[1., 0., 0., 0.]]).expand(batch, -1).clone()
         roles = torch.tensor([[0, 1]], dtype=torch.int32).expand(batch, -1).clone()
-        return sensor, poses, enabled, eyes, rotation, roles
+        sensor.directions = sensor.directions.to(device)
+        sensor.crop_directions = sensor.crop_directions.to(device)
+        sensor.intrinsics = sensor.intrinsics.to(device)
+        return (sensor, *(tensor.to(device) for tensor in (poses, enabled, eyes, rotation, roles)))
 
     def test_front_surface_occludes_target_but_isolated_denominator_remains(self):
         sensor, *args = self.fixture()
@@ -2101,12 +2247,12 @@ class GeometricVisionTests(unittest.TestCase):
         self.assertFalse(accepted.any())
         torch.testing.assert_close(depth[labels == 1], torch.full_like(depth[labels == 1], .8))
 
-    def test_inactive_body_does_not_occlude_and_external_occluder_is_distinct(self):
+    def test_inactive_body_does_not_occlude_and_active_distractor_is_distinct(self):
         sensor, poses, enabled, eyes, rotation, roles = self.fixture()
-        enabled[:, 1] = 0
+        enabled[:, 1] = -1
         first = sensor._trace(poses, enabled, eyes, rotation, roles)
         self.assertEqual(float(first[4][0, 0]), 1.)
-        enabled[:, 2] = 1
+        enabled[:, 1] = 2
         second = sensor._trace(poses, enabled, eyes, rotation, roles)
         self.assertEqual(int(second[3][0, 0]), 0)
         self.assertTrue((second[1] == 2).any())
@@ -2141,7 +2287,8 @@ class GeometricVisionTests(unittest.TestCase):
         expected = sensor._trace(poses, enabled, eyes, rotation, roles)
         # Move the role meshes away from slots 0/1; the last slot is a role.
         permutation = [2, 0, 1]
-        actual = sensor._trace(poses[:, permutation], enabled[:, permutation],
+        active_ids = torch.where(enabled >= 0, enabled + 1, -1)
+        actual = sensor._trace(poses[:, permutation], active_ids,
                                eyes, rotation, roles + 1)
         for index in (0, 2, 3, 4, 5):
             torch.testing.assert_close(actual[index], expected[index], rtol=0, atol=0)
@@ -2180,9 +2327,104 @@ class GeometricVisionTests(unittest.TestCase):
         self.assertNotIn('make_initial_camera_cfg', cfg)
         self.assertNotIn('VisionReferencesCfg', cfg)
         self.assertNotIn('sim.render(', (root / 'contact_manipulation/mdp/sensors.py').read_text())
-        for kwargs in ({'ray_width': 0}, {'ray_height': 13}, {'ray_batch_size': True}):
+        for kwargs in ({'ray_width': 0}, {'ray_height': 13}, {'ray_batch_size': True},
+                       {'ray_candidates_per_env': 0}, {'ray_candidates_per_env': True}):
             with self.assertRaises(ValueError):
                 self.module.InitialVisionCfg(**kwargs)
+
+    def test_viewpoints_are_seeded_bounded_and_independent_of_request_order(self):
+        sensor, *_ = self.fixture()
+        sensor.cfg.max_camera_attempts = 7
+        sensor.cfg.roll_degrees = (0., 0.)
+        sensor.cfg.aim_y_jitter = sensor.cfg.aim_z_jitter = 0.
+        requests = [dict(seed=seed, workspace_bounds=(-1., -.5, -.4, .4), shelf_top=1.)
+                    for seed in (19, 923, (1 << 40) + 19)]
+        positions = torch.tensor([[[-.8, .1, 1.1], [-.7, .05, 1.1]]]).repeat(3, 1, 1)
+        eyes, rotations = sensor._viewpoints(requests, positions)
+        self.assertTrue(((eyes[..., 0] >= .05) & (eyes[..., 0] <= .45)).all())
+        self.assertTrue(((eyes[..., 1] >= -.4) & (eyes[..., 1] <= .4)).all())
+        self.assertTrue(((eyes[..., 2] >= 1.18) & (eyes[..., 2] <= 1.48)).all())
+        torch.testing.assert_close(rotations.norm(dim=-1), torch.ones(3, 7))
+        target = torch.tensor([-.75, .075, 1.1])
+        forward = (target - eyes) / (target - eyes).norm(dim=-1, keepdim=True)
+        torch.testing.assert_close(obs.quat_apply(rotations, torch.tensor([0., 0., 1.]).expand_as(eyes)), forward)
+        self.assertFalse(torch.equal(eyes[0], eyes[2]))
+        for row in (2, 0, 1):
+            one = sensor._viewpoints([requests[row]], positions[row:row+1])
+            torch.testing.assert_close(one[0][0], eyes[row], atol=0, rtol=0)
+            torch.testing.assert_close(one[1][0], rotations[row], atol=0, rtol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA visibility parity requires a GPU.')
+    def test_cuda_ray_and_viewpoint_results_match_cpu(self):
+        expected, actual = self.fixture(batch=2), self.fixture(batch=2, device='cuda')
+        for fixture in (expected, actual):
+            fixture[1][1, 1, 0] = .4
+        reference = expected[0]._trace(*expected[1:])
+        result = actual[0]._trace(*actual[1:])
+        for first, second in zip(reference, result):
+            torch.testing.assert_close(first, second.cpu())
+        requests = [dict(seed=seed, workspace_bounds=(-1., -.5, -.4, .4), shelf_top=1.) for seed in (93, 1823)]
+        positions = torch.tensor([[[-.8, .1, 1.1], [-.7, .05, 1.1]]]).repeat(2, 1, 1)
+        reference = expected[0]._viewpoints(requests, positions)
+        def reject(*args, **kwargs):
+            raise AssertionError('GPU viewpoint generation read a tensor on the host')
+        with patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, 'tolist', reject), \
+             patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'cpu', reject):
+            result = actual[0]._viewpoints(requests, positions.cuda())
+        for first, second in zip(reference, result):
+            torch.testing.assert_close(first, second.cpu(), atol=1.e-6, rtol=1.e-6)
+
+    def test_queue_selects_first_valid_view_refills_and_honors_attempt_limit(self):
+        sensor, poses, *_ = self.fixture(batch=5)
+        sensor.capacity = 2
+        sensor.cfg.max_camera_attempts = 6  # Last group is smaller than four.
+        robot = SimpleNamespace(root_pos_w=torch.zeros(5, 3), root_quat_w=torch.tensor([[1., 0., 0., 0.]]).repeat(5, 1))
+        class Scene(dict):
+            env_origins = torch.zeros(5, 3)
+        scene = Scene(object_collection=SimpleNamespace(data=SimpleNamespace(object_link_pose_w=poses)),
+                      robot=SimpleNamespace(data=robot))
+        sensor.env = SimpleNamespace(scene=scene, device='cpu', cfg=SimpleNamespace(mdp=SimpleNamespace(max_objects=3)))
+        requests = [dict(env_id=row, active_ids=(0, 1), target_id=0, blocker_id=1, seed=row,
+                         workspace_bounds=(-1., -.5, -.4, .4), shelf_top=1.) for row in range(5)]
+        required = [0, 5, 2, 6, 4]  # Row 3 must fail: candidate 6 is beyond the search budget.
+        calls = []
+        def viewpoints(requests, role_positions):
+            eyes = torch.zeros(len(requests), 6, 3)
+            eyes[..., 0] = torch.tensor([r['env_id'] for r in requests])[:, None]
+            eyes[..., 1] = torch.arange(6)
+            rotations = torch.zeros(len(requests), 6, 4)
+            rotations[..., 0] = 1.
+            return eyes, rotations
+        def trace(poses, active, eyes, rotations, roles):
+            rows, attempts = eyes[:, 0].long(), eyes[:, 1].long()
+            calls.append(list(zip(rows.tolist(), attempts.tolist())))
+            accepted = attempts >= torch.tensor(required)[rows]
+            depth = torch.ones(len(rows), 80*60)
+            labels = torch.zeros_like(depth, dtype=torch.int32)
+            labels[:, 80*30:] = 1
+            visible = torch.full((len(rows), 2), 80*30, dtype=torch.int64)
+            return depth, labels, visible, visible, torch.ones(len(rows), 2), accepted
+        with patch.object(sensor, '_viewpoints', viewpoints), patch.object(sensor, '_trace', trace):
+            results = sensor.capture_batch(requests, retain_images=True)
+            self.assertEqual([None if r is None else r.attempts for r in results], [1, 6, 3, None, 5])
+            self.assertEqual({row for row, attempt in calls[1]}, {1, 2})
+            self.assertTrue(all(len(call) <= 8 for call in calls))
+            reference = results
+            sensor.cfg.ray_candidates_per_env = 1
+            sensor.capacity = 3
+            order = [4, 2, 1, 0, 3]
+            results = sensor.capture_batch([requests[row] for row in order], retain_images=True)
+        for result, row in zip(results, order):
+            if row == 3:
+                self.assertIsNone(result)
+                continue
+            self.assertEqual(result.attempts, reference[row].attempts)
+            torch.testing.assert_close(result.geometry_b, reference[row].geometry_b)
+            torch.testing.assert_close(result.camera_pose_w, reference[row].camera_pose_w)
+            self.assertEqual(result.pixel_counts, ((2400, 2400), (2400, 2400)))
+            self.assertEqual(result.depth.shape, (60, 80, 1))
+            self.assertEqual(result.role_masks.shape, (60, 80, 2))
+        self.assertEqual(sensor.capture_batch([]), [])
 
 
 class NativeGeometrySharingTests(unittest.TestCase):
