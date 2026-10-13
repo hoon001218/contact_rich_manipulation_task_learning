@@ -21,7 +21,7 @@ import isaaclab.envs.mdp as mdp
 from .state import reset_mdp
 from ..src.catalog import OBJECT_SPECS
 from ..src.assets import RobotPoseModel, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME
-from ..src.sensors import initialize_sensors, InitialVisionRejected
+from ..src.sensors import initialize_sensors, InitialVisionRejected, camera_sensor_ids
 from ..src.sampling import (
     ROBOT_START_TCP_ROTATION, ObjectGeometry, SpawnRules,
     oriented_box_separated, robot_start_region, sample_scene,
@@ -398,6 +398,18 @@ def validate_robot_start_state(env: ManagerBasedEnv, env_ids: torch.Tensor) -> N
         np.testing.assert_allclose(actual_tcp + origin, expected, atol=1.0e-5, rtol=0.0)
 
 
+def _shared_vision_results(env, env_ids, template):
+    """Reuse initial RGB-D/geometry, shifting only the recorded world camera pose."""
+    results = {}
+    for env_id in env_ids.cpu().tolist():
+        result = dict(template["vision"])
+        pose = result["pose"].clone()
+        pose[:3] += env.scene.env_origins[env_id] - template["origin"]
+        result["pose"] = pose
+        results[env_id] = result
+    return results
+
+
 def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
     """Sample active identities/roles/poses without altering unselected environments.
 
@@ -413,11 +425,22 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
     objects = env.scene["objects"]
     # Stage all samples first, so an impossible distribution fails before pool mutation.
     selected_ids = env_ids.cpu().tolist()
+    shared = bool(getattr(env.cfg, "shared_initial_scene", False))
+    current_template = getattr(env, "shared_initial_scene_template", None)
+    if shared and current_template is None and len(selected_ids) != env.num_envs:
+        raise ValueError("Shared initial scenes require a full environment reset before any partial reset.")
+    new_template = shared and (current_template is None or len(selected_ids) == env.num_envs)
+    sample_ids = ([0 if 0 in selected_ids else selected_ids[0]] if new_template
+                  else ([] if shared else selected_ids))
     samples = []
     seeds = []
     robot_starts = []
-    for env_id in selected_ids:
-        seed = int(env.cfg.seed) + 1_000_003 * env_id + 97_409 * int(env.spawn_reset_counts[env_id])
+    for env_id in sample_ids:
+        if shared:
+            generation = getattr(env, "shared_initial_scene_generation", 0)
+            seed = int(env.cfg.seed) + 97_409 * generation
+        else:
+            seed = int(env.cfg.seed) + 1_000_003 * env_id + 97_409 * int(env.spawn_reset_counts[env_id])
         seeds.append(seed)
         rng = random.Random(seed)
         # Fix externally assigned episode roles before generating any poses.
@@ -447,6 +470,10 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
         )
         samples.append(sample)
         robot_starts.append(_sample_robot_start(env, sample, seed) if env.cfg.robot_start.enabled else None)
+    if shared and not new_template:
+        samples = [current_template["sample"]] * len(selected_ids)
+        seeds = [current_template["seed"]] * len(selected_ids)
+        robot_starts = [current_template["robot_start"]] * len(selected_ids)
 
     # Rendering requires native candidate poses. Preserve the selected state
     # and metadata so exhausted vision retries are transactional as well.
@@ -469,36 +496,64 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
     saved = {name: getattr(env, name)[selected_ids].clone() for name in names}
     previous_samples = [env.spawn_samples[index] for index in selected_ids]
     camera = env.scene["initial_camera"]
-    previous_camera = (camera.data.pos_w[env_ids].clone(), camera.data.quat_w_ros[env_ids].clone())
+    camera_ids = camera_sensor_ids(camera, env_ids)
+    previous_camera = (camera.data.pos_w[camera_ids].clone(), camera.data.quat_w_ros[camera_ids].clone())
     fixed_ids = [sample.active_ids for sample in samples]
     try:
-        for layout_attempt in range(env.cfg.initial_vision.max_layout_attempts):
+        images = {}
+        if shared and not new_template:
             _apply_spawn_candidates(env, env_ids, samples, seeds, robot_starts)
             env.spawn_reset_counts[selected_ids] = saved["spawn_reset_counts"] + 1
             env.scene.write_data_to_sim()
             env.sim.forward()
-            try:
-                images = env.initial_vision_sensor.capture(env_ids, layout_attempt=layout_attempt)
-            except InitialVisionRejected as error:
-                if layout_attempt + 1 >= env.cfg.initial_vision.max_layout_attempts:
-                    raise
-                print(f"[VISION RETRY]: layout={layout_attempt + 1}: {error}", flush=True)
-                samples, robot_starts = [], []
-                for env_id, seed, active_ids in zip(selected_ids, seeds, fixed_ids):
-                    retry_seed = seed ^ ((layout_attempt + 1) * 0x71D5AF)
-                    old = env.spawn_samples[env_id]
-                    sample = sample_scene(env.spawn_geometries, env.spawn_rules, random.Random(retry_seed),
-                                          target_id=old.target_id, blocker_id=old.blocker_id, active_ids=active_ids)
-                    samples.append(sample)
-                    robot_starts.append(_sample_robot_start(env, sample, retry_seed) if env.cfg.robot_start.enabled else None)
-                continue
-            env.initial_vision_sensor.commit(images)
-            env.tool_force_torque_sensor.reset(env_ids)
-            env.binary_tactile_sensor.reset(env_ids)
-            # Wrenches stay invalid at this unchanged physics timestamp.
-            env.ft_last_update_time = env.sim.current_time
-            env.tactile_last_update_time = env.sim.current_time
-            return
+            images = _shared_vision_results(env, env_ids, current_template)
+            accepted_template = current_template
+        else:
+            # Accepted environments retain their layout and snapshot while
+            # another retries. Shared mode accepts just one scene template.
+            for sample_row, (env_id, seed, active_ids) in enumerate(zip(sample_ids, seeds, fixed_ids)):
+                row = selected_ids.index(env_id)
+                one_id = env_ids[row:row + 1]
+                sample, robot_start = samples[sample_row], robot_starts[sample_row]
+                for layout_attempt in range(env.cfg.initial_vision.max_layout_attempts):
+                    _apply_spawn_candidates(env, one_id, [sample], [seed], [robot_start])
+                    env.spawn_reset_counts[env_id] = saved["spawn_reset_counts"][row] + 1
+                    env.scene.write_data_to_sim()
+                    env.sim.forward()
+                    try:
+                        accepted = env.initial_vision_sensor.capture(one_id, layout_attempt=layout_attempt)
+                    except InitialVisionRejected as error:
+                        if layout_attempt + 1 >= env.cfg.initial_vision.max_layout_attempts:
+                            raise
+                        print(f"[VISION RETRY]: env={env_id}, layout={layout_attempt + 1}: {error}", flush=True)
+                        retry_seed = seed ^ ((layout_attempt + 1) * 0x71D5AF)
+                        sample = sample_scene(env.spawn_geometries, env.spawn_rules, random.Random(retry_seed),
+                                              target_id=sample.target_id, blocker_id=sample.blocker_id, active_ids=active_ids)
+                        robot_start = _sample_robot_start(env, sample, retry_seed) if env.cfg.robot_start.enabled else None
+                        continue
+                    images.update(accepted)
+                    break
+            if shared:
+                source = sample_ids[0]
+                accepted_template = {"sample": sample, "robot_start": robot_start, "seed": seed,
+                                     "vision": images[source], "origin": env.scene.env_origins[source].clone()}
+                count = len(selected_ids)
+                _apply_spawn_candidates(env, env_ids, [sample] * count, [seed] * count, [robot_start] * count)
+                env.spawn_reset_counts[selected_ids] = saved["spawn_reset_counts"] + 1
+                env.scene.write_data_to_sim()
+                env.sim.forward()
+                images = _shared_vision_results(env, env_ids, accepted_template)
+        env.initial_vision_sensor.commit(images)
+        env.tool_force_torque_sensor.reset(env_ids)
+        env.binary_tactile_sensor.reset(env_ids)
+        # Wrenches stay invalid at this unchanged physics timestamp.
+        env.ft_last_update_time = env.sim.current_time
+        env.tactile_last_update_time = env.sim.current_time
+        if shared:
+            env.shared_initial_scene_template = accepted_template
+            if new_template:
+                env.shared_initial_scene_generation = getattr(env, "shared_initial_scene_generation", 0) + 1
+        return
     except Exception:
         objects.write_object_state_to_sim(previous_states, env_ids=env_ids)
         robot.write_root_state_to_sim(previous_root, env_ids=env_ids)
@@ -510,8 +565,8 @@ def reset_spawn_scene(env: ManagerBasedEnv, env_ids: torch.Tensor) -> None:
         for index, sample in zip(selected_ids, previous_samples):
             env.spawn_samples[index] = sample
         objects.parked_mask = ~env.active_object_mask
-        camera.set_world_poses(*previous_camera, env_ids, convention="ros")
-        camera.reset(env_ids)
+        camera.set_world_poses(*previous_camera, camera_ids, convention="ros")
+        camera.reset(camera_ids)
         env.scene.write_data_to_sim()
         env.sim.forward()
         raise

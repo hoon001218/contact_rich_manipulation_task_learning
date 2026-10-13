@@ -24,8 +24,9 @@ def task_conditions(env, state, center, corners, rotation, velocity, active,
 
     All physical objects must settle and every non-target footprint must clear
     the fixed initial access region. Dropping, tilting, leaving the workspace,
-    lifting, hard sensor loads, and forbidden robot contact remain independent
-    failure channels, in the order exposed by training diagnostics.
+    lifting, hard external loads or total sensor overrange, and forbidden robot
+    contact remain independent failure channels, in the order exposed by
+    training diagnostics.
     """
     cfg = env.cfg.mdp
     initial_target_distance = torch.linalg.vector_norm(center - state.initial_center, dim=-1)
@@ -50,6 +51,11 @@ def task_conditions(env, state, center, corners, rotation, velocity, active,
     tilted = quat_apply(rotation, up)[..., 2] < math.cos(cfg.max_tilt)
     hard = ((torch.linalg.vector_norm(sensor_wrench[:, :3], dim=-1) > cfg.force_hard)
             | (torch.linalg.vector_norm(sensor_wrench[:, 3:], dim=-1) > cfg.torque_hard))
+    sensor = getattr(env, "tool_force_torque_sensor", None)
+    if sensor is not None:
+        # Range applies to total measured reaction before self-load removal.
+        # A clipped or compensated value cannot recover that overload signal.
+        hard |= sensor.valid & sensor.range_exceeded.any(-1)
     forbidden = getattr(env, "forbidden_contact", torch.zeros_like(state.failure))
     if callable(forbidden):
         forbidden = forbidden(env)

@@ -16,11 +16,12 @@ from isaaclab.utils import configclass
 
 from . import mdp as task_mdp
 from .mdp.events import reset_mdp, reset_spawn_scene
-from .src.catalog import DEFAULT_SHELF_USD_PATH, SHELF_POSITION
+from .src.catalog import DEFAULT_SHELF_USD_PATH, SHELF_POSITION, ForceTorqueSensorCfg
 from .src.sampling import RobotStartRules, SpawnRules
 from .src.sensors import (
     InitialVisionCfg, TactileCfg, VisionReferencesCfg, make_initial_camera_cfg,
-    tool_wrench, tool_wrench_valid, initial_rgb, initial_depth, initial_role_masks, initial_camera_pose,
+    tool_wrench, tool_wrench_valid, tool_wrench_range_exceeded,
+    initial_rgb, initial_depth, initial_role_masks, initial_camera_pose,
     tactile_contacts, tactile_valid,
 )
 
@@ -47,7 +48,9 @@ class ShelfRearrangementSceneCfg(InteractiveSceneCfg):
     )
     robot: ArticulationCfg = MISSING
     objects: RigidObjectCollectionCfg = MISSING
-    vision_references = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/VisionReferences", spawn=VisionReferencesCfg())
+    # Initial vision is captured once per episode. Reuse two render products
+    # and a render-only reference pool instead of cloning RTX cameras per env.
+    vision_references = AssetBaseCfg(prim_path="/World/VisionReferences", spawn=VisionReferencesCfg())
     initial_camera = make_initial_camera_cfg()
     silhouette_camera = make_initial_camera_cfg(reference=True)
 
@@ -65,6 +68,7 @@ class ObservationsCfg:
     class SensorsCfg(ObservationGroupCfg):
         wrench = ObservationTermCfg(func=tool_wrench)
         wrench_valid = ObservationTermCfg(func=tool_wrench_valid)
+        wrench_range_exceeded = ObservationTermCfg(func=tool_wrench_range_exceeded)
         tactile = ObservationTermCfg(func=tactile_contacts)
         tactile_valid = ObservationTermCfg(func=tactile_valid)
         rgb = ObservationTermCfg(func=initial_rgb)
@@ -100,7 +104,9 @@ class ShelfRearrangementSpawnEnvCfg(ManagerBasedEnvCfg):
     target_asset: str | None = None
     blocker_asset: str | None = None
     initial_vision: InitialVisionCfg = InitialVisionCfg()
+    shared_initial_scene: bool = False
     tactile: TactileCfg = TactileCfg()
+    force_torque: ForceTorqueSensorCfg = ForceTorqueSensorCfg()
 
     def __post_init__(self):
         self.decimation = 4
@@ -140,9 +146,13 @@ class LearningEventsCfg:
 
 @configclass
 class LearningRewardsCfg:
-    # Isaac Lab multiplies term weights by step_dt. This term returns r/step_dt
-    # so formulation v2's time and terminal terms are paid exactly once.
-    formulation_v2 = RewardTermCfg(func=task_mdp.reward_rate, weight=1.0)
+    # Each function returns the transition's component / step_dt. Isaac Lab
+    # applies the configured weight and dt once, and logs each named term.
+    clearance = RewardTermCfg(func=task_mdp.clearance, weight=1.0)
+    rearrangement = RewardTermCfg(func=task_mdp.rearrangement, weight=1.0)
+    motion = RewardTermCfg(func=task_mdp.motion, weight=1.0)
+    time = RewardTermCfg(func=task_mdp.time_penalty, weight=1.0)
+    terminal = RewardTermCfg(func=task_mdp.terminal, weight=1.0)
 
 
 @configclass
@@ -150,11 +160,6 @@ class LearningTerminationsCfg:
     success = TerminationTermCfg(func=task_mdp.success)
     failure = TerminationTermCfg(func=task_mdp.failure)
     time_out = TerminationTermCfg(func=lab_mdp.time_out, time_out=True)
-
-
-@configclass
-class EmptyManagerCfg:
-    pass
 
 
 @configclass
@@ -169,8 +174,6 @@ class ShelfRearrangementEnvCfg(ManagerBasedRLEnvCfg):
     events: LearningEventsCfg = LearningEventsCfg()
     rewards: LearningRewardsCfg = LearningRewardsCfg()
     terminations: LearningTerminationsCfg = LearningTerminationsCfg()
-    commands: EmptyManagerCfg = EmptyManagerCfg()
-    curriculum: EmptyManagerCfg = EmptyManagerCfg()
     mdp: task_mdp.MdpCfg = task_mdp.MdpCfg()
     seed: int = 0
     spawn_rules: SpawnRules = SpawnRules()
@@ -178,7 +181,9 @@ class ShelfRearrangementEnvCfg(ManagerBasedRLEnvCfg):
     target_asset: str | None = None
     blocker_asset: str | None = None
     initial_vision: InitialVisionCfg = InitialVisionCfg()
+    shared_initial_scene: bool = True
     tactile: TactileCfg = TactileCfg()
+    force_torque: ForceTorqueSensorCfg = ForceTorqueSensorCfg()
     forbidden_contact_threshold: float = 1.0
 
     def __post_init__(self):
@@ -188,5 +193,10 @@ class ShelfRearrangementEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.bounce_threshold_velocity = 0.05
         self.episode_length_s = 8.0
         self.num_rerenders_on_reset = 0  # reset_scene already captures accepted RGB-D
+        # Shared reset/perception inspect only the USD template. Fabric keeps
+        # independent physics replicas without composing the full USD tree N times.
+        self.scene.clone_in_fabric = self.shared_initial_scene
+        self.scene.initial_camera.render_shared_template_only = self.shared_initial_scene
+        self.scene.silhouette_camera.render_shared_template_only = self.shared_initial_scene
         self.viewer.eye = (1.6, -2.0, 2.0)
         self.viewer.lookat = (-0.5, 0.0, 1.05)

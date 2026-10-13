@@ -72,7 +72,8 @@ class RewardTests(unittest.TestCase):
         arguments = dict(cfg=self.cfg, blocked=torch.tensor([.01]), blocker_area=torch.tensor([.02]),
                          path_length=torch.zeros(1), joint_velocity=self.joint_velocity,
                          previous_joint_velocity=self.joint_velocity,
-                         wrench=self.wrench, previous_wrench=self.wrench, dt=1 / 30)
+                         wrench=self.wrench, previous_wrench=self.wrench, dt=1 / 30,
+                         elapsed_time=torch.zeros(1, dtype=torch.float64))
         arguments.update(changes)
         return mdp.reward_components(**arguments)
 
@@ -83,6 +84,31 @@ class RewardTests(unittest.TestCase):
         self.assertEqual(float(clear[0, 0]), 1.)
         full, _ = self.components(blocked=torch.tensor([.02]))
         self.assertAlmostEqual(float(full[0, 0]), math.exp(-1), places=6)
+
+    def test_exp_quality_slopes_independently_control_clearance_rearrangement_and_motion(self):
+        cfg = mdp.MdpCfg(clearance_decay=3., rearrangement_decay=4.,
+                         motion_acceleration_decay=2., motion_wrench_increase_decay=.5)
+        joint_velocity = self.joint_velocity.clone()
+        joint_velocity[:, 0] = cfg.arm_joint_acceleration_ref / 30
+        wrench = self.wrench.clone()
+        wrench[:, 0] = 2 * cfg.force_rate_ref / 30
+        components, costs = self.components(cfg=cfg, path_length=torch.tensor([.1]),
+                                             joint_velocity=joint_velocity, wrench=wrench)
+        torch.testing.assert_close(costs, torch.tensor([[1., 4.]]))
+        self.assertAlmostEqual(float(components[0, 0]), math.exp(-1.5), places=6)
+        self.assertAlmostEqual(float(components[0, 1]), math.exp(-.4), places=6)
+        self.assertAlmostEqual(float(components[0, 2]), math.exp(-2), places=6)
+        baseline, _ = self.components()
+        torch.testing.assert_close(components[:, 3], baseline[:, 3])
+
+    def test_rearrangement_uses_cumulative_meter_distance_without_reference_distance(self):
+        cfg = mdp.MdpCfg()
+        self.assertFalse(hasattr(cfg, "displacement_ref"))
+        for distance in (0., .1, .5, 1.):
+            with self.subTest(distance=distance):
+                components, _ = self.components(path_length=torch.tensor([distance]))
+                self.assertAlmostEqual(float(components[0, 1]), math.exp(-cfg.rearrangement_decay * distance),
+                                       places=6)
 
     def test_large_constant_joint_speed_and_load_do_not_reduce_motion_reward(self):
         stationary, stationary_costs = self.components()
@@ -130,14 +156,80 @@ class RewardTests(unittest.TestCase):
         torch.testing.assert_close(costs, torch.tensor([[1., 4.]]))
         self.assertAlmostEqual(float(components[0, 2]), (math.exp(-1) + math.exp(-4)) / 2, places=6)
 
-    def test_finite_difference_scales_and_time_reference_are_applied_once(self):
+    def test_finite_difference_scales_and_time_cost_rate_are_applied_once(self):
         previous = self.wrench.clone()
         current = previous.clone()
         current[0, 0] = 1.
         _, cost30 = self.components(wrench=current, previous_wrench=previous, dt=1 / 30)
         comp60, cost60 = self.components(wrench=current, previous_wrench=previous, dt=1 / 60)
         self.assertAlmostEqual(float(cost60[0, 1] / cost30[0, 1]), 4., places=6)
-        self.assertAlmostEqual(float(comp60[0, 3]), -(1 / 60) / self.cfg.time_ref, places=8)
+        expected = -self.cfg.time_penalty_scale * (math.expm1(self.cfg.time_penalty_growth_rate / 60)
+                                                    / self.cfg.time_penalty_growth_rate - 1 / 60)
+        self.assertAlmostEqual(float(comp60[0, 3]), expected, places=10)
+
+    def test_time_penalty_increases_with_elapsed_time_for_equal_duration_steps(self):
+        times = torch.tensor([0., 2., 4., 8.], dtype=torch.float64)
+        components, _ = self.components(blocked=torch.full((4,), .01), blocker_area=torch.full((4,), .02),
+                                        path_length=torch.zeros(4), joint_velocity=torch.zeros((4, 12)),
+                                        previous_joint_velocity=torch.zeros((4, 12)), wrench=torch.zeros((4, 6)),
+                                        previous_wrench=torch.zeros((4, 6)), elapsed_time=times)
+        self.assertTrue(bool((components[1:, 3] < components[:-1, 3]).all()))
+        expected = -self.cfg.time_penalty_scale * (
+            torch.exp(self.cfg.time_penalty_growth_rate * times) * math.expm1(self.cfg.time_penalty_growth_rate / 30)
+            / self.cfg.time_penalty_growth_rate - 1 / 30)
+        torch.testing.assert_close(components[:, 3].double(), expected, atol=1.0e-9, rtol=1.0e-6)
+
+    def test_accumulated_time_cost_depends_on_duration_and_not_control_frequency(self):
+        # The same 8 s episode has 120, 240, or 480 completed transitions.
+        for frequency in (15, 30, 60):
+            with self.subTest(frequency=frequency):
+                count, dt = 8 * frequency, 1 / frequency
+                times = torch.arange(count, dtype=torch.float64) * dt
+                components, _ = self.components(blocked=torch.zeros(count), blocker_area=torch.ones(count),
+                                                path_length=torch.zeros(count), joint_velocity=torch.zeros((count, 12)),
+                                                previous_joint_velocity=torch.zeros((count, 12)),
+                                                wrench=torch.zeros((count, 6)), previous_wrench=torch.zeros((count, 6)),
+                                                dt=dt, elapsed_time=times)
+                expected = -self.cfg.time_penalty_scale * (math.expm1(self.cfg.time_penalty_growth_rate * 8)
+                                                            / self.cfg.time_penalty_growth_rate - 8)
+                self.assertAlmostEqual(float(components[:, 3].double().sum()), expected, places=7)
+
+    def test_early_time_cost_is_small_and_its_increase_accelerates(self):
+        def penalty(t):
+            return -float(self.components(elapsed_time=torch.tensor([t], dtype=torch.float64))[0][0, 3])
+
+        self.assertGreater(penalty(0.), 0.)
+        self.assertLess(penalty(0.), .00001)
+        self.assertGreater(penalty(1.), penalty(0.))
+        self.assertGreater(penalty(5.) - penalty(4.), penalty(4.) - penalty(3.))
+
+    def test_time_integral_matches_independent_numerical_integration(self):
+        from scipy.integrate import quad
+
+        start, dt = 1.75, .5
+        components, _ = self.components(dt=dt, elapsed_time=torch.tensor([start], dtype=torch.float64))
+        expected, _ = quad(lambda t: self.cfg.time_penalty_scale * math.expm1(self.cfg.time_penalty_growth_rate * t),
+                           start, start + dt)
+        self.assertAlmostEqual(float(components[0, 3]), -expected, places=8)
+
+    def test_tiny_initial_time_interval_remains_positive_and_finite(self):
+        dt = 1.0e-12
+        components, _ = self.components(dt=dt)
+        expected = -.5 * self.cfg.time_penalty_scale * self.cfg.time_penalty_growth_rate * dt ** 2
+        self.assertLess(float(components[0, 3]), 0.)
+        self.assertTrue(bool(torch.isfinite(components).all()))
+        self.assertAlmostEqual(float(components[0, 3]) / expected, 1., places=6)
+
+    def test_zero_time_cost_scale_disables_penalty_and_no_reference_time_is_needed(self):
+        cfg = mdp.MdpCfg(time_penalty_scale=0.)
+        components, _ = self.components(cfg=cfg, elapsed_time=torch.tensor([10.], dtype=torch.float64))
+        self.assertEqual(float(components[0, 3]), 0.)
+        self.assertFalse(hasattr(cfg, "time_ref"))
+        self.assertFalse(hasattr(cfg, "time_penalty_threshold"))
+
+    def test_elapsed_time_shape_cannot_broadcast_across_episodes(self):
+        with self.assertRaisesRegex(ValueError, "one value per environment"):
+            self.components(elapsed_time=torch.zeros((1, 1)))
 
     def test_force_and_torque_increase_use_norms_and_independent_rate_refs(self):
         previous = torch.tensor([[-3., 0., 0., 0., -1., 0.]])
@@ -198,10 +290,14 @@ class RewardTests(unittest.TestCase):
         torch.testing.assert_close(packed[:, 472:], torch.zeros((2, 72)))
 
     def test_invalid_scales_and_thresholds_fail_early(self):
-        for changed in (dict(displacement_ref=0.), dict(w_clear=-1.), dict(time_ref=float("nan")),
+        for changed in (dict(clearance_decay=0.), dict(rearrangement_decay=-1.),
+                        dict(motion_acceleration_decay=float("nan")), dict(motion_wrench_increase_decay=0.),
+                        dict(rearrangement_decay=float("inf")), dict(w_clear=-1.), dict(time_penalty_scale=float("nan")),
+                        dict(time_penalty_scale=-.1), dict(time_penalty_growth_rate=-1.),
+                        dict(time_penalty_growth_rate=0.), dict(time_penalty_growth_rate=float("inf")),
                         dict(force_hard=0.), dict(torque_hard=-1.), dict(stable_steps=1.5), dict(history_length=8),
                         dict(arm_joint_acceleration_ref=0.), dict(hand_joint_acceleration_ref=-1.),
-                        dict(force_rate_ref=0.), dict(torque_rate_ref=0.)):
+                        dict(force_rate_ref=0.), dict(torque_rate_ref=0.), dict(w_terminal=-1.)):
             with self.assertRaises(ValueError):
                 mdp.MdpCfg(**changed)
 
@@ -209,6 +305,13 @@ class RewardTests(unittest.TestCase):
         cfg = mdp.MdpCfg(force_hard=5., torque_hard=.2)
         self.assertEqual(cfg.force_hard, 5.)
         self.assertEqual(cfg.torque_hard, .2)
+
+    def test_sensor_calibration_does_not_replace_motion_or_task_safety_scales(self):
+        cfg = mdp.MdpCfg()
+        self.assertEqual((cfg.force_rate_ref, cfg.torque_rate_ref), (200., 10.))
+        self.assertEqual((cfg.force_hard, cfg.torque_hard), (80., 4.))
+        self.assertFalse(hasattr(cfg, "observation_force_scale"))
+        self.assertFalse(hasattr(cfg, "observation_torque_scale"))
 
 
 class ObservationPackingTests(unittest.TestCase):
@@ -295,9 +398,11 @@ def make_tensor_env(num_envs=1):
     state.tcp_id = 0
     state.joint_ids = list(range(12))
     state.last_time = torch.zeros(1, dtype=torch.float64)
+    state.elapsed_time = torch.zeros(1, dtype=torch.float64)
     state.history = torch.zeros((1, 2, 72))
     state.history_valid = torch.ones((1, 2), dtype=torch.bool)
     state.previous_center = torch.zeros((1, 40, 3))
+    state.previous_corners = torch.zeros((1, 40, 8, 3))
     state.initial_center = torch.zeros_like(state.previous_center)
     state.initial_rotation = torch.tensor([[[1., 0., 0., 0.]] * 40])
     state.previous_joint_velocity = torch.zeros((1, 12))
@@ -305,6 +410,7 @@ def make_tensor_env(num_envs=1):
     state.wrench_bias = torch.zeros((1, 6))
     state.initial_sensor_point = torch.zeros((1, 3))
     state.path_length = torch.zeros(1)
+    state.rearrangement_increment = torch.zeros(1)
     state.stable_count = torch.zeros(1, dtype=torch.long)
     state.success = torch.zeros(1, dtype=torch.bool)
     state.failure = torch.zeros_like(state.success)
@@ -352,8 +458,9 @@ def make_tensor_env(num_envs=1):
                     setattr(owner, name, value.repeat(num_envs, *([1] * (value.ndim - 1))))
         env.scene.env_origins = torch.zeros((num_envs, 3))
         env.num_envs = num_envs
-    _, _, center, _, _, _ = mdp._physical_objects(env, state)
+    _, _, center, corners, _, _ = mdp._physical_objects(env, state)
     state.previous_center[:] = state.initial_center[:] = center
+    state.previous_corners[:] = corners
     return env
 
 
@@ -375,13 +482,151 @@ class TransitionTests(unittest.TestCase):
         reward = mdp.reward_rate(self.env)
         state = mdp.update_mdp(self.env)
         self.assertAlmostEqual(float(state.path_length), .05, places=6)
+        self.assertAlmostEqual(float(state.rearrangement_increment), .05, places=6)
+        previous_corners = state.previous_corners.clone()
         torch.testing.assert_close(reward * self.env.step_dt, state.discrete_reward)
         mdp.policy_observation(self.env)
         mdp.success(self.env)
         mdp.failure(self.env)
         self.assertAlmostEqual(float(state.path_length), .05, places=6)
+        torch.testing.assert_close(state.previous_corners, previous_corners)
+        self.assertAlmostEqual(float(state.rearrangement_increment), .05, places=6)
         self.move(2, (0., -.05, 0.))
         self.assertAlmostEqual(float(mdp.update_mdp(self.env).path_length), .10, places=6)
+
+    def test_named_reward_terms_preserve_default_reward_and_update_transition_once(self):
+        self.move(2, (0., .05, 0.))
+        terms = (mdp.clearance, mdp.rearrangement, mdp.motion, mdp.time_penalty, mdp.terminal)
+        # Managers may read terms in a different order; the first read updates
+        # history/episode accumulators and every later read uses that transition.
+        mdp.terminal(self.env)
+        history = self.env.mdp_state.history.clone()
+        rates = torch.stack([term(self.env) for term in terms], -1)
+        state = self.env.mdp_state
+        torch.testing.assert_close(rates * self.env.step_dt, state.components)
+        torch.testing.assert_close(rates.sum(-1) * self.env.step_dt, state.discrete_reward)
+        torch.testing.assert_close(state.history, history)
+        self.assertAlmostEqual(float(state.path_length), .05, places=6)
+        self.assertAlmostEqual(float(state.elapsed_time), self.env.step_dt, places=12)
+
+    def test_native_reward_weights_match_diagnostics_including_terminal_override(self):
+        names = ("clearance", "rearrangement", "motion", "time", "terminal")
+        weights = torch.tensor([2., .5, .25, 3., .4])
+        self.env.cfg.rewards = SimpleNamespace(**{
+            name: SimpleNamespace(weight=float(weight)) for name, weight in zip(names, weights)
+        })
+        mdp.sync_reward_weights(self.env.cfg)
+        self.move(2, (0., 0., .2))  # Dropping/lifting a scene object is a failure.
+        terms = (mdp.clearance, mdp.rearrangement, mdp.motion, mdp.time_penalty, mdp.terminal)
+        native_total = sum(term(self.env) * weight * self.env.step_dt
+                           for term, weight in zip(terms, weights))
+        state = self.env.mdp_state
+        torch.testing.assert_close(native_total, state.discrete_reward)
+        self.assertEqual(float(state.components[0, 4]), -self.env.cfg.mdp.failure_penalty)
+        self.assertEqual(self.env.cfg.mdp.success_reward, 500.)
+        self.assertEqual(self.env.cfg.mdp.failure_penalty, 100.)
+        self.assertEqual(self.env.cfg.mdp.w_terminal, float(weights[4]))
+
+    def test_disabled_native_terms_have_zero_diagnostic_weight(self):
+        self.env.cfg.rewards = SimpleNamespace(
+            clearance=None, rearrangement=SimpleNamespace(weight=1.),
+            motion=SimpleNamespace(weight=0.), time=SimpleNamespace(weight=1.), terminal=None,
+        )
+        mdp.sync_reward_weights(self.env.cfg)
+        self.assertEqual(self.env.cfg.mdp.w_clear, 0.)
+        self.assertEqual(self.env.cfg.mdp.w_motion, 0.)
+        self.assertEqual(self.env.cfg.mdp.w_terminal, 0.)
+        self.move(2, (0., .05, 0.))
+        state = mdp.update_mdp(self.env)
+        torch.testing.assert_close(state.discrete_reward, state.components[:, 1] + state.components[:, 3])
+
+    def test_invalid_native_reward_weights_fail_before_environment_creation(self):
+        for invalid in (-1., float("nan"), float("inf")):
+            with self.subTest(weight=invalid):
+                cfg = SimpleNamespace(mdp=mdp.MdpCfg(), rewards=SimpleNamespace(
+                    clearance=SimpleNamespace(weight=invalid), rearrangement=SimpleNamespace(weight=1.),
+                    motion=SimpleNamespace(weight=1.), time=SimpleNamespace(weight=1.),
+                    terminal=SimpleNamespace(weight=1.),
+                ))
+                with self.assertRaises(ValueError):
+                    mdp.sync_reward_weights(cfg)
+
+    def test_pure_translation_matches_object_distance_including_vertical_motion(self):
+        # This rigid translation has length 10 cm in three dimensions.
+        self.move(2, (.06, 0., .08))
+        state = mdp.update_mdp(self.env)
+        self.assertAlmostEqual(float(state.path_length), .1, places=6)
+        self.assertAlmostEqual(float(state.rearrangement_increment), .1, places=6)
+
+    def test_cube_center_rotation_has_nonzero_corner_manipulation_without_center_motion(self):
+        env, state = self.env, self.env.mdp_state
+        state.lower[2], state.upper[2] = torch.full((3,), -.05), torch.full((3,), .05)
+        _, _, center, corners, _, _ = mdp._physical_objects(env, state)
+        state.previous_center.copy_(center)
+        state.previous_corners.copy_(corners)
+        env.scene["objects"].data.object_link_pose_w[0, 2, 3:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        env.sim.current_time += env.step_dt
+        state = mdp.update_mdp(env)
+        # Each corner of a 10 cm cube travels a 10 cm chord for a 90 degree yaw.
+        self.assertAlmostEqual(float(state.path_length), .1, places=6)
+        _, _, new_center, _, _, _ = mdp._physical_objects(env, state)
+        torch.testing.assert_close(new_center, center)
+        self.assertAlmostEqual(float(state.components[0, 1]), math.exp(-.2), places=6)
+
+    def test_rotation_out_and_back_accumulates_both_manipulations(self):
+        env, state = self.env, self.env.mdp_state
+        state.lower[2], state.upper[2] = torch.full((3,), -.05), torch.full((3,), .05)
+        _, _, _, corners, _, _ = mdp._physical_objects(env, state)
+        state.previous_corners.copy_(corners)
+        pose = env.scene["objects"].data.object_link_pose_w
+        pose[0, 2, 3:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        env.sim.current_time += env.step_dt
+        mdp.update_mdp(env)
+        pose[0, 2, 3:] = torch.tensor([1., 0., 0., 0.])
+        env.sim.current_time += env.step_dt
+        state = mdp.update_mdp(env)
+        self.assertAlmostEqual(float(state.path_length), .2, places=6)
+        self.assertAlmostEqual(float(state.rearrangement_increment), .1, places=6)
+
+    def test_quaternion_sign_change_does_not_manipulate_the_object(self):
+        pose = self.env.scene["objects"].data.object_link_pose_w
+        pose[0, 2, 3:] = torch.tensor(Rotation.from_euler("xyz", [.2, -.1, .7]).as_quat()[[3, 0, 1, 2]])
+        _, _, _, corners, _, _ = mdp._physical_objects(self.env, self.env.mdp_state)
+        self.env.mdp_state.previous_corners.copy_(corners)
+        pose[0, 2, 3:] *= -1
+        self.env.sim.current_time += self.env.step_dt
+        state = mdp.update_mdp(self.env)
+        self.assertEqual(float(state.path_length), 0.)
+        self.assertEqual(float(state.rearrangement_increment), 0.)
+
+    def test_combined_pivot_matches_independent_fixed_corner_world_displacements(self):
+        env, state = self.env, self.env.mdp_state
+        before = state.previous_corners[0, 2].numpy().copy()
+        pivot = np.array([-.64, .21, 1.05])
+        rotation = Rotation.from_euler("xyz", [.1, -.2, .6])
+        pose = env.scene["objects"].data.object_link_pose_w
+        original_position = pose[0, 2, :3].numpy().copy()
+        pose[0, 2, :3] = torch.tensor(pivot + rotation.apply(original_position - pivot))
+        pose[0, 2, 3:] = torch.tensor(rotation.as_quat()[[3, 0, 1, 2]])
+        expected_corners = pivot + rotation.apply(before - pivot)
+        expected = np.linalg.norm(expected_corners - before, axis=-1).mean()
+        env.sim.current_time += env.step_dt
+        state = mdp.update_mdp(env)
+        self.assertAlmostEqual(float(state.rearrangement_increment), expected, places=6)
+        np.testing.assert_allclose(state.previous_corners[0, 2], expected_corners, atol=2.0e-7)
+
+    def test_all_active_objects_count_without_initial_visibility_and_padded_slots_are_excluded(self):
+        env = self.env
+        self.assertFalse(bool(env.initial_object_valid.any()))
+        # Includes Target, Blocker, and an unobserved distractor. The padding
+        # gathers body zero internally, but must not count its movement again.
+        env.scene["objects"].data.object_link_pose_w[0, 0, 0] += .01
+        env.scene["objects"].data.object_link_pose_w[0, 1, 1] += .02
+        env.scene["objects"].data.object_link_pose_w[0, 2, 2] += .03
+        env.sim.current_time += env.step_dt
+        state = mdp.update_mdp(env)
+        self.assertAlmostEqual(float(state.rearrangement_increment), .06, places=6)
+        self.assertAlmostEqual(float(state.path_length), .06, places=6)
 
     def test_static_objects_do_not_hide_robot_joint_motion_or_repeat_derivative_update(self):
         env = self.env
@@ -420,6 +665,31 @@ class TransitionTests(unittest.TestCase):
                 self.assertTrue(bool(state.failure))
                 self.assertTrue(bool(state.failure_reasons[0, 4]))
                 self.assertEqual(float(state.components[0, 4]), -env.cfg.mdp.failure_penalty)
+
+    def test_total_sensor_overrange_fails_even_with_zero_compensated_external_load(self):
+        for channel in range(6):
+            with self.subTest(channel=channel):
+                env = make_tensor_env()
+                flags = torch.zeros((1, 6), dtype=torch.bool)
+                flags[0, channel] = True
+                env.tool_force_torque_sensor = SimpleNamespace(
+                    range_exceeded=flags, valid=torch.ones(1, dtype=torch.bool))
+                env.sim.current_time += env.step_dt
+                state = mdp.update_mdp(env)
+                self.assertEqual(float(state.motion_costs.sum()), 0.)
+                self.assertTrue(bool(state.failure))
+                torch.testing.assert_close(state.failure_reasons,
+                                           torch.tensor([[False, False, False, False, True, False]]))
+                self.assertEqual(float(state.components[0, 4]), -env.cfg.mdp.failure_penalty)
+
+    def test_invalid_sensor_sample_cannot_trigger_stale_overrange_failure(self):
+        env = self.env
+        env.tool_force_torque_sensor = SimpleNamespace(
+            range_exceeded=torch.ones((1, 6), dtype=torch.bool), valid=torch.zeros(1, dtype=torch.bool))
+        env.sim.current_time += env.step_dt
+        state = mdp.update_mdp(env)
+        self.assertFalse(bool(state.failure))
+        self.assertFalse(bool(state.failure_reasons[0, 4]))
 
     def test_object_motion_with_robot_still_changes_rearrangement_but_not_robot_motion_costs(self):
         initial_motion = torch.ones(1)
@@ -478,12 +748,12 @@ class TransitionTests(unittest.TestCase):
         torch.testing.assert_close(before, after, atol=0., rtol=0.)
         self.assertGreater(float(self.env.mdp_state.path_length), 0.)
 
-    def test_dropped_active_object_is_a_failure_without_planar_displacement_cost(self):
+    def test_dropped_active_object_is_a_failure_and_counts_vertical_manipulation(self):
         self.move(2, (0., 0., -.1))
         state = mdp.update_mdp(self.env)
         self.assertTrue(bool(state.failure))
         self.assertTrue(bool(state.failure_reasons[0, 0]))
-        self.assertEqual(float(state.path_length), 0.)
+        self.assertAlmostEqual(float(state.path_length), .1, places=6)
 
     def test_unused_pool_body_is_excluded_from_geometry_motion_and_failure(self):
         env, state = self.env, self.env.mdp_state
@@ -596,6 +866,7 @@ class PreviousStepTests(unittest.TestCase):
     def test_repeated_manager_reads_do_not_shift_previous_sample(self):
         state = self.advance(.1, .2)
         original_history, original_valid = state.history.clone(), state.history_valid.clone()
+        original_elapsed, original_reward = state.elapsed_time.clone(), state.components.clone()
         for _ in range(3):
             mdp.policy_observation(self.env)
             mdp.reward_rate(self.env)
@@ -603,12 +874,80 @@ class PreviousStepTests(unittest.TestCase):
             mdp.failure(self.env)
         torch.testing.assert_close(state.history, original_history)
         torch.testing.assert_close(state.history_valid, original_valid)
+        torch.testing.assert_close(state.elapsed_time, original_elapsed)
+        torch.testing.assert_close(state.components, original_reward)
+
+    def test_episode_clock_counts_control_transitions_and_excludes_simulator_time_gaps(self):
+        state = self.env.mdp_state
+        self.env.sim.current_time += 5.  # Camera/reset preparation is not five seconds of agent actions.
+        state = mdp.update_mdp(self.env)
+        torch.testing.assert_close(state.elapsed_time, torch.full((2,), self.env.step_dt, dtype=torch.float64))
+        state = self.advance(.1, .2)
+        torch.testing.assert_close(state.elapsed_time, torch.full((2,), 2 * self.env.step_dt, dtype=torch.float64))
+
+    def test_mixed_timestamp_guard_advances_only_the_environment_with_a_new_transition(self):
+        state = self.env.mdp_state
+        self.env.sim.current_time += self.env.step_dt
+        state.last_time[0] = self.env.sim.current_time
+        mdp.update_mdp(self.env)
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([0., self.env.step_dt], dtype=torch.float64))
+        self.assertEqual(float(state.components[0].sum()), 0.)
+        self.assertLess(float(state.components[1, 3]), 0.)
+
+    def test_mixed_timestamp_guard_advances_only_selected_corner_accumulators(self):
+        state = self.env.mdp_state
+        before_corners = state.previous_corners.clone()
+        self.env.scene["objects"].data.object_link_pose_w[:, 2, 1] += .02
+        self.env.sim.current_time += self.env.step_dt
+        state.last_time[0] = self.env.sim.current_time
+        mdp.update_mdp(self.env)
+        torch.testing.assert_close(state.path_length, torch.tensor([0., .02]))
+        torch.testing.assert_close(state.rearrangement_increment, torch.tensor([0., .02]))
+        torch.testing.assert_close(state.previous_corners[0], before_corners[0])
+        self.assertGreater(float((state.previous_corners[1] - before_corners[1]).abs().sum()), 0.)
+
+    def test_partial_reset_reinitializes_only_selected_corner_history_and_manipulation(self):
+        env, state = self.env, self.env.mdp_state
+        pose = env.scene["objects"].data.object_link_pose_w
+        pose[:, 2, 1] += torch.tensor([.02, .04])
+        self.advance(.1, .2)
+        torch.testing.assert_close(state.path_length, torch.tensor([.02, .04]))
+        continuing_corners = state.previous_corners[1].clone()
+        pose[0, 2, 0] += .03  # A new episode starts at this physical pose.
+        pose[1, 2, 0] += .01  # Continuing episode movement is not reset.
+        mdp.reset_mdp(env, torch.tensor([0]))
+        torch.testing.assert_close(state.path_length, torch.tensor([0., .04]))
+        torch.testing.assert_close(state.rearrangement_increment, torch.tensor([0., .04]))
+        _, _, _, corners, _, _ = mdp._physical_objects(env, state)
+        torch.testing.assert_close(state.previous_corners[0], corners[0])
+        torch.testing.assert_close(state.previous_corners[1], continuing_corners)
+        self.advance(.3, .4)
+        torch.testing.assert_close(state.path_length, torch.tensor([0., .05]))
+        torch.testing.assert_close(state.rearrangement_increment, torch.tensor([0., .01]))
+
+    def test_partial_reset_restarts_time_penalty_without_resetting_continuing_episode(self):
+        self.env.step_dt = 1.
+        for _ in range(4):
+            state = self.advance(.1, .2)
+        mdp.reset_mdp(self.env, torch.tensor([0]))
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([0., 4.], dtype=torch.float64))
+        mdp.policy_observation(self.env)
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([0., 4.], dtype=torch.float64))
+        state = self.advance(.3, .4)
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([1., 5.], dtype=torch.float64))
+        cfg = self.env.cfg.mdp
+        for env_id, start in enumerate((0., 4.)):
+            expected = -cfg.time_penalty_scale * (math.exp(cfg.time_penalty_growth_rate * start)
+                                                  * math.expm1(cfg.time_penalty_growth_rate)
+                                                  / cfg.time_penalty_growth_rate - 1)
+            self.assertAlmostEqual(float(state.components[env_id, 3]), expected, places=7)
 
     def test_full_reset_invalidates_previous_sample_and_zeroes_stale_action(self):
         self.advance(.1, .2)
         state = self.advance(.3, .4)
         self.env.action_manager.action[:] = .9
         mdp.reset_mdp(self.env)
+        torch.testing.assert_close(state.elapsed_time, torch.zeros(2, dtype=torch.float64))
         torch.testing.assert_close(state.history_valid, torch.tensor([[True, False], [True, False]]))
         torch.testing.assert_close(state.history[:, 1], torch.zeros((2, 72)))
         torch.testing.assert_close(state.history[:, 0, -18:], torch.zeros((2, 18)))
@@ -754,6 +1093,53 @@ class WrenchTests(unittest.TestCase):
         sensors = SimpleNamespace(tool_wrench=lambda env: raw, tool_wrench_valid=lambda env: valid)
         with patch.dict(sys.modules, {"contact_rearrangement.src.sensors": sensors}):
             return mdp.corrected_wrench(env)
+
+    def test_measurement_resolution_is_applied_before_self_load_compensation(self):
+        env = self.wrench_env()
+        env.sim.cfg.gravity = (0., 0., -9.81)
+        # The total ideal reaction is 9.81 N self load plus .02 N contact.
+        # A .1 N-resolution sensor reports 9.8 N, before self-load removal.
+        measured = torch.tensor([[0., 0., 9.8, 0., 0., 0.]], dtype=torch.float64)
+        corrected = self.read_corrected(env, measured)
+        expected = torch.tensor([[0., 0., -.01, 0., 0., 0.]], dtype=torch.float64)
+        torch.testing.assert_close(corrected, expected, atol=1.0e-12, rtol=0.)
+        # Rounding after compensation would incorrectly turn this into zero.
+        self.assertNotEqual(float(corrected[0, 2]), 0.)
+        torch.testing.assert_close(measured, torch.tensor([[0., 0., 9.8, 0., 0., 0.]], dtype=torch.float64))
+
+    def dynamic_observation(self, env, wrench):
+        contacts = torch.zeros((env.num_envs, 17), dtype=torch.bool)
+        sensors = SimpleNamespace(tactile_contacts=lambda env: contacts,
+                                  tactile_valid=lambda env: torch.ones_like(contacts))
+        with patch.dict(sys.modules, {"contact_rearrangement.src.sensors": sensors}):
+            return mdp_observations._dynamic_observation(env, env.mdp_state, wrench)
+
+    def test_si2008_normalizes_fz_using_360n_and_other_force_axes_using_200n(self):
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                env = make_tensor_env(num_envs=2) if dtype == torch.float32 else self.wrench_env(num_envs=2)
+                wrench = torch.tensor([[200., -200., 200., 8., -8., 8.],
+                                       [0., 0., 360., 0., 0., 0.]], dtype=dtype)
+                observed = self.dynamic_observation(env, wrench)
+                expected = torch.tensor([[1., -1., 200 / 360, 1., -1., 1.],
+                                         [0., 0., 1., 0., 0., 0.]], dtype=dtype)
+                self.assertEqual(tuple(observed.shape), (2, 72))
+                self.assertEqual(observed.dtype, dtype)
+                torch.testing.assert_close(observed[:, 31:37], expected)
+                state = env.mdp_state
+                state.history[:, 0] = observed
+                state.history_valid[:, 0] = True
+                self.assertEqual(tuple(mdp.policy_observation(env).shape), (2, 544))
+
+    def test_normalization_uses_configured_ranges_and_preserves_compensated_overrange(self):
+        env = self.wrench_env()
+        env.cfg.force_torque = SimpleNamespace(ranges=(100., 200., 400., 2., 4., 8.))
+        wrench = torch.tensor([[150., -200., 400., 2., -4., 48.]], dtype=torch.float64)
+        observed = self.dynamic_observation(env, wrench)
+        # External compensation need not remain inside the total raw range;
+        # only the independent policy clip at five full scales is applied.
+        torch.testing.assert_close(observed[:, 31:37],
+                                   torch.tensor([[1.5, -1., 1., 1., -1., 5.]], dtype=torch.float64))
 
     def test_translation_removes_ma_and_its_sensor_center_moment_without_removing_external_load(self):
         env = self.wrench_env()

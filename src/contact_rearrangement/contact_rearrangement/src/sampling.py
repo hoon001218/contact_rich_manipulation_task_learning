@@ -40,7 +40,7 @@ class ObjectGeometry:
     asset_name: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class SpawnRules:
     x_range: tuple[float, float] = (-0.89, -0.51)
     y_range: tuple[float, float] = (-0.455, 0.455)
@@ -67,7 +67,7 @@ class SpawnRules:
     max_attempts: int = 300
 
 
-@dataclass(frozen=True)
+@dataclass
 class RobotStartRules:
     """Bounded, collision-checked hand starts in front of the episode Blocker.
 

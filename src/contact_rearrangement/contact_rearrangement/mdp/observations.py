@@ -103,9 +103,12 @@ def corrected_wrench(env):
 
     The parent-on-child reaction includes ``sum(m*(a_COM-g))`` and its moment,
     plus ``I*alpha + omega x (I*omega)`` for every hand and distal sensor body.
-    Raw F/T and native body kinematics belong to the same completed physics
-    step. Invalid/reset readings remain zero without evaluating stale motion.
-    Optional MDP tare measures a residual *after* full self-load compensation.
+    The sensor has already applied its sensing ranges and resolution to the
+    total reaction. These measured values and native body kinematics belong
+    to the same completed physics step. Compensation does not quantize the
+    resulting external load again. Invalid/reset readings remain zero without
+    evaluating stale motion. Optional MDP tare measures a residual *after*
+    full self-load compensation.
     """
     from ..src.sensors import tool_wrench, tool_wrench_valid
     state = ensure_mdp(env)
@@ -149,12 +152,16 @@ def _tcp_pose_b(env, state):
 
 
 def _dynamic_observation(env, state, wrench=None, zero_action=False):
+    from ..src.catalog import SI_200_8_CALIBRATION
     from ..src.sensors import tactile_contacts, tactile_valid
     cfg, robot = env.cfg.mdp, env.scene["robot"]
     tcp_pose_b = _tcp_pose_b(env, state)
     wrench = corrected_wrench(env) if wrench is None else wrench
-    normalized = torch.cat((wrench[:, :3] / cfg.observation_force_scale,
-                            wrench[:, 3:] / cfg.observation_torque_scale), -1).clamp(-5, 5)
+    calibration = getattr(env.cfg, "force_torque", SI_200_8_CALIBRATION)
+    scales = torch.as_tensor(calibration.ranges, device=wrench.device, dtype=wrench.dtype)
+    # Compensation can produce an external load beyond the raw sensing range;
+    # retain the existing policy clip independently of hardware saturation.
+    normalized = (wrench / scales).clamp(-5, 5)
     valid = tactile_valid(env)
     if zero_action:
         # A reset has no completed transition in this episode. Do not retain

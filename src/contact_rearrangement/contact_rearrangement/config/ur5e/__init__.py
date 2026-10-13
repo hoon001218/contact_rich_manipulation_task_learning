@@ -10,6 +10,6 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.osc_env_cfg:ContactRearrangementRLEnvCfg",
-        "ppo_cfg_entry_point": f"{__name__}.agents.ppo_cfg:ContactRearrangementPPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:ContactRearrangementPPORunnerCfg",
     },
 )

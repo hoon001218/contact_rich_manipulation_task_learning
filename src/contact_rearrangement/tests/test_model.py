@@ -282,6 +282,22 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients))
             self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
 
+    def test_fixed_entropy_noise_preserves_objective_across_subbatches(self):
+        noise = torch.randn(3, self.model.cfg.action_dim)
+        actions = torch.zeros_like(noise)
+        full = self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise)
+        chunks = [self.model.evaluate_actions(self.observation[start:stop], actions[start:stop],
+                                              masks=self.masks(self.observation[start:stop]),
+                                              entropy_noise=noise[start:stop])
+                  for start, stop in ((0, 2), (2, 3))]
+        for column, expected in enumerate(full):
+            torch.testing.assert_close(torch.cat([result[column] for result in chunks]), expected,
+                                       rtol=1e-5, atol=1e-6)
+        with self.assertRaisesRegex(ValueError, "Entropy noise"):
+            self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise[:, :-1])
+        with self.assertRaisesRegex(ValueError, "Entropy noise"):
+            self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise.double())
+
     def test_saturated_actions_preserve_probability_ratios_and_finite_gradients(self):
         with torch.no_grad():
             self.model.actor.bias[::2] = 20.0

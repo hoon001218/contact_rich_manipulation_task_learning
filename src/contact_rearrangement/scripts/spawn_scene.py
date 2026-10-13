@@ -339,6 +339,8 @@ def main() -> None:
     cfg = ContactRearrangementEnvCfg()
     cfg.scene.num_envs = args_cli.num_envs
     cfg.sim.device = args_cli.device
+    if args_cli.headless:
+        cfg.sim.render_interval = 2**30  # RGB-D is captured explicitly at reset.
     cfg.seed = args_cli.seed
     cfg.target_asset = args_cli.target_asset
     cfg.blocker_asset = args_cli.blocker_asset

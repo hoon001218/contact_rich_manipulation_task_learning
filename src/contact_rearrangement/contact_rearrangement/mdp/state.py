@@ -21,8 +21,15 @@ class MdpCfg:
     w_rearr: float = 1.0
     w_motion: float = 1.0
     w_time: float = 1.0
-    displacement_ref: float = 0.5
-    time_ref: float = 10.0
+    w_terminal: float = 1.0
+    # Positive slopes of the quality scores exp(-decay * cost).
+    clearance_decay: float = 1.0  # ratio is dimensionless
+    rearrangement_decay: float = 2.0  # 1/m of cumulative mean-corner displacement
+    motion_acceleration_decay: float = 1.0
+    motion_wrench_increase_decay: float = 1.0
+    # Time cost rate: scale * (exp(growth_rate * elapsed_seconds) - 1).
+    time_penalty_scale: float = 0.02  # reward/s
+    time_penalty_growth_rate: float = 0.7  # 1/s
     # Provisional scales: rad/s² for acceleration, N/s and N·m/s for load increase.
     arm_joint_acceleration_ref: float = 5.0
     hand_joint_acceleration_ref: float = 10.0
@@ -44,8 +51,6 @@ class MdpCfg:
     torque_hard: float = 4.0
     joint_position_scale: float = math.pi
     joint_velocity_scale: float = 2.0
-    observation_force_scale: float = 50.0
-    observation_torque_scale: float = 5.0
 
     def __post_init__(self):
         if self.history_length != 2 or self.max_objects != 40:
@@ -53,7 +58,7 @@ class MdpCfg:
         for name, value in vars(self).items():
             if not isinstance(value, (float, int)) or not math.isfinite(value):
                 raise ValueError(f"MDP parameter {name} must be finite.")
-            if name.startswith("w_") or name.endswith("_tolerance"):
+            if name.startswith("w_") or name == "time_penalty_scale" or name.endswith("_tolerance"):
                 if value < 0:
                     raise ValueError(f"MDP parameter {name} must be nonnegative.")
             elif value <= 0:
@@ -211,7 +216,11 @@ class MdpState:
         # samples are zero-padded by the observation producer.
         self.history_valid = torch.zeros((*shape[:1], cfg.history_length), device=device, dtype=torch.bool)
         self.last_time = torch.full(shape[:1], float(env.sim.current_time), device=device, dtype=torch.float64)
+        # Episode time counts completed control transitions, excluding camera
+        # rendering and reset preparation that may advance simulator time.
+        self.elapsed_time = torch.zeros(env.num_envs, device=device, dtype=torch.float64)
         self.previous_center = torch.zeros((*shape, 3), device=device)
+        self.previous_corners = torch.zeros((*shape, 8, 3), device=device)
         self.initial_center = torch.zeros_like(self.previous_center)
         self.initial_rotation = torch.zeros((*shape, 4), device=device)
         self.previous_joint_velocity = torch.zeros((env.num_envs, len(self.joint_ids)), device=device)
@@ -219,6 +228,7 @@ class MdpState:
         self.wrench_bias = torch.zeros_like(self.previous_wrench)
         self.initial_sensor_point = torch.zeros((env.num_envs, 3), device=device)
         self.path_length = torch.zeros(env.num_envs, device=device)
+        self.rearrangement_increment = torch.zeros(env.num_envs, device=device)
         self.stable_count = torch.zeros(env.num_envs, device=device, dtype=torch.long)
         self.success = torch.zeros(env.num_envs, device=device, dtype=torch.bool)
         self.failure = torch.zeros_like(self.success)
@@ -278,14 +288,17 @@ def reset_mdp(env, env_ids=None):
 
     state = ensure_mdp(env)
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
-    _, _, center, _, rotation, _ = _physical_objects(env, state)
+    _, _, center, corners, rotation, _ = _physical_objects(env, state)
     state.last_time[ids] = float(env.sim.current_time)
+    state.elapsed_time[ids] = 0
     state.previous_center[ids] = state.initial_center[ids] = center[ids]
+    state.previous_corners[ids] = corners[ids]
     state.initial_rotation[ids] = rotation[ids]
     state.previous_joint_velocity[ids] = env.scene["robot"].data.joint_vel[ids][:, state.joint_ids]
     state.previous_wrench[ids] = state.wrench_bias[ids] = 0
     state.initial_sensor_point[ids] = env.scene["robot"].data.body_link_pos_w[ids, state.sensor_id]
     state.path_length[ids] = 0
+    state.rearrangement_increment[ids] = 0
     state.stable_count[ids] = 0
     state.success[ids] = state.failure[ids] = state.terminal_paid[ids] = False
     state.discrete_reward[ids] = 0
@@ -311,8 +324,13 @@ def update_mdp(env):
         return state
     cfg, dt = env.cfg.mdp, float(env.step_dt)
     ids, active, center, corners, rotation, velocity = _physical_objects(env, state)
-    path = state.path_length + (torch.linalg.vector_norm(center[..., :2] - state.previous_center[..., :2], dim=-1)
-                                * active).sum(-1)
+    # Corners retain a fixed object-local order and use the fixed environment
+    # frame. Their full 3-D displacement measures translation and rotation in
+    # meters without a separate radians-to-meters conversion. Mean over eight
+    # corners makes a pure translation equal to the object's translation length.
+    increment = (torch.linalg.vector_norm(corners - state.previous_corners, dim=-1).mean(-1)
+                 * active).sum(-1)
+    path = state.path_length + increment
     polygon, count = convex_hull_xy(corners[..., :2])
     area = polygon_area(polygon, count)
     overlap = rectangle_overlap_area(polygon, count, env.access_region[:, None].expand(-1, cfg.max_objects, -1))
@@ -325,14 +343,15 @@ def update_mdp(env):
     fixed_wrench = _fixed_wrench(env, state, sensor_wrench)
     joint_velocity = env.scene["robot"].data.joint_vel[:, state.joint_ids]
     components, costs = reward_components(cfg, blocked, blocker_area, path, joint_velocity,
-                                          state.previous_joint_velocity, fixed_wrench, state.previous_wrench, dt)
+                                          state.previous_joint_velocity, fixed_wrench, state.previous_wrench, dt,
+                                          elapsed_time=state.elapsed_time)
     success_candidate, stable_count, reasons, failure = task_conditions(
         env, state, center, corners, rotation, velocity, active, target, total_overlap, sensor_wrench,
     )
     success, terminal, paid = terminal_transition(success_candidate, failure, stable_count,
                                                    state.terminal_paid, cfg)
     weighted = components @ torch.tensor((cfg.w_clear, cfg.w_rearr, cfg.w_motion, cfg.w_time), device=env.device)
-    discrete = weighted + terminal
+    discrete = weighted + cfg.w_terminal * terminal
     selected = advance.nonzero(as_tuple=False).flatten()
     dynamic = _dynamic_observation(env, state, sensor_wrench)
     state.history[selected, 1:] = state.history[selected, :-1].clone()
@@ -340,9 +359,11 @@ def update_mdp(env):
     state.history[selected, 0] = dynamic[selected]
     state.history_valid[selected, 0] = True
     state.previous_center[selected] = center[selected]
+    state.previous_corners[selected] = corners[selected]
     state.previous_joint_velocity[selected] = joint_velocity[selected]
     state.previous_wrench[selected] = fixed_wrench[selected]
     state.path_length[selected] = path[selected]
+    state.rearrangement_increment[selected] = increment[selected]
     state.stable_count[selected] = stable_count[selected]
     state.success[selected] = success[selected]
     state.failure[selected] = failure[selected]
@@ -353,6 +374,7 @@ def update_mdp(env):
     state.blocked_ratio[selected] = (blocked / blocker_area.clamp_min(1.0e-12)).clamp(0, 1)[selected]
     state.total_overlap[selected] = total_overlap[selected]
     state.failure_reasons[selected] = reasons[selected]
+    state.elapsed_time[selected] += dt
     state.last_time[selected] = timestamp
     return state
 

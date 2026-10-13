@@ -28,9 +28,31 @@ Reward v2·종료 조건, 초기 장면 GNN·역할 조건부 attention·유한 
 좌표계는 `examples`의 sweeping 프로젝트처럼 robot root/base다. 아래의
 스폰·센서 GPU 검증을 새 MDP의 학습 성공이나 제어 검증으로 확대하지 않는다.
 Reward·제어 수치는 provisional default이며 정책 성능은 아직 입증하지 않았다.
+후속 Time 교정은 `T_ref`를 제거하고 초반부터 완만하게 증가하다가 후반에
+가팔라지는 지수형 비용을 적용한다. 환경별 episode clock은 reward 내부에 두며
+현재 544D observation에는 추가하지 않는다. 자세한 수식과 개형은 4절에 둔다.
+Clearance·Rearrangement·Motion은 `exp(−a·x)` 품질 점수로 통일하고,
+Rearrangement는 모든 물체의 평균 OBB corner 3D 경로를 누적해 병진·회전을
+평가한다. 실제 물체 pose는 privileged reward·검증에만 사용한다.
+F/T 측정 모델은 사진의 **ATI Axia80 SI-200-8** 범위·유효 분해능으로 설정하고,
+측정 후 자중·관성을 보상해 축별 full scale로 정규화한다. 센서 전체 하중의
+범위 초과와 기존 보정 하중의 작업 안전 한계는 구분한다.
 코드 구조는 `examples`의 `sweeping_policy`를 따라 공통 환경 설정,
 `config/ur5e`의 로봇·학습 설정, `mdp`의 manager 함수, `src`의 장면 지원 구현으로
 정리했다. 학습은 `Isaac-Contact-Rearrangement-UR5e-v0`의 등록된 설정으로 실행한다.
+다중 환경 학습은 공통 초기 장면을 사용한다. 전체 reset마다 물체 배치·역할·로봇
+초기 자세를 새로 정하고 초기 vision을 한 번 승인해 모든 환경에서 재사용한다.
+부분 reset은 현재 공통 초기 장면을 복원하며 물리 상태·행동·센서는 환경별로
+독립적이다. 카메라는 실제 RGB-D와 비가림 기준 실루엣용 총 2개를 공유하고,
+Headless 실행에서는 자동 렌더링을 생략하고 초기 촬영 때만 명시적으로 렌더링한다.
+카메라 버퍼는 계속 유지하며 env 0만 시각적으로 렌더링한다. 물리 replica는
+Fabric으로 복제한다. PPO는 원래 minibatch의 gradient를 최대 32 sample씩 누적하며,
+학습 흐름은 예제의 **Hydra → gym.make → RslRlVecEnvWrapper → OnPolicyRunner → runner.learn**이다.
+Rollout storage·GAE·학습 반복·콘솔·TensorBoard·checkpoint는 native RSL-RL이 담당하며
+연구 network 공유·정확한 final-observation bootstrap·microbatch·profile 검사만 확장한다.
+환경은 SceneCfg와 manager/event 구조를 유지하고 RewardTerm 5개로 항별 로그를 생성한다.
+기본 출력 경로는
+`logs/rsl_rl/contact_rearrangement/<시작 시각>/`이다.
 새 패키지 `src/contact_rearrangement`는 **10종 asset 중 4–10종을 선택하고
 전체 선반 밀도에 필요한 수의 instance를 배치**한다. 이전에 4–10종을
 active instance 4–10개로 해석한 것은 잘못이며 종류 수와 개수를 분리했다.
@@ -173,7 +195,7 @@ Reset 직후 현재 sample만 valid, 직전 sample은 zero/invalid로 두며 그
 | 초기 물체 기하 | 물체별 위치 3D + quaternion(wxyz) 4D + OBB extent 3D = 10D, 현재 EEF 기준 | 단일 시점 visible depth의 근사 오차와 실기 detector |
 | 물체 역할 | K=40 중 슬롯 0=Target·1=Blocker·2–39=주변 물체. 역할 ID 채널 없이 고정 슬롯과 유효 기하로 mask 생성 | 실기에서의 identity/role association과 초기 정렬 |
 | Robot state | Arm 6개·hand 독립 6개 관절의 q/dq 24D + base 기준 EEF pose 7D = 31D | 실제 구동 관절 정규화·동기화 |
-| Wrist F/T | Sensor frame의 자중·병진/회전 관성 보상 force/torque 6D, 선택적 residual bias tare | Filtering·실제 질량/관성·가속도 추정과 bias 교정 |
+| Wrist F/T | SI-200-8 측정 범위·분해능 근사 후 sensor-frame 자중·병진/회전 관성 보상 force/torque 6D, 선택적 residual bias tare | Filtering·실제 질량/관성·가속도 추정과 bias 교정 |
 | Tactile | 17D, 0=비접촉·1=접촉·−1=결측. 유효성 mask는 이 값으로 생성 | 0.01 N은 변경 가능한 초기 threshold |
 | Previous action | 해당 관측 직전 적용한 normalized action 18D | Policy/control 주기 교정 |
 
@@ -210,8 +232,10 @@ finite robot/F/T/action·0이 아닌 EEF quaternion으로 판단한다. 미관�
 reset 직후의 직전 sample 슬롯은 zero padding, 결측 tactile은 −1이므로 추가 내부 정보가
 필요하지 않다. Reset 현재 tactile도 −1이다. Boolean mask는 learned feature로
 concat하지 않으며 결측 tactile은 encoder에 넣기 전에 0으로 필터링한다.
-관절 q/dq는 π·2 rad/s, force/torque는 50 N·5 N·m로
-정규화하는 초기 설정이다. 과거 `72 + 11K`의 current-only 입력안은 이력 구조로 대체했다.
+관절 q/dq는 π·2 rad/s, F/T는 축별 SI-200-8 full scale
+`[200,200,360,8,8,8]`(힘 3축 N, 토크 3축 N·m)로 나누고 기존 `[-5,5]` clip을 유지한다.
+과거의 scalar 50 N·5 N·m 정규화는 제거했다.
+과거 `72 + 11K`의 current-only 입력안은 이력 구조로 대체했다.
 
 Actor가 현재 실제 object pose·velocity를 받기로 한 것은 아니다. 시뮬레이터
 정답을 reward·검증·학습 label에 쓰는 것과 actor 실행 입력에 쓰는 것은 구분한다.
@@ -241,7 +265,7 @@ Observation 기하의 고정 역할 슬롯·zero padding·tactile 결측값
 - Node 64D, message passing 2 rounds의 dense valid edge를 사용하며 self/padding edge를 제외한다. Edge feature는 초기 물체 간 상대 위치·extent 차이다. Role-conditioned query는 Target·Blocker embedding에서 만들며 두 attention readout과 role/global feature를 결합한다.
 - Node encoder는 기하 10D, history projection은 sample 72D를 입력으로 받는다. Mask는 learned feature로 concat하지 않고 선택·필터링에 사용하며 역할 ID 채널도 없다.
 - History encoder는 64D causal convolution이며 기본 1개 layer로 현재·직전 두 sample을 처리한다. Padding을 제외하고 유효 sample만 pooling한다. Fused latent는 128D이며 기본 모델은 247,717개 parameter다. 더 오래된 sample이나 지속 hidden state는 제공하지 않는다.
-- Custom PPO가 scene/history encoder와 actor/critic을 공동학습한다. Actor와 critic은 같은 544D 입력과 encoder를 공유하며 privileged critic·현재 물체 GT 입력·보조 예측 head/loss는 추가하지 않았다. Rollout·PPO minibatch·timeout 마지막 관측에서 모두 observation만으로 mask를 다시 생성한다.
+- Native RSL-RL runner/PPO에 연구 모델 adapter를 연결해 scene/history encoder와 actor/critic을 공동학습한다. Actor와 critic은 같은 544D 입력과 encoder를 공유하며 privileged critic·현재 물체 GT 입력·보조 예측 head/loss는 추가하지 않았다. Rollout·PPO minibatch·timeout 마지막 관측에서 모두 observation만으로 mask를 다시 생성한다.
 - Tanh-Gaussian action의 log probability에는 변환 Jacobian을 반영한다. GAE는 실제 terminal state에서 bootstrap하지 않고, timeout에서는 auto-reset 이전 실제 final observation의 value로 bootstrap하며 다음 episode의 advantage를 이어 붙이지 않는다.
 
 이전 16-step 모델은 관측 1960D·286,053 parameter, mask 채널을 포함했던
@@ -311,8 +335,11 @@ physics substep의 측정 q에서 `min(native velocity limit, hand_target_rate)`
 **Formulation v2를 새 학습 환경에 구현했으며 수치는 초기 실행 기본값이다.**
 Transition `s_t → s_{t+1}`에 대해 계산한다. 상위 weight는 비음수, scale과
 `Δt`는 양수다. 최종 weight·정규화 scale·종료 허용오차와 학습 충분성은 미정이다.
-`MdpCfg`의 현재 상위 weight 4개는 모두 1, `d_0=0.5 m`, `T_ref=10 s`,
-성공 bonus 500·실패 penalty 100이다. Episode timeout 8초는 별도 초기 설정이다.
+Native `rewards.{clearance,rearrangement,motion,time,terminal}.weight` 5개는 모두 1이다.
+`MdpCfg.w_*`는 해당 설정을 반영하는 diagnostics 값이며 품질 점수별 민감도는 아래에 둔다.
+성공 bonus 500·실패 penalty 100이다. Time의 `T_ref`는 제거하고 지수형 비용률의
+강도 `a=0.02 reward/s`·증가율 `b=0.7 /s`를 초기값으로 둔다.
+Episode timeout 8초는 별도 초기 설정이다.
 
 $$
 r_t=w_{\mathrm{clear}}r_t^{\mathrm{clear}}
@@ -328,7 +355,7 @@ $$
 
 $$
 r_t^{\mathrm{clear}}
-=\exp\left(-\frac{A_{\mathrm{blocked},t+1}}{A_{\mathrm{blocker},t+1}}\right)
+=\exp\left(-a_{\mathrm{clear}}\frac{A_{\mathrm{blocked},t+1}}{A_{\mathrm{blocker},t+1}}\right)
 $$
 
 분자는 고정 접근영역 `A_0`와 지정 Blocker footprint의 겹침 면적, 분모는 같은
@@ -337,21 +364,83 @@ shelf 평면에 투영한 **Blocker의 전체 footprint 면적**이다. 접근�
 고정해 Target 이동에 따라 성공 영역이 같이 움직이지 않게 한다. 차단 비율이
 0이면 1, 1이면 `e^-1`이다. 이 점수만으로 전체 경로 확보를 판정하지 않는다.
 
-### 최소 재배치
+### 최소 재배치와 공통 지수 점수
 
-전체 유효 물체의 실제 누적 평면 이동량을 줄인다.
+최신 사용자 선택에 따라 Clearance·Rearrangement·Motion의 품질 점수는
+**`exp(−a·x)`** 형태로 통일한다. Time은 앞서 선택한 증가형 penalty를 유지하고
+Terminal은 별도 종료 사건 보상이다. `x`는 평가 비용이며 `a`는 비용 단위의
+역수를 가진 지수 민감도다. 상위 `w`는 항 사이 비중으로 역할이 다르다.
+
+| 품질 점수 | x | a의 초기값 |
+|---|---|---:|
+| Clearance | Blocker 차단 비율 ρ_b | clearance_decay=1 |
+| Rearrangement | 전체 누적 OBB corner 조작량 L (m) | rearrangement_decay=2 m⁻¹ |
+| Motion의 관절 항 | 정규화한 관절 가속도 제곱합 | motion_acceleration_decay=1 |
+| Motion의 F/T 항 | 정규화한 힘·토크 크기 증가율 제곱합 | motion_wrench_increase_decay=1 |
+
+민감도는 모두 유한한 양수다. 같은 `[0,1]` 범위가 실제 영향의 균형까지 보장하지
+않으며 비용 분포와 a·w를 함께 평가해야 한다. Clearance의 비율과 Motion의
+기존 정규화 비용은 유지한다. Rearrangement의 `displacement_ref=d_0`는 제거하고
+초기 `a_rearr=2 m⁻¹`는 이전 `1/0.5 m`의 민감도를 이어 받는다. 기준거리 표기를
+없애도 같은 지수 곡선의 scale 선택이 사라지는 것은 아니다.
+
+Rearrangement의 현재 x는 **직전 pose와 현재 pose에서 대응하는 OBB corner의
+이동량을 episode 동안 누적**한 값이다:
 
 $$
-D_0=0,\qquad D_{t+1}=D_t+
-\sum_{i\in\mathcal O}\|p^{xy}_{i,t+1}-p^{xy}_{i,t}\|_2,\qquad
-r_t^{\mathrm{rearr}}=\exp(-D_{t+1}/d_0)
+\Delta L_k=\sum_{i\in\mathcal O}\frac18\sum_{j=1}^{8}
+\|c_{i,j,k+1}-c_{i,j,k}\|_2,\qquad
+L_0=0,\quad L_{k+1}=L_k+\Delta L_k,\qquad
+r_k^{\mathrm{rearr}}=\exp(-a_{\mathrm{rearr}}L_{k+1})
 $$
 
-`O`에는 Target·Blocker·주변 물체를 포함하고 padding은 제외한다. `D`는
-초기–최종 변위가 아닌 물체 중심의 경로 길이 합이므로 왕복 이동도 비용으로 남는다.
-사용자는 **같은 실제 이동은 같은 비용**으로 취급하도록 교정했다. 물체 크기로
-나누거나 물체 수로 평균내지 않고 공통 `d_0`를 사용한다. 회전 환산 거리와
-역할별 가중치는 현재 식에 포함하지 않은 대안이다.
+`O`는 Target·Blocker·처음에 인식되지 않은 물체를 포함한 모든 active 물체이고
+padding과 주차한 pool 물체는 제외한다. OBB 8개 corner는 USD 측정 bounds와
+고정된 object-local 순서로 만들고 실제 pose로 갱신한다. 고정 environment frame에서
+같은 corner끼리 비교해 로봇 EEF 운동을 물체 이동으로 계산하지 않는다.
+매 step OBB를 다시 PCA로 추정하거나 가까운 점으로 재대응하지 않는다.
+
+물체별 corner는 평균내고 물체 간·step 간에는 합산한다. 순수 10 cm 병진은
+물체당 0.1 m다. 중심 이동 없이 한 변 10 cm인 정육면체를 90° yaw 회전하면
+8개 corner가 각각 10 cm 움직여 동일한 0.1 m다. 병진·회전·pivot·왕복·Z 이동을
+meter 단위로 평가한다. 실제 mesh 표면을 OBB로 근사하며 회전 비용은 실제
+대표점의 이동거리에 따라 크기·형상의 영향을 받는다. 물체 크기나 개수로
+정규화하는 것은 아니다. 이 형태는 두 pose에서 동일한 model vertex의 평균
+거리를 정의한 [BOP의 ADD 설명(2.2절)](https://arxiv.org/pdf/1808.08319)과 연결된다.
+이를 우리 RL reward에 사용하는 성능은 별도 검증 대상이다.
+
+**선택 과정:** 사용자는 모호한 d_0와 XY 위치만의 평가를 지적하고 물체 pose의
+병진·회전 평가를 요청했다. 초기–현재 편차 대신 **전체 조작량**을 선택해 왕복도
+남긴다. 위치(m)·회전(rad)을 별도로 더하는 안은 단위별 가중치 문제 때문에 OBB
+corner의 실제 이동거리로 구체화했다. 그 후 품질 항의 `exp(−a·x)` 공통 형태를
+선택했다. 앞서 제안했던 step 조작량의 직접 음수 비용은 현재 채택된 품질 점수가
+아니다. 현재 식은 누적량을 매 step 평가하므로 과거 이동이 이후 점수에도 영향을
+준다. **최종 조작량이 같아도 이동 시점에 따라 episode return이 달라진다.**
+
+**부분관측 조건:** 사용자는 observation은 초기 vision이고 물체 pose를 갱신하지
+않지만, **reward에서는 privileged info로 전체 물체를 사용해도 된다**고 명시했다.
+요구는 GT reward 금지가 아니라 observation 정보로 장면 변화의 영향을 어느
+정도 인지하도록 유도하는 것이다. Actor의 544D 초기 vision+현재·직전 센서 규약은
+유지하고 실제 corner·step 증가량·누적량은 reward와 검증용 extras에만 사용한다.
+초기 관측 물체만 평가하거나 손 이동 proxy로 대체하는 것은 선택하지 않았다.
+`initial_observed_object_ids`와 원본 `initial_object_valid`는 physical-slot 순서이고
+actor 역할 재정렬 mask와 구분해야 한다는 구현 근거는 유지한다.
+
+Reward만으로 숨은 물체 pose를 정확히 인식했다는 보장은 없으며 같은 센서 신호에
+여러 장면 변화가 대응하는 모호성과 두 sample 밖의 기억 제한은 남는다.
+**명시적인 인식 학습은 미채택 보조 목적 검토안**이다. Shared latent에서 직전
+transition의 전체 ΔL 또는 주변 물체 변화 여부를 예측하고 GT는 학습 label로만
+사용할 수 있다. `L_PPO+λ_aux L_pred`는 별도 loss이며 예측 정확도를 reward에
+더하는 안과 구분한다. 보조 head·label·loss·λ·기억 구조 변경은 아직 채택하지 않았다.
+보조 loss만으로 센서가 전달하지 않는 정보가 생기거나 모든 pose가 복원되는 것은 아니다.
+
+`MdpState.previous_corners`는 승인된 scene reset의 실제 corner로 초기화하고
+`rearrangement_increment`와 누적 `path_length`를 선택된 환경에만 갱신한다.
+기존 timestamp guard가 반복 manager 조회의 중복 누적을 막는다. 종료 전이의
+corner·증가량·누적량은 auto-reset 전에 복사하고 extras에 보존한다.
+`train.py --validate`는 SDK pose 변환으로 corner를 독립 재구성해 실제 증가량과
+지수 점수를 검사한다. Config·checkpoint에 수식·민감도를, metrics에 step 증가량과
+최대 누적 조작량을 기록한다.
 
 ### 운동과 접촉 안정성
 
@@ -361,7 +450,7 @@ $$
 
 $$
 r_t^{\mathrm{motion}}=\frac12
-\left[\exp(-x_{\mathrm{acc},t})+\exp(-x_{\mathrm{inc},t})\right]
+\left[\exp(-a_{\mathrm{acc}}x_{\mathrm{acc},t})+\exp(-a_{\mathrm{inc}}x_{\mathrm{inc},t})\right]
 $$
 
 | 비용 | 현재 계산 의미 |
@@ -397,19 +486,57 @@ moment를 옮긴 값을 사용하므로 sensor 회전·이동 자체가 wrench r
 ### 시간과 종료
 
 $$
-r_t^{\mathrm{time}}=-\frac{\Delta t}{T_{\mathrm{ref}}},\qquad
+c(s)=a\left(e^{bs}-1\right),\qquad
+r_t^{\mathrm{time}}=-\int_{t}^{t+\Delta t}c(s)\,ds
+=-\frac{a}{b}\left[e^{bt}\left(e^{b\Delta t}-1\right)-b\Delta t\right]
+$$
+
+$$
 r_t^{\mathrm{terminal}}=
 R_{\mathrm{success}}\mathbf1_{\mathrm{success},t}
 -R_{\mathrm{failure}}\mathbf1_{\mathrm{failure},t}
 $$
 
-사용자는 `T_ref` 유지를 선택했다. Step마다 −1로 교체하지 않는다. `T_ref`는
-보상 크기를 맞추는 시간 scale이며 timeout이나 물리적 허용시간으로 정한 값이 아니다.
-종료 보상은 한 번 지급한다.
+앞선 설계는 `−dt/T_ref`였으나, 사용자는 **시간이 지날수록 penalty가 커지고
+그 증가폭도 커져야 한다**고 교정했다. 이어 `T_ref`와 무관한 곡선을 요청했고,
+초반부터 완만하게 증가하다가 후반에 가팔라지는 **지수형**을 명시적으로 선택했다.
+이 선택이 기존 선형 비용과 성공 시에만 완료시간을 평가하는 제안을 대체한다.
+구간별 문턱을 둔 제곱형과 누적 제곱 비용의 증분도 최종 식으로 채택하지 않았다.
+
+`time_penalty_scale=a=0.02 reward/s`, `time_penalty_growth_rate=b=0.7 /s`는
+개발 초기값이며 사용자가 이 숫자 자체를 지정한 것은 아니다. `a`는 전체 강도,
+`b`는 곡선이 가팔라지는 속도다. 비용률은 0에서 시작하고 `c′(t)>0`, `c″(t)>0`다.
+매-step reward는 구간 적분이므로 비용의 크기와 증가폭이 모두 점차 커진다.
+`expm1`와 작은 `b·dt`의 급수 계산으로 첫 step의 상쇄 오차를 줄인다.
+상위 Time weight는 1, terminal의 +500/−100은 유지하며 종료 보상은 한 번 지급한다.
+
+| 경과 시간 | 직전 한 step Time reward, 30 Hz | 할인 전 누적 Time reward |
+|---|---:|---:|
+| 2초 | −0.002006 | −0.047291 |
+| 4초 | −0.010170 | −0.361276 |
+| 6초 | −0.043276 | −1.756752 |
+| 8초 | −0.177531 | −7.537897 |
+
+![지수형 시간 비용의 개형](figures/time_penalty.png)
+
+첫 step은 약 −0.00000784다. 할인 전 누적 비용은
+`−a/b · (exp(bT)−1−bT)`이며 같은 T에서는 control dt를 바꿔도 동일하다.
+할인된 합은 이 식과 다르며 gamma·제어 주기에 의존한다. Clock은 승인된 scene
+reset 후 0부터 control dt만큼 증가한다. Camera의 render-only warmup이나 같은
+step의 반복 reward/termination/observation 조회는 시간을 증가시키지 않는다.
+부분 reset은 선택 환경만 초기화하고 종료 전이의 clock·Time reward는 extras에
+보존해 PPO 검증에 사용한다. SDK episode counter로 clock을 독립 검증한다.
+
+현재 544D observation에는 경과 시간이 없으며 clock은 reward 내부 상태다.
+시간에 따른 행동 변화를 명시적으로 조건화하려면 actor 시간 입력을 별도로
+검토해야 한다. 이번 변경에 시간 feature를 추가한 것으로 해석하지 않는다.
+기존 품질 항이 양의 점수를 매 step 누적하는 구조와 terminal의 상대 scale는
+별도 검증 과제다. 지수형 선택만으로 +500의 영향이나 대기 유인이 해결됐다고
+기록하지 않는다.
 
 - 성공은 접근영역의 **전체 non-target 차단 면적**이 허용오차 이하이고 Target 보호·안정 조건을 만족하는 것이다. 지정 Blocker만 치우고 다른 물체가 막은 상태를 성공으로 처리하지 않는다.
 - 성공의 초기 기준은 전체 non-target 겹침 합 ≤1e−5 m², Target 이동 ≤2 cm·회전 ≤0.15 rad이며 모든 active 물체가 선속도 ≤0.015 m/s·각속도 ≤0.10 rad/s로 5 policy step 연속 안정한 상태다.
-- 실패의 초기 기준은 낙하 6 cm, 지지면에서 4 cm 초과 들어올림, shelf workspace 여유 1.5 cm 이탈, upright 대비 tilt 50° 초과, 보정 force 80 N·torque 4 N·m 초과 또는 금지 접촉이다. 성공과 실패를 동시에 검출하면 실패를 우선한다.
+- 실패의 초기 기준은 낙하 6 cm, 지지면에서 4 cm 초과 들어올림, shelf workspace 여유 1.5 cm 이탈, upright 대비 tilt 50° 초과, 보정 force 80 N·torque 4 N·m 초과, raw F/T의 SI-200-8 축별 측정 범위 초과 또는 금지 접촉이다. 성공과 실패를 동시에 검출하면 실패를 우선한다.
 - 학습 scene에만 UR arm 7개 body와 원통 2개 half의 ContactSensor **9개**를 둔다. 선반·물체·ground의 각 partner와의 normal force norm **>1 N**을 금지 접촉으로 보는 provisional 기준이다. GPU contact filter는 동적/kinematic body의 자식 mesh가 아닌 RigidBodyAPI prim을 사용한다. 기본 pool 100개와 선반 1개의 **101 rigid-body filter**, rigid body가 없는 static ground의 collision-shape filter를 각각 지정한다. 최근 4 physics substep 중 하나라도 초과하면 실패하며 서로 다른 partner의 반대 방향 force를 합산해 상쇄하지 않는다. Hand 접촉이나 hand–Target 접촉 자체는 이 판정에서 금지하지 않는다. Target 이동/회전은 별도 보호 조건으로 판정한다.
 - 8초 time limit는 PPO의 truncation으로 처리하며 성공/실패는 termination이다. 실기에서 초기 vision만으로 성공을 판별하는 방법은 미정이다.
 
@@ -421,9 +548,12 @@ $$
 접근 가능성을 충분히 나타내는지도 검증해야 한다.
 
 사용자는 성공 terminal **+500**이 다른 항보다 dominant해질 위험을 지적했다.
-이는 검증으로 정한 값이 아닌 구현 초기값이다. 현재 30 Hz·8초(240 step)·
-γ=0.99에서 dense step 최대는 `3−1/300≈2.9967`, 240-step 할인 누적 최대는
-**272.808**이다. 성공 bonus의 초기 상태 return 기여는 2초 성공 **276.342**,
+이는 검증으로 정한 값이 아닌 구현 초기값이다. 기존 선형 Time을 사용한 당시
+30 Hz·8초(240 step)·γ=0.99에서 dense step 최대는 `3−1/300≈2.9967`,
+240-step 할인 누적 최대는 **272.808**이었다. 현재 지수형 Time에서는 step
+최대가 경과 시간에 따라 달라진다. 8초의 Time 할인 합은 **−1.111502**,
+나머지 3항이 매 step 최대일 때 terminal 제외 할인 합은 **271.999912**다.
+성공 bonus의 초기 상태 return 기여는 2초 성공 **276.342**,
 4초 **151.202**, 8초 **45.267**이다. 따라서 단일 성공 전이에서는 크지만,
 모든 성공 시점에서 전체 return을 반드시 지배한다고 해석하지 않는다.
 같은 시점에 성공하는 두 경로에서는 terminal 항이 같아 dense 품질 차이는 남는다.
@@ -440,8 +570,8 @@ $$
 실제 dominant 학습 여부는 성공/실패별 discounted term return·완료 시간·actor/critic
 gradient 크기로 검증해야 한다. 기존 smoke 검증에는 task 성공이 없으므로 이 균형을
 입증한 결과로 사용하지 않는다. Quality 항을 zero 기준 비용으로 바꾸고 terminal
-비중을 비교하는 것은 **미채택 검토안**이다. 이 질의에서는 +500·−100이나 reward
-수식을 추가 변경하지 않았다. 전체 reward를 공통 배율로 나누는 것은 critic의 수치
+비중을 비교하는 것은 **미채택 검토안**이다. Terminal scale 질의만으로 +500·−100을
+바꾸지 않았으며 후속 Time 선택에서 시간 수식만 변경했다. 전체 reward를 공통 배율로 나누는 것은 critic의 수치
 scale만 바꾸며 상대적 목적 가중치 문제의 해결과 구분한다.
 
 로컬 Isaac Lab [RewardManager](../IsaacLab/source/isaaclab/isaaclab/managers/reward_manager.py)는
@@ -513,6 +643,9 @@ history 제거·교란 시 성능 변화, 비슷한 현재 관측과 서로 다�
 | 2026-10-12 F/T 관성 보상 | 자중만 제거하고 운동 관성이 남던 F/T에 관성 보상도 필요하다고 사용자가 요청했다. 센서 손쪽 33개 링크의 COM 병진 가속도·회전 가속도·각속도와 질량·관성으로 Newton–Euler 자체 반력을 계산해 제거한다. Observation·하중 reward·F/T 실패 판정에 공통 적용한다. |
 | 2026-10-12 Motion의 robot 기준 교정·tactile 검토 | 사용자가 Motion reward는 물체가 아닌 robot joint 속도 등의 기준이어야 한다고 교정하고 tactile의 역할을 검토하자고 요청했다. Motion의 속도·가속도 비용을 arm 6 + hand 독립 6관절로 바꾸며 F/T load/rate 네 항 구조를 유지한다. Tactile은 기존 observation으로 유지하고 신호 보존·reward 유인 문제를 검토하며 새 tactile reward는 채택하지 않았다. |
 | 2026-10-12 Motion의 급격한 변화 기준 교정 | 사용자가 빠른 속도·큰 힘 자체보다 급격한 가속·힘 증가를 억제하는 목적이라고 교정했다. 속도·절대 하중 reward 항과 soft 기준을 제거하고 joint acceleration·F/T norm 증가율 두 항만 평균한다. 후속 선택은 힘·토크 크기의 증가만 비용 부여이며 빠른 감소와 같은 크기의 방향 변화는 제외한다. 하드 안전 한계는 별도 유지한다. |
+| 2026-10-12 시간 비용의 지수형 교정 | 사용자가 시간이 지날수록 비용과 증가폭이 커지는 곡선을 요청하고 지수형을 선택했다. T_ref를 제거해 c(t)=a(exp(bt)−1)의 control 구간 적분을 차감한다. 초기 a=0.02 reward/s·b=0.7 /s, 환경별 clock·부분 reset·중복 조회 방지를 구현하며 544D observation과 terminal scale는 유지한다. |
+| 2026-10-12 품질 점수의 공통 지수형·pose 조작량 | 사용자가 Clearance·Rearrangement·Motion을 exp(−a·x)로 통일하고 Time은 기존 증가형으로 유지하도록 선택했다. Rearrangement는 모든 물체의 평균 8-corner 3D 이동거리 누적으로 확장하며 d_0를 민감도 a_rearr로 대체한다. 초기 계수는 1·2 m⁻¹·1·1이며 actor 관측과 보조 head 미도입 상태를 유지한다. |
+| 2026-10-12 SI-200-8 F/T 측정 모델 | 사용자가 사진의 ATI Axia80 SI-200-8 spec으로 센서를 설정하도록 요청했다. Raw sensor-frame 범위 Fx/Fy200 N·Fz360 N·토크8 N·m, 유효 분해능 힘0.1 N·토크0.005 N·m를 saturation·rounding으로 근사한 뒤 기존 자중·관성을 보상한다. 축별 normalization과 범위 초과 판정, reset/terminal cache·checkpoint profile을 연결하며 544D 관측과 기존 작업 안전·Motion 기준을 유지한다. |
 
 Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. 논문의 성과를 우리
 과업의 성공·속도·상태 이해 결과로 기록하지 않는다.
@@ -533,7 +666,7 @@ Notion에 정리된 기존 문헌 논의에서 다음 교정을 유지한다. �
 pose를 반환한다. 학습용 `ContactRearrangementRLEnv`는 별도 설정으로 18D
 OSC/hand action·Reward v2·종료 조건과 544D `policy` group을 사용한다.
 초기 visible-depth 기하·현재 EEF 재표현·현재/직전 두 sample, GNN/attention/temporal
-encoder와 shared actor/critic·custom PPO를 구현했다. `train.py`는
+encoder와 shared actor/critic을 native RSL-RL runner에 연결한다. `train.py`는
 `--task Isaac-Contact-Rearrangement-UR5e-v0`의 registry에서 환경·agent 설정을
 읽으며 `env.py`가 auto-reset 이전 final observation을 PPO에 보존한다.
 
@@ -657,12 +790,35 @@ pivot은 실제 hand contact point를 인증하는 것이 아니다. UR5e의 접
 측정 frame은 중앙점에 놓인 physical tool XYZ이며 parent→child 방향의
 `[Fx,Fy,Fz,Tx,Ty,Tz]`, 단위는 `[N,N,N,N·m,N·m,N·m]`다. 힘·토크에는 중력·
 관성·접촉·외력이 포함된다. Raw 관측에 자동 tare나 중력 보정을 적용하지 않는다.
+이상적 PhysX 반력은 별도로 보존하고 raw 관측에는 SI-200-8 범위 제한·유효
+분해능 rounding을 먼저 적용한다. 이후 학습의 `corrected_wrench`가 자중·관성을
+보상한다. 보상 후 잔차가 다시 분해능의 정수배일 필요는 없다.
 명시적인 `tare()`는 그 시점의 bias만 저장하며 중력 보정과 다르다. Reset은
-선택한 환경의 cache·bias를 비우고 `wrench_valid=False`로 둔다. 다음 완료된
+선택한 환경의 ideal/raw cache·bias·범위 초과 flag를 비우고 `wrench_valid=False`로 둔다. 다음 완료된
 physics step 뒤 timestamp가 증가했을 때 반력을 읽어 valid로 갱신한다.
 
+두 환경의 `cfg.force_torque`는 기본 `SI_200_8_CALIBRATION`이다. 사진과
+[ATI Axia80-M20 SI-200-8 공식 사양](https://www.ati-ia.com/products/ft/ft_models.aspx?id=Axia80-M20)을 따라
+센서 frame의 `[Fx,Fy,Fz,Tx,Ty,Tz]` 측정 범위는
+`±[200,200,360,8,8,8]`(N/N·m), 유효 분해능은
+`[0.1,0.1,0.1,0.005,0.005,0.005]`다. 전체 하중을 축별로 saturation하고 rounding한
+측정값에서 자중·관성·선택적 residual bias를 제거한다. 유효 분해능에는 noise가
+포함된다는 사양이므로 deterministic 양자화는 시뮬레이션 근사이며 정확도·ADC
+bit depth·noise 분포와 동일시하지 않는다. 임의 noise·지연·sampling rate 변경을
+추가하지 않았다. 기존 원통 조립·질량·41 body/18 DOF/41 collider는 유지한다.
+
+`read()`는 측정 모델을 거친 raw 값이고 `read_ideal()`은 PhysX 반력 보존값이다.
+`range_exceeded`는 saturation 전 raw의 축별 범위 초과이며 `valid`는 sample의
+freshness다. 두 기준을 섞지 않는다. 범위 초과를 기존 hard-load 실패 channel에
+OR하며 보정 하중 norm의 80 N/4 N·m 작업 기준은 별도로 유지한다. Motion ref
+200 N/s·10 N·m/s도 측정 범위로 바꾸지 않는다. Auto-reset 전 raw·ideal·범위 초과
+flag를 extras에 보존한다. Profile과 axis normalization은 config·checkpoint에
+기록하고 이어 학습은 profile이 없거나 다르면 거절해 이전 50 N/5 N·m 관측을
+조용히 새 scale로 해석하지 않는다. Native checkpoint에는 관측 규약과 F/T profile을 함께 보존하며 이전 custom trainer 형식은 직접 복원하지 않는다.
+
 `ObservationsCfg.sensors`는 concatenate하지 않는 dictionary다. `wrench` 6D,
-`wrench_valid` 1D, `tactile`·`tactile_valid` 각 bool 17D, RGB `480×640×3`,
+`wrench_valid` 1D, `wrench_range_exceeded` bool 6D,
+`tactile`·`tactile_valid` 각 bool 17D, RGB `480×640×3`,
 depth `480×640×1` m, Target/Blocker 순서의
 실제 instance mask `480×640×2`, camera world position+ROS quaternion(wxyz) 7D를
 반환한다. RGB/depth/mask/camera pose는 승인한 초기 snapshot의 cache를 읽으며
@@ -766,18 +922,21 @@ Camera는 로컬 `InitialCamera` subclass를 쓴다. Isaac Lab 2.3.2의 첫 Fabr
 | [src/sensors.py](../src/contact_rearrangement/contact_rearrangement/src/sensors.py) | 초기 RGB-D/PCA 기하·raw F/T·17채널 tactile·금지 접촉 sensor factory |
 | [src/visualization.py](../src/contact_rearrangement/contact_rearrangement/src/visualization.py) | Target/Blocker OBB debug draw |
 | [agents/model.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/model.py) | 공유 GNN·역할 attention·유한 temporal encoder·actor/critic |
-| [agents/ppo.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo.py) | 공동학습 PPO·terminal/timeout GAE·checkpoint |
-| [agents/ppo_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo_cfg.py) | Model/PPO와 runner 기본값 |
+| [agents/ppo.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo.py) | Native PPO 확장: 공유 모델·final-observation timeout·microbatch·profile 검사 |
+| [agents/ppo_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/ppo_cfg.py) | Simulator 독립 ModelCfg 차원 |
+| [agents/rsl_rl_ppo_cfg.py](../src/contact_rearrangement/contact_rearrangement/config/ur5e/agents/rsl_rl_ppo_cfg.py) | 예제의 RslRlOnPolicyRunnerCfg/RslRlPpoAlgorithmCfg 기본값 |
 | [spawn_scene.py](../src/contact_rearrangement/scripts/spawn_scene.py) | 장면 실행·5초 reset·역할 OBB·검증 |
-| [train.py](../src/contact_rearrangement/scripts/train.py) | Task 선택·학습 rollout·PPO update·checkpoint |
+| [train.py](../src/contact_rearrangement/scripts/train.py) | 예제의 Hydra·gym.make·RslRlVecEnvWrapper·OnPolicyRunner·learn 연결 |
 
 구조는 [sweeping_policy](../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy)의
 공통 `shelf_sweep_env_cfg.py`, `config/ur5e`의 concrete 환경과 등록,
 `mdp`의 manager 함수, `config/ur5e/agents`의 runner 설정에 대응한다.
 `Isaac-Contact-Rearrangement-UR5e-v0`의 `env_cfg_entry_point`와
-`ppo_cfg_entry_point`를 통해 설정을 불러오며 model·algorithm·기본 iteration·
-저장 간격은 `ContactRearrangementPPORunnerCfg`에 둔다. GNN·현재/직전 모델과
-custom PPO 구현을 유지하므로 예제의 RSL-RL 설정을 그대로 채택하지 않는다.
+`rsl_rl_cfg_entry_point`로 설정을 불러온다. `rsl_rl_ppo_cfg.py`의 native
+`ContactRearrangementPPORunnerCfg`에 model·algorithm·iteration·저장 간격을 둔다.
+`examples`의 sweeping 설정은 legacy actor/critic 형식이며 설치된 RSL-RL 5.0.1의
+actor/critic 모델 인터페이스에 연구 network를 연결한다. 검증 함수는
+`tests/check_learning.py`로 옮기고 `--validate`에서만 사용한다.
 장면 지원의 asset·sensor·sampling 구현은 각각 하나의 모듈로 유지한다.
 이전 flat 모듈을 다시 import하는 wrapper는 만들지 않는다.
 
@@ -1938,6 +2097,177 @@ Observation 544D·action 18D·247,717 parameter를 유지한다.
 --log_dir outputs/contact_rearrangement/smooth_motion_learning_smoke --validate`다.
 로그는 `outputs/contact_rearrangement/smooth_motion_learning_validation.log`,
 checkpoint는 `outputs/contact_rearrangement/smooth_motion_learning_smoke/model_latest.pt`다.
+
+### 2026-10-12 지수형 시간 비용과 환경별 clock
+
+사용자가 Time을 기존 선형 비용에서 **시간이 지날수록 penalty와 증가폭이
+함께 커지는 형태**로 바꾸도록 교정했다. `T_ref`와 무관한 함수 개형을 요청하고,
+지수형과 초반 일정 비용 이후의 구간 제곱형 중 **지수형을 명시적으로 선택**했다.
+최종 식은 `c(t)=a(exp(bt)−1)`의 해당 control 구간 적분을 차감하는 것이다.
+4절의 수식·개형·수치는 이 구현을 가리킨다. `a=0.02 reward/s`, `b=0.7 /s`는
+조절 가능한 개발 초기값이며 사용자가 정한 숫자는 아니다.
+
+`MdpCfg.time_ref`를 제거하고 `time_penalty_scale`, `time_penalty_growth_rate`를
+추가했다. Scale은 비음수이고 growth rate는 양수이며 둘 다 유한해야 한다.
+Scale 0은 시간 비용을 끈다. Float64 `MdpState.elapsed_time`은 완료된 control
+transition마다 한 번 증가하고 선택된 환경 reset 시에만 0으로 돌아간다.
+기존 timestamp guard가 여러 manager의 반복 조회를 막는다. `reward_components`
+는 transition 직전 경과 시간을 keyword 인자로 받으며 다른 reward 수식은 유지한다.
+
+환경의 `episode_elapsed_time` extras는 종료 직전 clock을 보존한다. Training의
+`--validate`는 step 전 SDK episode counter로 완료 시각을 독립 계산하고 Time
+적분과 continuing/reset clock을 매 전이에서 검사한다. Config·checkpoint에
+수식과 두 파라미터를 기록하고 metrics에 평균 Time component·최대 경과 시간을
+남긴다. 시간은 actor·mask 입력으로 전달하지 않는다. Network 구조는 호환되지만
+이전 checkpoint의 critic reward 규약과 새 run의 metadata를 구분한다.
+
+**검증:** CPU **151개**가 **33.297초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 63, model 23, PPO/runner 9, registration 2다.
+수치 적분과의 일치, 초반의 작은 비용·후반의 증가폭, 작은 dt의 수치 안정성,
+15/30/60 Hz에서 8초 누적 비용 **−7.537897**의 일치, zero scale,
+부분 reset·혼합 timestamp·중복 manager 조회·simulator time gap을 검사했다.
+
+실제 GPU의 **2환경·160 transition·PPO update 2회**가 exit code 0과
+`LEARNING_VALIDATED`로 완료했다. 학습 rollout의 failure 0회·timeout 2회,
+최대 episode 경과 시간 **2.4초**였다. 평균 Time component는 rollout별로
+**−0.000435456**, **−0.001496055**였다. Hold·실제 금지 접촉 fixture,
+EEF 기하·역할·이력·reward 검증, parameter 갱신과 checkpoint 복원도 통과했다.
+기존 544D observation·18D action·247,717 parameter·terminal +500/−100을 유지한다.
+짧은 smoke는 8초까지의 실제 정책 실행이나 reward 균형·정책 성능을 입증한 것은 아니다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 40 --episode_length_s 2.4
+--log_dir outputs/contact_rearrangement/exponential_time_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/exponential_time_learning_smoke/validation.log`,
+checkpoint는 같은 디렉터리의 `model_latest.pt`, 개형은
+[time_penalty.png](figures/time_penalty.png)다. `py_compile`도 통과했다.
+
+### 2026-10-12 공통 지수형 품질 점수와 OBB 조작량
+
+사용자가 Clearance·Rearrangement·Motion에 `exp(−a·x)` 공통 형태를 적용하고
+Time은 앞서 선택한 증가형 penalty를 유지하도록 명시적으로 선택했다.
+`clearance_decay=1`, `rearrangement_decay=2 m⁻¹`,
+`motion_acceleration_decay=1`, `motion_wrench_increase_decay=1`을 추가했다.
+`displacement_ref`를 제거했으며 Rearrangement의 초기 민감도는 이전 `1/0.5 m`와
+같다. 다른 항과의 상위 weight 4개는 모두 1이다. 이 초기값의 학습 적합성을
+공통 함수 형태만으로 검증한 것은 아니다.
+
+Rearrangement의 x는 매 step 모든 active 물체의 **평균 8-corner 3D 이동거리**를
+episode 동안 합산한 값이다. Target·Blocker·초기 미인식 물체를 포함하고 물체 간
+평균이나 크기 정규화는 하지 않는다. Fixed USD bounds·corner 순서·environment
+frame을 유지하며 병진·회전·pivot·왕복·Z 이동을 평가한다. 승인된 reset pose로
+`previous_corners`를 초기화하고 선택된 환경만 누적량을 초기화한다.
+`rearrangement_increment`, `path_length`, `previous_corners`를 같은 completed
+transition에서 한 번 갱신한다. 현재 reward는 **누적 조작량의 품질 점수**라 과거
+이동이 이후 step의 점수에도 영향을 준다. 앞선 직접 음수 증분 비용은 채택하지 않았다.
+
+환경 extras에 종료 전이의 corner·step 증가량·누적량을 보존한다. Train 검증은
+native pose와 SDK quaternion 변환으로 corner를 독립 재구성하고 증가량·누적량·
+지수 점수와 reset 이후 기준점을 비교한다. 해당 GT는 모델 입력이나 mask 생성에
+사용하지 않는다. Config·checkpoint에 공통 수식과 민감도, metrics에 평균 step
+조작량과 최대 누적 조작량을 저장한다. Observation 544D·action 18D·247,717
+parameter·기존 Time·terminal +500/−100을 유지한다. 보조 인식 head는 미도입이다.
+
+**검증:** CPU **161개**가 **33.162초**에 통과했다. Sampling 32,
+action/contact/control 22, MDP 73, model 23, PPO/runner 9, registration 2다.
+민감도별 지수 계산·invalid 계수, 순수 병진·제자리 회전·회전 왕복·quaternion
+부호·SciPy 변환을 이용한 pivot 교차 검증·Z 이동·미인식 물체 포함·비활성 slot
+제외·부분 reset·반복 manager 조회를 검사했다.
+
+실제 GPU **2환경·160 transition·PPO update 2회**가 exit code 0과
+`LEARNING_VALIDATED`로 완료했다. 학습 rollout의 failure 0회·timeout 2회였다.
+평균 step 조작량은 rollout별 **0.000201431 m**, **0.000134409 m**이며 최대
+누적 조작량은 **0.00896450 m**, **0.00984458 m**였다. 매 전이의 corner·누적량·
+Motion 비용·Time·reward 검증, hold·실제 금지 접촉 fixture·parameter 갱신과
+checkpoint 복원이 통과했다. 이 짧은 검증은 reward 균형·정책 재배치 성공·숨은
+물체 변화 인식 성능을 입증한 결과가 아니다.
+
+실행은 `train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless
+--num_envs 2 --iterations 2 --rollout_steps 40 --episode_length_s 2.4
+--log_dir outputs/contact_rearrangement/common_exp_obb_learning_smoke --validate`다.
+로그는 `outputs/contact_rearrangement/common_exp_obb_learning_smoke/validation.log`,
+checkpoint는 같은 디렉터리의 `model_latest.pt`다. `py_compile`도 통과했다.
+
+### 2026-10-12 SI-200-8 측정 범위·분해능과 보상 경로
+
+사진의 calibration SI-200-8과 ATI 공식 사양을 확인해 범위·유효 분해능을
+`ForceTorqueCalibration`에 설정했다. Simulator-independent profile을 기존
+`src/catalog.py`에 두고 측정 reader·센서 생성·두 환경 설정에 연결한다.
+생산 코드 모듈을 새로 세분화하지 않는다. ToolForceTorqueSensor는 이상적인
+PhysX 반력을 보존하고 별도의 raw 측정 cache에 saturation·rounding을 적용한다.
+Hardware axis range는 gravity/inertia 보상 전 전체 하중에 적용한다.
+
+정책은 보상한 wrench를 `[200,200,360,8,8,8]`로 축별 정규화한다. 기존 scalar
+50 N/5 N·m 설정은 제거하고 544D/72D sample·frame·tactile/mask 규약은 유지한다.
+Fresh sample의 raw range 초과를 hard-load 실패에 추가하고 기존 compensated
+norm80 N/4 N·m 및 Motion 증가율 ref200 N/s/10 N·m/s는 유지한다.
+종료 이전 raw·ideal·range flag·보상값을 보존해 reset과 섞이지 않게 한다.
+Checkpoint의 F/T profile 누락·불일치 시 training resume를 거절한다.
+
+**CPU 검증:** **179개**가 **33.089초**에 통과했다. Sampling32,
+action/contact/control22, MDP79, model23, PPO/runner12, registration2,
+calibration9다. Axis별 범위·분해능·경계·invalid profile, Fz360 N 정규화,
+quantization 후 compensation 순서, raw 범위 초과가 보상으로 숨지 않는 판정,
+invalid cache 무시, 기존 exact Newton–Euler 보상 수학과 profile 호환성을 검사했다.
+
+**GPU 센서 검증:** 실제 **2환경·151 public step + 2 env step + 19 bench physics
+step**, reset6회·partial reset2회·capture6회·render98회가 exit code0과
+`SENSOR AUDIT: PASS`로 완료했다. 33개 downstream link·0.876663 kg를 유지하며
+실제 force3 N·torque0.10 N·m를 각 축에 적용했다. Ideal load balance 오차는
+최대 **0.0122202 N/0.000850184 N·m**, 측정·보상 후 external 오차는
+**0.0787559 N/0.00359748 N·m**였다. 양자화 오차를 분리한 보상 오차는
+**0.012222 N/0.000850259 N·m**다. Axis별 최대 양자화 오차는 힘
+**0.0471473/0.0484791/0.0490457 N**, 토크
+**0.00247812/0.00243416/0.00240188 N·m**로 각각 half-resolution 이하였다.
+무접촉 운동의 gravity-only peak **1.17404 N/0.14016 N·m**는 full compensation
+후 **0.0787559 N/0.00359748 N·m**였다. 이전 이상적 sensor의 약1e−6 N 잔차와
+비교할 때 새 유효 분해능 근사에 따른 잔차를 구분한다. Controlled GPU tensor
+fixture로 per-axis saturation·range flag·tare·partial reset도 검사했다. 큰 물리
+과부하를 실제 articulation에 가한 시험으로 기록하지 않는다.
+
+**GPU 학습 검증:** **2환경·160 transition·PPO update2회**, failure0·timeout2회가
+exit code0과 `LEARNING_VALIDATED`로 완료했다. 매 전이 axis별 raw 측정·범위
+flag·보상값의 policy normalization, 기존 reward·OBB·Time·reset과 새 profile
+checkpoint 복원을 검사했다. Rollout의 range-exceeded counts는 모두0이었다.
+Compensated wrench peak는 rollout별 **0.0736205 N/0.00434070 N·m**,
+**0.0748436 N/0.00485677 N·m**였다. 센서 측정 근사와 데이터 경로의 검증이며
+실제 하드웨어 정확도·sampling bandwidth·정책 성공률을 입증한 결과는 아니다.
+
+센서 명령은 `tests/check_sensors.py --num_envs 2 --seed 0`, 로그는
+`outputs/contact_rearrangement/si2008_sensor_validation.log`다. 학습 명령은
+`scripts/train.py --task Isaac-Contact-Rearrangement-UR5e-v0 --headless --num_envs 2
+--iterations 2 --rollout_steps 40 --episode_length_s 2.4
+--log_dir outputs/contact_rearrangement/si2008_learning_smoke --validate`이며 로그와
+checkpoint는 같은 디렉터리의 `validation.log`·`model_latest.pt`다.
+`py_compile`도 통과했다.
+
+### 2026-10-13 예제 기준 native 학습·환경 흐름 정리
+
+사용자는 학습·환경 생성 전반을 Isaac Lab과 `examples`의 예제 흐름으로 따르고,
+그 안에 연구에 필요한 수정만 두도록 요청했다. `train.py`의 직접 rollout 수집,
+GAE와 학습 반복을 제거하고 native `OnPolicyRunner.learn`에 위임했다.
+등록은 `rsl_rl_cfg_entry_point`, 설정은 `RslRlOnPolicyRunnerCfg`와
+`RslRlPpoAlgorithmCfg`를 사용하며 YAML·TensorBoard·`model_<iteration>.pt`를 저장한다.
+Native value loss 계수 0.25는 이전 구현의 0.5×0.5 영향력을 유지한다.
+Shared GNN 모델·현재/직전 관측·observation에서 mask 생성·18D tanh Gaussian은 그대로다.
+Native PPO 확장은 shared parameter의 단일 등록, 실제 final observation timeout 값,
+32-sample gradient accumulation 및 checkpoint 관측/F/T profile 검사로 한정한다.
+Native storage와 GAE는 재구현하지 않는다. 기존 custom trainer checkpoint는 새
+native 포맷으로 직접 읽지 않는다.
+
+환경은 기존 SceneCfg→robot별 EnvCfg→ManagerBasedRLEnv→manager/reset event 흐름을
+보존하고 보상을 5개 기본 RewardTerm으로 연결한다. Term weight가 권위 설정이며
+MDP diagnostics는 이를 반영한다. 센서의 동적 class/globals 등록과 빈 manager config는
+제거한다. Hydra가 수정할 parameter 설정은 mutable로 두고 실제 F/T calibration은
+immutable 객체로 변환해 검증한다. 로봇·물체·스폰·카메라·F/T·tactile 조건은 유지한다.
+
+검증은 CPU **194개**와 실제 GPU **2환경·160 transition·2 PPO update**가 통과했다.
+Hold·실제 금지 접촉·EEF/frame·SI-200-8·history·reward 합·timeout·native checkpoint 복원을
+확인했다. 로그는 `outputs/contact_rearrangement/native_flow_validation.log`,
+checkpoint는 `outputs/contact_rearrangement/native_flow_validation/model_1.pt`다.
+이는 학습 연결 검사이며 수렴/성공률을 입증하지 않는다. 이전 확장 실행에서는
+128개 장면 구성의 높은 host RAM이 남아 메모리 guard로 중단했다. **1024개 이상
+환경 지원은 미완료**이며 이번 구조 변경의 통과와 구분한다.
 
 ## 9. 다음 구체화와 구현에서 정할 사항
 

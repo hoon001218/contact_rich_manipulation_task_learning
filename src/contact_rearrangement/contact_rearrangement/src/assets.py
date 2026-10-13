@@ -21,7 +21,7 @@ from isaaclab.sim.spawners.spawner_cfg import RigidObjectSpawnerCfg
 from isaaclab.sim.utils import clone, get_current_stage
 from isaaclab.utils import configclass
 
-from .catalog import NUCLEUS_ROOT, OBJECT_SPECS, parking_position
+from .catalog import ForceTorqueCalibration, NUCLEUS_ROOT, OBJECT_SPECS, SI_200_8_CALIBRATION, parking_position
 from .sampling import elbow_above_chord
 
 
@@ -514,21 +514,30 @@ class ToolForceTorqueSensor:
     so the backend's vector already has the requested frame and moment point:
     https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#link-incoming-joint-force
 
+    Native reactions remain available through ``read_ideal`` for diagnostics.
+    ``read`` reports range-limited values rounded to the calibration's effective
+    resolution; an explicit per-axis overload flag retains out-of-range loads.
     Call ``update`` after a completed physics step. ``reset`` invalidates only
     selected environments without inventing a zero physical measurement. The
     zero cache after reset is accompanied by ``valid=False`` until updated.
     """
 
-    def __init__(self, robot):
+    def __init__(self, robot, calibration: ForceTorqueCalibration = SI_200_8_CALIBRATION):
         self.robot = robot
+        if not isinstance(calibration, ForceTorqueCalibration):
+            raise TypeError("F/T sensor requires a ForceTorqueCalibration profile.")
+        calibration.__post_init__()  # Validate values updated by native Hydra/from_dict.
+        self.calibration = calibration
         try:
             self.body_index = robot.body_names.index(FORCE_TORQUE_BODY_NAME)
         except ValueError as exc:
             raise RuntimeError("Articulation has no distal F/T sensor link.") from exc
         shape = (robot.num_instances, 6)
+        self.data_ideal_wrench = torch.zeros(shape, dtype=torch.float32, device=robot.device)
         self.data_raw_wrench = torch.zeros(shape, dtype=torch.float32, device=robot.device)
         self.bias = torch.zeros_like(self.data_raw_wrench)
         self.valid = torch.zeros(robot.num_instances, dtype=torch.bool, device=robot.device)
+        self.range_exceeded = torch.zeros(shape, dtype=torch.bool, device=robot.device)
         self.metadata = {
             "body_name": FORCE_TORQUE_BODY_NAME,
             "joint_name": FORCE_TORQUE_JOINT_NAME,
@@ -540,14 +549,21 @@ class ToolForceTorqueSensor:
             "sample": "mean reaction over the last completed physics step",
             "includes": ("gravity", "inertia", "contact", "external_force"),
             "nominal_mount_mass_kg": robot.cfg.spawn.sensor_mount_mass,
+            "calibration": calibration.name,
+            "sensing_ranges": calibration.ranges,
+            "resolution": calibration.resolution,
+            "measurement_model": "range saturation and deterministic effective-resolution rounding",
+            "calibration_source": "https://www.ati-ia.com/products/ft/ft_models.aspx?id=Axia80-M20",
         }
 
     def reset(self, env_ids=None) -> None:
         """Clear the cache/tare for selected episodes and mark readings invalid."""
         selected = slice(None) if env_ids is None else env_ids
+        self.data_ideal_wrench[selected] = 0.0
         self.data_raw_wrench[selected] = 0.0
         self.bias[selected] = 0.0
         self.valid[selected] = False
+        self.range_exceeded[selected] = False
 
     def update(self, dt: float | None = None) -> None:
         """Read the actual link reaction after simulation; never apply a force."""
@@ -558,12 +574,20 @@ class ToolForceTorqueSensor:
         wrench = self.robot.root_physx_view.get_link_incoming_joint_force()[:, self.body_index, :]
         if not torch.isfinite(wrench).all():
             raise RuntimeError("PhysX returned a nonfinite F/T sensor joint reaction.")
-        self.data_raw_wrench.copy_(wrench)
+        measured, range_exceeded = self.calibration.measure(wrench)
+        self.data_ideal_wrench.copy_(wrench)
+        self.data_raw_wrench.copy_(measured)
+        self.range_exceeded.copy_(range_exceeded)
         self.valid[:] = True
 
     def read(self, env_ids=None, *, tared: bool = False) -> torch.Tensor:
-        """Return cached wrench; callers must also honor the ``valid`` mask."""
+        """Return calibrated raw wrench; callers must honor valid/overload flags."""
         values = self.data_raw_wrench - self.bias if tared else self.data_raw_wrench
+        return values.clone() if env_ids is None else values[env_ids].clone()
+
+    def read_ideal(self, env_ids=None) -> torch.Tensor:
+        """Return the unmodified PhysX reaction, exclusively for diagnostics."""
+        values = self.data_ideal_wrench
         return values.clone() if env_ids is None else values[env_ids].clone()
 
     def tare(self, env_ids=None) -> None:

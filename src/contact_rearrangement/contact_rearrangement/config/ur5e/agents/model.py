@@ -11,7 +11,8 @@ Both actor and critic use the same observable information.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 
 import torch
 from torch import Tensor, nn
@@ -260,7 +261,9 @@ class ContactRearrangementPolicy(nn.Module):
         actions = self._bounded_action(unconstrained)
         return actions, self._action_log_prob(distribution, actions), value
 
-    def evaluate_actions(self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks) -> tuple[Tensor, Tensor, Tensor]:
+    def evaluate_actions(
+        self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks, entropy_noise: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         mean, value = self.forward(observation, masks=masks)
         if actions.shape != mean.shape:
             raise ValueError(f"Actions must have shape {tuple(mean.shape)}, got {tuple(actions.shape)}.")
@@ -268,5 +271,250 @@ class ContactRearrangementPolicy(nn.Module):
         log_prob = self._action_log_prob(distribution, actions)
         # Squashed-Gaussian entropy has no analytic expression.  Use one
         # differentiable Monte Carlo sample of the actual bounded distribution.
-        entropy = -self._action_log_prob(distribution, self._bounded_action(distribution.rsample()))
+        # A caller splitting a PPO minibatch can supply slices of one shared
+        # noise draw so tensor chunk sizes do not change that sampled objective.
+        if entropy_noise is None:
+            sample = distribution.rsample()
+        else:
+            if entropy_noise.shape != mean.shape or entropy_noise.device != mean.device or entropy_noise.dtype != mean.dtype:
+                raise ValueError("Entropy noise must match the action mean shape, device, and dtype.")
+            sample = mean + distribution.scale * entropy_noise
+        entropy = -self._action_log_prob(distribution, self._bounded_action(sample))
         return log_prob, entropy, value
+
+
+class NativeContactActor(nn.Module):
+    """Expose the research policy through the RSL-RL model interface.
+
+    The actor owns the complete shared policy, including its value head. The
+    companion critic keeps an unregistered reference to this same policy so
+    the native PPO optimizer sees every parameter exactly once. Observation
+    masks are derived before each research-model call, never added as features.
+    """
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        obs: Mapping[str, Tensor],
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        output_dim: int,
+        model_cfg: dict | ModelCfg | None = None,
+        max_forward_batch_size: int = 32,
+        obs_normalization: bool = False,
+    ):
+        super().__init__()
+        self.cfg = model_cfg if isinstance(model_cfg, ModelCfg) else ModelCfg(**(model_cfg or {}))
+        if output_dim != self.cfg.action_dim:
+            raise ValueError(f"Actor output must contain {self.cfg.action_dim} research actions.")
+        if obs_normalization:
+            raise ValueError("Research observations retain physical values for observation-derived masks.")
+        if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
+            raise ValueError("max_forward_batch_size must be a positive integer.")
+        self.obs_groups = list(obs_groups[obs_set])
+        if self.obs_groups != ["policy"]:
+            raise ValueError("The research model requires the single public 'policy' observation group.")
+        self.obs_dim = self.cfg.observation_dim
+        self.output_dim = output_dim
+        self.max_forward_batch_size = max_forward_batch_size
+        self.policy = ContactRearrangementPolicy(self.cfg)
+        self._normal: torch.distributions.Normal | None = None
+        self._entropy: Tensor | None = None
+        self._entropy_noise: Tensor | None = None
+        self._cached_values: tuple | None = None
+        self.get_policy_observation(obs)
+
+    def get_policy_observation(self, obs: Mapping[str, Tensor]) -> Tensor:
+        """Return the public observation without adding masks or oracle values."""
+        observation = obs["policy"]
+        if observation.ndim < 2 or observation.shape[-1] != self.obs_dim:
+            raise ValueError(f"Expected a batched policy observation with width {self.obs_dim}.")
+        return observation
+
+    def _forward_policy(self, observation: Tensor) -> tuple[Tensor, Tensor]:
+        leading = observation.shape[:-1]
+        flattened = observation.reshape(-1, self.obs_dim)
+        if not flattened.shape[0]:
+            raise ValueError("The research model requires a nonempty observation batch.")
+        results = [
+            self.policy(chunk, masks=build_policy_masks(chunk, self.cfg))
+            for chunk in flattened.split(self.max_forward_batch_size)
+        ]
+        return (
+            torch.cat([result[0] for result in results]).reshape(*leading, self.output_dim),
+            torch.cat([result[1] for result in results]).reshape(*leading, 1),
+        )
+
+    def _cache_token(self, obs: Mapping[str, Tensor], observation: Tensor) -> tuple | None:
+        try:
+            observation_version = observation._version
+        except RuntimeError:
+            # Inference tensors have no mutation counter. Recompute their
+            # values rather than accepting potentially mutated cached inputs.
+            return None
+        return id(obs), id(observation), observation_version, tuple(parameter._version for parameter in self.policy.parameters())
+
+    def consume_cached_value(self, obs: Mapping[str, Tensor]) -> Tensor | None:
+        """Consume an immediately preceding actor value at most once."""
+        cached, self._cached_values = self._cached_values, None
+        if cached is None:
+            return None
+        observation = self.get_policy_observation(obs)
+        token = self._cache_token(obs, observation)
+        return cached[1] if token is not None and token == cached[0] else None
+
+    def forward(
+        self,
+        obs: Mapping[str, Tensor],
+        masks: Tensor | None = None,
+        hidden_state=None,
+        stochastic_output: bool = False,
+        entropy_noise: Tensor | None = None,
+    ) -> Tensor:
+        if masks is not None or hidden_state is not None:
+            raise ValueError("The finite observation history does not use recurrent state or trajectory masks.")
+        observation = self.get_policy_observation(obs)
+        mean, values = self._forward_policy(observation)
+        self._normal = self.policy._distribution(mean)
+        if entropy_noise is not None and (
+            entropy_noise.shape != mean.shape or entropy_noise.device != mean.device or entropy_noise.dtype != mean.dtype
+        ):
+            raise ValueError("Entropy noise must match the action mean shape, device, and dtype.")
+        self._entropy, self._entropy_noise = None, entropy_noise
+        token = self._cache_token(obs, observation)
+        self._cached_values = None if token is None else (token, values)
+        return self.policy._bounded_action(self._normal.rsample() if stochastic_output else mean)
+
+    def _current_distribution(self) -> torch.distributions.Normal:
+        if self._normal is None:
+            raise RuntimeError("Call the actor before querying its current action distribution.")
+        return self._normal
+
+    @property
+    def output_mean(self) -> Tensor:
+        """Mean of the underlying Gaussian, before the action tanh transform."""
+        return self._current_distribution().loc
+
+    @property
+    def output_std(self) -> Tensor:
+        """Standard deviation of the underlying Gaussian, matching PPO state."""
+        return self._current_distribution().scale
+
+    @property
+    def output_distribution_params(self) -> tuple[Tensor, Tensor]:
+        return self.output_mean, self.output_std
+
+    @property
+    def output_entropy(self) -> Tensor:
+        if self._entropy is None:
+            distribution = self._current_distribution()
+            sample = distribution.rsample() if self._entropy_noise is None else distribution.loc + distribution.scale * self._entropy_noise
+            self._entropy = -self.policy._action_log_prob(distribution, self.policy._bounded_action(sample))
+        return self._entropy
+
+    def get_output_log_prob(self, outputs: Tensor) -> Tensor:
+        distribution = self._current_distribution()
+        if outputs.shape != distribution.loc.shape:
+            raise ValueError(f"Actions must have shape {tuple(distribution.loc.shape)}, got {tuple(outputs.shape)}.")
+        return self.policy._action_log_prob(distribution, outputs)
+
+    def get_kl_divergence(
+        self, old_params: tuple[Tensor, Tensor], new_params: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        return torch.distributions.kl_divergence(
+            torch.distributions.Normal(*old_params), torch.distributions.Normal(*new_params),
+        ).sum(-1)
+
+    def reset(self, dones: Tensor | None = None, hidden_state=None) -> None:
+        self._cached_values = None
+
+    def get_hidden_state(self):
+        return None
+
+    def detach_hidden_state(self, dones: Tensor | None = None) -> None:
+        pass
+
+    def update_normalization(self, obs: Mapping[str, Tensor]) -> None:
+        pass
+
+    def as_jit(self):
+        raise NotImplementedError("Graph/history policy export is not implemented.")
+
+    def as_onnx(self, verbose: bool = False):
+        raise NotImplementedError("Graph/history policy export is not implemented.")
+
+
+class NativeContactCritic(nn.Module):
+    """Native critic view of the value head owned by the shared actor policy."""
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        obs: Mapping[str, Tensor],
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        output_dim: int,
+        shared_policy: ContactRearrangementPolicy,
+        actor: NativeContactActor | None = None,
+        model_cfg: dict | ModelCfg | None = None,
+        max_forward_batch_size: int = 32,
+        obs_normalization: bool = False,
+    ):
+        super().__init__()
+        self.cfg = shared_policy.cfg if model_cfg is None else (
+            model_cfg if isinstance(model_cfg, ModelCfg) else ModelCfg(**model_cfg)
+        )
+        if asdict(self.cfg) != asdict(shared_policy.cfg):
+            raise ValueError("Actor and critic must use the same shared research model configuration.")
+        if output_dim != 1 or obs_normalization:
+            raise ValueError("The shared research critic requires one value output and unnormalized observations.")
+        if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
+            raise ValueError("max_forward_batch_size must be a positive integer.")
+        self.obs_groups = list(obs_groups[obs_set])
+        if self.obs_groups != ["policy"]:
+            raise ValueError("Actor and critic must use the same single public 'policy' observation group.")
+        self.obs_dim = self.cfg.observation_dim
+        self.output_dim = output_dim
+        self.max_forward_batch_size = max_forward_batch_size
+        # nn.Module registration would add these parameters to native PPO a
+        # second time. The actor owns and moves the entire shared policy.
+        object.__setattr__(self, "policy", shared_policy)
+        object.__setattr__(self, "_actor", actor)
+        if obs["policy"].shape[-1] != self.obs_dim:
+            raise ValueError(f"Expected a policy observation with width {self.obs_dim}.")
+        if actor is not None and actor.policy is not shared_policy:
+            raise ValueError("The critic must reference the same policy owned by its actor.")
+
+    def forward(self, obs: Mapping[str, Tensor], masks: Tensor | None = None, hidden_state=None) -> Tensor:
+        if masks is not None or hidden_state is not None:
+            raise ValueError("The finite observation history does not use recurrent state or trajectory masks.")
+        if self._actor is not None:
+            cached = self._actor.consume_cached_value(obs)
+            if cached is not None:
+                return cached
+        observation = obs["policy"]
+        if observation.ndim < 2 or observation.shape[-1] != self.obs_dim:
+            raise ValueError(f"Expected a batched policy observation with width {self.obs_dim}.")
+        flattened = observation.reshape(-1, self.obs_dim)
+        if not flattened.shape[0]:
+            raise ValueError("The research model requires a nonempty observation batch.")
+        values = [
+            self.policy.value(chunk, masks=build_policy_masks(chunk, self.cfg))
+            for chunk in flattened.split(self.max_forward_batch_size)
+        ]
+        return torch.cat(values).reshape(*observation.shape[:-1], 1)
+
+    def reset(self, dones: Tensor | None = None, hidden_state=None) -> None:
+        if self._actor is not None:
+            self._actor._cached_values = None
+
+    def get_hidden_state(self):
+        return None
+
+    def detach_hidden_state(self, dones: Tensor | None = None) -> None:
+        pass
+
+    def update_normalization(self, obs: Mapping[str, Tensor]) -> None:
+        pass

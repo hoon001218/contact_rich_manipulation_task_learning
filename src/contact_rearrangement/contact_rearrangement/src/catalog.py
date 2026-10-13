@@ -7,6 +7,60 @@ import os
 from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
+class ForceTorqueCalibration:
+    """Six-axis calibration in physical sensor XYZ, independent of the SDK.
+
+    The deterministic rounding approximates the stated effective resolution,
+    which includes noise. It is not an ADC, accuracy, or stochastic noise model.
+    Range flags describe the original applied load, before saturation or tare.
+    """
+
+    name: str = "ATI Axia80 SI-200-8"
+    ranges: tuple[float, ...] = (200.0, 200.0, 360.0, 8.0, 8.0, 8.0)
+    resolution: tuple[float, ...] = (0.1, 0.1, 0.1, 0.005, 0.005, 0.005)
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("F/T calibration name must be nonempty.")
+        for field_name in ("ranges", "resolution"):
+            values = getattr(self, field_name)
+            if len(values) != 6 or any(not isinstance(value, (int, float)) or isinstance(value, bool)
+                                       or not math.isfinite(value) or value <= 0 for value in values):
+                raise ValueError(f"F/T {field_name} must contain six finite positive axis values.")
+            object.__setattr__(self, field_name, tuple(float(value) for value in values))
+
+    def measure(self, wrench):
+        """Return saturated, rounded readings and original per-axis overloads.
+
+        ``wrench`` is a floating-point tensor with last dimension six, in
+        [Fx, Fy, Fz, Tx, Ty, Tz] order and N/N·m units. No physics is modified.
+        """
+        if wrench.ndim < 1 or wrench.shape[-1] != 6 or not wrench.is_floating_point():
+            raise ValueError("F/T wrench must be a floating-point tensor with six axes.")
+        ranges, resolution = wrench.new_tensor(self.ranges), wrench.new_tensor(self.resolution)
+        range_exceeded = wrench.abs() > ranges
+        measured = (wrench.clamp(min=-ranges, max=ranges) / resolution).round() * resolution
+        # Preserve the calibrated range even for custom profiles whose range
+        # is not an integer multiple of their resolution.
+        return measured.clamp(min=-ranges, max=ranges), range_exceeded
+
+
+SI_200_8_CALIBRATION = ForceTorqueCalibration()
+
+
+@dataclass
+class ForceTorqueSensorCfg:
+    """Mutable environment settings resolved to an immutable physical calibration."""
+
+    name: str = SI_200_8_CALIBRATION.name
+    ranges: tuple[float, ...] = SI_200_8_CALIBRATION.ranges
+    resolution: tuple[float, ...] = SI_200_8_CALIBRATION.resolution
+
+    def calibration(self) -> ForceTorqueCalibration:
+        return ForceTorqueCalibration(self.name, self.ranges, self.resolution)
+
+
 FORBIDDEN_CONTACT_BODY_NAMES = (
     "base_link", "shoulder_link", "upper_arm_link", "forearm_link",
     "wrist_1_link", "wrist_2_link", "wrist_3_link",

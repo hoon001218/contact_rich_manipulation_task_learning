@@ -14,7 +14,10 @@ from .observations import (
     policy_observation, pack_policy_observation, geometry_in_eef_frame,
     corrected_wrench, tare_compensated_wrench,
 )
-from .rewards import reward_components, reward_rate
+from .rewards import (
+    reward_components, reward_rate, clearance, rearrangement, motion,
+    time_penalty, terminal, sync_reward_weights,
+)
 from .terminations import terminal_transition, success, failure
 
 __all__ = [
@@ -23,7 +26,8 @@ __all__ = [
     "polygon_area", "rectangle_overlap_area", "object_geometry",
     "policy_observation", "pack_policy_observation", "geometry_in_eef_frame",
     "corrected_wrench", "tare_compensated_wrench", "reward_components",
-    "reward_rate", "terminal_transition", "success", "failure",
+    "reward_rate", "clearance", "rearrangement", "motion", "time_penalty",
+    "terminal", "sync_reward_weights", "terminal_transition", "success", "failure",
 ]
 
 

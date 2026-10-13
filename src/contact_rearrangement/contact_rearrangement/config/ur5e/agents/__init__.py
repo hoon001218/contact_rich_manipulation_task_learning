@@ -1,18 +1,25 @@
 """UR5e graph/history policy and PPO training configuration."""
 
-from .model import ContactRearrangementPolicy, HistoryEncoder, PolicyMasks, SceneGraphEncoder, build_policy_masks
-from .ppo import PPOTrainer, generalized_advantage_estimate
-from .ppo_cfg import ContactRearrangementPPORunnerCfg, ModelCfg, PPOCfg
+from .model import (
+    ContactRearrangementPolicy,
+    HistoryEncoder,
+    NativeContactActor,
+    NativeContactCritic,
+    PolicyMasks,
+    SceneGraphEncoder,
+    build_policy_masks,
+)
+from .ppo import ContactRearrangementPPO
+from .ppo_cfg import ModelCfg
 
 __all__ = [
-    "ContactRearrangementPPORunnerCfg",
+    "ContactRearrangementPPO",
     "ContactRearrangementPolicy",
     "HistoryEncoder",
     "ModelCfg",
-    "PPOCfg",
-    "PPOTrainer",
+    "NativeContactActor",
+    "NativeContactCritic",
     "PolicyMasks",
     "SceneGraphEncoder",
     "build_policy_masks",
-    "generalized_advantage_estimate",
 ]

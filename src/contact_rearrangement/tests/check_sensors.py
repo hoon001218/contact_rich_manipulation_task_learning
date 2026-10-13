@@ -23,6 +23,7 @@ import sys
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -43,10 +44,14 @@ from scipy.spatial.transform import Rotation
 
 from contact_rearrangement.mdp.observations import corrected_wrench
 from contact_rearrangement.mdp.state import MdpCfg
+from contact_rearrangement.mdp.events import reset_spawn_scene
 from contact_rearrangement.src.assets import (
     ARM_JOINT_NAMES, HAND_JOINT_NAMES, FORCE_TORQUE_BODY_NAME, FORCE_TORQUE_PROXIMAL_BODY_NAME,
+    ToolForceTorqueSensor,
 )
-from contact_rearrangement.src.sensors import InitialVisionCfg, InitialVisionSensor, tool_wrench, tool_wrench_valid
+from contact_rearrangement.src.sensors import (
+    InitialVisionCfg, InitialVisionRejected, InitialVisionSensor, tool_wrench, tool_wrench_valid,
+)
 
 
 def validate_invalid_ranges():
@@ -136,6 +141,233 @@ def validate_snapshot(env, selected):
                 and (distances <= cfg.front_distance_range[1] + 1e-5).all())
 
 
+def verify_shared_cameras(env):
+    cameras = (env.scene["initial_camera"], env.scene["silhouette_camera"])
+    assert all(camera.num_instances == 1 for camera in cameras), "Reset cameras must not scale with env count"
+    paths = [path for camera in cameras for path in camera.render_product_paths]
+    assert len(paths) == len(set(paths)) == 2, "Initial vision must reuse exactly two render products"
+    for camera in cameras:
+        assert camera.data.pos_w.shape == (1, 3)
+    references = env.scene.stage.GetPrimAtPath("/World/VisionReferences")
+    assert len(list(references.GetChildren())) == 10, "Silhouette references must be a shared catalog pool"
+
+
+def verify_independent_vision_retries(env):
+    """Force one environment to retry; retain another's accepted physical scene."""
+    if env.num_envs < 2:
+        return
+    capture = InitialVisionSensor.capture
+    protected = {}
+    injected = False
+    accepted_zero = 0
+    before_counts = env.spawn_reset_counts.clone()
+
+    def protected_state():
+        robot, objects = env.scene["robot"], env.scene["objects"]
+        return {"objects": objects.data.object_state_w[:1].clone(),
+                "root": robot.data.root_state_w[:1].clone(),
+                "q": robot.data.joint_pos[:1].clone(),
+                "v": robot.data.joint_vel[:1].clone(),
+                "targets": robot.data.joint_pos_target[:1].clone()}
+
+    def retry_once(sensor, env_ids, **kwargs):
+        nonlocal injected, accepted_zero
+        assert len(env_ids) == 1, "Layout rejection must be isolated to one environment"
+        index = int(env_ids[0])
+        if index == 1:
+            assert protected, "First environment should already have an accepted snapshot"
+            assert env.spawn_samples[0] is protected["sample"], "Retry resampled an accepted environment"
+            for key, value in protected_state().items():
+                torch.testing.assert_close(value, protected["physical"][key], rtol=0, atol=1e-6)
+            if not injected:
+                injected = True
+                raise InitialVisionRejected("fixture: retry env1 while preserving env0")
+        result = capture(sensor, env_ids, **kwargs)
+        if index == 0:
+            accepted_zero += 1
+            protected.update(sample=env.spawn_samples[0], physical=protected_state(), result=result[0])
+        return result
+
+    selected = torch.tensor([0, 1], device=env.device)
+    with patch.object(InitialVisionSensor, "capture", retry_once):
+        env.reset(env_ids=selected)
+    assert injected and accepted_zero == 1
+    torch.testing.assert_close(env.spawn_reset_counts[selected], before_counts[selected] + 1)
+    for name, key in (("initial_vision_rgb", "rgb"), ("initial_vision_depth", "depth"),
+                      ("initial_vision_role_masks", "masks"), ("initial_camera_pose_w", "pose")):
+        torch.testing.assert_close(getattr(env, name)[0], protected["result"][key], rtol=0, atol=0)
+    verify_shared_cameras(env)
+    print("[VISION RETRY FIXTURE]: PASS; env1 retries independently; env0 scene/snapshot retained", flush=True)
+
+
+def verify_vision_retry_rollback(env):
+    """Exhaust a later environment's retry and restore the entire selected batch."""
+    if env.num_envs < 2:
+        return
+    capture = InitialVisionSensor.capture
+    before_physics, before_snapshot = physics_state(env), snapshot(env)
+    metadata_names = ("active_object_mask", "active_object_ids", "target_object_id", "blocker_object_id",
+                      "access_region", "spawn_initial_state", "spawn_reset_counts", "spawn_seeds",
+                      "robot_initial_joint_pos", "robot_start_tcp_pos_w", "robot_start_region",
+                      "robot_start_elbow_height", "robot_start_attempts")
+    metadata = {name: getattr(env, name).clone() for name in metadata_names}
+    before_samples = list(env.spawn_samples)
+    before_raw = env.tool_force_torque_sensor.read()
+    before_valid = env.tool_force_torque_sensor.valid.clone()
+    camera = env.scene["initial_camera"]
+    before_camera = (camera.data.pos_w.clone(), camera.data.quat_w_ros.clone())
+    layout_attempts = env.cfg.initial_vision.max_layout_attempts
+    accepted_zero = False
+
+    def exhaust_later(sensor, env_ids, **kwargs):
+        nonlocal accepted_zero
+        assert len(env_ids) == 1
+        if int(env_ids[0]) == 1:
+            assert accepted_zero
+            raise InitialVisionRejected("fixture: exhaust env1 retries")
+        result = capture(sensor, env_ids, **kwargs)
+        accepted_zero = True
+        # Let env0 use its full sampling budget; then exhaust env1 immediately.
+        env.cfg.initial_vision.max_layout_attempts = 1
+        return result
+
+    selected = torch.tensor([0, 1], device=env.device)
+    try:
+        with patch.object(InitialVisionSensor, "capture", exhaust_later):
+            try:
+                reset_spawn_scene(env, selected)
+            except InitialVisionRejected as error:
+                assert str(error) == "fixture: exhaust env1 retries"
+            else:
+                raise AssertionError("Exhausted camera retries should abort the selected reset transaction")
+    finally:
+        env.cfg.initial_vision.max_layout_attempts = layout_attempts
+    assert accepted_zero
+    after_physics = physics_state(env)
+    assert after_physics["time"] == before_physics["time"]
+    assert after_physics["step"] == before_physics["step"]
+    for key in set(before_physics) - {"time", "step"}:
+        torch.testing.assert_close(after_physics[key], before_physics[key], rtol=0, atol=1e-6,
+                                   msg=f"Exhausted retry failed to restore native state: {key}")
+    assert_snapshot_equal(env, before_snapshot)
+    for name, value in metadata.items():
+        torch.testing.assert_close(getattr(env, name), value, rtol=0, atol=0)
+    assert all(actual is before for actual, before in zip(env.spawn_samples, before_samples))
+    torch.testing.assert_close(env.tool_force_torque_sensor.read(), before_raw, rtol=0, atol=0)
+    torch.testing.assert_close(env.tool_force_torque_sensor.valid, before_valid)
+    torch.testing.assert_close(camera.data.pos_w, before_camera[0], rtol=0, atol=1e-6)
+    torch.testing.assert_close(camera.data.quat_w_ros, before_camera[1], rtol=0, atol=1e-6)
+    verify_shared_cameras(env)
+    print("[VISION ROLLBACK FIXTURE]: PASS; exhausted env1 restores selected native state/metadata/snapshots", flush=True)
+
+
+def verify_shared_scene_template(env):
+    """Shared layouts retain independent native bodies and need no partial-reset render."""
+    if env.num_envs < 2:
+        return
+    original_mode = env.cfg.shared_initial_scene
+    capture = InitialVisionSensor.capture
+    captures, accepted = [], []
+
+    def count_capture(sensor, env_ids, **kwargs):
+        captures.extend(env_ids.cpu().tolist())
+        result = capture(sensor, env_ids, **kwargs)
+        accepted.extend(result)
+        return result
+
+    def assert_common_scene():
+        objects, robot = env.scene["objects"], env.scene["robot"]
+        native = objects.reshape_view_to_data(objects.root_physx_view.get_transforms()).clone()
+        native[..., :3] -= env.scene.env_origins[:, None, :]
+        torch.testing.assert_close(native, native[:1].expand_as(native), rtol=0, atol=1e-5)
+        torch.testing.assert_close(robot.data.joint_pos, robot.data.joint_pos[:1].expand_as(robot.data.joint_pos),
+                                   rtol=0, atol=1e-6)
+        for name in ("initial_vision_rgb", "initial_vision_depth", "initial_vision_role_masks",
+                     "active_object_ids", "target_object_id", "blocker_object_id", "spawn_seeds"):
+            value = getattr(env, name)
+            torch.testing.assert_close(value, value[:1].expand_as(value), rtol=0, atol=0)
+        camera_positions = env.initial_camera_pose_w[:, :3] - env.scene.env_origins
+        torch.testing.assert_close(camera_positions, camera_positions[:1].expand_as(camera_positions), rtol=0, atol=1e-6)
+        assert all(sample is env.shared_initial_scene_template["sample"] for sample in env.spawn_samples)
+
+    env.cfg.shared_initial_scene = True
+    try:
+        if not hasattr(env, "shared_initial_scene_template"):
+            before_initialization = physics_state(env)
+            try:
+                reset_spawn_scene(env, torch.tensor([1], device=env.device))
+            except ValueError as error:
+                assert "full environment reset" in str(error)
+            else:
+                raise AssertionError("Shared mode needs an initial full reset before restoring a partial clone")
+            assert_physics_preserved(env, before_initialization, "Rejected initial partial shared reset")
+        # Reverse the complete batch to check that template capture still uses
+        # env0 and that template counters map to selected rows correctly.
+        all_ids = torch.arange(env.num_envs, device=env.device).flip(0)
+        before_counts = env.spawn_reset_counts.clone()
+        with patch.object(InitialVisionSensor, "capture", count_capture):
+            env.reset(env_ids=all_ids)
+        assert captures and set(captures) == {0} and accepted == [0]
+        torch.testing.assert_close(env.spawn_reset_counts, before_counts + 1)
+        assert_common_scene()
+        first_template = env.shared_initial_scene_template
+        first_generation = env.shared_initial_scene_generation
+        native_before, snapshot_before = physics_state(env), snapshot(env)
+        renders_before, captures_before = audit["renders"], len(captures)
+        with patch.object(InitialVisionSensor, "capture", count_capture):
+            env.reset(env_ids=torch.tensor([1], device=env.device))
+        assert audit["renders"] == renders_before and len(captures) == captures_before
+        assert env.shared_initial_scene_template is first_template
+        assert env.shared_initial_scene_generation == first_generation
+        assert_physics_preserved(env, native_before, "Shared partial reset of an already-initial clone")
+        assert_snapshot_equal(env, snapshot_before)
+        assert_common_scene()
+
+        captures.clear()
+        accepted.clear()
+        with patch.object(InitialVisionSensor, "capture", count_capture):
+            env.reset()
+        assert captures and set(captures) == {0} and accepted == [0]
+        template = env.shared_initial_scene_template
+        assert template is not first_template and template["seed"] != first_template["seed"]
+        assert env.shared_initial_scene_generation == first_generation + 1
+        assert_common_scene()
+
+        before_physics, before_snapshot = physics_state(env), snapshot(env)
+        before_counts = env.spawn_reset_counts.clone()
+        attempts = env.cfg.initial_vision.max_layout_attempts
+
+        def reject_template(sensor, env_ids, **kwargs):
+            assert env_ids.cpu().tolist() == [0]
+            raise InitialVisionRejected("fixture: reject shared replacement")
+
+        try:
+            env.cfg.initial_vision.max_layout_attempts = 1
+            with patch.object(InitialVisionSensor, "capture", reject_template):
+                try:
+                    reset_spawn_scene(env, all_ids)
+                except InitialVisionRejected as error:
+                    assert str(error) == "fixture: reject shared replacement"
+                else:
+                    raise AssertionError("Shared template rejection should abort replacement")
+        finally:
+            env.cfg.initial_vision.max_layout_attempts = attempts
+        assert env.shared_initial_scene_template is template
+        assert env.shared_initial_scene_generation == first_generation + 1
+        torch.testing.assert_close(env.spawn_reset_counts, before_counts)
+        assert_snapshot_equal(env, before_snapshot)
+        after_physics = physics_state(env)
+        assert after_physics["time"] == before_physics["time"] and after_physics["step"] == before_physics["step"]
+        for key in set(before_physics) - {"time", "step"}:
+            torch.testing.assert_close(after_physics[key], before_physics[key], rtol=0, atol=1e-6)
+        verify_shared_cameras(env)
+        print("[SHARED SCENE FIXTURE]: PASS; common native layouts/joints, env0-only initial capture, "
+              "partial reset without render, transactional template replacement", flush=True)
+    finally:
+        env.cfg.shared_initial_scene = original_mode
+        env.reset()
+
+
 def verify_force_torque_load_response(env, sensor):
     robot = env.scene["robot"]
     view = robot.root_physx_view
@@ -163,7 +395,9 @@ def verify_force_torque_load_response(env, sensor):
     assert hand_base_ids, "The compensation bench omitted the attached hand base."
     print(f"[F/T BENCH]: {len(ids)} downstream links; total mass={masses.sum():.6f}kg; hand base included", flush=True)
     dt = env.physics_dt
-    errors, compensated_errors, unloaded_gravity_only, unloaded_compensated = [], [], [], []
+    errors, compensated_errors, ideal_compensated_errors = [], [], []
+    quantization_errors, unloaded_gravity_only, unloaded_compensated = [], [], []
+    half_resolution = np.asarray(sensor.calibration.resolution) * .5
     original_targets = robot.data.joint_pos_target.clone()
     missing = object()
     original_mdp_cfg = getattr(env.cfg, "mdp", missing)
@@ -172,6 +406,8 @@ def verify_force_torque_load_response(env, sensor):
         for name in ("mdp_state", "initial_object_geometry", "initial_object_valid", "initial_object_roles")
     }
     original_raw_wrench = sensor.data_raw_wrench.clone()
+    original_ideal_wrench = sensor.data_ideal_wrench.clone()
+    original_range_exceeded = sensor.range_exceeded.clone()
     original_sensor_bias, original_sensor_valid = sensor.bias.clone(), sensor.valid.clone()
     original_ft_timestamp = env.ft_last_update_time
     # Exercise the production observation with actual tensor API values. The
@@ -213,18 +449,27 @@ def verify_force_torque_load_response(env, sensor):
         rotation = all_rotations[sensor.body_index]
         expected = np.r_[rotation.T @ net_force_w, rotation.T @ net_torque_w]
         observed = sensor.read([0])[0].cpu().numpy()
-        errors.append(observed - expected)
+        ideal = sensor.read_ideal([0])[0].cpu().numpy()
+        errors.append(ideal - expected)
+        quantization_error = observed - ideal
+        quantization_errors.append(quantization_error)
+        assert not bool(sensor.range_exceeded[0].any()), "Load-response fixture exceeded the selected calibration."
+        assert np.all(np.abs(quantization_error) <= half_resolution + 2e-6), (
+            f"Measured load exceeded half-resolution quantization error: {quantization_error}"
+        )
         external_moment = np.cross(com_w[sensor.body_index] - point, force_w) + torque_w
         expected_contact_reaction = -np.r_[rotation.T @ force_w, rotation.T @ external_moment]
         compensated = corrected_wrench(env)[0].cpu().numpy()
         assert np.isfinite(compensated).all(), "Compensated observation contains nonfinite values."
         compensated_errors.append(compensated - expected_contact_reaction)
+        ideal_compensated_errors.append(compensated - expected_contact_reaction - quantization_error)
         # Calls during a single completed physics step must be repeatable and
         # may not advance dynamics, reset sensor validity, or rewrite raw data.
         saved = physics_state(env)
         torch.testing.assert_close(corrected_wrench(env)[0], torch.as_tensor(compensated, device=env.device),
                                    atol=0, rtol=0)
         torch.testing.assert_close(sensor.read([0])[0], torch.as_tensor(observed, device=env.device), atol=0, rtol=0)
+        torch.testing.assert_close(sensor.read_ideal([0])[0], torch.as_tensor(ideal, device=env.device), atol=0, rtol=0)
         assert_physics_preserved(env, saved, "Repeated compensated F/T read")
         if unloaded_motion:
             # The gravity-only baseline uses the independently computed SciPy
@@ -267,6 +512,8 @@ def verify_force_torque_load_response(env, sensor):
         robot.set_external_force_and_torque(zero, zero, body_ids=[sensor.body_index], env_ids=[0], is_global=True)
         robot.set_joint_position_target(original_targets)
         sensor.data_raw_wrench.copy_(original_raw_wrench)
+        sensor.data_ideal_wrench.copy_(original_ideal_wrench)
+        sensor.range_exceeded.copy_(original_range_exceeded)
         sensor.bias.copy_(original_sensor_bias)
         sensor.valid.copy_(original_sensor_valid)
         # Physics has advanced; restoring this pre-bench timestamp allows the
@@ -292,10 +539,15 @@ def verify_force_torque_load_response(env, sensor):
     print(f"[F/T BENCH]: six-axis applied-load balance passed; "
           f"max_force_error={force_error:.6g}N max_torque_error={torque_error:.6g}Nm", flush=True)
     compensated_errors = np.asarray(compensated_errors)
+    ideal_compensated_errors = np.asarray(ideal_compensated_errors)
     force_residual_error = np.linalg.norm(compensated_errors[:, :3], axis=-1).max()
     torque_residual_error = np.linalg.norm(compensated_errors[:, 3:], axis=-1).max()
-    assert force_residual_error < 0.10, f"Compensated external-force mismatch: {force_residual_error}N"
-    assert torque_residual_error < 0.015, f"Compensated external-torque mismatch: {torque_residual_error}Nm"
+    ideal_force_error = np.linalg.norm(ideal_compensated_errors[:, :3], axis=-1).max()
+    ideal_torque_error = np.linalg.norm(ideal_compensated_errors[:, 3:], axis=-1).max()
+    assert ideal_force_error < 0.10, f"Ideal compensated external-force mismatch: {ideal_force_error}N"
+    assert ideal_torque_error < 0.015, f"Ideal compensated external-torque mismatch: {ideal_torque_error}Nm"
+    assert force_residual_error < 0.10 + np.linalg.norm(half_resolution[:3])
+    assert torque_residual_error < 0.015 + np.linalg.norm(half_resolution[3:])
     gravity_only, compensated = np.asarray(unloaded_gravity_only), np.asarray(unloaded_compensated)
     gravity_force_peak = np.linalg.norm(gravity_only[:, :3], axis=-1).max()
     gravity_torque_peak = np.linalg.norm(gravity_only[:, 3:], axis=-1).max()
@@ -310,6 +562,45 @@ def verify_force_torque_load_response(env, sensor):
           f"{torque_residual_error:.6g}Nm; unloaded gravity-only peaks={gravity_force_peak:.6g}N/"
           f"{gravity_torque_peak:.6g}Nm -> full-compensation peaks={compensated_force_peak:.6g}N/"
           f"{compensated_torque_peak:.6g}Nm", flush=True)
+    print(f"[F/T SI-200-8]: PASS; ideal external-load errors={ideal_force_error:.6g}N/"
+          f"{ideal_torque_error:.6g}Nm; max axis quantization error="
+          f"{np.abs(np.asarray(quantization_errors)).max(axis=0).tolist()}", flush=True)
+
+
+def verify_calibration_cache(env):
+    """Exercise the production sensor's calibration/cache with known GPU loads.
+
+    A controlled tensor backend tests overrange and reset without applying an
+    out-of-range physical load to the live articulation.
+    """
+    saved = physics_state(env)
+    loads = torch.tensor([[200.04, -199.96, 359.96, 8.004, -7.999, .0074],
+                          [0.04, -.06, 200.04, .0024, -.0026, -.0074]], device=env.device)
+    backend = SimpleNamespace(get_link_incoming_joint_force=lambda: loads[:, None, :])
+    robot = SimpleNamespace(body_names=[FORCE_TORQUE_BODY_NAME], num_instances=2, device=env.device,
+                            root_physx_view=backend,
+                            cfg=SimpleNamespace(spawn=SimpleNamespace(sensor_mount_mass=.2)))
+    sensor = ToolForceTorqueSensor(robot, env.cfg.force_torque)
+    sensor.update()
+    expected = loads.new_tensor([[200, -200, 360, 8, -8, .005],
+                                [0, -.1, 200, 0, -.005, -.005]])
+    flags = torch.tensor([[True, False, False, True, False, False],
+                          [False, False, False, False, False, False]], device=env.device)
+    torch.testing.assert_close(sensor.read(), expected, rtol=0, atol=1e-6)
+    torch.testing.assert_close(sensor.read_ideal(), loads, rtol=0, atol=0)
+    torch.testing.assert_close(sensor.range_exceeded, flags)
+    before_raw, before_ideal = sensor.read([0]), sensor.read_ideal([0])
+    sensor.tare([1])
+    torch.testing.assert_close(sensor.read([1], tared=True), torch.zeros((1, 6), device=env.device), rtol=0, atol=0)
+    sensor.reset([1])
+    torch.testing.assert_close(sensor.read([0]), before_raw, rtol=0, atol=0)
+    torch.testing.assert_close(sensor.read_ideal([0]), before_ideal, rtol=0, atol=0)
+    torch.testing.assert_close(sensor.range_exceeded[0], flags[0])
+    assert bool(sensor.valid[0]) and not bool(sensor.valid[1])
+    assert not bool(sensor.range_exceeded[1].any())
+    torch.testing.assert_close(sensor.read_ideal([1]), torch.zeros((1, 6), device=env.device), rtol=0, atol=0)
+    assert_physics_preserved(env, saved, "Calibration/cache fixture")
+    print("[F/T CALIBRATION CACHE]: PASS; per-axis range, resolution, overload, tare, partial reset", flush=True)
 
 
 original_render = InitialVisionSensor._render
@@ -348,6 +639,8 @@ class AuditedEnv(original_env_class):
         saved_snap = snapshot(self, untouched) if untouched.numel() else {}
         sensor = self.tool_force_torque_sensor
         saved_wrench = sensor.read(untouched)
+        saved_ideal = sensor.read_ideal(untouched)
+        saved_overrange = sensor.range_exceeded[untouched].clone()
         saved_valid = sensor.valid[untouched].clone()
         time, step = self.sim.current_time, self.sim.current_time_step_index
         result = super().reset(seed=seed, env_ids=selected, options=options)
@@ -356,16 +649,23 @@ class AuditedEnv(original_env_class):
             f"step {step}->{self.sim.current_time_step_index}"
         )
         validate_snapshot(self, selected)
+        verify_shared_cameras(self)
         assert not bool(sensor.valid[selected].any()), "F/T reset values must remain invalid until physics advances"
         torch.testing.assert_close(sensor.read(selected), torch.zeros((len(selected), 6), device=self.device), atol=0, rtol=0)
+        torch.testing.assert_close(sensor.read_ideal(selected), torch.zeros((len(selected), 6), device=self.device), atol=0, rtol=0)
+        assert not bool(sensor.range_exceeded[selected].any())
         torch.testing.assert_close(tool_wrench(self)[selected], sensor.read(selected), atol=0, rtol=0)
         assert not bool(tool_wrench_valid(self)[selected].any()), "Observation reread made stale reset wrench valid"
         if untouched.numel():
             assert_snapshot_equal(self, saved_snap, untouched)
             torch.testing.assert_close(sensor.read(untouched), saved_wrench, atol=0, rtol=0)
+            torch.testing.assert_close(sensor.read_ideal(untouched), saved_ideal, atol=0, rtol=0)
+            torch.testing.assert_close(sensor.range_exceeded[untouched], saved_overrange)
             torch.testing.assert_close(sensor.valid[untouched], saved_valid, atol=0, rtol=0)
             audit["partial_resets"] += 1
         self._audited_accepted_snapshot = snapshot(self)
+        self._audited_camera_frames = [self.scene[name]._frame.clone()
+                                       for name in ("initial_camera", "silhouette_camera")]
         audit["resets"] += 1
         print(f"[SENSOR AUDIT]: reset#{audit['resets']} selected={selected.tolist()} "
               f"camera_attempts={self.initial_camera_attempts[selected].tolist()} "
@@ -377,6 +677,9 @@ class AuditedEnv(original_env_class):
     def step(self, action):
         result = super().step(action)
         assert_snapshot_equal(self, self._audited_accepted_snapshot)
+        for name, frame in zip(("initial_camera", "silhouette_camera"), self._audited_camera_frames):
+            torch.testing.assert_close(self.scene[name]._frame, frame,
+                                       msg="Initial camera buffers must not be updated by ordinary environment steps")
         assert bool(self.tool_force_torque_sensor.valid.all()), "Completed step did not produce fresh F/T measurements"
         assert bool(torch.isfinite(self.tool_force_torque_sensor.read()).all())
         assert self.ft_last_update_time == self.sim.current_time, "F/T observation timestamp lags completed physics"
@@ -390,6 +693,9 @@ original_validate = scope["validate_settling_and_reset"]
 
 def validate_with_load_bench(env, visualizer=None):
     original_validate(env, visualizer)
+    verify_independent_vision_retries(env)
+    verify_vision_retry_rollback(env)
+    verify_shared_scene_template(env)
     robot = env.scene["robot"]
     assert robot.num_bodies == 41 and robot.num_joints == 18
     assert len(env.robot_pose_model.colliders) == 41
@@ -403,6 +709,7 @@ def validate_with_load_bench(env, visualizer=None):
     env.step(env.action_manager.action)
     frozen = snapshot(env)
     before_bench = env.sim.current_time_step_index
+    verify_calibration_cache(env)
     verify_force_torque_load_response(env, env.tool_force_torque_sensor)
     assert env.sim.current_time_step_index - before_bench == 19
     # The bench explicitly updates the raw sensor while directly stepping

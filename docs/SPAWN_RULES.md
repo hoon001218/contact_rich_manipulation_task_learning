@@ -478,7 +478,7 @@ gap·밀집도를 자동 완화한 fallback은 없다. 종류·역할 조합별 
 보고 sampler의 어려운 조합을 확인해야 하며, 모든 가능한 조합이 균등하게
 성공한다고 가정하지 않는다.
 
-각 환경의 reset seed는 다음과 같다.
+환경별 배치를 사용하는 spawn 환경(`shared_initial_scene=False`)의 reset seed는 다음과 같다.
 
 ```text
 episode_seed = cfg.seed + 1_000_003*env_id + 97_409*reset_count[env_id]
@@ -488,6 +488,19 @@ episode_seed = cfg.seed + 1_000_003*env_id + 97_409*reset_count[env_id]
 증가한다. 부분 reset은 선택한 환경의 count만 바꾸므로 다른 환경의 다음
 장면 sequence를 진행시키지 않는다. 같은 catalog geometry·설정·seed와 동일
 reset 순서는 동일 sampling을 재현한다.
+
+학습 기본값 `shared_initial_scene=True`에서는 전체 환경에 공통 초기 물체 배치·역할·
+로봇 자세를 적용한다. 전체 reset마다 `cfg.seed + 97_409*shared_generation`으로
+새 공통 장면을 만들고 env 0에서 초기 RGB-D와 가시성을 한 번 승인한다. 부분 reset은
+현재 공통 초기 장면·vision을 재사용하고 선택된 환경의 reset count만 증가시킨다.
+모든 물체·로봇은 환경별 PhysX 인스턴스를 유지하므로 이후 동작과 접촉은 독립적이다.
+기하·카메라 자세는 환경 원점 차이를 반영해 각 환경의 좌표로 옮긴다.
+
+카메라 2개와 render-only 기준 물체 10개는 전체 환경이 공유한다. 실제 카메라는
+RGB-D를, 기준 카메라는 같은 시점·물체 자세의 비가림 실루엣을 제공한다. Headless
+실행은 step 중 자동 렌더링을 생략하고 초기 촬영 때만 명시적으로 렌더링한다.
+카메라 버퍼는 유지하며 부분 reset은 새 이미지를 촬영하지 않는다. Headless 학습은
+env 0의 visual만 렌더링하고 다른 환경의 physics는 Fabric replica로 유지한다.
 
 Event는 선택된 모든 환경의 물체 sample·robot 시작 후보를 CPU에서 승인한 뒤
 native state에 적용하고 camera pixel acceptance를 검사한다. Camera 32개

@@ -10,10 +10,11 @@ from itertools import product
 
 import numpy as np
 import torch
+import omni.timeline
 from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 import isaaclab.sim as sim_utils
-from isaaclab.sensors import Camera, CameraCfg, ContactSensor, ContactSensorCfg
+from isaaclab.sensors import Camera, CameraCfg, ContactSensor, ContactSensorCfg, SensorBase
 from isaaclab.sim.spawners.spawner_cfg import SpawnerCfg
 from isaaclab.sim.utils import clone, get_current_stage
 from isaaclab.utils import configclass
@@ -24,91 +25,115 @@ from isaaclab.utils.math import (
 from .assets import (
     TACTILE_BODY_NAMES, ToolForceTorqueSensor, _set_world_transform_on_reference_root, _world_transform,
 )
-from .catalog import ASSET_SPECS, OBJECT_SPECS, FORBIDDEN_CONTACT_BODY_NAMES
+from .catalog import ASSET_SPECS, OBJECT_SPECS, FORBIDDEN_CONTACT_BODY_NAMES, SI_200_8_CALIBRATION, ForceTorqueSensorCfg
 
 
-def _load_contact_sensor_class() -> None:
-    from pxr import PhysxSchema, Usd, UsdPhysics
-    import omni.timeline
+class _TaskContactSensorBase(SensorBase):
+    """Count physical replicas before the SDK contact buffers are allocated.
 
-    import isaaclab.sim as sim_utils
-    from isaaclab.sensors import ContactSensor, ContactSensorCfg
-    from isaaclab.utils import configclass
+    Fabric cloning keeps just the template on the USD stage. SensorBase counts
+    USD parents, whereas the PhysX view already contains every independent
+    replica. This task attaches one contact sensor to one body per environment.
+    """
 
-    class ForbiddenContactSensor(ContactSensor):
-        """One-to-many contact sensor whose exact collider filters come from USD.
+    def _initialize_impl(self):
+        super()._initialize_impl()
+        from isaacsim.core.simulation_manager import SimulationManager
 
-        Build reporter APIs and paths before simulation starts; never toggle
-        rigid-body flags during an episode. A wildcard matching multiple
-        partners per environment is not used because PhysX's batched filter
-        patterns must match the sensor count (or one global static collider).
-        """
+        view = SimulationManager.get_physics_sim_view().create_rigid_body_view(
+            self.cfg.prim_path.replace(".*", "*")
+        )
+        replicas = view.count
+        if replicas < 1:
+            raise RuntimeError(f"Contact sensor has no physical replicas: {self.cfg.prim_path}")
+        if replicas != self._num_envs:
+            self._num_envs = replicas
+            self._is_outdated = torch.ones(replicas, dtype=torch.bool, device=self._device)
+            self._timestamp = torch.zeros(replicas, device=self._device)
+            self._timestamp_last_update = torch.zeros_like(self._timestamp)
 
-        def __init__(self, cfg):
-            if omni.timeline.get_timeline_interface().is_playing():
-                raise RuntimeError("Forbidden-contact sensors must be created before simulation starts.")
-            stage = sim_utils.get_current_stage()
-            env_expression = cfg.prim_path.split("/Robot/", 1)[0]
-            environments = sim_utils.find_matching_prims(env_expression)
-            if not environments:
-                raise RuntimeError("Forbidden-contact sensor cannot find its environment template.")
-            template = min((str(prim.GetPath()) for prim in environments), key=lambda p: (len(p), p))
-            robot = stage.GetPrimAtPath(f"{template}/Robot")
-            candidates = [prim for prim in Usd.PrimRange(robot, Usd.TraverseInstanceProxies())
-                          if prim.GetName() == cfg.observed_body_name
-                          and prim.HasAPI(UsdPhysics.RigidBodyAPI)
-                          and "/ROASRightHand/" not in str(prim.GetPath())]
-            if len(candidates) != 1:
-                raise RuntimeError(f"Cannot uniquely resolve monitored body {cfg.observed_body_name}.")
-            body_path = str(candidates[0].GetPath())
-            cfg = cfg.copy()
-            cfg.prim_path = env_expression + body_path[len(template):]
-            for prim in sim_utils.find_matching_prims(cfg.prim_path):
-                reporter = PhysxSchema.PhysxContactReportAPI.Apply(prim)
-                reporter.CreateThresholdAttr().Set(0.0)
 
-            from .catalog import OBJECT_NAMES
+class TaskContactSensor(ContactSensor, _TaskContactSensorBase):
+    """Use native contact reporting with USD or Fabric scene replication.
 
-            filters = []
-            # On GPU, dynamic/kinematic partner filters must name rigid bodies,
-            # not their child collision shapes. Static ground has no rigid body
-            # and is the one supported collision-shape exception.
-            roots = [f"{template}/Shelf", *(f"{template}/{name}" for name in OBJECT_NAMES), "/World/Ground"]
-            for root_path in roots:
-                root = stage.GetPrimAtPath(root_path)
-                if not root.IsValid():
-                    raise RuntimeError(f"Missing forbidden-contact partner subtree {root_path}.")
-                count_before = len(filters)
-                rigid_bodies = [prim for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
-                                if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
-                partners = rigid_bodies
-                if not partners:
-                    partners = [prim for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
-                                if prim.HasAPI(UsdPhysics.CollisionAPI)
-                                and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False]
-                for prim in partners:
-                    path = str(prim.GetPath())
-                    filters.append(env_expression + path[len(template):]
-                                   if path.startswith(template + "/") else path)
-                if len(filters) == count_before:
-                    raise RuntimeError(f"No physics body or static collider under forbidden-contact partner {root_path}.")
-            cfg.filter_prim_paths_expr = sorted(set(filters))
-            super().__init__(cfg)
+    The MRO routes ContactSensor's parent initialization through the replica
+    count adapter. Force buffers, histories, filters, updates and resets remain
+    the SDK implementation; no proxy bodies or duplicate USD meshes are added.
+    """
 
-        def _initialize_impl(self):
-            super()._initialize_impl()
-            if self._num_bodies != 1 or self.contact_physx_view.filter_count != len(self.cfg.filter_prim_paths_expr):
-                raise RuntimeError("Forbidden-contact sensor partner filters did not resolve one-to-many correctly.")
 
-    @configclass
-    class ForbiddenContactSensorCfg(ContactSensorCfg):
-        class_type: type = ForbiddenContactSensor
-        observed_body_name: str = ""
+class ForbiddenContactSensor(TaskContactSensor):
+    """One-to-many contact sensor whose exact collider filters come from USD.
 
-    ForbiddenContactSensor.__qualname__ = "ForbiddenContactSensor"
-    ForbiddenContactSensorCfg.__qualname__ = "ForbiddenContactSensorCfg"
-    globals().update(ForbiddenContactSensor=ForbiddenContactSensor,
-                     ForbiddenContactSensorCfg=ForbiddenContactSensorCfg)
+    Build reporter APIs and paths before simulation starts; never toggle
+    rigid-body flags during an episode. A wildcard matching multiple
+    partners per environment is not used because PhysX's batched filter
+    patterns must match the sensor count (or one global static collider).
+    """
+
+    def __init__(self, cfg):
+        if omni.timeline.get_timeline_interface().is_playing():
+            raise RuntimeError("Forbidden-contact sensors must be created before simulation starts.")
+        stage = sim_utils.get_current_stage()
+        env_expression = cfg.prim_path.split("/Robot/", 1)[0]
+        environments = sim_utils.find_matching_prims(env_expression)
+        if not environments:
+            raise RuntimeError("Forbidden-contact sensor cannot find its environment template.")
+        template = min((str(prim.GetPath()) for prim in environments), key=lambda p: (len(p), p))
+        robot = stage.GetPrimAtPath(f"{template}/Robot")
+        candidates = [prim for prim in Usd.PrimRange(robot, Usd.TraverseInstanceProxies())
+                      if prim.GetName() == cfg.observed_body_name
+                      and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+                      and "/ROASRightHand/" not in str(prim.GetPath())]
+        if len(candidates) != 1:
+            raise RuntimeError(f"Cannot uniquely resolve monitored body {cfg.observed_body_name}.")
+        body_path = str(candidates[0].GetPath())
+        cfg = cfg.copy()
+        cfg.prim_path = env_expression + body_path[len(template):]
+        for prim in sim_utils.find_matching_prims(cfg.prim_path):
+            reporter = PhysxSchema.PhysxContactReportAPI.Apply(prim)
+            reporter.CreateThresholdAttr().Set(0.0)
+
+        from .catalog import OBJECT_NAMES
+
+        filters = []
+        # On GPU, dynamic/kinematic partner filters must name rigid bodies,
+        # not their child collision shapes. Static ground has no rigid body
+        # and is the one supported collision-shape exception.
+        roots = [f"{template}/Shelf", *(f"{template}/{name}" for name in OBJECT_NAMES), "/World/Ground"]
+        for root_path in roots:
+            root = stage.GetPrimAtPath(root_path)
+            if not root.IsValid():
+                raise RuntimeError(f"Missing forbidden-contact partner subtree {root_path}.")
+            count_before = len(filters)
+            rigid_bodies = [prim for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+                            if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
+            partners = rigid_bodies
+            if not partners:
+                partners = [prim for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+                            if prim.HasAPI(UsdPhysics.CollisionAPI)
+                            and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False]
+            for prim in partners:
+                path = str(prim.GetPath())
+                filters.append(env_expression + path[len(template):]
+                               if path.startswith(template + "/") else path)
+            if len(filters) == count_before:
+                raise RuntimeError(f"No physics body or static collider under forbidden-contact partner {root_path}.")
+        cfg.filter_prim_paths_expr = sorted(set(filters))
+        super().__init__(cfg)
+
+    def _initialize_impl(self):
+        super()._initialize_impl()
+        if self._num_bodies != 1 or self.contact_physx_view.filter_count != len(self.cfg.filter_prim_paths_expr):
+            raise RuntimeError("Forbidden-contact sensor partner filters did not resolve one-to-many correctly.")
+        if self.body_physx_view.count != self.num_instances:
+            raise RuntimeError("Forbidden-contact sensor physical replica count differs from its buffers.")
+
+
+@configclass
+class ForbiddenContactSensorCfg(ContactSensorCfg):
+    class_type: type = ForbiddenContactSensor
+    observed_body_name: str = ""
 
 
 def make_forbidden_contact_cfg(body_name: str, history_length: int = 4):
@@ -117,14 +142,11 @@ def make_forbidden_contact_cfg(body_name: str, history_length: int = 4):
         raise ValueError(f"Unknown forbidden-contact body {body_name}.")
     if not isinstance(history_length, int) or history_length < 1:
         raise ValueError("Forbidden-contact history_length must be a positive integer.")
-    if "ForbiddenContactSensorCfg" not in globals():
-        _load_contact_sensor_class()
-    return globals()["ForbiddenContactSensorCfg"](
+    return ForbiddenContactSensorCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot/{body_name}", observed_body_name=body_name,
         update_period=0.0, history_length=history_length, track_pose=False,
         track_air_time=False, max_contact_data_count_per_prim=128, debug_vis=False,
     )
-
 
 
 TACTILE_SENSOR_NAMES = tuple(f"contact_{body_name}" for body_name in TACTILE_BODY_NAMES)
@@ -142,6 +164,7 @@ def make_tactile_contact_cfg(body_name: str) -> ContactSensorCfg:
     if body_name not in TACTILE_BODY_NAMES:
         raise ValueError(f"Unknown tactile sensor body: {body_name}")
     return ContactSensorCfg(
+        class_type=TaskContactSensor,
         prim_path=f"{{ENV_REGEX_NS}}/Robot/ROASRightHand/{body_name}",
         update_period=0.0,
         history_length=0,
@@ -170,6 +193,8 @@ class BinaryTactileSensor:
                 raise RuntimeError(
                     f"Tactile sensor {name!r} must resolve exactly {body_name!r}; got {sensor.body_names}."
                 )
+            if sensor.num_instances != env.num_envs or sensor.body_physx_view.count != env.num_envs:
+                raise RuntimeError(f"Tactile sensor {name!r} did not resolve all {env.num_envs} physical replicas.")
         shape = (env.num_envs, len(TACTILE_BODY_NAMES))
         self.net_forces_w = torch.zeros((*shape, 3), device=env.device)
         self.contacts = torch.zeros(shape, dtype=torch.bool, device=env.device)
@@ -276,11 +301,53 @@ def _without_physics(sim):
 
 
 class InitialCamera(Camera):
-    """Guard implicit SDK stage refreshes during camera pose queries/writes.
+    """Reuse a camera for explicitly captured reset snapshots.
 
     IsaacLab 2.3.2's first Fabric pose read calls update_stage(), which updates
     Kit even from Camera.reset(). These cameras must not integrate physics.
     """
+
+    def _initialize_impl(self):
+        if self.cfg.render_shared_template_only and not sim_utils.SimulationContext.instance().has_gui():
+            # Only env0 supplies the shared initial image. Visibility affects
+            # RTX scene geometry, while every clone retains its PhysX bodies,
+            # collisions and independent episode state.
+            environments = self.stage.GetPrimAtPath("/World/envs")
+            for environment in environments.GetChildren():
+                if environment.GetName() != "env_0":
+                    UsdGeom.Imageable(environment).MakeInvisible()
+            # Fabric replicas do not have USD prims. Author their visibility
+            # through USDRT while keeping their native physics state intact.
+            import usdrt
+
+            fabric_stage = usdrt.Usd.Stage.Attach(sim_utils.get_current_stage_id())
+            paths = {str(path) for type_name in ("Xform", "UsdGeomXform")
+                     for path in fabric_stage.GetPrimsWithTypeName(type_name)}
+            self._hidden_environment_paths = []
+            for path in sorted(paths):
+                if (path.startswith("/World/envs/env_") and path.count("/") == 3
+                        and path != "/World/envs/env_0"):
+                    environment = fabric_stage.GetPrimAtPath(path)
+                    visibility = usdrt.UsdGeom.Imageable(environment).CreateVisibilityAttr()
+                    visibility.Set(usdrt.UsdGeom.Tokens.invisible)
+                    if visibility.Get() != usdrt.UsdGeom.Tokens.invisible:
+                        raise RuntimeError(f"Cannot hide shared-scene render replica {path}.")
+                    self._hidden_environment_paths.append(path)
+        super()._initialize_impl()
+
+    @property
+    def data(self):
+        # Initial vision is explicitly updated by _render only. A reset marks
+        # SDK buffers outdated, but a lazy annotator read before the next
+        # rendered frame may block. Pose reset already refreshes pose buffers.
+        return self._data
+
+    def reset(self, env_ids=None):
+        # InteractiveScene forwards environment indices to every sensor. A
+        # global reset camera has one sensor slot, independent of env count.
+        if self.is_initialized and self.num_instances == 1:
+            env_ids = None
+        super().reset(env_ids)
 
     def _update_poses(self, env_ids):
         with _without_physics(sim_utils.SimulationContext.instance()):
@@ -291,10 +358,15 @@ class InitialCamera(Camera):
             super().set_world_poses(positions, orientations, env_ids, convention)
 
 
+@configclass
+class InitialCameraCfg(CameraCfg):
+    render_shared_template_only: bool = False
+
+
 def make_initial_camera_cfg(*, reference: bool = False) -> CameraCfg:
-    return CameraCfg(
+    return InitialCameraCfg(
         class_type=InitialCamera,
-        prim_path="{ENV_REGEX_NS}/" + ("SilhouetteCamera" if reference else "InitialCamera"),
+        prim_path="/World/" + ("SilhouetteCamera" if reference else "InitialCamera"),
         update_period=1.0e9,
         width=640,
         height=480,
@@ -309,12 +381,22 @@ def make_initial_camera_cfg(*, reference: bool = False) -> CameraCfg:
     )
 
 
+def camera_sensor_index(camera, env_id: int) -> int:
+    """Map an episode to its reset camera slot, allowing legacy batched cameras."""
+    return 0 if camera.num_instances == 1 else env_id
+
+
+def camera_sensor_ids(camera, env_ids: torch.Tensor) -> torch.Tensor:
+    return env_ids.new_zeros(1) if camera.num_instances == 1 else env_ids
+
+
 def _instance_mask(camera, env_id: int, root_path: str) -> torch.Tensor:
-    info = camera.data.info[env_id].get("instance_segmentation_fast", {})
+    sensor_id = camera_sensor_index(camera, env_id)
+    info = camera.data.info[sensor_id].get("instance_segmentation_fast", {})
     labels = info.get("idToLabels")
     if labels is None:
         raise RuntimeError("Camera produced no instance-label mapping.")
-    pixels = camera.data.output["instance_segmentation_fast"][env_id, ..., 0]
+    pixels = camera.data.output["instance_segmentation_fast"][sensor_id, ..., 0]
     mask = torch.zeros_like(pixels, dtype=torch.bool)
     for key, label in labels.items():
         if isinstance(label, str) and (label == root_path or label.startswith(root_path + "/")):
@@ -357,16 +439,17 @@ def estimate_initial_scene(env, env_id: int) -> dict[str, torch.Tensor]:
     from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
     camera = env.scene["initial_camera"]
-    depth = camera.data.output["distance_to_image_plane"][env_id, ..., 0]
+    sensor_id = camera_sensor_index(camera, env_id)
+    depth = camera.data.output["distance_to_image_plane"][sensor_id, ..., 0]
     h, w = depth.shape
     rows, columns = torch.meshgrid(torch.arange(h, device=env.device), torch.arange(w, device=env.device), indexing="ij")
-    intrinsics = camera.data.intrinsic_matrices[env_id]
+    intrinsics = camera.data.intrinsic_matrices[sensor_id]
     points_c = torch.stack(((columns + 0.5 - intrinsics[0, 2]) * depth / intrinsics[0, 0],
                             (rows + 0.5 - intrinsics[1, 2]) * depth / intrinsics[1, 1], depth), dim=-1)
     shape = points_c.shape
     points_c = points_c.reshape(-1, 3)
-    camera_q = camera.data.quat_w_ros[env_id].expand(len(points_c), -1)
-    points_w = quat_apply(camera_q, points_c) + camera.data.pos_w[env_id]
+    camera_q = camera.data.quat_w_ros[sensor_id].expand(len(points_c), -1)
+    points_w = quat_apply(camera_q, points_c) + camera.data.pos_w[sensor_id]
     robot = env.scene["robot"]
     root_pos, root_q = robot.data.root_pos_w[env_id], robot.data.root_quat_w[env_id]
     points_b = quat_apply_inverse(root_q.expand(len(points_c), -1), points_w - root_pos).reshape(shape)
@@ -426,22 +509,18 @@ class InitialVisionSensor:
             raise ValueError("Initial vision requires a +X camera and complete same-pose reference silhouettes.")
         self.camera = env.scene["initial_camera"]
         self.reference_camera = env.scene["silhouette_camera"]
-        self._warm = False
+        self._warmed_cameras = set()
         self._references = {}
-        for env_id, env_path in enumerate(env.scene.env_prim_paths):
-            for asset_index, spec in enumerate(ASSET_SPECS):
-                root_path = f"{env_path}/VisionReferences/{spec.name}"
-                root = env.scene.stage.GetPrimAtPath(root_path)
-                relative = root.GetCustomDataByKey("reference_body")
-                body = root if relative == "." else env.scene.stage.GetPrimAtPath(root.GetPath().AppendPath(relative))
-                world = _world_transform(body)
-                if env_id:
-                    world.SetTranslateOnly(world.ExtractTranslation() + Gf.Vec3d(0., 0., 5. * env_id))
-                    _set_world_transform_on_reference_root(body, world)
-                rigid_rotation = Gf.Matrix4d(1.0).SetRotate(Gf.Transform(world).GetRotation())
-                stretch = world * rigid_rotation.GetInverse()
-                stretch.SetTranslateOnly(Gf.Vec3d(0.0))
-                self._references[env_id, spec.name] = (root_path, body, stretch, _reference_offset(asset_index, env_id))
+        for asset_index, spec in enumerate(ASSET_SPECS):
+            root_path = f"/World/VisionReferences/{spec.name}"
+            root = env.scene.stage.GetPrimAtPath(root_path)
+            relative = root.GetCustomDataByKey("reference_body")
+            body = root if relative == "." else env.scene.stage.GetPrimAtPath(root.GetPath().AppendPath(relative))
+            world = _world_transform(body)
+            rigid_rotation = Gf.Matrix4d(1.0).SetRotate(Gf.Transform(world).GetRotation())
+            stretch = world * rigid_rotation.GetInverse()
+            stretch.SetTranslateOnly(Gf.Vec3d(0.0))
+            self._references[spec.name] = (root_path, body, stretch, asset_index)
         n, h, w = env.num_envs, self.camera.cfg.height, self.camera.cfg.width
         env.initial_vision_rgb = torch.zeros((n, h, w, 3), dtype=torch.uint8, device=env.device)
         env.initial_vision_depth = torch.zeros((n, h, w, 1), device=env.device)
@@ -461,30 +540,50 @@ class InitialVisionSensor:
 
     def _render(self, camera):
         # SDK texture warmup; render() forwards Fabric but does not integrate.
-        for _ in range(5 if not self._warm else 2):
-            self.env.sim.render()
-        self._warm = True
+        # Keep the two products attached and enabled. Pausing their Hydra
+        # textures invalidates synthetic-data GPU pointers on Isaac Sim 5.1.
+        # Headless learning suppresses automatic render calls instead.
         with _without_physics(self.env.sim):
+            minimum_frames = 2 if camera in self._warmed_cameras else 5
+            for frame in range(1, 31):
+                self.env.sim.render()
+                if frame < minimum_frames:
+                    continue
+                ready = True
+                for annotators in camera._rep_registry.values():
+                    for annotator in annotators:
+                        output = annotator.get_data()
+                        if isinstance(output, dict):
+                            output = output.get("data")
+                        shape = getattr(output, "shape", ())
+                        ready &= bool(shape) and math.prod(shape) >= camera.cfg.width * camera.cfg.height
+                if ready:
+                    break
+            else:
+                raise RuntimeError(f"Initial camera annotators did not initialize after 30 renders: {camera.cfg.prim_path}")
             camera.update(0.0, force_recompute=True)
+            self._warmed_cameras.add(camera)
 
     def prepare(self):
         """Warm lazy annotator buffers before any camera.data read at reset."""
-        if not self._warm:
-            self._render(self.camera)
-            self._render(self.reference_camera)
+        for camera in (self.camera, self.reference_camera):
+            if camera not in self._warmed_cameras:
+                self._render(camera)
 
     def _reference_mask(self, env_id, object_id, position, quaternion):
         spec = OBJECT_SPECS[object_id]
-        root_path, body, stretch, offset = self._references[env_id, spec.asset_name]
+        root_path, body, stretch, asset_index = self._references[spec.asset_name]
+        offset = _reference_offset(asset_index, env_id)
         q = quaternion.detach().cpu().tolist()
         matrix = Gf.Matrix4d(1.0).SetRotate(Gf.Quatd(q[0], Gf.Vec3d(*q[1:])))
         matrix.SetTranslateOnly(Gf.Vec3d(*(position.detach().cpu().numpy() + offset)))
         _set_world_transform_on_reference_root(body, stretch * matrix)
-        ids = torch.tensor([env_id], device=self.env.device)
+        ids = torch.tensor([camera_sensor_index(self.reference_camera, env_id)], device=self.env.device)
+        camera_id = camera_sensor_index(self.camera, env_id)
         shift = torch.as_tensor(offset, device=self.env.device, dtype=torch.float32)[None]
         self.reference_camera.set_world_poses(
-            self.camera.data.pos_w[env_id:env_id + 1] + shift,
-            self.camera.data.quat_w_ros[env_id:env_id + 1], ids, convention="ros",
+            self.camera.data.pos_w[camera_id:camera_id + 1] + shift,
+            self.camera.data.quat_w_ros[camera_id:camera_id + 1], ids, convention="ros",
         )
         self.reference_camera.reset(ids)
         self._render(self.reference_camera)
@@ -502,13 +601,14 @@ class InitialVisionSensor:
         points = points @ rotation.T + np.array(sample.positions[object_id])
         points += self.env.scene.env_origins[env_id].cpu().numpy()
         pose = self.camera.data
-        q = pose.quat_w_ros[env_id].cpu().numpy()
+        sensor_id = camera_sensor_index(self.camera, env_id)
+        q = pose.quat_w_ros[sensor_id].cpu().numpy()
         camera_rotation = Rotation.from_quat(q[[1, 2, 3, 0]]).as_matrix()
-        local = (points - pose.pos_w[env_id].cpu().numpy()) @ camera_rotation
+        local = (points - pose.pos_w[sensor_id].cpu().numpy()) @ camera_rotation
         near, far = self.camera.cfg.spawn.clipping_range
         if np.any(local[:, 2] <= near) or np.any(local[:, 2] >= far):
             return False
-        projected = local @ pose.intrinsic_matrices[env_id].cpu().numpy().T
+        projected = local @ pose.intrinsic_matrices[sensor_id].cpu().numpy().T
         uv = projected[:, :2] / projected[:, 2:3]
         return bool(np.all(uv > 1) and np.all(uv < (self.camera.cfg.width - 2, self.camera.cfg.height - 2)))
 
@@ -519,12 +619,13 @@ class InitialVisionSensor:
         results = {}
         states = env.scene["objects"].data.object_link_state_w
         for env_id in env_ids.cpu().tolist():
+            sensor_id = camera_sensor_index(self.camera, env_id)
             sample = env.spawn_samples[env_id]
             rng = random.Random(int(env.spawn_seeds[env_id]) ^ 0x29AD93 ^ (layout_attempt * 0xC47213))
             origin = env.scene.env_origins[env_id].cpu().numpy()
             blocker = np.array(sample.positions[sample.blocker_id])
             target = np.array(sample.positions[sample.target_id])
-            ids = torch.tensor([env_id], device=env.device)
+            ids = torch.tensor([sensor_id], device=env.device)
             best = (0.0, 0.0)
             for attempt in range(1, cfg.max_camera_attempts + 1):
                 eye = origin + np.array((env.spawn_rules.x_range[1] + rng.uniform(*cfg.front_distance_range),
@@ -564,11 +665,11 @@ class InitialVisionSensor:
                     else:
                         perceived_scene = None
                     results[env_id] = {
-                        "rgb": self.camera.data.output["rgb"][env_id, ..., :3].clone(),
-                        "depth": self.camera.data.output["distance_to_image_plane"][env_id].clone(),
+                        "rgb": self.camera.data.output["rgb"][sensor_id, ..., :3].clone(),
+                        "depth": self.camera.data.output["distance_to_image_plane"][sensor_id].clone(),
                         "masks": torch.stack(actual_masks, dim=-1),
-                        "pose": torch.cat((self.camera.data.pos_w[env_id], self.camera.data.quat_w_ros[env_id])).clone(),
-                        "intrinsics": self.camera.data.intrinsic_matrices[env_id].clone(),
+                        "pose": torch.cat((self.camera.data.pos_w[sensor_id], self.camera.data.quat_w_ros[sensor_id])).clone(),
+                        "intrinsics": self.camera.data.intrinsic_matrices[sensor_id].clone(),
                         "fractions": fractions, "counts": counts, "attempts": attempt,
                         "perceived_scene": perceived_scene,
                     }
@@ -599,7 +700,10 @@ class InitialVisionSensor:
 
 def initialize_sensors(env):
     if not hasattr(env, "tool_force_torque_sensor"):
-        env.tool_force_torque_sensor = ToolForceTorqueSensor(env.scene["robot"])
+        calibration = getattr(env.cfg, "force_torque", SI_200_8_CALIBRATION)
+        if isinstance(calibration, ForceTorqueSensorCfg):
+            calibration = calibration.calibration()
+        env.tool_force_torque_sensor = ToolForceTorqueSensor(env.scene["robot"], calibration)
         env.ft_last_update_time = env.sim.current_time
     if not hasattr(env, "binary_tactile_sensor"):
         env.binary_tactile_sensor = BinaryTactileSensor(env)
@@ -622,6 +726,12 @@ def tool_wrench(env) -> torch.Tensor:
 def tool_wrench_valid(env) -> torch.Tensor:
     tool_wrench(env)
     return env.tool_force_torque_sensor.valid[:, None].clone()
+
+
+def tool_wrench_range_exceeded(env) -> torch.Tensor:
+    """Report raw applied-load overloads before measurement saturation or tare."""
+    tool_wrench(env)
+    return env.tool_force_torque_sensor.range_exceeded.clone()
 
 
 def tactile_contacts(env) -> torch.Tensor:
