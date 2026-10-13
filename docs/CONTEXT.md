@@ -2313,3 +2313,225 @@ checkpoint는 `outputs/contact_rearrangement/native_flow_validation/model_1.pt`�
 Notion에 언급된 이전 대화 전체·발표 원본·`docs/연구논의/` 등 모든 자료가
 이 checkout에 존재하거나 이번 작업에서 직접 확인된 것은 아니다. 필요하면 원문을
 확인하고, 이 문서에 보존된 요약을 전체 transcript 확인으로 확대하지 않는다.
+
+### 2026-10-13 새 프로젝트: 렌더링 없는 초기 기하 관측
+
+대상은 `src/contact_manipulation`이다. 기존 `src/contact_rearrangement`는 변경하지 않는다.
+사용자는 카메라·렌더링 메모리 비용을 없애고, 각 reset 시점에 보일 것으로 예상되는 정보만
+초기 observation으로 구성하는 방향을 제안했다. 기존 카메라는 reset마다 생성한 것이 아니라
+고정된 tiled pool을 재사용했지만, 실제 측정에서 첫 렌더 초기화의 메모리 증가가 컸다.
+
+새 프로젝트의 camera/render product/annotator/실루엣 참조 객체를 제거하고, Isaac Lab
+RayCaster와 같은 Warp mesh query 방식으로 대체했다. 사용자는 컵 손잡이·빈 공간을 반영하고
+보이는 표면에서만 observation을 추정하는 **실제 메시 기반 ray casting**을 선택해 확정했다.
+물체 종류별·로봇 링크별·
+선반의 표면 BVH를 공유하고 각 환경의 현재 pose만 적용한다. 매 episode의 독립 배치,
+Target/Blocker 선정과 앞쪽 시점·방향 randomization은 유지한다.
+
+- 기본 격자 320×240, 동시에 처리하는 가상 시점 상한 8. 환경 수만큼 카메라나 메시를 만들지 않는다.
+- Target ≥40%, Blocker ≥95% 조건은 같은 자세의 비가림 실루엣에 대한 **광선 표본 비율**로 계산한다.
+  넓힌 2배 격자의 고립 실루엣을 분모로 쓰고 시야 밖으로 잘린 role 물체는 거절한다.
+- 물체·로봇·선반 중 가장 가까운 표면만 보인다. 보이지 않는 물체는 observation에서 제외하며,
+  물체 전체 pose/크기를 직접 제공하지 않는다. 보이는 교차점의 PCA·extrema로 upright OBB를 추정한다.
+- 기하 추정은 tensor scatter로 처리한다. 초기 OBB를 episode 동안 고정하고 EEF frame으로
+  재표현하는 기존 544D observation, 고정 Target/Blocker 슬롯, mask 생성 규약은 유지한다.
+- 광학적 렌더링과 동일하지 않다. 불투명 표면·이상적 물체 association을 가정하며 투명/반사 재질,
+  조명, 검출 실패와 depth noise를 재현하지 않는다. 해상도 및 primitive tessellation 오차도 남는다.
+- Headless 학습은 카메라 기능을 강제로 켜지 않으며 reset render 호출은 0이다. GUI/video는
+  사용자가 요청한 표시/녹화용 렌더링을 별도로 사용한다.
+
+실제 32개 환경에서 초기 reset은 21.86→9.34초, 16개 부분 reset은 9.73→2.35초였다.
+프로세스 최고 RSS는 39,223→20,309 MiB, GPU 전체 사용량은 8,363→3,990 MiB였다.
+이는 각각 1회 통합 측정이며 JIT·IK 준비·재시도까지 포함한다. 부분 reset의 미선택 상태와
+physics 시간 보존, 새 초기 관측 및 가시율 조건을 통과했다. 장면·물리 복제 메모리는 여전히
+남으므로 이를 1,024개 실제 물리 환경의 생성/학습 검증으로 해석하지 않는다.
+
+### 2026-10-13 새 프로젝트: 장면 복제 메모리와 UR5e 표시 수정
+
+사용자가 1,024개 headless 실행의 종료와 4개 GUI 환경에서 UR5e가 하나만 보이는 현상을
+보고했다. 커널 OOM 기록상 15:02:12에 해당 Python이 host RAM 부족으로 종료됐으며,
+anonymous RSS는 40,233,996 KiB(약 38.37 GiB)였다. 초기 reset 이전 장면 복제 단계로,
+함께 출력된 Replicator semantic-label 경고가 종료 원인은 아니었다.
+
+`src/contact_manipulation`의 scene 마지막 spawner가 완성된 rigid body subtree를
+임시 USD에 저장하고 instance로 공유하도록 했다. 기존 nested geometry instance는
+flatten 전에 펼치며 외부 재질 binding도 함께 보존한다. 환경별 물리 body·관절·pose는
+독립적으로 유지하고 원본 에셋은 수정하지 않는다. Native USD cloner와 physics replication을
+사용하며 `clone_in_fabric=False`로 모든 환경을 Stage tree에서도 확인할 수 있다.
+필요 없는 semantic label 작성은 제거했다. ManagerBasedRLEnv·학습 runner는 그대로 사용한다.
+
+실제 32개 환경의 최고 RSS는 20,309→5,002 MiB로 감소했고 초기 가시율 결과가 기존과
+일치했다. 128개 환경은 최고 RSS 5,342 MiB, GPU 전체 사용량 4,340 MiB였다.
+32/128개에서 4 control step 및 절반 환경 reset 시 미선택 환경 보존이 통과했다.
+4개 환경의 실제 렌더에서 UR5e·hand가 모두 표시되며 각 환경의 로봇 메시 78개,
+총 articulation 4개를 확인했다. Native USD 검사 2개로 메시·재질·충돌체 보존과
+geometry 공유, body pose 독립성을 검증했다.
+
+1,024개 환경 생성은 통과했으나 초기 가시성 검사에서 기존 layout 8회 한도로는
+2개 환경이 남았다. 실패한 환경만 최대 32개 layout까지 재시도하도록 한도를 늘렸다.
+Target·Blocker·물체 구성 고정과 Target 40% / Blocker 95% 가시성 조건은 유지한다.
+
+수정 후 실제 1,024개 환경에서 기본 rollout 32, PPO 4 epochs·4 minibatches로
+native 학습 1 iteration을 완료했다(exit code 0). 초기 reset은 최대 17개 layout 제안으로
+모든 환경이 승인됐고, 학습 중 개별 auto-reset·32,768 transition 수집·PPO 갱신·
+TensorBoard와 checkpoint 저장까지 확인했다. 프로세스 최고 RSS 8,658 MiB(8.45 GiB),
+5초 간격 GPU 전체 사용량 관측 최댓값 7,732 MiB였다. Scene 생성 13.78초,
+학습 iteration 45.21초(수집 23.79초·갱신 21.42초), 초기화·초기 reset·종료 포함
+전체 실행 3분 56초였다. CPU 검사 156개와 별도 native USD 검사 2개가 통과했다.
+이로써 이전의 “1,024개 실제 환경 미검증” 상태를 해소했지만 장시간 학습·여러 seed는
+아직 검증하지 않았다. 새 production 파일이나 별도 Env/runner 클래스는 추가하지 않았다.
+
+### 2026-10-13 새 프로젝트: raw current/previous 입력과 초기 IK 교정
+
+사용자는 current/previous observation의 별도 encoder 도입을 확정한 적 없음을 지적했고,
+우선 scene encoder 결과에 두 sample을 직접 concat하여 최종 MLP에서 처리하도록 결정했다.
+이에 `HistoryEncoder`의 causal convolution과 `temporal_dim` 설정을 제거했다.
+Scene 320D + 현재 72D + 직전 72D = 464D를 MLP 256→128에 입력한다.
+GNN·역할 조건부 attention, actor/critic 공유, 544D observation 및 외부 mask 규약은 유지한다.
+Mask는 결측만 0으로 처리하며 feature로 붙이지 않는다. 파라미터 수는 234,789개다.
+이전 temporal encoder checkpoint는 새 구조와 호환되지 않으며 metadata 검사에서 거절한다.
+
+초기 자세 문제의 최종 사용자 설명은 “hand는 선반을 향하지만 elbow가 선반 쪽으로 나와
+꼬인 듯한 자세”였다. 기존 elbow-up 검사만으로는 높은 팔꿈치 앞에서 전완이 뒤로 접히는
+branch를 막지 못했고, 자기 충돌 검사는 arm끼리만 검사하여 hand–arm 겹침을 빠뜨렸다.
+수정 후 손목 관절 중심이 팔꿈치보다 선반 방향(-X)으로 최소 5 cm 앞에 있어야 한다.
+기존 elbow 높이 ≥5 cm·Blocker 앞 random TCP·hand 방향·scene 여유 15 mm도 유지한다.
+
+모든 hand collider와 arm 사이의 OBB 여유 2 mm를 배치 GPU SAT에 추가했다.
+고정 장착 관계인 hand–wrist_3/센서와 열린 hand 내부는 제외한다. Arm끼리의 두 관절 이내
+기계적 하우징 예외는 유지한다. 쌍 목록은 한 번 캐시해 CPU 검증과 GPU 검증이 공유한다.
+이는 초기 reset 후보의 검사이며 runtime PhysX self-collision 활성화 변경은 아니다.
+실패한 후보는 채택하지 않고 기존 독립 배치 재시도 경로로 처리한다.
+
+실제 USD 기하에서 독립 배치 128개로 비교했다. 기존 IK의 승인 127개 중 26개가 새 전완 방향
+조건을 위반했고, 10개가 hand–arm OBB 여유를 위반했다(두 집합은 중복 가능).
+수정 후 같은 배치 128개 중 승인된 125개는 모두 두 조건을 통과했고 최소 전완 전진 거리
+5.17 cm였다. 3개는 IK 한도 내에 해를 찾지 못해 거절됐다. 이 측정에는 시점 가시성 검사는
+포함하지 않는다. 4개 실제 환경의 초기 reset과 렌더 확인도 완료했다.
+
+최종 CPU 검사 158개와 native USD 검사 2개가 통과했다. 새 모델·IK 검사로 실제
+1,024개 환경에서 기본 rollout 32·PPO 4 epochs의 학습 1 iteration도 완료했다(exit code 0).
+TensorBoard·checkpoint 저장까지 확인했으며 최고 RSS 8,228 MiB(8.04 GiB),
+iteration 41.16초, 초기화·종료 포함 전체 실행 3분 41초였다. 새 production 파일은 없다.
+
+### 2026-10-13 새 프로젝트: iteration 처리량 개선
+
+사용자는 약 30초/iteration에서 90,000 iteration이 너무 오래 걸린다고 지적했다.
+실제 사용자 TensorBoard 로그에서 collection 약 9–13초, learning 약 17–18초를 확인했다.
+환경 수·rollout 32·PPO 4 epochs·4 minibatches·모델 설계를 유지하는 최적화를 적용했다.
+
+- GNN message MLP의 두 번째 affine map을 edge 평균 이후로 옮겼다.
+  `mean(Wx+b)=W mean(x)+b`를 사용하며, 이웃이 없는 node에서는 bias를 0으로 차단한다.
+  기존 dense 식의 출력·입력/파라미터 gradient 및 고립 node의 bias gradient 검사가 통과했다.
+- 추론 chunk 기본값 128→512, 학습 microbatch 128→1,024로 변경했다.
+  각 PPO minibatch 안의 gradient 누적 횟수만 줄이며 전체 sample·optimizer step 수는 유지한다.
+  모델 파라미터·state dict·metadata는 같아서 기존 raw current/previous checkpoint도 호환된다.
+- 합성 native runner(1,024환경·rollout 32·epochs 4·minibatches 4)에서 기존 chunk 128의
+  18.34초가 최적화 후 chunk 1,024에서 3.97초로 감소했다. PyTorch allocated peak는
+  약 1,893 MiB이며 이는 시뮬레이터 제외 측정이다.
+- 실제 1,024환경·3 iteration에서 learning 3.40/3.32/3.33초,
+  collection 23.42/12.78/13.48초, iteration 26.82/16.10/16.81초를 확인했다.
+  CPU 검사 159개가 통과했고 기존 사용자 checkpoint의 metadata·전체 모델 weight를
+  strict load로 확인했다. Native runner와 production reset logging은 변경하지 않았다.
+
+남은 큰 비용은 환경 실행과 독립 reset이다. 임시 계측에서 3 iteration reset 준비 합계
+26.37초 중 layout 8.87초·IK 3.79초·vision 13.20초였다. 이는 host wall time이며
+긴 학습에서 timeout reset이 늘어난 구간의 평균은 아직 확인하지 않았다.
+90,000 iteration은 현재 설정에서 2,949,120,000 transition이므로 30초일 때 31.25일,
+16–17초일 때도 약 16.7–17.7일이다. 이번 작업에서 epoch·rollout·환경 수를 줄이거나
+학습을 90,000회 실행하지는 않았다. 새 production 파일은 추가하지 않았다.
+
+### 2026-10-13 새 프로젝트: ReLU baseline과 attention/fusion 명확화
+
+사용자는 SiLU 대신 ReLU를 선택했다. GNN node/message/update MLP와 concat 이후 최종
+MLP의 SiLU를 모두 ReLU로 변경했다. Activation은 weight가 없으므로 tensor shape만으로
+checkpoint 호환성을 판별할 수 없다. `ModelCfg.activation="relu"`를 metadata에 포함하여
+이전 SiLU checkpoint를 동일 모델처럼 resume하는 것을 막는다. 위 처리량 수치는 ReLU 전환
+전 SiLU 모델에서 측정한 결과다.
+
+역할 조건부 attention은 제거되지 않았으며 `SceneGraphEncoder.forward()`에서 Target/Blocker
+embedding으로 두 query를 만들고 전체 관측 node의 key/value와 masked softmax를 계산한다.
+`fusion`의 `nn.Sequential`은 concat 후 최종 MLP의 layer container다. 시간 인코더가 아니며
+`Linear(464,256) → ReLU → Linear(256,128) → ReLU`를 순서대로 실행한다.
+
+### 2026-10-13 초기 ray perception의 중복 연산 축소
+
+Ray casting은 CPU가 아니라 환경의 CUDA device에서 Warp mesh BVH query로 실행한다.
+CPU에는 시점 난수 생성과 후보 재시도 제어가 남는다. ReLU/SiLU 교체와 별개로
+reset의 초기 관측 생성이 큰 비용임을 확인하고 기존 sensors.py 안에서 최적화했다.
+
+- 시야 밖의 고립 실루엣 광선은 전체 body 목록을 순회하지 않고 두 role mesh를 직접 조회한다.
+- Target/Blocker 가시성 검사를 통과한 후보만 visible point cloud와 OBB를 계산한다.
+- 실제 메시, 320×240 해상도, 40%/95% 가시율, 독립 episode seed와 재시도 규칙은 유지한다.
+
+32환경 native 검사에서 16환경 부분 reset의 capture_batch 합계는 1.196→1.026초,
+부분 reset 전체는 2.187→2.046초였다. 최초 reset은 7.770→7.794초로 유의한 개선이
+없었다(초기 컴파일/준비 비용 포함). 단일 비교이며 1,024환경 전체 iteration의 개선율로
+일반화하지 않는다. CPU 테스트 160개 실행 중 159개 통과, native 전용 1개 skip.
+
+추가로 같은 GPU 실제 장면에서 기존/신규 capture를 11 batch 비교했다. Role mask,
+가시율, pixel count, 승인 여부, 선택 시점의 attempt가 일치했다. Depth/OBB/시점 pose는
+float32 연산 오차를 고려한 rtol=1e-4, atol=1e-5로 일치했다. 최초 준비 batch를 제외한
+동일 입력 비교에서도 초기 관측 생성 시간이 감소했으며, 장시간 1,024환경 학습은
+이번 변경 후 다시 측정하지 않았다.
+
+### 2026-10-13 1,024환경 iteration 병목 실측
+
+사용자는 512환경도 느려 중단했으며, 분석 기준을 1,024환경으로 지정했다.
+학습 알고리즘·관측·보상·가시율·해상도·timeout을 변경하지 않고 native runner의
+10 iteration을 임시 wrapper로 계측했다. 새 production 파일은 추가하지 않았다.
+
+기존 장시간 실행 `logs/rsl_rl/contact_manipulation/2026-10-13_17-25-25`의
+마지막 100 iteration은 collection 평균 37.563초, learning 평균 3.394초였다.
+약 92%가 rollout 쪽이다. 초기 몇 iteration만 측정하면 reset 부담을 과소평가한다.
+
+이번 계측은 `/tmp/contact_hotspots_train.py`, 결과는 `/tmp/contact_hotspots_1024.json`,
+native 로그는 `/tmp/logs/rsl_rl/contact_manipulation/2026-10-13_19-36-13`에 있다.
+초기화 비용은 제외했다. 10 iteration 전체 학습 시간은 284.07초였다.
+
+8번째 iteration(index 7)의 collection 123.24초 + learning 3.45초를 분해하면:
+
+| 구간 | 시간 | 비고 |
+| --- | ---: | --- |
+| CPU 배치 생성 `sample_scene` | 59.38초 | 1,323회 호출; reset 대상별 순차 실행 |
+| 초기 vision 전체 | 51.86초 | 1,091장면 요청, 8,910시점 후보 |
+| IK 초기 자세 검색 | 3.83초 | 이미 CUDA graph를 사용하는 batch IK |
+| 나머지 reset | 0.88초 | reset 전체 115.94초에서 위 세 항을 제외 |
+| reset 제외 env.step | 6.90초 | 물리·제어·상태 갱신 등 |
+| PPO/return 계산 | 3.45초 | native logger learning_time |
+| 나머지 rollout | 0.40초 | policy 추론·rollout bookkeeping 등 |
+
+이 iteration의 reset 대상은 924개였다. 위 시간은 중첩 구간을 제외한 분해다.
+별도 CUDA event에서 vision 내부 `_trace`는 41.94초, OBB fit은 0.99초였다.
+GPU 시간은 vision 시간에 포함되므로 표에 다시 더하면 안 된다.
+계측 wrapper와 GPU 동기화/CPU 대기 때문에 미세한 비용 귀속 오차가 있으며,
+동일 seed라도 GPU 수치 오차와 학습 경로에 따라 기존 실행과 reset 대상 수는 달라질 수 있다.
+
+Reset이 적은 index 1–6은 reset 제외 env.step 평균 6.61초, PPO update 평균 3.34초였다.
+현재 구현에서 reset을 완전히 제거한다고 가정해도 약 10초 수준의 기본 비용이 남는다.
+이는 하드웨어의 절대 하한이 아니라 이번 구현에서 측정한 기준이다.
+
+원인과 다음 최적화 우선순위:
+
+1. `events._build_episode_batch`가 Python `for row in pending` 안에서 전체 layout을
+   순차 탐색한다. 일부 SAT/영역 계산만 Numba이며 경로 sweep·convex hull은 Python이다.
+   실제 catalog를 재사용한 별도 CPU profile(50회)에서는 `sample_scene` 누적 2.244초 중
+   `_path_sweeps` 0.871초, 그 내부 `_convex_hull` 0.764초였다(중첩 수치).
+   성공 경로 sweep의 재계산을 줄이고 이 기하 루프를 컴파일/배치화하는 것이 우선이다.
+   독립 seed를 유지하면서 환경별 준비를 병렬화할 여지도 크다.
+2. Ray query 자체는 Warp CUDA다. 현재 이미지 내 광선은 모든 활성 object/robot/shelf
+   mesh를 순회하고, 가시성에 실패한 시점에서도 이 전체 작업을 수행한다.
+   실제 메시 기반 role-only 판정으로 필수 조건을 먼저 검사하고, 통과 후보만 전체 장면을
+   조회하는 단계화와 보수적인 광선/메시 후보 제거가 다음 대상이다.
+   Role-only 가시율은 다른 가림을 추가하기 전의 상한이므로 이미 기준 미달이면
+   전체 장면 조회 없이 안전하게 거절할 수 있다. 최종 승인에는 전체 메시 판정이 필요하다.
+3. Episode 8초 / control dt 1/30초 = 240step, rollout 32step이므로 동시에 시작한
+   episode의 첫 timeout이 8번째 iteration에 몰린다. 부하 분산은 최대 지연을 줄이지만
+   reset 총량을 없애지는 않는다. Native timeout counter만 무작위화하면 elapsed time,
+   initial vision/history와 episode 의미가 어긋나므로 그 방식은 적용하지 않는다.
+4. 그다음은 기본 물리/제어 비용이다. 이번 보통 iteration에서 physics_step 약 2.8초,
+   apply_actions 약 1.3초, scene.update 약 0.62초였다(호스트 측 구간이며 CUDA 대기 포함).
+   OBB fit, activation 교체, policy 추론은 현재 우선순위가 낮다.
+
+이번 턴은 원인 분석이며 위 구조 변경의 속도 향상을 구현/보장한 것은 아니다.
+모든 환경의 독립 장면과 실제 메시 가시성 조건을 유지하는 방향으로 후속 최적화를 진행한다.

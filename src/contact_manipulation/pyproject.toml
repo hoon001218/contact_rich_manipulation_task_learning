@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contact-manipulation"
+version = "0.0.1"
+description = "Manager-based Isaac Lab MDP and graph policy for contact-rich shelf manipulation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["gymnasium", "numba>=0.59", "trimesh", "warp-lang"]
+
+[tool.setuptools.packages.find]
+include = ["contact_manipulation*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"

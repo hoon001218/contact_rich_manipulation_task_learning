@@ -1,0 +1,2265 @@
+"""CPU MDP invariants and numerical controller checks; no Isaac Sim scene required."""
+
+import ast
+from contextlib import contextmanager
+import dataclasses
+import math
+from pathlib import Path
+import sys
+import types
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+from scipy.spatial import ConvexHull
+from scipy.spatial.transform import Rotation
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from contact_manipulation.mdp import events as task, observations as obs, rewards, terminations
+
+# Execute the actual numerical section of actions.py. The native ActionTerm
+# classes below that section require a running Kit app and are checked separately.
+control = types.ModuleType("contact_control")
+_action_path = Path(__file__).resolve().parents[1] / "contact_manipulation/mdp/actions.py"
+exec(compile(_action_path.read_text().split("from isaaclab.controllers import", 1)[0],
+             str(_action_path), "exec"), control.__dict__)
+
+def scene(batch=2, objects=5):
+    geometry = torch.zeros((batch, objects, 10), dtype=torch.float64)
+    geometry[..., 0] = torch.arange(objects)
+    geometry[..., 3] = 1.0
+    geometry[..., 7:] = 0.1
+    return geometry
+
+
+def identity(batch, bodies=None):
+    shape = (batch, 4) if bodies is None else (batch, bodies, 4)
+    quaternion = torch.zeros(shape, dtype=torch.float64)
+    quaternion[..., 0] = 1.0
+    return quaternion
+
+
+def rotation_matrix(q):
+    """Independent quaternion-to-matrix formula used only by the force oracle."""
+    w, x, y, z = q.unbind(-1)
+    return torch.stack((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w),
+                        2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w),
+                        2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)), -1).reshape(*q.shape[:-1], 3, 3)
+
+
+class InitialGeometryTests(unittest.TestCase):
+    def test_roles_reorder_once_distractors_preserve_order_and_padding_is_zero(self):
+        source = scene()
+        original = source.clone()
+        valid = torch.tensor([[True, True, False, True, True], [True, False, True, True, True]])
+        geometry, ordered_valid = obs.prepare_initial_geometry(
+            source, valid, torch.tensor([3, 2]), torch.tensor([0, 4]), capacity=7
+        )
+        torch.testing.assert_close(geometry[0, :4, 0], torch.tensor([3., 0., 1., 4.], dtype=source.dtype))
+        torch.testing.assert_close(geometry[1, :4, 0], torch.tensor([2., 4., 0., 3.], dtype=source.dtype))
+        self.assertTrue(ordered_valid[:, :4].all())
+        self.assertFalse(ordered_valid[:, 4:].any())
+        self.assertEqual(int(geometry[:, 4:].count_nonzero()), 0)
+        torch.testing.assert_close(source, original)
+
+    def test_unobserved_target_and_unassociated_blocker_leave_reserved_slots_empty(self):
+        source = scene(batch=1)
+        valid = torch.tensor([[True, True, False, True, False]])
+        geometry, result_valid = obs.prepare_initial_geometry(
+            source, valid, torch.tensor([2]), torch.tensor([-1]), capacity=5
+        )
+        self.assertEqual(int(geometry[:, :2].count_nonzero()), 0)
+        self.assertFalse(result_valid[:, :2].any())
+        torch.testing.assert_close(geometry[0, 2:, 0], source[0, [0, 1, 3], 0])
+
+    def test_source_can_be_larger_than_output_when_only_visible_objects_fit(self):
+        source = scene(batch=1, objects=100)
+        valid = torch.zeros((1, 100), dtype=torch.bool)
+        valid[:, [6, 30, 90]] = True
+        geometry, result_valid = obs.prepare_initial_geometry(
+            source, valid, torch.tensor([90]), torch.tensor([30]), capacity=4
+        )
+        torch.testing.assert_close(geometry[0, :3, 0], source[0, [90, 30, 6], 0])
+        self.assertEqual(int(result_valid.sum()), 3)
+
+    def test_invalid_role_assignments_or_capacity_fail_at_snapshot_acceptance(self):
+        source, valid = scene(batch=1), torch.ones((1, 5), dtype=torch.bool)
+        for target, blocker in ((0, 0), (-2, 1), (5, 0)):
+            with self.subTest(target=target, blocker=blocker), self.assertRaises(ValueError):
+                obs.prepare_initial_geometry(source, valid, torch.tensor([target]), torch.tensor([blocker]))
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            obs.prepare_initial_geometry(source, valid, torch.tensor([0]), torch.tensor([1]), capacity=4)
+
+    def test_valid_geometry_rejects_nonfinite_nonpositive_extent_and_nonunit_quaternion(self):
+        valid = torch.ones((1, 5), dtype=torch.bool)
+        for component, value in ((0, float("nan")), (8, float("inf")), (7, 0.0), (9, -.2),
+                                 (3, 0.0), (3, 2.0)):
+            source = scene(batch=1)
+            source[0, 2, component] = value
+            with self.subTest(component=component, value=value), self.assertRaisesRegex(
+                ValueError, "finite.*positive extents.*unit quaternions"
+            ):
+                obs.prepare_initial_geometry(source, valid, torch.tensor([0]), torch.tensor([1]))
+
+    def test_slight_quaternion_drift_is_normalized_without_mutating_source_and_invalid_nan_is_padding(self):
+        source = scene(batch=1)
+        source[0, 0, 3] = 1.0005
+        source[0, 2] = float("nan")
+        valid = torch.tensor([[True, True, False, True, True]])
+        result, result_valid = obs.prepare_initial_geometry(
+            source, valid, torch.tensor([0]), torch.tensor([1]), capacity=6
+        )
+        self.assertEqual(float(result[0, 0, 3]), 1.0)
+        self.assertEqual(float(source[0, 0, 3]), 1.0005)
+        self.assertTrue(torch.isfinite(result).all())
+        self.assertEqual(int(result[:, 4:].count_nonzero()), 0)
+        self.assertFalse(result_valid[:, 4:].any())
+
+    def test_eef_coordinates_follow_robot_measurement_without_mutating_frozen_geometry(self):
+        source = scene(batch=1, objects=2)
+        source[0, 0, :3] = torch.tensor([2., 2., 3.])
+        original = source.clone()
+        tcp = torch.tensor([[1., 2., 3., math.sqrt(.5), 0., 0., math.sqrt(.5)]], dtype=source.dtype)
+        result = obs.geometry_in_eef_frame(source, torch.tensor([[True, False]]), tcp)
+        torch.testing.assert_close(result[0, 0, :3], torch.tensor([0., -1., 0.], dtype=source.dtype))
+        torch.testing.assert_close(result[0, 0, 3:7], torch.tensor([math.sqrt(.5), 0., 0., -math.sqrt(.5)], dtype=source.dtype))
+        torch.testing.assert_close(result[0, 0, 7:], source[0, 0, 7:])
+        self.assertEqual(int(result[0, 1].count_nonzero()), 0)
+        torch.testing.assert_close(source, original)
+
+    def test_quaternion_sign_equivalent_geometry_has_same_policy_encoding(self):
+        source = scene(batch=1, objects=2)
+        source[0, 1, 0] = 0.0
+        source[0, 1, 3] = -1.0
+        tcp = torch.tensor([[0., 0., 0., 1., 0., 0., 0.]], dtype=source.dtype)
+        result = obs.geometry_in_eef_frame(source, torch.ones((1, 2), dtype=torch.bool), tcp)
+        torch.testing.assert_close(result[:, 0], result[:, 1])
+
+
+class DynamicObservationTests(unittest.TestCase):
+    def values(self, batch=3):
+        tcp = torch.zeros((batch, 7))
+        tcp[:, 3] = 1.0
+        return dict(joint_pos=torch.zeros((batch, 12)), joint_vel=torch.zeros((batch, 12)),
+                    tcp_pose_b=tcp, compensated_wrench=torch.zeros((batch, 6)),
+                    tactile_contacts=torch.zeros((batch, 17), dtype=torch.bool),
+                    tactile_valid=torch.ones((batch, 17), dtype=torch.bool),
+                    previous_action=torch.zeros((batch, 18)))
+
+    def test_72_channels_have_agreed_units_sensor_axes_and_missing_tactile(self):
+        values = self.values(batch=1)
+        values["joint_pos"][:] = math.pi
+        values["joint_vel"][:] = 2.0
+        values["compensated_wrench"][:] = torch.tensor([200., -200., 360., -8., 8., 80.])
+        values["tactile_contacts"][:, [0, 5]] = True
+        values["tactile_valid"][:, [5, 16]] = False
+        values["previous_action"][:, 0] = 2.0
+        sample = obs.dynamic_sample(**values)
+        self.assertEqual(sample.shape, (1, 72))
+        torch.testing.assert_close(sample[:, :24], torch.ones((1, 24)))
+        torch.testing.assert_close(sample[:, 24:31], values["tcp_pose_b"])
+        torch.testing.assert_close(sample[0, 31:37], torch.tensor([1., -1., 1., -1., 1., 5.]))
+        torch.testing.assert_close(sample[0, [37, 42, 53]], torch.tensor([1., -1., -1.]))
+        self.assertEqual(float(sample[0, 54]), 1.0)
+
+    def test_pack_has_exactly_geometry_current_previous_with_no_role_or_mask_channels(self):
+        geometry = scene(batch=3, objects=40)
+        current = obs.dynamic_sample(**self.values())
+        previous = current.clone()
+        previous[:, 0] = -0.5
+        history = torch.stack((current, previous), dim=1).double()
+        packed = obs.pack_policy_observation(geometry, history)
+        self.assertEqual(packed.shape, (3, 544))
+        torch.testing.assert_close(packed[:, :400], geometry.flatten(1))
+        torch.testing.assert_close(packed[:, 400:472], current.double())
+        torch.testing.assert_close(packed[:, 472:], previous.double())
+
+    def test_invalid_mimic_joint_or_long_history_dimensions_are_rejected(self):
+        values = self.values()
+        values["joint_pos"] = torch.zeros((3, 18))
+        with self.assertRaisesRegex(ValueError, "12 independent"):
+            obs.dynamic_sample(**values)
+        with self.assertRaisesRegex(ValueError, "current and previous"):
+            obs.pack_policy_observation(scene(), torch.zeros((2, 16, 72)))
+
+    def test_hot_path_batches_1024_environments_without_tensor_scalar_reads(self):
+        batch = 1024
+        values = self.values(batch)
+        geometry = scene(batch, 40).float()
+        valid = torch.ones((batch, 40), dtype=torch.bool)
+        with patch.object(torch.Tensor, "item", side_effect=AssertionError("GPU scalar synchronization")), \
+             patch.object(torch.Tensor, "__bool__", side_effect=AssertionError("GPU condition synchronization")):
+            current = obs.dynamic_sample(**values)
+            transformed = obs.geometry_in_eef_frame(geometry, valid, values["tcp_pose_b"])
+            packed = obs.pack_policy_observation(transformed, torch.stack((current, current), dim=1))
+            raw, _ = obs.calibrate_wrench(values["compensated_wrench"])
+            corrected = obs.compensate_wrench(raw, raw, raw, torch.ones(batch, dtype=torch.bool))
+        self.assertEqual(packed.shape, (batch, 544))
+        torch.testing.assert_close(corrected, torch.zeros_like(raw))
+
+
+class WrenchTests(unittest.TestCase):
+    def test_saturation_resolution_and_overload_apply_to_raw_before_compensation(self):
+        ideal = torch.tensor([[200.2, -.14, 360.0, 8.2, .011, -.014]], dtype=torch.float64)
+        measured, exceeded = obs.calibrate_wrench(ideal)
+        torch.testing.assert_close(measured, torch.tensor([[200., -.1, 360., 8., .01, -.015]], dtype=ideal.dtype))
+        torch.testing.assert_close(exceeded, torch.tensor([[True, False, False, True, False, False]]))
+        load = measured - .003
+        corrected = obs.compensate_wrench(measured, load, torch.zeros_like(load), torch.tensor([True]))
+        torch.testing.assert_close(corrected, torch.full_like(corrected, .003))
+
+    def test_static_gravity_and_lever_arm_remove_distal_weight(self):
+        masses = torch.tensor([[2.]], dtype=torch.float64)
+        com = torch.tensor([[[1., 0., 0.]]], dtype=masses.dtype)
+        wrench = obs.self_motion_wrench(
+            masses, torch.eye(3, dtype=masses.dtype)[None, None], com, identity(1, 1),
+            torch.zeros((1, 1, 6), dtype=masses.dtype), torch.zeros((1, 1, 3), dtype=masses.dtype),
+            torch.zeros((1, 3), dtype=masses.dtype), identity(1), torch.tensor([0., 0., -9.81]),
+        )
+        torch.testing.assert_close(wrench, torch.tensor([[0., 0., 19.62, 0., -19.62, 0.]], dtype=masses.dtype))
+
+    def test_articulated_rotational_inertia_matches_independent_world_matrix_oracle(self):
+        generator = torch.Generator().manual_seed(47)
+        def random(*shape):
+            return torch.randn(shape, generator=generator, dtype=torch.float64)
+        batch, bodies = 7, 5
+        masses = random(batch, bodies).abs() + .1
+        basis = random(batch, bodies, 3, 3)
+        inertias = basis @ basis.transpose(-1, -2)
+        body_q, sensor_q = random(batch, bodies, 4), random(batch, 4)
+        body_q = body_q / body_q.norm(dim=-1, keepdim=True)
+        sensor_q = sensor_q / sensor_q.norm(dim=-1, keepdim=True)
+        com, acceleration, omega = random(batch, bodies, 3), random(batch, bodies, 6), random(batch, bodies, 3)
+        sensor_pos, gravity = random(batch, 3), torch.tensor([0., 0., -9.81], dtype=torch.float64)
+        actual = obs.self_motion_wrench(masses, inertias, com, body_q, acceleration, omega,
+                                        sensor_pos, sensor_q, gravity)
+        body_r, sensor_r = rotation_matrix(body_q), rotation_matrix(sensor_q)
+        inertia_world = body_r @ inertias @ body_r.transpose(-1, -2)
+        forces = masses[..., None] * (acceleration[..., :3] - gravity)
+        momentum = (inertia_world @ omega[..., None]).squeeze(-1)
+        moment = (inertia_world @ acceleration[..., 3:, None]).squeeze(-1)
+        moment += torch.linalg.cross(omega, momentum, dim=-1)
+        moment += torch.linalg.cross(com-sensor_pos[:, None], forces, dim=-1)
+        inverse_sensor = sensor_r.transpose(-1, -2)
+        expected = torch.cat(((inverse_sensor @ forces.sum(1)[..., None]).squeeze(-1),
+                              (inverse_sensor @ moment.sum(1)[..., None]).squeeze(-1)), dim=-1)
+        torch.testing.assert_close(actual, expected)
+
+    def test_compensation_cancels_self_load_and_bias_preserves_external_load_and_masks_invalid(self):
+        self_load = torch.arange(18, dtype=torch.float64).reshape(3, 6)
+        bias = torch.full_like(self_load, .025)
+        external = torch.tensor([[1., -2., 3., .1, -.2, .3]], dtype=self_load.dtype).expand(3, -1)
+        raw = self_load + bias + external
+        raw[1] = float("nan")
+        result = obs.compensate_wrench(raw, self_load, bias, torch.tensor([True, False, True]))
+        torch.testing.assert_close(result[[0, 2]], external[[0, 2]])
+        torch.testing.assert_close(result[1], torch.zeros(6, dtype=result.dtype))
+
+def settings():
+    return SimpleNamespace(
+        clearance_decay=1.0, rearrangement_decay=2.0, motion_acceleration_decay=1.0,
+        motion_wrench_increase_decay=1.0, time_penalty_scale=0.02, time_penalty_growth_rate=0.7,
+        arm_joint_acceleration_ref=5.0, hand_joint_acceleration_ref=10.0,
+        force_rate_ref=200.0, torque_rate_ref=10.0, stable_steps=5,
+        success_reward=500.0, failure_penalty=100.0, target_translation_tolerance=0.02,
+        target_rotation_tolerance=0.15, stable_linear_velocity=0.015,
+        stable_angular_velocity=0.10, success_overlap_area=1.e-5,
+        workspace_tolerance=0.015, drop_tolerance=0.06, lift_tolerance=0.04,
+        max_tilt=math.radians(50), force_hard=80.0, torque_hard=4.0,
+    )
+
+
+def reward_inputs(n=1):
+    return dict(
+        blocked=torch.zeros(n, dtype=torch.float64), blocker_area=torch.ones(n, dtype=torch.float64),
+        path_length=torch.zeros(n, dtype=torch.float64),
+        joint_velocity=torch.zeros(n, 12, dtype=torch.float64),
+        previous_joint_velocity=torch.zeros(n, 12, dtype=torch.float64),
+        wrench=torch.zeros(n, 6, dtype=torch.float64), previous_wrench=torch.zeros(n, 6, dtype=torch.float64),
+        elapsed_time=torch.zeros(n, dtype=torch.float64), dt=0.1,
+    )
+
+
+def physical_inputs(n=1, objects=3):
+    center = torch.zeros(n, objects, 3, dtype=torch.float64)
+    center[..., 2] = 0.1
+    signs = torch.tensor([[-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
+                          [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]], dtype=center.dtype)
+    corners = center[..., None, :] + 0.1 * signs
+    rotation = torch.zeros(n, objects, 4, dtype=center.dtype)
+    rotation[..., 0] = 1.0
+    active = torch.ones(n, objects, dtype=torch.bool)
+    target = torch.zeros_like(active)
+    target[:, 0] = True
+    return dict(center=center, corners=corners, rotation=rotation,
+                velocity=torch.zeros(n, objects, 6, dtype=center.dtype), active=active, target=target,
+                initial_center=center.clone(), initial_rotation=rotation.clone(),
+                total_overlap=torch.zeros(n, dtype=center.dtype),
+                sensor_wrench=torch.zeros(n, 6, dtype=center.dtype),
+                stable_count=torch.zeros(n, dtype=torch.long),
+                workspace_bounds=torch.tensor([-1., 1., -1., 1.], dtype=center.dtype),
+                shelf_top=0.0, ceiling=0.8)
+
+
+class RewardTests(unittest.TestCase):
+    def test_three_quality_scores_follow_exponential_costs(self):
+        data = reward_inputs(3)
+        data["blocked"][:] = torch.tensor([0.0, 0.5, 1.0])
+        data["path_length"][:] = torch.tensor([0.0, 0.25, 0.5])
+        components, costs = rewards.reward_components(settings(), **data)
+        expected = torch.exp(torch.tensor([0.0, -0.5, -1.0], dtype=torch.float64))
+        torch.testing.assert_close(components[:, 0], expected)
+        torch.testing.assert_close(components[:, 1], expected)
+        torch.testing.assert_close(components[:, 2], torch.ones(3, dtype=torch.float64))
+        torch.testing.assert_close(costs, torch.zeros_like(costs))
+
+    def test_motion_acceleration_uses_arm_and_independent_hand_joint_scales(self):
+        data = reward_inputs(2)
+        data["joint_velocity"][0, 0] = 0.5  # 5 rad/s², one arm reference.
+        data["joint_velocity"][1, 6] = 1.0  # 10 rad/s², one hand reference.
+        scores, costs = rewards.reward_components(settings(), **data)
+        torch.testing.assert_close(costs[:, 0], torch.ones(2, dtype=torch.float64))
+        torch.testing.assert_close(scores[:, 2], torch.full((2,), (math.exp(-1) + 1) / 2, dtype=torch.float64))
+        data["previous_joint_velocity"].copy_(data["joint_velocity"])
+        constant_scores, _ = rewards.reward_components(settings(), **data)
+        torch.testing.assert_close(constant_scores[:, 2], torch.ones(2, dtype=torch.float64))
+
+    def test_force_and_torque_only_penalize_magnitude_increase(self):
+        data = reward_inputs(4)
+        data["previous_wrench"][:, 0] = 20.0
+        data["previous_wrench"][:, 3] = 1.0
+        data["wrench"][0] = torch.tensor([40., 0., 0., 2., 0., 0.])  # Each +one rate reference.
+        data["wrench"][1] = data["previous_wrench"][1]
+        data["wrench"][2] = 0.0  # Release contributes no cost.
+        data["wrench"][3] = torch.tensor([0., -20., 0., 0., -1., 0.])  # Direction only.
+        _, costs = rewards.reward_components(settings(), **data)
+        torch.testing.assert_close(costs[:, 1], torch.tensor([2., 0., 0., 0.], dtype=torch.float64))
+
+    def test_corner_path_translation_rotation_return_and_inactive_nan(self):
+        data = physical_inputs(objects=2)
+        before = data["corners"]
+        translated = before + torch.tensor([0.3, 0.4, 0.0], dtype=before.dtype)
+        active = torch.tensor([[True, False]])
+        translated[:, 1] = math.nan
+        increment = rewards.corner_path_increment(before, translated, active)
+        torch.testing.assert_close(increment, torch.tensor([0.5], dtype=before.dtype))
+        returned = rewards.corner_path_increment(translated, before, active)
+        torch.testing.assert_close(increment + returned, torch.tensor([1.0], dtype=before.dtype))
+        # Rotate the cube 90 degrees about its center: every XY corner moves 0.2 m.
+        rotated = before.clone()
+        rotated[..., 0], rotated[..., 1] = -before[..., 1], before[..., 0]
+        angular_increment = rewards.corner_path_increment(before, rotated, active)
+        torch.testing.assert_close(angular_increment, torch.tensor([0.2], dtype=before.dtype))
+
+    def test_exact_time_integral_independent_of_step_partition(self):
+        cfg = settings()
+        total_time = 8.0
+        reference = -cfg.time_penalty_scale * (math.expm1(cfg.time_penalty_growth_rate * total_time)
+                                              / cfg.time_penalty_growth_rate - total_time)
+        for steps in (1, 80, 240, 800):
+            data = reward_inputs(steps)
+            data["dt"] = total_time / steps
+            data["elapsed_time"] = torch.arange(steps, dtype=torch.float64) * data["dt"]
+            components, _ = rewards.reward_components(cfg, **data)
+            self.assertAlmostEqual(components[:, 3].sum().item(), reference, places=12)
+            self.assertTrue(torch.all(components[1:, 3] < components[:-1, 3]))
+
+    def test_small_first_time_step_retains_nonzero_cost(self):
+        data = reward_inputs()
+        data["dt"] = 1.e-8
+        scores, _ = rewards.reward_components(settings(), **data)
+        expected = -0.02 * 0.7 * data["dt"] ** 2 / 2
+        self.assertAlmostEqual(scores[0, 3].item() / expected, 1.0, places=8)
+
+    def test_nonfinite_state_does_not_produce_nonfinite_reward(self):
+        data = reward_inputs(3)
+        data["joint_velocity"][0, 0] = math.nan
+        data["wrench"][1, 1] = math.inf
+        data["path_length"][2] = math.nan
+        scores, costs = rewards.reward_components(settings(), **data)
+        self.assertTrue(torch.isfinite(scores).all())
+        self.assertTrue(torch.isfinite(costs).all())
+        self.assertEqual(scores[0, 2], 0.0)
+        self.assertEqual(scores[2, 1], 0.0)
+
+    def test_large_parallel_reward_batch_equals_independent_chunks(self):
+        torch.manual_seed(11)
+        data = reward_inputs(4096)
+        for key in ("blocked", "path_length", "joint_velocity", "previous_joint_velocity", "wrench", "previous_wrench"):
+            data[key].uniform_(0.0, 1.0)
+        data["elapsed_time"].uniform_(0.0, 8.0)
+        all_scores, all_costs = rewards.reward_components(settings(), **data)
+        split_scores, split_costs = [], []
+        for start in range(0, 4096, 257):
+            chunk = {k: v[start:start + 257] if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+            scores, costs = rewards.reward_components(settings(), **chunk)
+            split_scores.append(scores)
+            split_costs.append(costs)
+        torch.testing.assert_close(all_scores, torch.cat(split_scores))
+        torch.testing.assert_close(all_costs, torch.cat(split_costs))
+
+
+class TerminationTests(unittest.TestCase):
+    def test_stable_success_failure_priority_and_single_terminal_payment(self):
+        cfg = settings()
+        candidate = torch.tensor([True, True, True, False])
+        failed = torch.tensor([False, False, True, False])
+        stable = torch.tensor([4, 5, 5, 0])
+        paid = torch.zeros(4, dtype=torch.bool)
+        success, terminal, paid = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
+        self.assertEqual(success.tolist(), [False, True, False, False])
+        self.assertEqual(terminal.tolist(), [0., 500., -100., 0.])
+        _, repeated, _ = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
+        torch.testing.assert_close(repeated, torch.zeros_like(repeated))
+
+    def test_target_protection_overlap_and_all_objects_settled(self):
+        data = physical_inputs(5)
+        data["center"][1, 0, 0] += 0.021
+        data["rotation"][2, 0] = torch.tensor([math.cos(0.08), 0., 0., math.sin(0.08)])
+        data["total_overlap"][3] = 1.e-4
+        data["velocity"][4, 2, 0] = 0.016
+        data["stable_count"][:] = 2
+        candidate, stable, _, failed = terminations.task_conditions(settings(), **data)
+        self.assertEqual(candidate.tolist(), [True, False, False, False, False])
+        self.assertEqual(stable.tolist(), [3, 0, 0, 0, 0])
+        self.assertFalse(failed.any())
+
+    def test_each_failure_reason_and_invalid_state_is_independent(self):
+        data = physical_inputs(7)
+        data["corners"][0, 1, :, 2] -= 0.061
+        data["rotation"][1, 1] = torch.tensor([math.cos(math.pi / 6), math.sin(math.pi / 6), 0., 0.])
+        data["corners"][2, 1, :, 0] += 1.1
+        data["corners"][3, 1, :, 2] += 0.041
+        data["sensor_wrench"][4, 0] = 80.1
+        data["forbidden_contact"] = torch.tensor([False, False, False, False, False, True, False])
+        data["center"][6, 1, 1] = math.nan
+        candidate, stable, reasons, failed = terminations.task_conditions(settings(), **data)
+        torch.testing.assert_close(reasons, torch.eye(7, dtype=torch.bool))
+        self.assertTrue(failed.all())
+        self.assertFalse(candidate.any())
+        torch.testing.assert_close(stable, torch.zeros(7, dtype=torch.long))
+
+    def test_nonfinite_initial_geometry_wrench_velocity_and_robot_fail(self):
+        data = physical_inputs(5)
+        data["initial_rotation"][0, 1] = math.nan
+        data["sensor_wrench"][1, 0] = math.nan
+        data["velocity"][2, 1, 0] = math.inf
+        data["state_valid"] = torch.tensor([True, True, True, False, True])
+        data["rotation"][4, 1] = 0.0  # Invalid quaternion must not count as upright.
+        _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        self.assertTrue(reasons[:, 6].all())
+        self.assertTrue(failed.all())
+
+    def test_inactive_nan_slots_do_not_poison_conditions(self):
+        data = physical_inputs(2)
+        data["active"][:, 2] = False
+        for key in ("center", "corners", "rotation", "velocity", "initial_center", "initial_rotation"):
+            data[key][:, 2] = math.nan
+        candidate, stable, reasons, failed = terminations.task_conditions(settings(), **data)
+        self.assertTrue(candidate.all())
+        self.assertFalse(reasons.any())
+        self.assertFalse(failed.any())
+        torch.testing.assert_close(stable, torch.ones_like(stable))
+
+    def test_total_sensor_overrange_fails_even_with_zero_compensated_load(self):
+        data = physical_inputs(2)
+        data["sensor_range_exceeded"] = torch.zeros(2, 6, dtype=torch.bool)
+        data["sensor_range_exceeded"][1, 2] = True
+        _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        self.assertEqual(failed.tolist(), [False, True])
+        self.assertTrue(reasons[1, 4])
+
+    def test_per_environment_workspace_and_shelf_offsets(self):
+        data = physical_inputs(2)
+        data["corners"][1, :, :, 2] += 2.0
+        data["shelf_top"] = torch.tensor([0.0, 2.0], dtype=torch.float64)
+        data["ceiling"] = torch.tensor([0.8, 2.8], dtype=torch.float64)
+        data["workspace_bounds"] = data["workspace_bounds"].repeat(2, 1)
+        candidate, _, _, failed = terminations.task_conditions(settings(), **data)
+        self.assertTrue(candidate.all())
+        self.assertFalse(failed.any())
+
+    def test_large_parallel_conditions_equal_independent_chunks(self):
+        torch.manual_seed(19)
+        data = physical_inputs(2048, objects=40)
+        data["velocity"].normal_(mean=0.0, std=0.006)
+        data["total_overlap"].uniform_(0.0, 2.e-5)
+        data["stable_count"].random_(0, 8)
+        data["sensor_wrench"].normal_(mean=0.0, std=1.0)
+        full = terminations.task_conditions(settings(), **data)
+        chunks = [[], [], [], []]
+        for start in range(0, 2048, 257):
+            chunk = {k: v[start:start + 257] if isinstance(v, torch.Tensor) and k != "workspace_bounds" else v
+                     for k, v in data.items()}
+            partial = terminations.task_conditions(settings(), **chunk)
+            for output, value in zip(chunks, partial):
+                output.append(value)
+        for expected, parts in zip(full, chunks):
+            torch.testing.assert_close(expected, torch.cat(parts))
+
+class ActionContractTests(unittest.TestCase):
+    def test_batched_mapping_keeps_segments_units_and_per_environment_limits(self):
+        actions = torch.tensor([[1, -1, 0, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1.0]])
+        actions = actions.expand(1024, -1)
+        gain_min = torch.tensor([100, 100, 100, 5, 5, 5.0])
+        gain_span = 7 * gain_min
+        hand_lower = torch.arange(1024, dtype=torch.float32)[:, None].expand(-1, 6) / 1024
+        hand_span = torch.full((1024, 6), 0.6)
+        normal, delta, gain, hand = control.map_action(
+            actions, torch.tensor([0.01, 0.02, 0.03, 0.04, 0.05, 0.06]),
+            gain_min, gain_span, hand_lower, hand_span,
+        )
+        torch.testing.assert_close(normal, actions)
+        torch.testing.assert_close(delta[0], torch.tensor([0.01, -0.02, 0, -0.04, 0, 0.06]))
+        torch.testing.assert_close(gain[0], torch.tensor([100, 450, 800, 5, 22.5, 40.0]))
+        torch.testing.assert_close(hand - hand_lower, torch.tensor([0, 0.3, 0.6, 0, 0.3, 0.6]).expand_as(hand))
+
+    def test_invalid_and_out_of_range_actions_map_to_finite_bounded_commands(self):
+        actions = torch.tensor([[math.nan, math.inf, -math.inf] * 6])
+        mapped = control.map_action(actions, torch.ones(6), torch.ones(6), torch.ones(6),
+                                    torch.zeros(1, 6), torch.ones(1, 6))
+        self.assertTrue(all(bool(torch.isfinite(value).all()) for value in mapped))
+        torch.testing.assert_close(mapped[0][0, :3], torch.tensor([0, 1, -1.0]))
+        self.assertTrue(math.isnan(actions[0, 0]))  # Source tensor remains unchanged.
+
+    def test_rotation_uses_fixed_base_axes_and_measured_pose_each_step(self):
+        half = math.sqrt(0.5)
+        pose = torch.tensor([[0.2, -0.1, 0.3, half, 0, half, 0]], dtype=torch.float64)
+        delta = torch.tensor([[0.01, 0.02, -0.03, math.pi / 2, 0, 0]], dtype=torch.float64)
+        low, high = torch.full((3,), -2.0), torch.full((3,), 2.0)
+        target, clipped = control.pose_target_from_delta(pose, delta, low, high)
+        torch.testing.assert_close(target, torch.tensor([[0.21, -0.08, 0.27, 0.5, 0.5, 0.5, 0.5]], dtype=torch.float64))
+        self.assertFalse(bool(clipped[0]))
+        torch.testing.assert_close(target, control.pose_target_from_delta(pose, delta, low, high)[0])
+
+    def test_zero_rotation_workspace_bound_and_hand_target_do_not_wind_up(self):
+        pose = torch.tensor([[0.99, 0, 0, -1, 0, 0, 0.0]])
+        target, clipped = control.pose_target_from_delta(pose, torch.tensor([[0.1, 0, 0, 0, 0, 0.0]]),
+                                                       torch.full((3,), -1.0), torch.ones(3))
+        torch.testing.assert_close(target, torch.tensor([[1, 0, 0, 1, 0, 0, 0.0]]))
+        self.assertTrue(bool(clipped[0]))
+        measured, desired, step = torch.tensor([[0.2, 0.4]]), torch.tensor([[1.0, 0.0]]), torch.tensor([[0.01, 0.02]])
+        hand = control.bounded_hand_target(desired, measured, step)
+        torch.testing.assert_close(hand, torch.tensor([[0.21, 0.38]]))
+        torch.testing.assert_close(hand, control.bounded_hand_target(desired, measured, step))
+
+    def test_com_shift_and_base_rotation_match_rigid_body_velocity(self):
+        jacobian = torch.tensor([[[1.0], [0], [0], [0], [0], [2.0]]])
+        expected = torch.tensor([-1, -0.5, 0, 0, 0, 2.0])
+        shifted = control.jacobian_at_link_origin(jacobian, torch.tensor([[0.25, 0, 0]]),
+                                                torch.diag(torch.tensor([-1, -1, 1.0]))[None])
+        torch.testing.assert_close(shifted[0, :, 0], expected)
+        torch.testing.assert_close(jacobian[0, :, 0], torch.tensor([1, 0, 0, 0, 0, 2.0]))
+
+
+class PhysicalControllerTests(unittest.TestCase):
+    def test_coupled_matrix_square_root_matches_eigen_reference(self):
+        torch.manual_seed(17)
+        basis, _ = torch.linalg.qr(torch.randn(128, 6, 6))
+        eigenvalues = torch.logspace(-3, 1, 6).expand(128, -1)
+        matrix = (basis * eigenvalues[:, None, :]) @ basis.mT
+        root, converged = control.symmetric_matrix_sqrt(matrix, torch.eye(6).expand_as(matrix))
+        self.assertTrue(bool(converged.all()))
+        reference = (basis * eigenvalues.sqrt()[:, None, :]) @ basis.mT
+        torch.testing.assert_close(root, reference, atol=2e-5, rtol=2e-4)
+        self.assertEqual(root.dtype, torch.float32)
+
+    def test_ill_conditioned_square_root_retains_small_directions_or_flags_failure(self):
+        values = torch.tensor([[1.0, 2, 3, 4, 5, 1e8], [1.0, 2, 3, 4, 5, 1e10]])
+        matrix = torch.diag_embed(values)
+        identity = torch.eye(6).expand_as(matrix)
+        root, converged = control.symmetric_matrix_sqrt(matrix, identity)
+        self.assertTrue(bool(converged.all()))
+        torch.testing.assert_close(root.diagonal(dim1=-2, dim2=-1), values.sqrt(), rtol=1e-4, atol=1e-5)
+        _, incomplete = control.symmetric_matrix_sqrt(matrix, identity, iterations=20)
+        self.assertFalse(bool(incomplete.any()))
+
+    def test_full_coupled_damping_matches_geometric_mean_reference(self):
+        dtype = torch.float64
+        inertia = torch.diag(torch.tensor([0.01, 0.02, 0.1, 1, 2, 0.004], dtype=dtype))[None]
+        inertia[0, 0, 1] = inertia[0, 1, 0] = 0.003
+        gains = torch.tensor([[300, 600, 800, 5, 20, 40]], dtype=dtype)
+        identity = torch.eye(6, dtype=dtype)[None]
+        error = torch.tensor([[0.01, -0.03, 0.02, -0.05, 0.1, 0.02]], dtype=dtype)
+        velocity = torch.tensor([[0.01, 0.02, 0.03, 0.04, -0.01, 0.02]], dtype=dtype)
+        dt, eps = 1 / 120, 1e-6
+        correction, next_velocity, invalid = control.implicit_cartesian_damping(
+            identity, inertia, gains, velocity, error, dt, identity,
+        )
+        regularized_mass = torch.linalg.inv(torch.linalg.inv(inertia) + eps * identity)
+        root_gain = gains.sqrt()
+        scaled_mass = regularized_mass / root_gain[:, :, None] / root_gain[:, None, :]
+        values, axes = torch.linalg.eigh(scaled_mass)
+        root = (axes * values.sqrt().unsqueeze(-2)) @ axes.mT
+        damping = 2 * root_gain[:, :, None] * root * root_gain[:, None, :]
+        torch.testing.assert_close(damping @ torch.linalg.solve(regularized_mass, damping), 4 * torch.diag_embed(gains))
+        expected_v = torch.linalg.solve(regularized_mass + dt * damping + dt * dt * torch.diag_embed(gains),
+                                       regularized_mass @ velocity[..., None] + dt * (gains * error)[..., None])
+        torch.testing.assert_close(next_velocity, expected_v.squeeze(-1), atol=1e-8, rtol=1e-7)
+        torch.testing.assert_close(correction, ((damping + dt * torch.diag_embed(gains)) @ expected_v).squeeze(-1),
+                                   atol=1e-8, rtol=1e-7)
+        self.assertFalse(bool(invalid[0]))
+
+    def test_light_wrist_backward_euler_decreases_energy(self):
+        identity = torch.eye(6, dtype=torch.float64)[None]
+        inertia = torch.diag(torch.tensor([1, 1, 1, 0.0014, 0.002, 0.003], dtype=torch.float64))[None]
+        gains = torch.tensor([[800, 800, 800, 40, 40, 40]], dtype=torch.float64)
+        error = torch.tensor([[0.01, 0, 0, 0.05, 0.02, 0]], dtype=torch.float64)
+        velocity = torch.zeros_like(error)
+        energy = 0.5 * (gains * error.square()).sum()
+        for _ in range(60):
+            correction, _, invalid = control.implicit_cartesian_damping(
+                identity, inertia, gains, velocity, error, 1 / 120, identity,
+            )
+            self.assertFalse(bool(invalid[0]))
+            velocity += torch.linalg.solve(inertia, (gains * error - correction)[..., None]).squeeze(-1) / 120
+            error -= velocity / 120
+            next_energy = 0.5 * ((gains * error.square()).sum() + (velocity[:, None, :] @ inertia @ velocity[..., None]).sum())
+            self.assertLessEqual(next_energy.item(), energy.item() + 1e-10)
+            energy = next_energy
+        self.assertLess(energy.item(), 1e-8)
+
+    def test_rank_deficient_batch_is_finite_and_solver_failure_stays_per_env(self):
+        count = 1024
+        identity = torch.eye(6).expand(count, -1, -1)
+        jacobian = identity.clone()
+        jacobian[::2, 5] = 0
+        inertia = identity.clone()
+        inertia[-1] = 0
+        correction, velocity, invalid = control.implicit_cartesian_damping(
+            jacobian, inertia, torch.full((count, 6), 100.0),
+            torch.zeros(count, 6), torch.full((count, 6), 0.01), 1 / 120, identity,
+        )
+        self.assertTrue(bool(torch.isfinite(correction[:-1]).all()))
+        self.assertTrue(bool(torch.isfinite(velocity[:-1]).all()))
+        self.assertFalse(bool(invalid[:-1].any()))
+        self.assertTrue(bool(invalid[-1]))
+
+def _clip_oracle(vertices, bounds):
+    """Independent scalar half-plane oracle operating on SciPy's convex hull."""
+    current = [np.asarray(vertex) for vertex in vertices]
+    for axis, bound, keep_lower in ((0, bounds[0], False), (0, bounds[1], True),
+                                     (1, bounds[2], False), (1, bounds[3], True)):
+        output = []
+        if not current:
+            return 0.0
+        for previous, following in zip(current[-1:] + current[:-1], current):
+            previous_inside = previous[axis] <= bound if keep_lower else previous[axis] >= bound
+            next_inside = following[axis] <= bound if keep_lower else following[axis] >= bound
+            if previous_inside != next_inside:
+                ratio = (bound - previous[axis]) / (following[axis] - previous[axis])
+                output.append(previous + ratio * (following - previous))
+            if next_inside:
+                output.append(following)
+        current = output
+    if len(current) < 3:
+        return 0.0
+    polygon = np.asarray(current)
+    return abs(np.dot(polygon[:, 0], np.roll(polygon[:, 1], -1))
+               - np.dot(polygon[:, 1], np.roll(polygon[:, 0], -1))) / 2
+
+
+def fixture(n=3, *, dtype=torch.float64):
+    cfg = task.MdpCfg()
+    o = cfg.max_objects
+    center = torch.zeros(n, o, 3, dtype=dtype)
+    center[..., 0] = torch.arange(o, dtype=dtype) * 0.12
+    center[..., 2] = 0.05
+    signs = torch.tensor([[-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
+                          [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]], dtype=dtype)
+    corners = center[..., None, :] + 0.05 * signs
+    rotation = torch.zeros(n, o, 4, dtype=dtype)
+    rotation[..., 0] = 1.0
+    sensor_rotation = torch.zeros(n, 4, dtype=dtype)
+    sensor_rotation[:, 0] = 1.0
+    tcp_pose = torch.zeros(n, 7, dtype=dtype)
+    tcp_pose[:, 3] = 1.0
+    batch = task.TransitionBatch(
+        center=center, corners=corners, rotation=rotation,
+        velocity=torch.zeros(n, o, 6, dtype=dtype), joint_velocity=torch.zeros(n, 12, dtype=dtype),
+        sensor_wrench=torch.zeros(n, 6, dtype=dtype), sensor_position=torch.zeros(n, 3, dtype=dtype),
+        sensor_rotation=sensor_rotation, sensor_range_exceeded=torch.zeros(n, 6, dtype=torch.bool),
+        forbidden_contact=torch.zeros(n, dtype=torch.bool), state_valid=torch.ones(n, dtype=torch.bool),
+        sample=torch.arange(72, dtype=dtype).expand(n, -1).clone(), tcp_pose_b=tcp_pose,
+    )
+    active = torch.ones(n, o, dtype=torch.bool)
+    target = torch.zeros_like(active)
+    target[:, 0] = True
+    blocker = torch.zeros_like(active)
+    blocker[:, 1] = True
+    geometry = torch.zeros(n, o, 10, dtype=dtype)
+    geometry[..., :3] = center
+    geometry[..., 3] = 1.0
+    geometry[..., 7:] = 0.1
+    reset = dict(geometry_b=geometry, geometry_valid=active.clone(), active=active, target=target,
+                 blocker=blocker, access_region=torch.tensor([-0.1, 0.2, -0.2, 0.2], dtype=dtype).expand(n, -1),
+                 workspace_bounds=torch.tensor([-10., 10., -2., 2.], dtype=dtype).expand(n, -1),
+                 shelf_top=torch.zeros(n, dtype=dtype), ceiling=torch.ones(n, dtype=dtype))
+    state = task.TaskState(n, "cpu", cfg, 0.1, dtype=dtype)
+    state.reset(torch.arange(n), batch, **reset, step=0)
+    return state, batch, reset
+
+
+def clone_batch(batch, **updates):
+    values = {field.name: getattr(batch, field.name).clone() for field in dataclasses.fields(batch)}
+    values.update(updates)
+    return task.TransitionBatch(**values)
+
+
+def native_fixture(n=3):
+    """Native tensor layout with deliberately independent camera and GT geometry."""
+    class Scene(dict):
+        pass
+
+    origins = torch.zeros(n, 3)
+    origins[:, 1] = torch.arange(n) * 3.0
+    root_q = torch.tensor([1., 0., 0., 0.]).expand(n, 4).clone()
+    body_q = root_q[:, None].expand(n, 4, 4).clone()
+    body_pos = origins[:, None].expand(n, 4, 3).clone()
+    body_pos[:, 1:, 2] += .5
+    body_com = body_pos.clone()
+    body_com[:, 3, 0] += .1
+    data = types.SimpleNamespace(
+        body_link_pos_w=body_pos, body_link_quat_w=body_q,
+        body_com_pos_w=body_com, body_com_acc_w=torch.zeros(n, 4, 6),
+        body_com_ang_vel_w=torch.zeros(n, 4, 3), root_pos_w=origins.clone(), root_quat_w=root_q,
+        joint_pos=torch.zeros(n, 12), joint_vel=torch.zeros(n, 12),
+    )
+    inertia = torch.diag(torch.tensor([.01, .02, .03])).flatten().expand(n, 4, 9).clone()
+    robot = types.SimpleNamespace(
+        body_names=["base", "tcp", "ft", "hand"], data=data,
+        root_physx_view=types.SimpleNamespace(get_masses=lambda: torch.ones(n, 4), get_inertias=lambda: inertia),
+    )
+    physical_pose = torch.zeros(n, 4, 7)
+    physical_pose[..., :3] = origins[:, None]
+    physical_pose[..., 0] += torch.tensor([-.1, .1, .3, .5])
+    physical_pose[..., 2] += .05
+    physical_pose[..., 3] = 1.
+    objects = types.SimpleNamespace(data=types.SimpleNamespace(
+        object_link_pose_w=physical_pose, object_com_pos_w=physical_pose[..., :3].clone(),
+        object_com_vel_w=torch.zeros(n, 4, 6),
+    ))
+    scene = Scene(robot=robot, object_collection=objects)
+    scene.env_origins = origins
+    action = types.SimpleNamespace(arm_joint_ids=list(range(6)), hand_joint_ids=list(range(6, 12)),
+                                   tcp_body_id=1, normalized_actions=torch.zeros(n, 18),
+                                   invalid_control=torch.zeros(n, dtype=torch.bool))
+    object_ids = torch.full((n, 40), -1, dtype=torch.long)
+    object_ids[:, :3] = torch.tensor([2, 0, 3])
+    observed_ids = torch.full((n, 40), -1, dtype=torch.long)
+    observed_ids[:, :3] = torch.tensor([3, 2, 0])
+    geometry = torch.zeros(n, 40, 10)
+    geometry[:, :3, 0] = torch.tensor([.51, .31, -.11])
+    geometry[:, :3, 2] = .12
+    geometry[:, :3, 3] = 1.
+    geometry[:, :3, 7:] = .08
+    geometry_valid = observed_ids >= 0
+    source = task.SceneBatch(
+        object_ids=object_ids, target_id=torch.full((n,), 2), blocker_id=torch.zeros(n, dtype=torch.long),
+        geometry_b=geometry, geometry_valid=geometry_valid, observed_ids=observed_ids,
+        lower=torch.full((4, 3), -.05), upper=torch.full((4, 3), .05),
+        upright=torch.tensor([1., 0., 0., 0.]).expand(4, 4).clone(),
+        access_region=torch.tensor([-.2, .29, -.2, .2]).expand(n, 4).clone(),
+        workspace_bounds=torch.tensor([-1., 1., -1., 1.]).expand(n, 4).clone(),
+        shelf_top=torch.zeros(n), ceiling=torch.ones(n), sensor_body_name="ft", distal_body_names=("ft", "hand"),
+    )
+    external = torch.tensor([1., 2., 3., .1, .2, .3]).expand(n, 6).clone()
+    self_load = torch.tensor([0., 0., 20., 0., -1., 0.])
+    sensors = task.SensorBatch(
+        ideal_wrench=external+self_load, wrench_valid=torch.ones(n, dtype=torch.bool),
+        tactile_force=torch.zeros(n, 17, 3), tactile_valid=torch.ones(n, 17, dtype=torch.bool),
+        forbidden_contact=torch.zeros(n, dtype=torch.bool),
+    )
+    env = types.SimpleNamespace(
+        num_envs=n, device="cpu", cfg=types.SimpleNamespace(mdp=task.MdpCfg()), step_dt=.1,
+        common_step_counter=0, scene=scene, sim=types.SimpleNamespace(cfg=types.SimpleNamespace(gravity=(0., 0., -10.))),
+        action_manager=types.SimpleNamespace(get_term=lambda name: action),
+        task_scene_data=source, sensors=sensors, extras={}, sensor_read_count=0,
+    )
+    def read_sensors():
+        env.sensor_read_count += 1
+        return env.sensors
+    env.task_sensor_reader = read_sensors
+    return env, action, external
+
+
+class GeometryTests(unittest.TestCase):
+    def test_random_roll_pitch_yaw_obb_hull_and_overlap_match_scipy(self):
+        rng = np.random.default_rng(33)
+        rotations = Rotation.random(200, random_state=rng)
+        sizes = rng.uniform(0.01, 0.5, (200, 3))
+        centers = rng.uniform(-0.3, 0.3, (200, 3))
+        signs = np.array([[-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
+                          [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]])
+        corners = np.einsum("nij,nkj->nki", rotations.as_matrix(), sizes[:, None, :] * signs) + centers[:, None, :]
+        points = torch.tensor(corners[..., :2], dtype=torch.float64)
+        polygons, counts = task.convex_hull_xy(points)
+        areas = task.polygon_area(polygons, counts).numpy()
+        bounds = np.array([-0.15, 0.25, -0.2, 0.3])
+        overlaps = task.rectangle_overlap_area(polygons, counts, torch.tensor(bounds)).numpy()
+        expected_areas, expected_overlaps = [], []
+        for xy in corners[..., :2]:
+            hull = ConvexHull(xy)
+            expected_areas.append(hull.volume)
+            expected_overlaps.append(_clip_oracle(xy[hull.vertices], bounds))
+        np.testing.assert_allclose(areas, expected_areas, rtol=1.e-11, atol=1.e-12)
+        np.testing.assert_allclose(overlaps, expected_overlaps, rtol=1.e-10, atol=1.e-12)
+
+    def test_axis_aligned_duplicate_corners_and_disjoint_clipping(self):
+        _, batch, _ = fixture(1)
+        points = batch.corners[:, 0, :, :2]
+        polygons, count = task.convex_hull_xy(points)
+        self.assertEqual(count.item(), 4)
+        torch.testing.assert_close(task.polygon_area(polygons, count), torch.tensor([0.01], dtype=points.dtype))
+        overlap = task.rectangle_overlap_area(polygons, count, torch.tensor([2., 3., 2., 3.]))
+        torch.testing.assert_close(overlap, torch.zeros_like(overlap))
+
+    def test_degenerate_zero_boxes_have_zero_area_and_overlap(self):
+        points = torch.zeros(10, 8, 2, dtype=torch.float64)
+        polygon, count = task.convex_hull_xy(points)
+        torch.testing.assert_close(task.polygon_area(polygon, count), torch.zeros(10, dtype=points.dtype))
+        overlap = task.rectangle_overlap_area(polygon, count, torch.tensor([-1., 1., -1., 1.]))
+        torch.testing.assert_close(overlap, torch.zeros_like(overlap))
+
+    def test_object_geometry_removes_catalog_upright_once_with_off_center_origin(self):
+        q = torch.tensor([[math.sqrt(0.5), 0., 0., math.sqrt(0.5)]], dtype=torch.float64)
+        pose = torch.cat((torch.tensor([[2., 3., 0.]], dtype=q.dtype), q), -1)
+        local_center = torch.tensor([[0.2, 0., 0.1]], dtype=q.dtype)
+        local_corners = local_center[:, None, :].expand(-1, 8, -1).clone()
+        center, corners, relative = task.object_geometry(pose, local_center, local_corners, q)
+        torch.testing.assert_close(center, pose[:, :3] + local_center)
+        torch.testing.assert_close(corners, (pose[:, :3] + local_center)[:, None, :].expand(-1, 8, -1))
+        torch.testing.assert_close(relative, torch.tensor([[1., 0., 0., 0.]], dtype=q.dtype))
+
+
+class StateTests(unittest.TestCase):
+    def test_history_current_previous_and_once_per_global_step(self):
+        state, batch, _ = fixture()
+        initial = state.history.clone()
+        batch.sample.fill_(5.0)
+        state.advance(batch, 1)
+        torch.testing.assert_close(state.history[:, 1], initial[:, 0])
+        torch.testing.assert_close(state.history[:, 0], batch.sample)
+        snapshot = {k: v.clone() for k, v in vars(state).items() if isinstance(v, torch.Tensor)}
+        batch.sample.fill_(8.0)
+        state.advance(batch, 1)
+        for key, value in snapshot.items():
+            torch.testing.assert_close(getattr(state, key), value)
+        state.advance(batch, 2)
+        torch.testing.assert_close(state.history[:, 1], torch.full_like(batch.sample, 5.0))
+        torch.testing.assert_close(state.history[:, 0], torch.full_like(batch.sample, 8.0))
+        torch.testing.assert_close(state.elapsed_time, torch.full_like(state.elapsed_time, 0.2))
+
+    def test_partial_reset_only_changes_selected_episode_rows(self):
+        state, batch, reset = fixture(4)
+        batch.corners.add_(torch.tensor([0.001, 0.0, 0.0], dtype=batch.corners.dtype))
+        batch.center[..., 0].add_(0.001)
+        state.advance(batch, 1)
+        untouched = torch.tensor([0, 2])
+        snapshot = {k: v[untouched].clone() for k, v in vars(state).items()
+                    if isinstance(v, torch.Tensor) and v.shape[:1] == state.history.shape[:1]}
+        ids = torch.tensor([1, 3])
+        batch.sample.fill_(6.0)
+        state.reset(ids, batch, **reset, step=1)
+        for key, value in snapshot.items():
+            torch.testing.assert_close(getattr(state, key)[untouched], value)
+        torch.testing.assert_close(state.path_length[ids], torch.zeros(2, dtype=state.path_length.dtype))
+        torch.testing.assert_close(state.elapsed_time[ids], torch.zeros(2, dtype=state.elapsed_time.dtype))
+        torch.testing.assert_close(state.history[ids, 1], torch.zeros_like(state.history[ids, 1]))
+        torch.testing.assert_close(state.history[ids, 0, 31:37], torch.zeros(2, 6, dtype=state.history.dtype))
+        torch.testing.assert_close(state.history[ids, 0, 37:54], -torch.ones(2, 17, dtype=state.history.dtype))
+        # Late settling/render physics without a completed control step cannot advance history.
+        batch.sample.fill_(12.0)
+        state.advance(batch, 1)
+        torch.testing.assert_close(state.history[ids, 0, :31], torch.full((2, 31), 6.0, dtype=state.history.dtype))
+        state.advance(batch, 2)
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([.2, .1, .2, .1], dtype=state.elapsed_time.dtype))
+
+    def test_cumulative_corner_path_keeps_out_and_back_movement(self):
+        state, batch, _ = fixture(1)
+        before = clone_batch(batch)
+        batch.corners[..., 0].add_(0.01)
+        batch.center[..., 0].add_(0.01)
+        state.advance(batch, 1)
+        torch.testing.assert_close(state.path_length, torch.tensor([0.4], dtype=state.path_length.dtype))
+        state.advance(before, 2)
+        torch.testing.assert_close(state.path_length, torch.tensor([0.8], dtype=state.path_length.dtype))
+        torch.testing.assert_close(state.components[:, 1], torch.exp(-2 * state.path_length))
+
+    def test_wrench_transforms_to_fixed_world_axes_and_initial_sensor_origin(self):
+        state, batch, _ = fixture(1)
+        batch.sensor_rotation[:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        batch.sensor_position[0, 0] = 1.0
+        batch.sensor_wrench[0, 0] = 1.0
+        state.advance(batch, 1)
+        expected = torch.tensor([[0., 1., 0., 0., 0., 1.]], dtype=state.previous_wrench.dtype)
+        torch.testing.assert_close(state.previous_wrench, expected, rtol=1.e-6, atol=1.e-7)
+        # Same resultant wrench at the fixed origin despite moving the measurement origin.
+        batch.sensor_position[0, 0] = 2.0
+        batch.sensor_wrench[0, 5] = -1.0
+        state.advance(batch, 2)
+        torch.testing.assert_close(state.previous_wrench, expected, rtol=1.e-6, atol=1.e-7)
+        torch.testing.assert_close(state.motion_costs[:, 1], torch.zeros(1, dtype=expected.dtype), atol=1.e-12, rtol=0)
+
+    def test_global_step_gaps_fail_explicitly(self):
+        state, batch, _ = fixture(1)
+        with self.assertRaisesRegex(RuntimeError, "once every"):
+            state.advance(batch, 2)
+
+    def test_invalid_state_failure_has_finite_learning_outputs(self):
+        state, batch, _ = fixture(2)
+        batch.corners[0, 1] = math.nan
+        batch.sample[0, 0] = math.nan
+        batch.state_valid[0] = False
+        state.advance(batch, 1)
+        self.assertTrue(state.failure[0])
+        self.assertEqual(state.components[0, 4].item(), -100.)
+        self.assertTrue(torch.isfinite(state.components).all())
+        self.assertTrue(torch.isfinite(state.history).all())
+
+    def test_1024_env_advance_without_tensor_scalar_reads(self):
+        state, batch, _ = fixture(1024, dtype=torch.float32)
+        batch.corners[..., 0].add_(0.001)
+        batch.center[..., 0].add_(0.001)
+        def reject_scalar(*args, **kwargs):
+            raise AssertionError("Per-step Tensor scalar read / host synchronization")
+        with patch.object(torch.Tensor, "__bool__", reject_scalar), patch.object(torch.Tensor, "item", reject_scalar):
+            state.advance(batch, 1)
+        self.assertEqual(state.components.shape, (1024, 5))
+        torch.testing.assert_close(state.path_length, torch.full((1024,), 0.04), atol=1.e-5, rtol=1.e-5)
+        self.assertTrue(torch.isfinite(state.components).all())
+
+
+class NativeAdapterTests(unittest.TestCase):
+    def test_missing_scene_and_sensor_provider_fail_before_native_binding(self):
+        env, _, _ = native_fixture()
+        del env.task_sensor_reader
+        with self.assertRaisesRegex(RuntimeError, "SceneBatch.*task_sensor_reader"):
+            task.reset_task(env)
+
+    def test_sensor_provider_shape_and_boolean_contract_is_checked_on_reset(self):
+        invalid_values = (("ideal_wrench", torch.zeros(3, 5)), ("wrench_valid", torch.ones(3, 1, dtype=torch.bool)),
+                          ("wrench_valid", torch.ones(3)), ("tactile_force", torch.zeros(3, 16, 3)),
+                          ("tactile_valid", torch.ones(3, 17)), ("forbidden_contact", torch.zeros(3, 1)))
+        for name, value in invalid_values:
+            env, _, _ = native_fixture()
+            setattr(env.sensors, name, value)
+            with self.subTest(name=name, shape=value.shape), self.assertRaisesRegex(ValueError, f"SensorBatch.{name}"):
+                task.reset_task(env)
+
+    def test_valid_initial_observations_cannot_refer_to_inactive_or_duplicated_objects(self):
+        for invalid_id in (-1, 1, 2):
+            env, _, _ = native_fixture()
+            env.task_scene_data.observed_ids[:, 0] = invalid_id
+            with self.subTest(invalid_id=invalid_id), self.assertRaisesRegex(ValueError, "distinct active objects"):
+                task.reset_task(env)
+
+    def test_invalid_duplicate_association_cannot_hide_the_valid_target_slot(self):
+        env, _, _ = native_fixture()
+        source = env.task_scene_data
+        source.geometry_valid[:, 0] = False
+        source.observed_ids[:, 0] = source.target_id
+        task.reset_task(env)
+        state = task.get_task_state(env)
+        torch.testing.assert_close(state.geometry_b[:, 0], source.geometry_b[:, 1])
+        self.assertTrue(state.geometry_valid[:, 0].all())
+
+    def test_observation_dimension_probe_does_not_invent_geometry_and_first_step_requires_reset(self):
+        env, _, _ = native_fixture()
+        initial = task.get_task_state(env)
+        self.assertFalse(initial.ready)
+        self.assertEqual(int(initial.geometry_b.count_nonzero()), 0)
+        self.assertEqual(env.sensor_read_count, 0)
+        env.common_step_counter = 1
+        with self.assertRaisesRegex(RuntimeError, "reset_task"):
+            task.get_task_state(env)
+
+    def test_initial_reset_keeps_role_slots_and_base_coordinates_independent_of_env_origin(self):
+        env, _, _ = native_fixture()
+        task.reset_task(env)
+        initial_reads = env.sensor_read_count
+        state = task.get_task_state(env)
+        torch.testing.assert_close(state.geometry_b[:, :3], env.task_scene_data.geometry_b[:, [1, 2, 0]])
+        torch.testing.assert_close(state.tcp_pose_b[:, :3], torch.tensor([0., 0., .5]).expand(3, 3))
+        torch.testing.assert_close(state.initial_center[:, :3, 0], torch.tensor([.3, -.1, .5]).expand(3, 3))
+        self.assertEqual(env.sensor_read_count, initial_reads)
+        self.assertEqual(int(state.history[:, 1].count_nonzero()), 0)
+        torch.testing.assert_close(state.history[:, 0, 37:54], -torch.ones(3, 17))
+        self.assertEqual(int(state.history[:, 0, 54:].count_nonzero()), 0)
+
+    def test_one_native_step_compensates_gravity_and_inertia_and_updates_history_once(self):
+        env, action, external = native_fixture()
+        task.reset_task(env)
+        initial_reads = env.sensor_read_count
+        initial = env._contact_mdp.history[:, 0].clone()
+        data = env.scene["robot"].data
+        # Two 1 kg distal links: +2 m/s² in Z adds 4 N; both Iyy=.02.
+        # Lever moment changes by -.2 Nm; angular acceleration adds +.04 Nm.
+        data.body_com_acc_w[:, 2:, 2] = 2.
+        data.body_com_acc_w[:, 2:, 4] = 1.
+        env.sensors.ideal_wrench[:, 2] += 4.
+        env.sensors.ideal_wrench[:, 4] -= .16
+        action.normalized_actions[:, 0] = .4
+        env.sensors.tactile_force[:, 0, 2] = .011
+        env.sensors.tactile_force[:, 1, 2] = .009
+        env.sensors.tactile_valid[:, 2] = False
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        torch.testing.assert_close(state.history[:, 1], initial)
+        torch.testing.assert_close(state.history[:, 0, 31:37], external / torch.tensor(task.SI_200_8_RANGES))
+        torch.testing.assert_close(state.history[:, 0, 37:40], torch.tensor([1., 0., -1.]).expand(3, 3))
+        torch.testing.assert_close(state.history[:, 0, 54], torch.full((3,), .4))
+        self.assertEqual(env.sensor_read_count, initial_reads + 1)
+        saved = state.history.clone()
+        env.sensors.ideal_wrench[:, 0] += 10.
+        self.assertIs(task.get_task_state(env), state)
+        torch.testing.assert_close(state.history, saved)
+        self.assertEqual(env.sensor_read_count, initial_reads + 1)
+
+    def test_partial_reset_preserves_other_environment_state_and_completed_terminal_observation(self):
+        env, action, _ = native_fixture()
+        task.reset_task(env)
+        self.assertNotIn("terminal_env_ids", env.extras)
+        action.normalized_actions[:, 0] = .6
+        action.invalid_control[1] = True
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        final_observation = env.extras["terminal_observation"].clone()
+        self.assertTrue(env.extras["terminated"][1])
+        self.assertEqual(final_observation.shape, (3, 544))
+        self.assertEqual(env.extras["terminal_env_ids"].numel(), 0)
+        self.assertEqual(float(state.components[1, 4]), -100.)
+        untouched = torch.tensor([0, 2])
+        snapshot = {key: value[untouched].clone() for key, value in vars(state).items()
+                    if isinstance(value, torch.Tensor) and value.shape[:1] == (env.num_envs,)}
+        action.invalid_control[1] = False
+        task.reset_task(env, torch.tensor([1]))
+        for key, expected in snapshot.items():
+            torch.testing.assert_close(getattr(state, key)[untouched], expected)
+        torch.testing.assert_close(env.extras["terminal_observation"], final_observation)
+        torch.testing.assert_close(env.extras["terminal_env_ids"], torch.tensor([1]))
+        self.assertEqual(int(state.history[1, 1].count_nonzero()), 0)
+        self.assertEqual(int(state.history[1, 0, 54:].count_nonzero()), 0)
+        self.assertFalse(state.failure[1])
+        env.common_step_counter = 2
+        task.get_task_state(env)
+        self.assertEqual(env.extras["terminal_env_ids"].numel(), 0)
+        torch.testing.assert_close(state.elapsed_time, torch.tensor([.2, .1, .2], dtype=state.elapsed_time.dtype))
+
+    def test_current_object_ground_truth_changes_rewards_but_not_frozen_actor_geometry(self):
+        env, _, _ = native_fixture()
+        task.reset_task(env)
+        state = task.get_task_state(env)
+        initial_geometry = state.geometry_b.clone()
+        object_data = env.scene["object_collection"].data
+        object_data.object_link_pose_w[:, 0, 0] += .01
+        object_data.object_com_pos_w[:, 0, 0] += .01
+        # Subsequent edits to the producer are not accepted until the next reset.
+        env.task_scene_data.geometry_b[:, :3, 0] += 100.
+        env.common_step_counter = 1
+        task.get_task_state(env)
+        torch.testing.assert_close(state.geometry_b, initial_geometry)
+        torch.testing.assert_close(state.path_length, torch.full((3,), .01), atol=1.e-6, rtol=1.e-5)
+        actor_geometry = env.extras["terminal_observation"][:, :400].reshape(3, 40, 10)
+        torch.testing.assert_close(actor_geometry, task.geometry_in_eef_frame(
+            initial_geometry, state.geometry_valid, state.tcp_pose_b
+        ))
+
+    def test_partner_resolved_contact_history_cannot_cancel_and_nan_is_forbidden(self):
+        forces = torch.zeros(3, 4, 2, 2, 3)
+        forces[0, 2, 0, 0, 0] = 2.
+        forces[0, 2, 0, 1, 0] = -2.
+        forces[1, 3, 1, 0, 0] = .5
+        forces[2, 0, 0, 0, 2] = math.nan
+        torch.testing.assert_close(task.forbidden_contact_from_history(forces), torch.tensor([True, False, True]))
+
+    def test_sensor_overrange_invalid_control_and_forbidden_contacts_each_fail_only_affected_env(self):
+        env, action, _ = native_fixture(4)
+        task.reset_task(env)
+        env.sensors.ideal_wrench[0, 0] = 201.
+        action.invalid_control[1] = True
+        env.sensors.forbidden_contact[2] = True
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        torch.testing.assert_close(state.failure, torch.tensor([True, True, True, False]))
+        torch.testing.assert_close(state.components[:, 4], torch.tensor([-100., -100., -100., 0.]))
+        self.assertTrue(torch.isfinite(env.extras["terminal_observation"]).all())
+
+    def test_nonfinite_robot_measurement_fails_and_terminal_observation_remains_finite(self):
+        env, _, _ = native_fixture()
+        task.reset_task(env)
+        env.scene["robot"].data.joint_pos[1, 3] = math.nan
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        torch.testing.assert_close(state.failure, torch.tensor([False, True, False]))
+        self.assertTrue(torch.isfinite(env.extras["terminal_observation"]).all())
+        self.assertTrue(torch.isfinite(state.components).all())
+
+    def test_native_adapter_hot_path_does_not_read_tensor_scalars(self):
+        env, _, _ = native_fixture(32)
+        task.reset_task(env)
+        env.common_step_counter = 1
+        def reject_scalar(*args, **kwargs):
+            raise AssertionError("Per-step Tensor scalar read / host synchronization")
+        with patch.object(torch.Tensor, "__bool__", reject_scalar), patch.object(torch.Tensor, "item", reject_scalar):
+            state = task.get_task_state(env)
+        self.assertEqual(state.history.shape, (32, 2, 72))
+        self.assertEqual(env.extras["terminal_observation"].shape, (32, 544))
+
+class EpisodeLayoutTests(unittest.TestCase):
+    @staticmethod
+    def catalog():
+        sizes = ((.05, .05, .14), (.085, .06, .19), (.075, .10, .12),
+                 (.065, .065, .11), (.10, .08, .17), (.055, .055, .15),
+                 (.10, .10, .14), (.06, .16, .21), (.045, .095, .18), (.065, .065, .10))
+        return tuple(task.ObjectGeometry(f"type_{kind}_{copy}",
+                                        (.013-x/2, -.02-y/2, -.007),
+                                        (.013+x/2, -.02+y/2, z-.007), f"type_{kind}")
+                     for kind, (x, y, z) in enumerate(sizes) for copy in range(4))
+
+    def test_fixed_forty_body_pool_meets_whole_shelf_density_without_target_copies(self):
+        import random
+        from collections import Counter
+        catalog, rules = self.catalog(), task.SpawnRules()
+        sample = task.sample_scene(catalog, rules, random.Random(1))
+        task.validate_sample(sample, catalog, rules)
+        metrics = task.scene_metrics(sample, catalog, rules)
+        counts = Counter(catalog[index].asset_name for index in sample.active_ids)
+        self.assertGreaterEqual(metrics.shelf_occupancy, .35)
+        self.assertGreaterEqual(min(metrics.region_occupancies), .10)
+        self.assertEqual(counts[catalog[sample.target_id].asset_name], 1)
+        self.assertNotEqual(catalog[sample.target_id].asset_name, catalog[sample.blocker_id].asset_name)
+        self.assertLessEqual(max(counts.values()), 4)
+        self.assertGreater(len(sample.active_ids), len(counts))
+        self.assertGreaterEqual(min(counts.values()), 1)
+        for index in sample.active_ids:
+            self.assertAlmostEqual(sample.positions[index][2] + catalog[index].lower[2], rules.shelf_top)
+
+    def test_too_small_selected_species_capacity_is_rejected_before_layout(self):
+        import random
+        with self.assertRaisesRegex(RuntimeError, "cannot meet whole-shelf density"):
+            task.sample_scene(self.catalog(), task.SpawnRules(), random.Random(0))
+
+    def test_layout_rejection_can_retry_composition_while_preserving_episode_roles(self):
+        import random
+        catalog, rules, rng = self.catalog(), task.SpawnRules(), random.Random(0)
+        target = rng.randrange(len(catalog))
+        blocker = rng.choice([i for i, geometry in enumerate(catalog)
+                              if geometry.asset_name != catalog[target].asset_name])
+        with self.assertRaisesRegex(RuntimeError, "cannot meet whole-shelf density"):
+            task.sample_scene(catalog, rules, rng, target_id=target, blocker_id=blocker)
+        sample = task.sample_scene(catalog, rules, rng, target_id=target, blocker_id=blocker)
+        self.assertEqual((sample.target_id, sample.blocker_id), (target, blocker))
+        task.validate_sample(sample, catalog, rules)
+
+    def test_front_start_region_respects_rotated_blocker_and_elbow_geometry(self):
+        geometry = (task.ObjectGeometry("target", (-.025, -.025, 0), (.025, .025, .1)),
+                    task.ObjectGeometry("blocker", (-.08, -.06, 0), (.12, .04, .1)))
+        sample = task.SceneSample((0, 1), 0, 1,
+                                  {0: (-.85, .1, 1.05), 1: (-.75, .1, 1.05)},
+                                  {0: 0., 1: math.pi/2}, (-.8, -.5, .04, .16), (-.75, -.1))
+        bounds = task.robot_start_region(sample, geometry,
+                                          dataclasses.replace(task.SpawnRules(), x_range=(-.9, -.5)),
+                                          task.RobotStartRules())
+        np.testing.assert_allclose(bounds, (-.44, -.30, .02, .18, 1.25, 1.33))
+        self.assertGreater(task.elbow_above_chord((0,0,1), (.3,0,1.4), (.6,0,1)), 0)
+        self.assertLess(task.elbow_above_chord((0,0,1), (.3,0,.6), (.6,0,1)), 0)
+
+    def test_pivot_sweep_detects_mid_motion_obstacle(self):
+        # Endpoints clear a thin post, but the rotating long bar crosses it.
+        bar = task.ObjectGeometry("bar", (-.10, -.01, 0), (.10, .01, .1))
+        motion = task.PlanarMotion(task.PlanarPose(0., 0., 0.), task.PlanarPose(0., 0., math.pi/2), (0., 0.))
+        obstacle = task.rectangle_polygon((.052, .065, .052, .065))
+        self.assertTrue(task.polygons_separated(task.footprint_polygon(bar, (0., 0.), 0.), obstacle))
+        self.assertTrue(task.polygons_separated(task.footprint_polygon(bar, (0., 0.), math.pi/2), obstacle))
+        self.assertTrue(any(not task.polygons_separated(sweep, obstacle)
+                            for sweep in task.motion_sweeps(bar, motion)))
+
+    def test_vectorized_proposal_sat_matches_independent_scalar_polygon_oracle(self):
+        rng = np.random.default_rng(704)
+        geometry = task.ObjectGeometry("box", (-.06, -.03, 0.), (.06, .03, .1))
+        centers = rng.uniform(-.25, .25, size=(180, 2))
+        for yaw in (0., .43, math.pi/2):
+            local = np.asarray(task.footprint_polygon(geometry, (0., 0.), yaw))
+            motion = task.PlanarMotion(task.PlanarPose(.03, -.02, .2),
+                                     task.PlanarPose(.03, -.02, 1.3))
+            # Unequal polygon widths exercise every edge of curved sweep bounds.
+            obstacles = [task.rectangle_polygon((-.02, .03, -.05, .08)),
+                         *task.motion_sweeps(geometry, motion)[::3]]
+            gaps = rng.choice((0., .003, .017), size=len(obstacles))
+            expected = np.asarray([
+                all(task.polygons_separated(tuple(tuple(map(float, point)) for point in local + center),
+                                            obstacle, gap)
+                    for obstacle, gap in zip(obstacles, gaps))
+                for center in centers
+            ])
+            np.testing.assert_array_equal(task._proposal_clear_mask(centers, local, obstacles, gaps), expected)
+        self.assertEqual(task._proposal_clear_mask(centers[:0], local, obstacles, gaps).shape, (0,))
+        np.testing.assert_array_equal(task._proposal_clear_mask(centers, local, (), np.empty(0)), True)
+
+    def test_vectorized_neighbor_distances_match_scalar_euclidean_oracle(self):
+        rng = np.random.default_rng(88)
+        geometry = task.ObjectGeometry("box", (-.06, -.03, 0.), (.06, .03, .1))
+        left = [task.footprint_polygon(geometry, (-.3, float(y)), float(a))
+                for y, a in rng.uniform(-1., 1., size=(7, 2))]
+        right = [task.footprint_polygon(geometry, (.3, float(y)), float(a))
+                 for y, a in rng.uniform(-1., 1., size=(11, 2))]
+        expected = np.asarray([[task.polygon_distance(first, second) for second in right] for first in left])
+        actual = task._footprint_boundary_distances(np.asarray(left), np.asarray(right))
+        np.testing.assert_allclose(actual, expected, rtol=2.e-15, atol=2.e-15)
+        self.assertEqual(task._footprint_boundary_distances(np.empty((0, 4, 2)), np.asarray(right)).shape, (0, 11))
+
+    def test_compiled_regional_overlap_matches_scalar_clipping_oracle(self):
+        rng = np.random.default_rng(805)
+        geometry = task.ObjectGeometry("box", (-.09, -.04, 0.), (.09, .04, .1))
+        rules = task.SpawnRules()
+        regions = task.shelf_regions(rules)
+        polygons = [task.footprint_polygon(geometry, (float(x), float(y)), float(yaw))
+                    for x, y, yaw in rng.uniform((-.9, -.5, -math.pi), (-.5, .5, math.pi), size=(96, 3))]
+        expected = np.asarray([[task.overlap_area(polygon, task.rectangle_polygon(region)) for region in regions]
+                               for polygon in polygons])
+        actual = task._footprint_region_areas(np.asarray(polygons), np.asarray(regions))
+        np.testing.assert_allclose(actual, expected, rtol=1.e-12, atol=2.e-16)
+        self.assertEqual(task._footprint_region_areas(np.empty((0, 4, 2)), np.asarray(regions)).shape, (0, 6))
+
+    def test_batched_placement_is_deterministic_and_independent_across_episodes(self):
+        import random
+        catalog, rules = self.catalog(), task.SpawnRules()
+        first = task.sample_scene(catalog, rules, random.Random(1))
+        repeated = task.sample_scene(catalog, rules, random.Random(1))
+        self.assertEqual(first, repeated)
+        other = task.sample_scene(catalog, rules, random.Random(103),
+                                  target_id=first.target_id, blocker_id=first.blocker_id,
+                                  active_ids=first.active_ids)
+        self.assertEqual(other.active_ids, first.active_ids)
+        self.assertNotEqual(other.positions, first.positions)
+        task.validate_sample(other, catalog, rules)
+
+
+
+def episode_reset_fixture(batch=5, selected=2):
+    """Native asset-shaped buffers exposing indexed writes, without a simulator."""
+    class Objects:
+        def __init__(self):
+            self.state = torch.full((batch, 4, 13), -7.)
+            self.parked_mask = torch.zeros(batch, 4, dtype=torch.bool)
+            self.writes = 0
+
+        def write_object_state_to_sim(self, value, env_ids):
+            self.state[env_ids] = value
+            self.writes += 1
+
+    class Robot:
+        def __init__(self):
+            default = torch.zeros(batch, 13)
+            default[:, 0], default[:, 3], default[:, 7:] = .2, 1., 8.
+            self.data = SimpleNamespace(default_root_state=default)
+            self.root = torch.full((batch, 13), -8.)
+            self.position = torch.full((batch, 12), -9.)
+            self.velocity = torch.full_like(self.position, -10.)
+            self.position_target = torch.full_like(self.position, -11.)
+            self.velocity_target = torch.full_like(self.position, -12.)
+            self.effort_target = torch.full_like(self.position, -13.)
+            self.root_writes = self.joint_writes = 0
+
+        def write_root_state_to_sim(self, value, env_ids):
+            self.root[env_ids] = value
+            self.root_writes += 1
+
+        def write_joint_state_to_sim(self, position, velocity, env_ids):
+            self.position[env_ids], self.velocity[env_ids] = position, velocity
+            self.joint_writes += 1
+
+        def set_joint_position_target(self, value, env_ids):
+            self.position_target[env_ids] = value
+
+        def set_joint_velocity_target(self, value, env_ids):
+            self.velocity_target[env_ids] = value
+
+        def set_joint_effort_target(self, value, env_ids):
+            self.effort_target[env_ids] = value
+
+    class Scene(dict):
+        def __init__(self):
+            super().__init__(object_collection=Objects(), robot=Robot())
+            self.env_origins = torch.zeros(batch, 3)
+            self.env_origins[:, 0] = 2.5 * torch.arange(batch)
+            self.env_origins[:, 1] = -1.5 * torch.arange(batch)
+            self.writes = 0
+
+        def write_data_to_sim(self):
+            self.writes += 1
+
+    runtime = SimpleNamespace(
+        reset_counts=torch.zeros(batch, dtype=torch.long),
+        robot_regions=torch.full((batch, 6), -21.), robot_tcp=torch.full((batch, 3), -22.),
+        visibility=torch.full((batch, 2), -23.),
+        camera_pose=torch.full((batch, 7), -24.), camera_intrinsics=torch.full((batch, 3, 3), -25.),
+        episode_seeds=torch.full((batch,), -1, dtype=torch.long),
+    )
+    scene_data = SimpleNamespace(
+        object_ids=torch.full((batch, 40), -1, dtype=torch.long),
+        target_id=torch.full((batch,), -1, dtype=torch.long), blocker_id=torch.full((batch,), -1, dtype=torch.long),
+        access_region=torch.full((batch, 4), -31.), geometry_b=torch.full((batch, 40, 10), -32.),
+        geometry_valid=torch.zeros(batch, 40, dtype=torch.bool),
+        observed_ids=torch.full((batch, 40), -1, dtype=torch.long),
+    )
+    from unittest.mock import Mock
+    env = SimpleNamespace(num_envs=batch, device='cpu', scene=Scene(), task_scene_data=scene_data,
+                          _episode_reset=runtime, task_sensor_reader=SimpleNamespace(reset=Mock()),
+                          sim=SimpleNamespace(forward=Mock()))
+    rows = torch.arange(selected)
+    object_state = torch.zeros(selected, 4, 13)
+    object_state[:, :, 0] = torch.arange(4)[None] * .1 + rows[:, None] * .013
+    object_state[:, :, 2], object_state[:, :, 3] = 1.05, 1.
+    slots = torch.full((selected, 40), -1, dtype=torch.long)
+    # Vary roles and inactive bodies by episode, so accidental broadcasting fails.
+    slots[:, :3] = (torch.tensor([2, 0, 3])[None] + rows[:, None]) % 4
+    active = torch.zeros(selected, 4, dtype=torch.bool)
+    active.scatter_(1, slots[:, :3], True)
+    geometry = torch.zeros(selected, 40, 10)
+    geometry[:, :, 0] = rows[:, None] + 100.
+    geometry[:, :, 3], geometry[:, :, 7:] = 1., .1
+    valid = torch.zeros(selected, 40, dtype=torch.bool)
+    valid[:, :3] = True
+    camera_pose = torch.zeros(selected, 7)
+    camera_pose[:, 0], camera_pose[:, 3] = rows * .1, 1.
+    episodes = task.EpisodeBatch(
+        object_state=object_state, object_ids=slots, active=active,
+        target_id=slots[:, 0].clone(), blocker_id=slots[:, 1].clone(),
+        access_region=torch.tensor([-.8, -.5, -.1, .1])[None].repeat(selected, 1) + rows[:, None] * .001,
+        joint_positions=torch.arange(selected * 12).reshape(selected, 12).float() / 100.,
+        geometry_b=geometry, geometry_valid=valid, observed_ids=slots.clone(),
+        robot_regions=torch.arange(selected * 6).reshape(selected, 6).float() / 10.,
+        robot_tcp=torch.tensor([-.4, .1, 1.25])[None].repeat(selected, 1) + rows[:, None] * .01,
+        visibility=torch.tensor([.45, .99])[None].repeat(selected, 1) + rows[:, None].remainder(4) * .001,
+        camera_pose=camera_pose,
+        camera_intrinsics=torch.eye(3)[None].repeat(selected, 1, 1) * (rows[:, None, None] + 1),
+        seeds=rows + 43,
+    )
+    return env, episodes
+
+
+class EpisodeResetTests(unittest.TestCase):
+    @staticmethod
+    def builder_fixture():
+        """Real proposal/commit buffers with rendering and collision search substituted."""
+        from contextlib import nullcontext
+        from unittest.mock import Mock
+
+        env, _ = episode_reset_fixture()
+        objects, robot = env.scene['object_collection'], env.scene['robot']
+        default = torch.zeros(env.num_envs, 4, 13)
+        default[:, :, 3] = 1.
+        objects.data = SimpleNamespace(object_state_w=objects.state, default_object_state=default)
+        for field, value in (
+            ('root_state_w', robot.root), ('joint_pos', robot.position), ('joint_vel', robot.velocity),
+            ('joint_pos_target', robot.position_target), ('joint_vel_target', robot.velocity_target),
+            ('joint_effort_target', robot.effort_target),
+        ):
+            setattr(robot.data, field, value)
+        robot.root_physx_view = SimpleNamespace(get_link_transforms=Mock(return_value=torch.zeros(5, 1, 7)))
+        env.cfg = SimpleNamespace(seed=73, target_asset=None, blocker_asset=None,
+                                  initial_vision=SimpleNamespace(max_layout_attempts=2))
+        env.spawn_rules, env.spawn_geometries = task.SpawnRules(), ()
+        env.task_scene_data.lower = torch.tensor([[-.05, -.05, 0.]]).repeat(4, 1)
+        env.task_scene_data.upper = torch.tensor([[.05, .05, .1]]).repeat(4, 1)
+        env.task_scene_data.upright = torch.tensor([[1., 0., 0., 0.]]).repeat(4, 1)
+        env._episode_reset.specs = tuple(SimpleNamespace(asset_name=f'type_{index}') for index in range(4))
+        env._episode_reset.vision = SimpleNamespace(capture_session=nullcontext, capture_batch=Mock())
+        proposal_count = 0
+
+        def sample_scene(geometries, rules, rng, *, target_id, blocker_id, active_ids):
+            nonlocal proposal_count
+            proposal_count += 1
+            return task.SceneSample(
+                (0, 1, 2, 3), target_id, blocker_id,
+                {index: (-.8 + proposal_count * .01, index * .03, 1.05) for index in range(4)},
+                {index: 0. for index in range(4)}, (-.8, -.5, -.1, .1), (-.7, -.2),
+            )
+
+        def sample_robot_start(env, samples, seeds):
+            return [(np.full(12, sample.positions[0][0]), (-.4, -.2, -.1, .1, 1.2, 1.3),
+                     np.array([-.3, 0., 1.25]), .08, 1) for sample in samples]
+
+        def snapshot(env_id):
+            geometry = torch.zeros(40, 10)
+            geometry[:4, :3] = objects.state[env_id, :, :3] - env.scene.env_origins[env_id]
+            geometry[:4, 3], geometry[:4, 7:] = 1., .1
+            valid, observed = torch.zeros(40, dtype=torch.bool), torch.full((40,), -1, dtype=torch.long)
+            valid[:4], observed[:4] = True, torch.arange(4)
+            return SimpleNamespace(
+                geometry_b=geometry, valid=valid, observed_ids=observed, visible_fractions=(.5, 1.),
+                camera_pose_w=torch.tensor([env_id, 0., 2., 1., 0., 0., 0.]), intrinsics=torch.eye(3),
+            )
+
+        return env, sample_scene, sample_robot_start, snapshot
+
+    def test_packing_applies_upright_once_corrects_off_center_roots_and_clears_all_velocity(self):
+        default = torch.zeros(4, 13)
+        default[:, :3] = torch.tensor([7., 8., 9.])
+        default[:, 3], default[:, 7:] = 1., 42.
+        lower = torch.tensor([[-.01, -.04, -.02], [-.1, -.1, 0.], [-.02, -.06, -.01], [-.1, -.1, 0.]])
+        upper = torch.tensor([[.05, .02, .10], [.1, .1, .1], [.08, .02, .2], [.1, .1, .1]])
+        upright = torch.tensor([[1., 0., 0., 0.]]).repeat(4, 1)
+        upright[2] = torch.tensor([math.sqrt(.5), -math.sqrt(.5), 0., 0.])
+        sample = task.SceneSample((2, 0), 2, 0, {2: (-.7, .1, 1.06), 0: (-.8, -.1, 1.07)},
+                                  {2: math.pi/2, 0: 0.}, (-.8, -.5, -.1, .1), (-.7, -.2))
+        states, active, slots = task.pack_object_states(default, sample, lower, upper, upright)
+        torch.testing.assert_close(states[2, :3], torch.tensor([-.72, .07, 1.06]))
+        torch.testing.assert_close(states[0, :3], torch.tensor([-.82, -.09, 1.07]))
+        expected_xyzw = (Rotation.from_euler('z', math.pi/2) * Rotation.from_euler('x', -math.pi/2)).as_quat()
+        expected_wxyz = torch.tensor(expected_xyzw[[3, 0, 1, 2]], dtype=states.dtype)
+        torch.testing.assert_close(states[2, 3:7], expected_wxyz)
+        torch.testing.assert_close(states[[1, 3], :7], default[[1, 3], :7])
+        self.assertEqual(int(states[:, 7:].count_nonzero()), 0)
+        self.assertTrue(torch.equal(active, torch.tensor([True, False, True, False])))
+        self.assertTrue(torch.equal(slots[:2], torch.tensor([2, 0])))
+        self.assertTrue((slots[2:] == -1).all())
+        self.assertTrue((default[:, 7:] == 42.).all())
+
+    def test_independent_reset_writes_unsorted_selected_rows_and_clears_physical_targets(self):
+        env, episodes = episode_reset_fixture()
+        ids = torch.tensor([3, 1])
+        untouched = torch.tensor([0, 2, 4])
+        object_state_before = episodes.object_state.clone()
+        task.apply_episode_batch(env, ids, episodes)
+        objects, robot, data = env.scene['object_collection'], env.scene['robot'], env.task_scene_data
+        expected = object_state_before.clone()
+        expected[..., :3] += env.scene.env_origins[ids, None]
+        torch.testing.assert_close(objects.state[ids], expected)
+        torch.testing.assert_close(episodes.object_state, object_state_before)
+        self.assertTrue((objects.state[untouched] == -7.).all())
+        self.assertTrue((robot.root[untouched] == -8.).all())
+        self.assertTrue((robot.position[untouched] == -9.).all())
+        self.assertTrue((robot.velocity[untouched] == -10.).all())
+        self.assertTrue((robot.position_target[untouched] == -11.).all())
+        self.assertTrue((robot.velocity_target[untouched] == -12.).all())
+        self.assertTrue((robot.effort_target[untouched] == -13.).all())
+        torch.testing.assert_close(robot.root[ids, :3], env.scene.env_origins[ids] + torch.tensor([.2, 0., 0.]))
+        torch.testing.assert_close(robot.position[ids], episodes.joint_positions)
+        torch.testing.assert_close(robot.position_target[ids], episodes.joint_positions)
+        for tensor in (robot.root[ids, 7:], robot.velocity[ids], robot.velocity_target[ids], robot.effort_target[ids]):
+            self.assertEqual(int(tensor.count_nonzero()), 0)
+        torch.testing.assert_close(objects.parked_mask[ids], ~episodes.active)
+        self.assertEqual(int(objects.parked_mask[untouched].count_nonzero()), 0)
+        for field in ('object_ids', 'target_id', 'blocker_id', 'access_region',
+                      'geometry_b', 'geometry_valid', 'observed_ids'):
+            torch.testing.assert_close(getattr(data, field)[ids], getattr(episodes, field))
+        self.assertTrue((data.geometry_b[untouched] == -32.).all())
+        self.assertTrue((data.object_ids[untouched] == -1).all())
+        self.assertTrue((data.target_id[untouched] == -1).all())
+        self.assertTrue((data.blocker_id[untouched] == -1).all())
+        self.assertTrue((data.access_region[untouched] == -31.).all())
+        self.assertFalse(data.geometry_valid[untouched].any())
+        self.assertTrue((data.observed_ids[untouched] == -1).all())
+        torch.testing.assert_close(env._episode_reset.robot_tcp[ids], episodes.robot_tcp + env.scene.env_origins[ids])
+        for field in ('robot_regions', 'visibility', 'camera_pose', 'camera_intrinsics'):
+            torch.testing.assert_close(getattr(env._episode_reset, field)[ids], getattr(episodes, field))
+        torch.testing.assert_close(env._episode_reset.episode_seeds[ids], episodes.seeds)
+        self.assertTrue((env._episode_reset.robot_tcp[untouched] == -22.).all())
+        self.assertTrue((env._episode_reset.camera_pose[untouched] == -24.).all())
+        self.assertTrue((env._episode_reset.episode_seeds[untouched] == -1).all())
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.tensor([0, 1, 0, 1, 0]))
+        # Partial resets must not flush force buffers for untouched environments.
+        self.assertEqual((objects.writes, robot.root_writes, robot.joint_writes, env.scene.writes), (1, 1, 1, 0))
+        env.task_sensor_reader.reset.assert_called_once()
+        torch.testing.assert_close(env.task_sensor_reader.reset.call_args.args[0], ids)
+        env.sim.forward.assert_called_once()
+
+    def test_batch_application_has_no_tensor_scalar_reads_or_per_environment_writes(self):
+        env, episodes = episode_reset_fixture(1024, selected=512)
+        ids = torch.arange(0, 1024, 2)
+        def reject(*args, **kwargs):
+            raise AssertionError('Host tensor read in batched episode application')
+        with patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
+             patch.object(torch.Tensor, 'tolist', reject), patch.object(torch.Tensor, 'cpu', reject), \
+             patch.object(torch.Tensor, 'numpy', reject):
+            task.apply_episode_batch(env, ids, episodes)
+        self.assertEqual(env.scene['object_collection'].writes, 1)
+        self.assertEqual(env.scene['robot'].joint_writes, 1)
+        torch.testing.assert_close(env._episode_reset.episode_seeds[ids], episodes.seeds)
+        torch.testing.assert_close(env.scene['robot'].position[ids], episodes.joint_positions)
+        self.assertEqual(int(env._episode_reset.reset_counts.sum()), 512)
+
+    def test_partial_reset_builds_new_episodes_even_before_any_full_reset(self):
+        env, episodes = episode_reset_fixture()
+        ids = torch.tensor([4, 1])
+        with patch.object(task, '_build_episode_batch', return_value=episodes) as build:
+            task.reset_scene(env, ids)
+        build.assert_called_once_with(env, env._episode_reset, ids)
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.tensor([0, 1, 0, 0, 1]))
+        torch.testing.assert_close(env.task_scene_data.target_id[ids], episodes.target_id)
+        self.assertEqual(env.scene['object_collection'].writes, 1)
+
+    def test_full_reset_uses_same_independent_episode_path(self):
+        env, episodes = episode_reset_fixture(selected=5)
+        with patch.object(task, '_build_episode_batch', return_value=episodes) as build:
+            task.reset_scene(env)
+        self.assertEqual(build.call_count, 1)
+        self.assertIs(build.call_args.args[0], env)
+        self.assertIs(build.call_args.args[1], env._episode_reset)
+        torch.testing.assert_close(build.call_args.args[2], torch.arange(5))
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.ones(5, dtype=torch.long))
+        torch.testing.assert_close(env.task_scene_data.geometry_b, episodes.geometry_b)
+
+    def test_each_reset_replaces_initial_scene_and_vision_for_only_its_episode(self):
+        env, first = episode_reset_fixture()
+        _, second = episode_reset_fixture()
+        ids = torch.tensor([4, 1])
+        second.object_state[:, :, 1] += .027
+        second.geometry_b[:, :, 1] += .031
+        second.seeds += 1000
+        with patch.object(task, '_build_episode_batch', side_effect=[first, second]) as build:
+            task.reset_scene(env, ids)
+            before = env.scene['object_collection'].state.clone()
+            task.reset_scene(env, ids)
+        self.assertEqual(build.call_count, 2)
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.tensor([0, 2, 0, 0, 2]))
+        torch.testing.assert_close(env._episode_reset.episode_seeds[ids], second.seeds)
+        torch.testing.assert_close(env.task_scene_data.geometry_b[ids], second.geometry_b)
+        torch.testing.assert_close(env.scene['object_collection'].state[ids, :, 1], before[ids, :, 1] + .027)
+        torch.testing.assert_close(env.scene['object_collection'].state[[0, 2, 3]], before[[0, 2, 3]])
+
+    def test_episode_seeds_are_reproducible_and_independent_of_reset_batch_order(self):
+        expected = {(index, count): task._episode_seed(123, index, count)
+                    for index in range(1024) for count in range(3)}
+        self.assertEqual(len(set(expected.values())), 3072)
+        for index in (1023, 7, 0, 83):
+            for count in (2, 0, 1):
+                value = task._episode_seed(123, index, count)
+                self.assertEqual(value, expected[index, count])
+                self.assertGreaterEqual(value, 0)
+                self.assertLess(value, 2**63)
+        self.assertNotEqual(task._episode_seed(123, 7, 2), task._episode_seed(124, 7, 2))
+
+    def test_builder_retries_only_rejected_rows_and_retains_corresponding_initial_vision(self):
+        env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
+        ids = torch.tensor([4, 1])
+        captures, accepted_geometry = [], {}
+        objects = env.scene['object_collection']
+        untouched_before = objects.state[[0, 2, 3]].clone()
+
+        def capture(**kwargs):
+            env_id = kwargs['env_id']
+            captures.append(env_id)
+            if env_id == 1 and captures.count(1) == 1:
+                return None
+            result = snapshot(env_id)
+            accepted_geometry[env_id] = result.geometry_b.clone()
+            return result
+
+        env._episode_reset.vision.capture_batch.side_effect = lambda requests: [capture(**request) for request in requests]
+        with patch.object(task, 'sample_scene', side_effect=sample_scene) as propose, \
+             patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
+             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
+            episodes = task._build_episode_batch(env, env._episode_reset, ids)
+        self.assertEqual(captures, [4, 1, 1])
+        self.assertEqual(propose.call_count, 3)
+        self.assertEqual(objects.writes, 2)
+        self.assertEqual(env.scene['robot'].root_physx_view.get_link_transforms.call_count, 2)
+        torch.testing.assert_close(episodes.geometry_b[0], accepted_geometry[4])
+        torch.testing.assert_close(episodes.geometry_b[1], accepted_geometry[1])
+        torch.testing.assert_close(episodes.geometry_b[:, :4, :3], episodes.object_state[:, :, :3])
+        self.assertNotEqual(float(episodes.object_state[0, 0, 0]), float(episodes.object_state[1, 0, 0]))
+        torch.testing.assert_close(objects.state[[0, 2, 3]], untouched_before)
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.zeros(5, dtype=torch.long))
+        self.assertTrue((env.task_scene_data.geometry_b == -32.).all())
+        env.task_sensor_reader.reset.assert_not_called()
+
+    def test_failed_builder_restores_selected_physics_and_preserves_scene_metadata(self):
+        env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
+        ids = torch.tensor([4, 1])
+        objects, robot = env.scene['object_collection'], env.scene['robot']
+        physical = (objects.state, objects.parked_mask, robot.root, robot.position, robot.velocity,
+                    robot.position_target, robot.velocity_target, robot.effort_target)
+        physical_before = [value.clone() for value in physical]
+        metadata_before = {key: value.clone() for key, value in vars(env.task_scene_data).items()
+                           if isinstance(value, torch.Tensor)}
+        captures = []
+
+        def capture(**kwargs):
+            captures.append(kwargs['env_id'])
+            if kwargs['env_id'] == 1:
+                return None
+            return snapshot(kwargs['env_id'])
+
+        env._episode_reset.vision.capture_batch.side_effect = lambda requests: [capture(**request) for request in requests]
+        with patch.object(task, 'sample_scene', side_effect=sample_scene), \
+             patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
+             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
+            with self.assertRaisesRegex(RuntimeError, 'Independent episode preparation exhausted retries'):
+                task._build_episode_batch(env, env._episode_reset, ids)
+        self.assertEqual(captures, [4, 1, 1])
+        for actual, expected in zip(physical, physical_before):
+            torch.testing.assert_close(actual, expected)
+        for name, expected in metadata_before.items():
+            torch.testing.assert_close(getattr(env.task_scene_data, name), expected)
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.zeros(5, dtype=torch.long))
+        self.assertTrue((env._episode_reset.episode_seeds == -1).all())
+        self.assertEqual(env.scene.writes, 0)
+        env.task_sensor_reader.reset.assert_not_called()
+
+    def test_empty_reset_does_not_initialize_resources_or_write_assets(self):
+        env, _ = episode_reset_fixture()
+        del env._episode_reset
+        with patch.object(task, '_initialize_episode_reset', side_effect=AssertionError('Unexpected initialize')):
+            task.reset_scene(env, torch.empty(0, dtype=torch.long))
+        self.assertEqual(env.scene['object_collection'].writes, 0)
+
+
+
+class PartialResetBatchTests(unittest.TestCase):
+    def test_transition_subset_matches_full_batch_and_limits_geometry_and_self_load_work(self):
+        env, action, _ = native_fixture(8)
+        task.reset_task(env)
+        state = env._contact_mdp
+        robot = env.scene['robot'].data
+        robot.joint_pos[:, 0] = torch.arange(8) * .01
+        robot.joint_vel[:, 1] = torch.arange(8) * .02
+        robot.body_com_acc_w[:, 3, 0] = torch.arange(8) * .1
+        env.sensors.tactile_force[:, 2, 0] = torch.arange(8)
+        env.sensors.forbidden_contact[6] = True
+        action.normalized_actions[:, 3] = torch.arange(8) * .01
+        action.invalid_control[1] = True
+        full = task._read_transition(env, state)
+        ids = torch.tensor([6, 1])
+        def reject(*args, **kwargs):
+            raise AssertionError('Subset transition must not read device scalar values')
+        with patch.object(task, 'self_motion_wrench', wraps=task.self_motion_wrench) as compensate, \
+             patch.object(task, 'object_geometry', wraps=task.object_geometry) as geometry, \
+             patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
+             patch.object(torch.Tensor, 'cpu', reject):
+            subset = task._read_transition(env, state, ids)
+        self.assertEqual(compensate.call_args.args[0].shape[0], 2)
+        self.assertEqual(geometry.call_args.args[0].shape[0], 2)
+        for field in dataclasses.fields(full):
+            with self.subTest(field=field.name):
+                self.assertEqual(getattr(subset, field.name).shape[0], 2)
+                torch.testing.assert_close(getattr(subset, field.name), getattr(full, field.name)[ids])
+
+    def test_selected_state_reset_matches_full_input_api_for_unsorted_ids(self):
+        state_full, batch, values = fixture(6)
+        state_selected, _, _ = fixture(6)
+        batch.sample[:, :12] += torch.arange(6, dtype=batch.sample.dtype)[:, None]
+        batch.tcp_pose_b[:, 0] = torch.arange(6, dtype=batch.sample.dtype) * .01
+        ids = torch.tensor([4, 1])
+        subset = task.TransitionBatch(**{field.name: getattr(batch, field.name)[ids]
+                                        for field in dataclasses.fields(batch)})
+        selected_values = {name: value[ids] for name, value in values.items()}
+        state_full.reset(ids, batch, **values, step=0)
+        state_selected.reset(ids, subset, **selected_values, step=0, batch_is_selected=True)
+        for name, value in vars(state_full).items():
+            if isinstance(value, torch.Tensor):
+                with self.subTest(field=name):
+                    torch.testing.assert_close(getattr(state_selected, name), value)
+
+    def test_native_partial_reset_limits_all_preparation_to_selected_rows_and_preserves_neighbors(self):
+        env, _, _ = native_fixture(8)
+        task.reset_task(env)
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        ids = torch.tensor([6, 1])
+        other_ids = torch.tensor([0, 2, 3, 4, 5, 7])
+        preserved = {name: value[other_ids].clone() for name, value in vars(state).items()
+                     if isinstance(value, torch.Tensor) and value.shape[:1] == (8,)}
+        final_observation = env.extras['terminal_observation'].clone()
+        env.task_scene_data.geometry_b[ids, :3, 0] += .01
+        with patch.object(task, 'self_motion_wrench', wraps=task.self_motion_wrench) as compensate, \
+             patch.object(task, 'prepare_initial_geometry', wraps=task.prepare_initial_geometry) as prepare, \
+             patch.object(task, 'geometry_in_eef_frame', wraps=task.geometry_in_eef_frame) as transform, \
+             patch.object(state, 'reset', wraps=state.reset) as commit:
+            task.reset_task(env, ids)
+        self.assertEqual(compensate.call_args.args[0].shape[0], 2)
+        self.assertEqual(prepare.call_args.args[0].shape[0], 2)
+        self.assertEqual(transform.call_args.args[0].shape[0], 2)
+        self.assertEqual(commit.call_args.args[1].sample.shape, (2, 72))
+        self.assertEqual(commit.call_args.kwargs['geometry_b'].shape, (2, 40, 10))
+        self.assertTrue(commit.call_args.kwargs['batch_is_selected'])
+        for name, expected in preserved.items():
+            with self.subTest(field=name):
+                torch.testing.assert_close(getattr(state, name)[other_ids], expected)
+        torch.testing.assert_close(env.extras['terminal_observation'], final_observation)
+        self.assertIsNot(env.extras['terminal_observation'], state.observation)
+
+
+class SensorRuntimeTests(unittest.TestCase):
+    """Execute the production sensor tensor path without initializing Kit."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation/mdp/sensors.py'
+        module = types.ModuleType('contact_manipulation.mdp._sensor_numerical_tests')
+        module.__package__ = 'contact_manipulation.mdp'
+        sys.modules[module.__name__] = module  # dataclasses resolves field types through this entry.
+        exec(compile(path.read_text().split('# Native classes are imported only', 1)[0],
+                     str(path), 'exec'), module.__dict__)
+        cls.sensors = module
+
+    @staticmethod
+    def fixture(batch=4):
+        tactile_names = tuple(f'touch_{index}' for index in range(17))
+        forbidden_names = tuple(f'arm_{index}' for index in range(9))
+        ft_name = 'ToolForceTorqueLink'
+
+        class Contact:
+            def __init__(self, name):
+                self.num_bodies, self.num_instances, self.body_names = 1, batch, [name]
+                self.cfg = SimpleNamespace(history_length=4)
+                self.data = SimpleNamespace(
+                    net_forces_w=torch.zeros(batch, 1, 3),
+                    force_matrix_w_history=torch.zeros(batch, 4, 1, 3, 3),
+                )
+
+            def reset(self, ids):
+                self.data.net_forces_w[ids] = 0
+                self.data.force_matrix_w_history[ids] = 0
+
+        # The force sensor is deliberately not body zero. The raw load includes
+        # values above the torque sensing range; calibration belongs to the MDP.
+        reaction = torch.arange(batch * 3 * 6, dtype=torch.float32).reshape(batch, 3, 6)
+        scene = {'robot': SimpleNamespace(
+            body_names=['base_link', ft_name, 'hand_base'],
+            root_physx_view=SimpleNamespace(
+                get_link_incoming_joint_force=lambda: reaction,
+                link_paths=[['/World/envs/env_0/Robot/base_link',
+                             '/World/envs/env_0/Robot/' + ft_name,
+                             '/World/envs/env_0/Robot/ROASRightHand/base_link']],
+            ),
+        )}
+        scene.update({f'contact_{name}': Contact(name) for name in tactile_names})
+        scene.update({f'forbidden_{name}': Contact(name) for name in forbidden_names})
+        env = SimpleNamespace(scene=scene, num_envs=batch, device='cpu',
+                              sim=SimpleNamespace(current_time=0.), cfg=SimpleNamespace(decimation=4))
+        asset_module = types.ModuleType('contact_manipulation.config.ur5e.scene')
+        asset_module.FORCE_TORQUE_BODY_NAME = ft_name
+        asset_module.TACTILE_BODY_NAMES = tactile_names
+        asset_module.FORBIDDEN_CONTACT_BODY_NAMES = forbidden_names
+        with patch.dict(sys.modules, {asset_module.__name__: asset_module}):
+            reader = SensorRuntimeTests.sensors.SensorReader(env)
+        return env, reader, reaction
+
+    def test_initial_measurement_invalid_then_physics_valid_and_selected_reset_preserves_other_rows(self):
+        env, reader, reaction = self.fixture()
+        self.assertFalse(reader().wrench_valid.any())
+        self.assertEqual(reader.distal_body_names, ('ToolForceTorqueLink', 'hand_base'))
+        env.sim.current_time = .1
+
+        def reject(*args, **kwargs):
+            raise AssertionError('Sensor hot path read a tensor scalar on the host')
+
+        with patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
+             patch.object(torch.Tensor, 'tolist', reject), patch.object(torch.Tensor, 'cpu', reject), \
+             patch.object(torch.Tensor, 'numpy', reject):
+            batch = reader()
+        torch.testing.assert_close(batch.ideal_wrench, reaction[:, 1])
+        self.assertTrue(batch.wrench_valid.all())
+        reader.reset(torch.tensor([1, 3]))
+        self.assertEqual(reader().wrench_valid.tolist(), [True, False, True, False])
+        self.assertEqual(reader().ideal_wrench[1].count_nonzero(), 0)
+        torch.testing.assert_close(reader().ideal_wrench[[0, 2]], reaction[[0, 2], 1])
+        env.sim.current_time = .2
+        self.assertTrue(reader().wrench_valid.all())
+
+    def test_same_timestamp_read_does_not_revalidate_reset_rows_or_refresh_cached_others(self):
+        env, reader, reaction = self.fixture()
+        env.sim.current_time = .1
+        reader.reset(torch.tensor([0]))
+        before = reader().ideal_wrench[1].clone()
+        reaction[1] += 3
+        self.assertFalse(reader().wrench_valid[0])
+        torch.testing.assert_close(reader().ideal_wrench[1], before)
+
+    def test_opposing_partners_and_contact_in_oldest_substep_cannot_cancel(self):
+        env, reader, _ = self.fixture()
+        forces = env.scene['forbidden_arm_0'].data.force_matrix_w_history
+        forces[0, 3, 0, 0, 0], forces[0, 3, 0, 1, 0] = 2., -2.
+        forces[1, 0, 0, 0, 0] = .5
+        forces[2, 0, 0, 0, 0] = float('nan')
+        env.sim.current_time = .1
+        self.assertEqual(reader().forbidden_contact.tolist(), [True, False, True, False])
+
+    def test_nonfinite_ft_and_tactile_invalidate_only_affected_measurements(self):
+        env, reader, reaction = self.fixture()
+        reaction[0, 1, 2] = float('nan')
+        env.scene['contact_touch_3'].data.net_forces_w[2, 0, 0] = float('inf')
+        env.sim.current_time = .1
+        batch = reader()
+        self.assertEqual(batch.wrench_valid.tolist(), [False, True, True, True])
+        self.assertFalse(batch.tactile_valid[2, 3])
+        self.assertTrue(batch.tactile_valid[2, 2])
+        self.assertTrue(batch.tactile_valid[1, 3])
+
+    def test_visible_depth_pca_is_translation_invariant_and_keeps_upright_orientation(self):
+        generator = torch.Generator().manual_seed(2)
+        points = torch.rand((1000, 3), generator=generator) * torch.tensor([.12, .04, .19])
+        shift = torch.tensor([.1, -.2, .3])
+        labels = torch.zeros((1, len(points)), dtype=torch.long)
+        original = self.sensors.fit_visible_obbs(points[None], labels, 1, 16)[0][0, 0]
+        translated = self.sensors.fit_visible_obbs((points + shift)[None], labels, 1, 16)[0][0, 0]
+        torch.testing.assert_close(original[:3] + shift, translated[:3])
+        torch.testing.assert_close(original[3:], translated[3:], atol=2.e-6, rtol=1.e-5)
+        self.assertEqual(original[4:6].tolist(), [0., 0.])
+        self.assertTrue((original[7:] > 0).all())
+
+    def test_camera_config_rejects_invalid_acceptance_ranges_and_retry_counts(self):
+        for kwargs in ({'min_target_visible_fraction': 1.1}, {'height_above_shelf': (.3, .2)},
+                       {'max_camera_attempts': 0}, {'max_layout_attempts': 0},
+                       {'roll_degrees': (float('nan'), 3)}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.sensors.InitialVisionCfg(**kwargs)
+
+
+class BatchedRobotKinematicsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Load production numerical methods without importing the simulator SDK.
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation/config/ur5e/scene.py'
+        tree = ast.parse(path.read_text())
+        names = {'_RobotJoint', 'RobotColliderBox', 'RobotPoseModel'}
+        nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
+        nodes += [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
+        module = types.ModuleType('contact_test_robot_kinematics')
+        sys.modules[module.__name__] = module
+        module.__dict__.update(np=np, torch=torch, math=math, dataclass=dataclasses.dataclass,
+                               FORCE_TORQUE_PROXIMAL_BODY_NAME='SensorMountProximal',
+                               FORCE_TORQUE_BODY_NAME='ToolForceTorqueLink')
+        exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), 'exec'), module.__dict__)
+        cls.numerics = module
+
+    def model(self):
+        module = self.numerics
+        model = module.RobotPoseModel()
+        model.joint_names = ('pan', 'lift', 'elbow', 'wrist1', 'wrist2', 'wrist3', 'finger')
+        model.body_names = ('base_link', 'shoulder_link', 'upper_arm_link', 'forearm_link',
+                            'wrist_1_link', 'wrist_2_link', 'wrist_3_link', 'palm', 'finger')
+        model.arm_ids = np.arange(6)
+        model.default_joint_positions = np.array([.1, -.8, 1.1, -.4, .3, -.2, .1])
+        model.arm_limits = np.tile([-2*math.pi, 2*math.pi], (6, 1))
+        model.root_body_name, model.tcp_body_name = 'base_link', 'palm'
+        model.root_transform = np.eye(4)
+        model.root_transform[:3, 3] = (.1, -.2, .8)
+        joints = []
+        for i in range(6):
+            pre, inverse_post = np.eye(4), np.eye(4)
+            pre[:3, 3] = (.06, .015, .09)
+            pre[:3, :3] = Rotation.from_rotvec([.01*i, -.02*i, .03]).as_matrix()
+            inverse_post[:3, 3] = (.02, -.03, .04)
+            axis = np.eye(3)[[2, 1, 1, 0, 1, 2][i]]
+            joints.append(module._RobotJoint(model.joint_names[i], model.body_names[i],
+                                            model.body_names[i+1], pre, inverse_post, axis, i, i == 3))
+        pre = np.eye(4)
+        pre[:3, 3] = (.02, .03, .05)
+        joints.append(module._RobotJoint('fixed_palm', 'wrist_3_link', 'palm', pre,
+                                        np.eye(4), np.zeros(3), None))
+        joints.append(module._RobotJoint('finger', 'palm', 'finger', pre,
+                                        np.eye(4), np.array([1., 0., 0.]), 6))
+        model.joints = tuple(joints)
+        model.body_parents = {joint.child: joint.parent for joint in joints}
+        model.colliders = [module.RobotColliderBox(name, np.array([.01, .02, .03]), np.eye(3),
+                                                  np.array([.01, .015, .02]), name) for name in model.body_names]
+        model.base_origin = np.zeros(3)
+        return model
+
+    def test_collapsed_tensor_fk_matches_all_scalar_links_including_reverse_and_default_finger(self):
+        model = self.model()
+        q = torch.tensor(np.tile(model.default_joint_positions, (17, 1)), dtype=torch.float64)
+        q[:, :6] += torch.randn((17, 6), generator=torch.Generator().manual_seed(11), dtype=q.dtype) * .5
+        actual = model.forward_batch(q)
+        expected = np.stack([[model.forward(row.numpy())[name] for name in model.body_names] for row in q])
+        torch.testing.assert_close(actual, torch.tensor(expected), atol=1.e-12, rtol=1.e-12)
+
+    def test_hand_arm_pairs_cover_forearm_and_wrist_but_exclude_fixed_mount(self):
+        model = self.model()
+        pairs = {frozenset((model.colliders[a].body_name, model.colliders[b].body_name))
+                 for a, b in model.self_collision_pairs()}
+        for hand in ('palm', 'finger'):
+            for arm in ('base_link', 'shoulder_link', 'upper_arm_link', 'forearm_link',
+                        'wrist_1_link', 'wrist_2_link'):
+                self.assertIn(frozenset((hand, arm)), pairs)
+            self.assertNotIn(frozenset((hand, 'wrist_3_link')), pairs)
+        self.assertNotIn(frozenset(('palm', 'finger')), pairs)
+
+    def test_scalar_and_batch_reject_hand_arm_overlap_folded_forearm_and_low_elbow(self):
+        batch = 4
+        frames = torch.eye(4, dtype=torch.float64).repeat(batch, 2, 1, 1)
+        frames[:, :, 2, 3] = 1.
+        frames[:, 1, 0, 3] = .2
+        frames[2, 1, 0, 3] = .03  # Hand intersects forearm.
+        joints = torch.eye(4, dtype=torch.float64).repeat(batch, 6, 1, 1)
+        joints[:, 1, :3, 3] = torch.tensor([.2, 0., 1.])
+        joints[:, 2, :3, 3] = torch.tensor([0., 0., 1.3])
+        joints[:, 3, :3, 3] = torch.tensor([-.2, 0., 1.])
+        joints[1, 3, 0, 3] = .1  # Wrist behind elbow despite high elbow.
+        joints[3, 2, 2, 3] = 1.  # No elbow-up margin.
+        constants = dict(collider_owners=torch.tensor([0, 1]),
+                         collider_offsets=torch.eye(4, dtype=torch.float64).repeat(2, 1, 1),
+                         collider_half=torch.full((2, 3), .02, dtype=torch.float64),
+                         self_pairs=torch.tensor([[0, 1]]))
+        colliders = [self.numerics.RobotColliderBox(name, np.zeros(3), np.eye(3), np.full(3, .02), name)
+                     for name in ('forearm_link', 'palm')]
+        model = SimpleNamespace(_tensor_constants=lambda *_: constants, colliders=colliders,
+                                self_collision_pairs=lambda: np.array([[0, 1]]))
+        env = SimpleNamespace(robot_pose_model=model, cfg=SimpleNamespace(robot_start=task.RobotStartRules()))
+        valid, height = task._robot_candidate_clearance(
+            env, frames, joints, frames[:, 1], frames.new_empty(batch, 0, 3),
+            frames.new_empty(batch, 0, 3, 3), frames.new_empty(batch, 0, 3), torch.empty(batch, 0, dtype=torch.bool))
+        self.assertEqual(valid.tolist(), [True, False, False, False])
+        for row in range(batch):
+            model.arm_landmarks = lambda _, row=row: joints[row, [1, 2, 3], :3, 3].numpy()
+            transforms = {box.body_name: frames[row, index].numpy() for index, box in enumerate(colliders)}
+            reason = task.robot_start_collision_reason(env, None, transforms, obstacles=[])
+            scalar_valid = reason is None and float(height[row]) >= env.cfg.robot_start.min_elbow_height
+            self.assertEqual(scalar_valid, bool(valid[row]))
+            if row == 2:
+                self.assertIn('forearm_link / palm', reason)
+
+    def test_analytic_tensor_jacobian_matches_finite_difference_of_exact_usd_chain(self):
+        model = self.model()
+        arm = torch.tensor(model.default_joint_positions[:6][None], dtype=torch.float64)
+        _, _, tcp, jacobian = model.arm_forward_batch(arm, jacobian=True)
+        for index in range(6):
+            shifted = arm.clone()
+            shifted[:, index] += 1.e-6
+            _, _, other = model.arm_forward_batch(shifted)
+            linear = (other[0, :3, 3] - tcp[0, :3, 3]) / 1.e-6
+            angular = Rotation.from_matrix((other[0, :3, :3] @ tcp[0, :3, :3].T).numpy()).as_rotvec() / 1.e-6
+            torch.testing.assert_close(jacobian[0, :, index], torch.cat((linear, torch.tensor(angular))),
+                                       atol=3.e-7, rtol=2.e-6)
+
+    def test_batch_ik_reaches_distinct_targets_and_obeys_limits(self):
+        model = self.model()
+        truth = torch.tensor(np.tile(model.default_joint_positions[:6], (6, 1)), dtype=torch.float64)
+        truth += torch.randn(truth.shape, generator=torch.Generator().manual_seed(22), dtype=truth.dtype) * .15
+        _, _, target = model.arm_forward_batch(truth)
+        q, valid, _, _, result = model.solve_batch(target[:, :3, 3], target[:, :3, :3], truth + .08)
+        self.assertTrue(valid.all())
+        self.assertTrue((q[:, :6].abs() <= 2*math.pi).all())
+        self.assertTrue(((result[:, :3, 3] - target[:, :3, 3]).norm(dim=-1) < 5.e-4).all())
+        torch.testing.assert_close(q[:, 6], torch.full((6,), .1, dtype=q.dtype))
+
+    def test_physical_link_check_handles_distinct_origins_and_rejects_one_corrupt_link_only(self):
+        model = self.model()
+        q = np.tile(model.default_joint_positions, (3, 1))
+        q[:, :6] += np.array([[-.03], [0.], [.04]])
+        predicted = model.forward_batch(torch.tensor(q, dtype=torch.float64)).numpy()
+        origins = torch.tensor([[0., 0., 0.], [5., -3., 0.], [-2., 8., 0.]], dtype=torch.float64)
+        poses = torch.zeros((3, len(model.body_names), 7), dtype=torch.float64)
+        poses[..., :3] = torch.tensor(predicted[..., :3, 3]) + origins[:, None]
+        poses[..., 3:] = torch.tensor(Rotation.from_matrix(predicted[..., :3, :3].reshape(-1, 3, 3)).as_quat()).reshape(3, -1, 4)
+        starts = [(row, None, None, None, None) for row in q]
+        env = SimpleNamespace(robot_pose_model=model)
+        result = task._check_physical_robot_starts(env, [None]*3, starts, poses, origins)
+        self.assertTrue(result.all())
+        poses[1, -1, 0] += .001
+        torch.testing.assert_close(task._check_physical_robot_starts(env, [None]*3, starts, poses, origins),
+                                   torch.tensor([True, False, True]))
+
+    def test_unreachable_ik_targets_are_reported_invalid_without_invalid_joint_values(self):
+        model = self.model()
+        seed = torch.tensor(model.default_joint_positions[:6][None], dtype=torch.float64)
+        q, valid, *_ = model.solve_batch(torch.tensor([[9., 9., 9.]], dtype=seed.dtype),
+                                        torch.eye(3, dtype=seed.dtype)[None], seed)
+        self.assertFalse(valid.any())
+        self.assertTrue(torch.isfinite(q).all())
+        self.assertTrue((q[:, :6].abs() <= 2*math.pi).all())
+
+    def test_candidate_seed_stream_is_unchanged_for_memory_caps_below_eight(self):
+        model = self.model()
+        model.shelf_boxes = []
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        rules = task.RobotStartRules(max_attempts=19)
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry,
+                              spawn_rules=task.SpawnRules(x_range=(-.8, -.4)),
+                              cfg=SimpleNamespace(robot_start=rules), device='cpu')
+        expected = None
+        for cap in (8, 1, 3, 7, 16):
+            rules.ik_batch_size = cap
+            proposals = []
+            def solve(positions, rotations, seeds):
+                proposals.append(seeds.clone())
+                n = len(seeds)
+                # Force all proposals to be visited, isolating RNG/batching
+                # from solver convergence and geometric acceptance.
+                tcp = torch.eye(4).expand(n, -1, -1).clone()
+                tcp[:, :3, 3] = positions
+                return (torch.zeros((n, len(model.joint_names))), torch.zeros(n, dtype=torch.bool),
+                        torch.zeros((n, 7, 4, 4)), torch.zeros((n, 6, 4, 4)), tcp)
+            def clear(_env, frames, *_args):
+                return torch.ones(len(frames), dtype=torch.bool), torch.full((len(frames),), .1)
+            with patch.object(model, 'solve_batch', side_effect=solve), \
+                 patch.object(task, '_robot_candidate_clearance', side_effect=clear):
+                self.assertEqual(task._sample_robot_starts(env, [sample], [571]), [None])
+            actual = torch.cat(proposals)
+            if expected is None:
+                expected = actual
+            else:
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_tensor_rotation_error_handles_exact_pi_without_silent_zero(self):
+        model = self.model()
+        current = torch.eye(3, dtype=torch.float64)[None]
+        target = torch.tensor(Rotation.from_rotvec(np.array([1., 2., 3.]) / np.sqrt(14) * math.pi).as_matrix())[None]
+        actual = model._rotation_error_batch(target, current)[0]
+        self.assertAlmostEqual(float(actual.norm()), math.pi, places=10)
+        np.testing.assert_allclose(Rotation.from_rotvec(actual.numpy()).as_matrix(), target[0].numpy(), atol=1.e-12)
+
+    def test_batched_sat_matches_complete_scalar_obb_oracle_and_parallel_touches(self):
+        rng = np.random.default_rng(90)
+        n = 400
+        first, second = rng.normal(size=(n, 3)), rng.normal(size=(n, 3))
+        rotation_a = Rotation.random(n, random_state=rng).as_matrix()
+        rotation_b = Rotation.random(n, random_state=rng).as_matrix()
+        half_a, half_b = rng.uniform(.01, .6, size=(n, 3)), rng.uniform(.01, .6, size=(n, 3))
+        for gap in (0., .015):
+            expected = torch.tensor([task.oriented_box_separated(a, ra, ha, b, rb, hb, gap)
+                                    for a, ra, ha, b, rb, hb in zip(first, rotation_a, half_a, second, rotation_b, half_b)])
+            actual = task.oriented_boxes_separated_batch(*[torch.tensor(value) for value in
+                (first, rotation_a, half_a, second, rotation_b, half_b)], gap)
+            torch.testing.assert_close(actual, expected)
+        center = torch.zeros((3, 3), dtype=torch.float64)
+        shifted = center.clone()
+        shifted[:, 0] = torch.tensor([1., 1.-1.e-6, 1.+.015], dtype=center.dtype)
+        rotation = torch.eye(3, dtype=center.dtype).expand(3, -1, -1)
+        half = torch.full_like(center, .5)
+        torch.testing.assert_close(task.oriented_boxes_separated_batch(center, rotation, half, shifted, rotation, half),
+                                   torch.tensor([True, False, True]))
+        torch.testing.assert_close(task.oriented_boxes_separated_batch(center, rotation, half, shifted, rotation, half, .015),
+                                   torch.tensor([False, False, True]))
+
+
+
+
+
+class GeometricVisionTests(unittest.TestCase):
+    """Use the production Warp kernel on CPU; no Kit or renderer is involved."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import warp as wp
+        cls.wp = wp
+        cls.cache_dir = tempfile.TemporaryDirectory(prefix='contact_ray_tests_')
+        cls.old_cache_dir = wp.config.kernel_cache_dir
+        wp.config.kernel_cache_dir = cls.cache_dir.name
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation/mdp/sensors.py'
+        module = types.ModuleType('contact_geometric_test_runtime')
+        module.__file__ = str(path)
+        sys.modules[module.__name__] = module
+        numerical = path.read_text().split('# Native classes are imported only', 1)[0]
+        module.__package__ = 'contact_manipulation.mdp'
+        exec(compile(numerical, str(path), 'exec'), module.__dict__)
+        nodes = [node for node in ast.parse(path.read_text()).body
+                 if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                 and node.name in ('_initial_surface_rays', 'InitialVisionSensor')]
+        module.__dict__.update(wp=wp)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), module.__dict__)
+        cls.module = module
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.wp.config.kernel_cache_dir = cls.old_cache_dir
+        cls.cache_dir.cleanup()
+
+    def fixture(self, batch=1):
+        wp = self.wp
+        # Two actual triangle surfaces and one optional shelf/robot occluder.
+        # Avoid tangent rays exactly on an edge: float32 rigid transforms can
+        # classify that measure-zero boundary on either side of the triangle.
+        points = np.array([[-.2937, -.2937, 0], [.2937, -.2937, 0],
+                           [.2937, .2937, 0], [-.2937, .2937, 0]], np.float32)
+        mesh = wp.Mesh(points=wp.array(points, dtype=wp.vec3, device='cpu'),
+                       indices=wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device='cpu'))
+        sensor = self.module.InitialVisionSensor.__new__(self.module.InitialVisionSensor)
+        sensor.cfg = self.module.InitialVisionCfg(ray_width=80, ray_height=60)
+        sensor.meshes = [mesh]
+        sensor.mesh_ids = wp.array([mesh.id] * 3, dtype=wp.uint64, device='cpu')
+        rows, columns = torch.meshgrid(torch.arange(120), torch.arange(160), indexing='ij')
+        sensor.directions = torch.stack(((columns + .5 - 80) / 60,
+                                         (rows + .5 - 60) / 60, torch.ones_like(rows)), -1).float().reshape(-1, 3)
+        poses = torch.zeros(batch, 3, 7)
+        poses[..., 3] = 1
+        poses[:, 0, 2] = 1.4
+        poses[:, 1, 2] = .8
+        poses[:, 2, 2] = .5
+        enabled = torch.tensor([[1, 1, 0]], dtype=torch.int32).expand(batch, -1).clone()
+        eyes = torch.zeros(batch, 3)
+        rotation = torch.tensor([[1., 0., 0., 0.]]).expand(batch, -1).clone()
+        roles = torch.tensor([[0, 1]], dtype=torch.int32).expand(batch, -1).clone()
+        return sensor, poses, enabled, eyes, rotation, roles
+
+    def test_front_surface_occludes_target_but_isolated_denominator_remains(self):
+        sensor, *args = self.fixture()
+        depth, labels, full, visible, ratios, accepted = sensor._trace(*args)
+        self.assertGreater(int(full[0, 0]), 0)
+        self.assertEqual(int(visible[0, 0]), 0)
+        self.assertEqual(float(ratios[0, 1]), 1.)
+        self.assertFalse(accepted.any())
+        torch.testing.assert_close(depth[labels == 1], torch.full_like(depth[labels == 1], .8))
+
+    def test_inactive_body_does_not_occlude_and_external_occluder_is_distinct(self):
+        sensor, poses, enabled, eyes, rotation, roles = self.fixture()
+        enabled[:, 1] = 0
+        first = sensor._trace(poses, enabled, eyes, rotation, roles)
+        self.assertEqual(float(first[4][0, 0]), 1.)
+        enabled[:, 2] = 1
+        second = sensor._trace(poses, enabled, eyes, rotation, roles)
+        self.assertEqual(int(second[3][0, 0]), 0)
+        self.assertTrue((second[1] == 2).any())
+
+    def test_batch_equals_individual_and_rigid_transform_does_not_change_visibility(self):
+        sensor, poses, enabled, eyes, rotation, roles = self.fixture(batch=2)
+        poses[1, 1, 0] = .4
+        together = sensor._trace(poses, enabled, eyes, rotation, roles)
+        for row in range(2):
+            alone = sensor._trace(poses[row:row+1], enabled[row:row+1], eyes[row:row+1], rotation[row:row+1], roles[row:row+1])
+            for actual, expected in zip(together, alone):
+                torch.testing.assert_close(actual[row:row+1], expected)
+        q = torch.tensor([math.sqrt(.5), 0., math.sqrt(.5), 0.])
+        shift = torch.tensor([1., -.5, 2.])
+        transformed = poses.clone()
+        transformed[..., :3] = obs.quat_apply(q.expand(2, 3, -1), poses[..., :3]) + shift
+        transformed[..., 3:] = q
+        rotated = sensor._trace(transformed, enabled, eyes + shift, q.expand(2, -1), roles)
+        torch.testing.assert_close(rotated[1], together[1])
+        torch.testing.assert_close(rotated[2], together[2])
+
+    def test_partly_off_frame_role_is_rejected_using_full_silhouette(self):
+        sensor, poses, enabled, eyes, rotation, roles = self.fixture()
+        poses[:, 1, 0] = .5
+        result = sensor._trace(poses, enabled, eyes, rotation, roles)
+        self.assertGreater(int(result[2][0, 1]), int(result[3][0, 1]))
+        self.assertFalse(result[-1].any())
+
+    def test_off_frame_silhouettes_follow_role_ids_not_body_order(self):
+        sensor, poses, enabled, eyes, rotation, roles = self.fixture()
+        poses[:, 1, 0] = .5
+        expected = sensor._trace(poses, enabled, eyes, rotation, roles)
+        # Move the role meshes away from slots 0/1; the last slot is a role.
+        permutation = [2, 0, 1]
+        actual = sensor._trace(poses[:, permutation], enabled[:, permutation],
+                               eyes, rotation, roles + 1)
+        for index in (0, 2, 3, 4, 5):
+            torch.testing.assert_close(actual[index], expected[index], rtol=0, atol=0)
+        remapped = torch.where(expected[1] >= 0, expected[1] + 1, expected[1])
+        torch.testing.assert_close(actual[1], remapped, rtol=0, atol=0)
+
+    def test_visible_fit_uses_only_hits_and_leaves_hidden_slots_zero(self):
+        points = torch.tensor([[[0., 0., .1], [.1, 0., .1], [0., .2, .3], [.1, .2, .3], [100., 100., 100.]]])
+        labels = torch.tensor([[0, 0, 0, 0, -1]])
+        geometry, valid = self.module.fit_visible_obbs(points, labels, 3, 3)
+        self.assertEqual(valid.tolist(), [[True, False, False]])
+        self.assertEqual(geometry[:, 1:].count_nonzero(), 0)
+        self.assertTrue(torch.isfinite(geometry).all())
+        torch.testing.assert_close(geometry[0, 0, :3], torch.tensor([.05, .1, .2]))
+        self.assertLess(float(geometry[0, 0, 7:].max()), .3)
+
+    def test_visible_fit_batch_and_translation_parity_without_host_scalar_reads(self):
+        generator = torch.Generator().manual_seed(91)
+        points = torch.rand(3, 100, 3, generator=generator)
+        labels = torch.randint(-1, 4, (3, 100), generator=generator)
+        def reject(*args, **kwargs):
+            raise AssertionError('Visible-surface fitting synchronized with the host')
+        with patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, 'tolist', reject), \
+             patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'cpu', reject):
+            together = self.module.fit_visible_obbs(points, labels, 4, 4)
+        for row in range(3):
+            single = self.module.fit_visible_obbs(points[row:row+1], labels[row:row+1], 4, 4)
+            torch.testing.assert_close(together[0][row:row+1], single[0])
+        shifted = self.module.fit_visible_obbs(points + .5, labels, 4, 4)
+        torch.testing.assert_close(shifted[0][..., :3], together[0][..., :3] + .5)
+        torch.testing.assert_close(shifted[0][..., 3:], together[0][..., 3:], atol=2.e-5, rtol=1.e-4)
+
+    def test_headless_task_has_no_camera_or_reference_resources(self):
+        root = Path(__file__).resolve().parents[1]
+        cfg = (root / 'contact_manipulation/config/ur5e/ur5e_env_cfg.py').read_text()
+        self.assertNotIn('make_initial_camera_cfg', cfg)
+        self.assertNotIn('VisionReferencesCfg', cfg)
+        self.assertNotIn('sim.render(', (root / 'contact_manipulation/mdp/sensors.py').read_text())
+        for kwargs in ({'ray_width': 0}, {'ray_height': 13}, {'ray_batch_size': True}):
+            with self.assertRaises(ValueError):
+                self.module.InitialVisionCfg(**kwargs)
+
+
+class NativeGeometrySharingTests(unittest.TestCase):
+    """Run with Kit's USD modules available; ordinary CPU discovery skips these."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from pxr import Usd, Sdf, UsdGeom, UsdPhysics, UsdShade
+        except ImportError:
+            raise unittest.SkipTest('Native USD geometry tests require an initialized Isaac Sim app.')
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation/config/ur5e/scene.py'
+        nodes = [node for node in ast.parse(path.read_text()).body
+                 if isinstance(node, ast.FunctionDef) and node.name in ('_deinstance_subtree', 'share_rigid_body_geometry')]
+        namespace = dict(Usd=Usd, Sdf=Sdf, UsdGeom=UsdGeom, UsdPhysics=UsdPhysics)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
+        cls.share = staticmethod(namespace['share_rigid_body_geometry'])
+        cls.Usd, cls.Sdf, cls.UsdGeom, cls.UsdPhysics, cls.UsdShade = Usd, Sdf, UsdGeom, UsdPhysics, UsdShade
+
+    def fixture(self):
+        stage = self.Usd.Stage.CreateInMemory()
+        self.UsdGeom.Xform.Define(stage, '/World/envs/env_0')
+        body = self.UsdGeom.Xform.Define(stage, '/World/envs/env_0/body')
+        body.AddTranslateOp().Set((1., 2., 3.))
+        self.UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        self.UsdGeom.Xform.Define(stage, '/Source')
+        mesh = self.UsdGeom.Mesh.Define(stage, '/Source/mesh')
+        mesh.CreatePointsAttr([(-1., 0., 0.), (1., 0., 0.), (0., 1., 0.)])
+        mesh.CreateFaceVertexCountsAttr([3])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+        material = self.UsdShade.Material.Define(stage, '/Looks/Paint')
+        shader = self.UsdShade.Shader.Define(stage, '/Looks/Paint/Shader')
+        shader.CreateIdAttr('UsdPreviewSurface')
+        shader.CreateInput('diffuseColor', self.Sdf.ValueTypeNames.Color3f).Set((.1, .2, .3))
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), 'surface')
+        self.UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+        visual = self.UsdGeom.Xform.Define(stage, '/World/envs/env_0/body/visuals').GetPrim()
+        visual.GetReferences().AddInternalReference('/Source')
+        visual.SetInstanceable(True)
+        collider = self.UsdGeom.Cube.Define(stage, '/World/envs/env_0/body/collider')
+        collider.CreateSizeAttr(.25)
+        self.UsdPhysics.CollisionAPI.Apply(collider.GetPrim()).CreateCollisionEnabledAttr(True)
+        return stage, body.GetPrim()
+
+    def test_nested_mesh_instances_material_and_collision_survive_and_replicas_share_geometry(self):
+        import tempfile
+        stage, body = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.share(stage, '/World/envs/env_0', str(Path(directory) / 'geometry.usdc')), 1)
+            self.assertTrue(body.IsInstance())
+            mesh = self.UsdGeom.Mesh(stage.GetPrimAtPath('/World/envs/env_0/body/visuals/mesh'))
+            self.assertEqual(list(mesh.GetFaceVertexIndicesAttr().Get()), [0, 1, 2])
+            np.testing.assert_array_equal(np.asarray(mesh.GetPointsAttr().Get()), [[-1., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+            material, _ = self.UsdShade.MaterialBindingAPI(mesh).ComputeBoundMaterial()
+            self.assertTrue(material)
+            surface = self.UsdShade.Shader(material.GetPrim().GetChild('Shader'))
+            np.testing.assert_allclose(surface.GetInput('diffuseColor').Get(), [.1, .2, .3])
+            collider = stage.GetPrimAtPath('/World/envs/env_0/body/collider')
+            self.assertTrue(self.UsdPhysics.CollisionAPI(collider).GetCollisionEnabledAttr().Get())
+            self.assertEqual(self.UsdGeom.Cube(collider).GetSizeAttr().Get(), .25)
+            copy = self.UsdGeom.Xform.Define(stage, '/World/envs/env_1').GetPrim()
+            copy.GetInherits().AddInherit('/World/envs/env_0')
+            other = stage.GetPrimAtPath('/World/envs/env_1/body')
+            self.assertEqual(body.GetPrototype(), other.GetPrototype())
+            other.GetAttribute('xformOp:translate').Set((4., 5., 6.))
+            self.assertEqual(tuple(body.GetAttribute('xformOp:translate').Get()), (1., 2., 3.))
+            self.assertTrue(self.UsdPhysics.RigidBodyAPI(other))
+            self.assertFalse(other.IsInstanceProxy())
+
+    def test_joint_or_nested_body_root_is_not_made_an_instance(self):
+        import tempfile
+        stage, body = self.fixture()
+        self.UsdPhysics.FixedJoint.Define(stage, '/World/envs/env_0/body/joint')
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.share(stage, '/World/envs/env_0', str(Path(directory) / 'geometry.usdc')), 0)
+            self.assertFalse(body.IsInstance())
+
+
+if __name__ == "__main__":
+    unittest.main()
