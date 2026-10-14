@@ -2913,3 +2913,105 @@ GPU 시점 생성 중 host tensor 읽기 부재, 첫 통과 선택/큐 보충/�
 Vision→IK 순서 변경, 시점 후보 묶음 크기 변경, 추가 ray ROI/버퍼 최적화는 후순위다.
 실패 이유별 비용을 먼저 비교해야 하며, 앞 단계에서 다른 단계가 실패할 후보를 더 계산하는
 역효과도 있을 수 있다. 해상도를 더 낮추는 것은 현재 우선순위가 아니다.
+
+### 2026-10-14 저장된 정책 재생
+
+추가 최적화에 앞서 학습된 checkpoint를 확인할 수 있도록
+`src/contact_manipulation/scripts/play.py`를 추가했다. 새 파일은 이 진입점 하나다.
+Isaac Lab play 예제의 AppLauncher/Hydra → gym.make → RslRlVecEnvWrapper →
+OnPolicyRunner.load → get_inference_policy → env.step 흐름을 사용한다.
+공유 GNN/attention 모델의 기존 actor가 observation으로 mask를 만들고
+`tanh(mean)`을 출력한다. 별도의 정책 구현이나 자동 JIT/ONNX export는 추가하지 않았다.
+
+- `--checkpoint`는 파일 경로이며 생략하면 native get_checkpoint_path로 최신 run/model을
+  선택한다. `--load_run`, `--num_envs`, `--seed`, `--device`, Hydra override를 지원한다.
+- `--real-time`은 제어 주기에 맞춰 대기한다. `--max_steps`는 종료할 제어 step 수다.
+  Episode 종료 후 새 장면/관측 생성은 환경의 기존 auto-reset을 그대로 사용한다.
+- `--video --video_length N`은 checkpoint 옆 videos/play에 영상을 저장한다.
+  렌더링은 영상 저장/GUI용이며 정책의 초기 관측은 GPU ray casting을 유지한다.
+- Runner는 log_dir=None으로 생성하고 optimizer state는 불러오지 않는다.
+  모델/F/T metadata와 state dict의 strict 검사를 유지하며 checkpoint를 수정하지 않는다.
+  현재 환경 설정으로 재생하므로 이전 환경/관측 생성 방식의 완전한 복원은 아니다.
+
+기존 tests/test_learning.py에 optimizer 없이 checkpoint를 불러오는 play 경로를 검증했다.
+원본 정책과 출력 일치, 반복 추론의 결정성, 비어 있는 optimizer state, iteration 복원을
+확인했고 관련 checkpoint/metadata/inference 테스트 3개가 통과했다.
+실제 GPU에서 `2026-10-13_23-18-25/model_2050.pt`를 환경 4개로 260 control step
+headless 재생하여 정상 종료(exit 0)를 확인했다. 실행 명령은 패키지 README에 기록했다.
+이전 `2026-10-13_17-25-25/model_150.pt`도 환경 1개에서 영상 저장·실시간 pacing을 켜고
+12 control step 재생하여 정상 종료했다. 첫 녹화 프레임이 검게 나오는 문제는 RGB annotator를
+render-only 3회로 먼저 초기화해 수정했고, 저장 MP4의 첫 프레임과 장면 렌더링을 확인했다.
+
+### 2026-10-14 CPU 경로 검사·GNN/PPO·제어 실행 최적화
+
+사용자가 앞서 제안한 추가 최적화를 진행하도록 요청했다. 기존 파일 안에서 구현했으며
+배치 조건, 관측/보상/action, GNN·attention의 파라미터 구조, PPO epoch/minibatch,
+물리 120 Hz·제어 30 Hz는 유지했다. Ray casting 방식·해상도도 변경하지 않았다.
+
+구현:
+
+- `events.py`: 경로 후보의 A₀ 이탈 여부는 동일한 rectangle SAT 식을 Numba로 묶어 계산한다.
+  이동·회전·pivot 후보의 endpoint/전체 sweep 지지·Target 충돌 검사는 환경×후보의 Warp
+  kernel로 처리한다. 회전마다 최대 5° 간격, endpoint hull와 arc 오차 padding, 기존 EPS를
+  유지하고 후보 순서상 첫 유효 경로를 선택한다. 선택한 경로만 CPU에서 예약 sweep으로 만든다.
+  예약 다각형 SAT 축·투영 구간·AABB도 GPU에서 한 번에 계산한다.
+- 생성된 XY/yaw tensor를 SceneSample에 보존하고 IK용 active OBB, 물리 pose 생성까지
+  재사용한다. 전체 catalog가 아닌 각 batch의 최대 active 수까지 OBB를 모아 collision
+  scratch 크기를 유지한다. IK 관절값/TCP/시작 영역은 tensor로 물리 쓰기와 FK 검사에 전달한다.
+  독립 검증/debug용 CPU pose 사본, 역할·구성/ID metadata와 NumPy IK 난수 생성은 남는다.
+  전체 reset 경로가 GPU-only가 되었다는 뜻은 아니다.
+- `model.py`: CUDA FP32에서 edge add/ReLU/mask/reduction을 Triton kernel로 융합한다.
+  Backward는 node 입력에서 ReLU 부호를 재계산하여 receiver/sender gradient를 모은다.
+  `[B,40,40,64]` pair activation/gradient를 저장하지 않는다. CPU/다른 dtype은 기존 Torch 식이다.
+  Node projection·role attention·최종 MLP, state_dict와 model_cfg는 동일하다.
+- `rsl_rl_ppo_cfg.py`: 추론 chunk 512→1024, 학습 microbatch 1024→4096.
+  1024 env×32 step, 4 epoch×4 minibatch에서 microbatch backward는 128→32회로 줄지만,
+  원래 minibatch당 optimizer update 1회(총 16회), sample 가중 gradient 합산은 유지한다.
+- `actions.py`: Newton–Schulz 제곱근의 기존 32회 연산을 CUDA graph로 재실행한다.
+  순수 tensor 계산만 capture하며 PhysX/OSC 호출 순서·제어식·수렴 판정은 유지한다.
+  반환 tensor는 clone하여 다음 replay가 이전 결과를 덮어쓰지 않는다.
+  CPU/gradient 필요 입력은 기존 경로다. torch.compile 방식도 별도 측정했으나 근특이 자세의
+  제어 출력 차이 때문에 채택하지 않았다. CUDA graph는 TF32 켜짐/꺼짐, broadcast identity,
+  변경된 입력에서 유한 값과 invalid/NaN 위치가 기존과 정확히 일치했다.
+
+검증 중 GPU hull의 초기 unique=0일 때 음수 scratch 인덱스에 접근하는 문제를 발견했다.
+첫 정점을 미리 포함하고 두 번째 정점부터 처리하도록 수정한 뒤 CPU 및 Isaac Sim 내장
+Warp 1.8.2 CUDA 검증과 1024환경 native 실행이 통과했다. 해결 전 커널은 최종 경로에 없다.
+
+계측(RTX 3090, 동일한 장비):
+
+| 구간 | 이전 | 최종 |
+|---|---:|---:|
+| 독립 배치 1024개, 같은 seed, warm 2회 평균 | 3.327 s | 2.254 s |
+| 모델 FP32 forward/backward, batch 1024 | 22.18 ms | 8.50 ms |
+| 위 모델의 추가 peak allocated memory | 1705 MiB | 250 MiB |
+| Native PPO update, iteration 1–7 평균 | 3.301 s | 1.030 s |
+| Native 학습 8 iteration 전체 | 113.14 s | 91.10 s |
+| 8 iteration 기준 평균 | 14.143 s | 11.388 s |
+
+독립 모델 비교는 TF32를 끈 FP32이며 물리/센서 메모리를 포함하지 않는다.
+개선 모델의 batch 2048/4096 forward+backward는 16.42/31.35 ms,
+추가 peak 500/999 MiB였다. Native 학습은 기존처럼 TF32를 켜서 실행했다.
+
+최종 native iteration 시간은 14.39, 10.64, 9.96, 9.90, 9.32, 9.84, 8.58, 18.22초였다.
+초기화 이후 iteration 1–6 평균은 9.707초(이전 12.325초)다. 마지막 iteration에서
+918개 reset, layout 4.051초, IK 2.786초, vision 2.608초, reset 전체 10.318초,
+reset 제외 env.step 6.672초, PPO 1.018초였다. Physics 3.188초와 action 적용 1.019초는
+env.step 안에 포함되므로 합산하지 않는다. Damping 부분은 약 0.402→0.106초였다.
+
+8 iteration 전체 시간은 약 19.5% 감소했다. 두 실행의 전체 reset 수는 1164/1166,
+마지막 iteration은 915/918로 조금 다르며 부동소수 합산 순서와 물리/학습 궤적의 차이가 있다.
+초기화 시간을 제외한 단기 비교이며 장기 처리량 보장은 아니다. 이 평균을 단순 적용하면
+90000 iteration은 약 285시간(11.9일)로, 직전 추정 354시간보다 약 69시간 짧다.
+남은 큰 비용은 물리 step, reset의 역할/구성 준비·packing과 IK이며 모든 CPU 작업을 제거한 것은 아니다.
+
+CPU 전체 172개 검사 중 168개 통과, CUDA/native USD용 4개 skip.
+별도 실제 GPU 실행에서는 Isaac Sim 내장 Warp 1.8.2를 사용한 관련 검사 6개가 모두 통과했다.
+기존 파일의 검사에 GPU fused GNN의 출력/gradient, 빈 이웃·ReLU=0·비연속 upstream gradient,
+경로 전체의 scalar oracle(중간 pivot 충돌 포함), device pose→충돌/물리 상태 일치 및 host
+pose 읽기 부재, CUDA graph 제어의 결과/수명 검사를 추가했다.
+실제 1024환경×8 iteration은 정상 종료(exit 0)했고 native logging/checkpoint를 유지했다.
+
+재현 자료는 `/tmp/contact_gnn_opt_bench.{py,json,log}`, `/tmp/contact_layout_opt_bench.{py,json,log}`,
+`/tmp/contact_compute_opt_final_native_1024.log`, `/tmp/contact_hotspots_compute_opt_final_1024.json`,
+`/tmp/contact_opt_final_cpu_tests.log`, `/tmp/contact_opt_final_gpu_tests.log`에 있다.

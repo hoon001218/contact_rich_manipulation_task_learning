@@ -5,12 +5,12 @@ One batched update per common_step_counter keeps history and path integrals
 independent of manager call order. Only selected rows change on partial reset.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 import random
 from itertools import combinations
-from typing import Generator, Sequence
+from typing import Sequence
 from types import SimpleNamespace
 
 import numpy as np
@@ -712,6 +712,10 @@ class SceneSample:
     clearance_witness: Point
     clearance_path: tuple[PlanarMotion, ...] = ()
     clearance_kind: str = "translation"
+    # Keep the packer's coordinates on device for IK and physics. CPU mappings
+    # remain available for independent validation/debugging and role metadata.
+    planar_poses: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    planar_ids: tuple[int, ...] = field(default=(), repr=False, compare=False)
 
 
 def rectangle_polygon(region: Region) -> Polygon:
@@ -1335,10 +1339,14 @@ def _clearance_candidates(geometry: ObjectGeometry, initial: PlanarPose, access:
         for angle in (-math.pi / 2, math.pi / 2):
             prefixes.append((PlanarMotion(initial, shifted),
                              PlanarMotion(shifted, PlanarPose(shifted.x, shifted.y, shifted.yaw + angle))))
+    poses = np.asarray([(p[-1].end.x, p[-1].end.y, p[-1].end.yaw) if p else
+                        (initial.x, initial.y, initial.yaw) for p in prefixes])
+    clear = _prefix_clearance(poses, (geometry.upper[0]-geometry.lower[0])/2,
+                              (geometry.upper[1]-geometry.lower[1])/2, np.asarray(access), rules.gap)
     candidates = []
-    for prefix in prefixes:
+    for index, prefix in enumerate(prefixes):
         pose = prefix[-1].end if prefix else initial
-        if prefix and polygons_separated(_pose_polygon(geometry, pose), rectangle_polygon(access), rules.gap):
+        if prefix and clear[index]:
             candidates.append(prefix)
         _, hy = _half_extents(geometry, pose.yaw)
         for y in (access[2] - hy - rules.gap - 0.001, access[3] + hy + rules.gap + 0.001):
@@ -1347,10 +1355,222 @@ def _clearance_candidates(geometry: ObjectGeometry, initial: PlanarPose, access:
     return candidates
 
 
+@njit(cache=True)
+def _prefix_clearance(poses, hx, hy, access, gap):
+    """The same four rectangle SAT axes, batched before candidate shuffling."""
+    result = np.zeros(len(poses), dtype=np.bool_)
+    ox, oy = (access[0]+access[1])/2, (access[2]+access[3])/2
+    ohx, ohy = (access[1]-access[0])/2, (access[3]-access[2])/2
+    for k in range(len(poses)):
+        x, y, angle = poses[k]
+        c, s = math.cos(angle), math.sin(angle)
+        for ax, ay in ((c,s),(-s,c),(1.,0.),(0.,1.)):
+            radius = hx*abs(ax*c+ay*s)+hy*abs(-ax*s+ay*c)
+            other = ohx*abs(ax)+ohy*abs(ay)
+            if abs((x-ox)*ax+(y-oy)*ay) >= radius+other+gap-_EPS:
+                result[k] = True
+                break
+    return result
+
+
 # Layout state stays on the requested device across candidate/commit rounds.
 # Candidate geometry uses bounded local scratch; adjacency caches only pair flags.
 _LayoutQuad = wp.types.matrix(shape=(4, 2), dtype=wp.float64)
 _LayoutClip = wp.types.matrix(shape=(12, 2), dtype=wp.float64)
+_PathVertices = wp.types.matrix(shape=(64, 2), dtype=wp.float64)
+
+
+@wp.func
+def _path_hull(points: _PathVertices, count: int):
+    # Match the independent scalar monotone chain, including near-collinear EPS.
+    ordered = points
+    for i in range(1, count):
+        x, y = ordered[i, 0], ordered[i, 1]
+        j = i - 1
+        while j >= 0:
+            if ordered[j, 0] < x or (ordered[j, 0] == x and ordered[j, 1] <= y):
+                break
+            ordered[j+1, 0] = ordered[j, 0]
+            ordered[j+1, 1] = ordered[j, 1]
+            j -= 1
+        ordered[j+1, 0] = x
+        ordered[j+1, 1] = y
+    unique = int(1)
+    for i in range(1,count):
+        if ordered[i, 0] != ordered[unique-1, 0] or ordered[i, 1] != ordered[unique-1, 1]:
+            ordered[unique, 0] = ordered[i, 0]
+            ordered[unique, 1] = ordered[i, 1]
+            unique += 1
+    hull = _PathVertices()
+    written = int(0)
+    for reverse in range(2):
+        begin = written
+        for k in range(unique):
+            i = k
+            if reverse == 1:
+                i = unique-1-k
+            x, y = ordered[i, 0], ordered[i, 1]
+            while written-begin >= 2:
+                ax, ay = hull[written-2, 0], hull[written-2, 1]
+                bx, by = hull[written-1, 0], hull[written-1, 1]
+                if (bx-ax)*(y-ay)-(by-ay)*(x-ax) > wp.float64(1.e-9):
+                    break
+                written -= 1
+            hull[written, 0] = x
+            hull[written, 1] = y
+            written += 1
+        written -= 1
+    return hull, written
+
+
+@wp.func
+def _path_clear(p: _PathVertices, count: int, obstacle: _LayoutQuad, bounds: wp.vec4d, gap: wp.float64):
+    for i in range(count):
+        if (p[i, 0] < bounds[0]-wp.float64(1.e-9) or p[i, 0] > bounds[1]+wp.float64(1.e-9)
+                or p[i, 1] < bounds[2]-wp.float64(1.e-9) or p[i, 1] > bounds[3]+wp.float64(1.e-9)):
+            return False
+    for edge in range(count+4):
+        dx, dy = wp.float64(0.), wp.float64(0.)
+        if edge < count:
+            j = (edge+1) % count
+            dx, dy = p[j, 0]-p[edge, 0], p[j, 1]-p[edge, 1]
+        else:
+            i = edge-count
+            j = (i+1) % 4
+            dx, dy = obstacle[j, 0]-obstacle[i, 0], obstacle[j, 1]-obstacle[i, 1]
+        length = wp.sqrt(dx*dx+dy*dy)
+        if length > wp.float64(1.e-9):
+            ax, ay = -dy/length, dx/length
+            low, high = wp.float64(wp.inf), wp.float64(-wp.inf)
+            other_low, other_high = wp.float64(wp.inf), wp.float64(-wp.inf)
+            for i in range(count):
+                value = p[i, 0]*ax+p[i, 1]*ay
+                low, high = wp.min(low,value), wp.max(high,value)
+            for i in range(4):
+                value = obstacle[i, 0]*ax+obstacle[i, 1]*ay
+                other_low, other_high = wp.min(other_low,value), wp.max(other_high,value)
+            if high+gap <= other_low+wp.float64(1.e-9) or other_high+gap <= low+wp.float64(1.e-9):
+                return True
+    return False
+
+
+@wp.func
+def _path_pose(start: wp.vec3d, end: wp.vec3d, pivot: wp.vec2d, use_pivot: bool, fraction: wp.float64):
+    angle = fraction*(end[2]-start[2])
+    result = start+fraction*(end-start)
+    if use_pivot:
+        c, s = wp.cos(angle), wp.sin(angle)
+        dx, dy = start[0]-pivot[0], start[1]-pivot[1]
+        result = wp.vec3d(pivot[0]+c*dx-s*dy, pivot[1]+s*dx+c*dy, start[2]+angle)
+    return result
+
+
+@wp.kernel
+def _clearance_paths(motions: wp.array4d(dtype=wp.float64), counts: wp.array2d(dtype=wp.int32),
+                     half: wp.array2d(dtype=wp.float64), targets: wp.array3d(dtype=wp.float64),
+                     bounds: wp.vec4d, gap: wp.float64, valid: wp.array2d(dtype=wp.int32)):
+    row, candidate = wp.tid()
+    valid[row, candidate] = 0
+    count = counts[row, candidate]
+    if count == 0:
+        return
+    target = _LayoutQuad()
+    for i in range(4):
+        target[i, 0] = targets[row, i, 0]
+        target[i, 1] = targets[row, i, 1]
+    hx, hy = half[row, 0], half[row, 1]
+    # Reject endpoints before constructing conservative swept envelopes.
+    for k in range(count):
+        p = _layout_quad(motions[row,candidate,k,3], motions[row,candidate,k,4], motions[row,candidate,k,5],hx,hy)
+        points = _PathVertices()
+        for i in range(4):
+            points[i,0] = p[i,0]
+            points[i,1] = p[i,1]
+        if not _path_clear(points,4,target,bounds,gap):
+            return
+    for k in range(count):
+        start = wp.vec3d(motions[row,candidate,k,0],motions[row,candidate,k,1],motions[row,candidate,k,2])
+        end = wp.vec3d(motions[row,candidate,k,3],motions[row,candidate,k,4],motions[row,candidate,k,5])
+        pivot = wp.vec2d(motions[row,candidate,k,6],motions[row,candidate,k,7])
+        use_pivot = motions[row,candidate,k,8] != wp.float64(0.)
+        delta = end[2]-start[2]
+        previous = _layout_quad(start[0],start[1],start[2],hx,hy)
+        divisions, padding = int(1), wp.float64(0.)
+        rotating = wp.abs(delta) > wp.float64(1.e-9)
+        if rotating:
+            divisions = wp.max(1,int(wp.ceil(wp.abs(delta)/wp.float64(0.08726646259971647))))
+            origin = wp.vec2d(start[0],start[1])
+            if use_pivot:
+                origin = pivot
+            radius = wp.float64(0.)
+            for i in range(4):
+                radius = wp.max(radius,wp.length(wp.vec2d(previous[i,0],previous[i,1])-origin))
+            padding = radius*(wp.float64(1.)-wp.cos(wp.abs(delta)/wp.float64(2*divisions)))
+        for step in range(1,divisions+1):
+            pose = _path_pose(start,end,pivot,use_pivot,wp.float64(step)/wp.float64(divisions))
+            # The scalar non-rotation path uses authored end, including any
+            # sub-EPS angular delta, rather than a pivot interpolation.
+            if not rotating:
+                pose = end
+            current = _layout_quad(pose[0],pose[1],pose[2],hx,hy)
+            points = _PathVertices()
+            for i in range(4):
+                points[i,0] = previous[i,0]
+                points[i,1] = previous[i,1]
+                points[i+4,0] = current[i,0]
+                points[i+4,1] = current[i,1]
+            hull, size = _path_hull(points,8)
+            if rotating:
+                expanded = _PathVertices()
+                for i in range(size):
+                    for j in range(4):
+                        dx,dy = -padding,-padding
+                        if j == 1 or j == 2:
+                            dx = padding
+                        if j >= 2:
+                            dy = padding
+                        expanded[i*4+j,0] = hull[i,0]+dx
+                        expanded[i*4+j,1] = hull[i,1]+dy
+                hull,size = _path_hull(expanded,size*4)
+            if not _path_clear(hull,size,target,bounds,gap):
+                return
+            previous = current
+    valid[row,candidate] = 1
+
+
+@dataclass
+class _PathRequest:
+    geometry: ObjectGeometry
+    candidates: list
+    target: Polygon
+
+
+def _choose_clearance_paths(requests, rules, device):
+    """Check independent candidates together; return only the first valid index per row."""
+    wp.init()
+    width = max(len(r.candidates) for r in requests)
+    motions = np.zeros((len(requests),width,3,9))
+    counts = np.zeros((len(requests),width),np.int32)
+    half, targets = [], []
+    for row, request in enumerate(requests):
+        g = request.geometry
+        half.append(((g.upper[0]-g.lower[0])/2,(g.upper[1]-g.lower[1])/2))
+        targets.append(request.target)
+        for column,path in enumerate(request.candidates):
+            counts[row,column] = len(path)
+            for k,motion in enumerate(path):
+                a,b = motion.start,motion.end
+                motions[row,column,k] = (a.x,a.y,a.yaw,b.x,b.y,b.yaw,*(motion.pivot or (0.,0.)),motion.pivot is not None)
+    tensors = [torch.as_tensor(a,device=device) for a in
+               (motions,counts,np.asarray(half,dtype=np.float64),np.asarray(targets,dtype=np.float64))]
+    valid = torch.empty(counts.shape,device=device,dtype=torch.int32)
+    bounds = wp.vec4d(rules.x_range[0]+rules.edge_margin,rules.x_range[1]-rules.edge_margin,
+                      rules.y_range[0]+rules.edge_margin,rules.y_range[1]-rules.edge_margin)
+    stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if torch.device(device).type == 'cuda' else None
+    wp.launch(_clearance_paths,dim=counts.shape,inputs=[*(wp.from_torch(t) for t in tensors),bounds,rules.gap,
+              wp.from_torch(valid)],device=str(device),stream=stream)
+    first = torch.where(valid.bool(),torch.arange(width,device=device),width).amin(-1).tolist()
+    return [r.candidates[index] if index < width else None for r,index in zip(requests,first)]
 
 
 @wp.func
@@ -1665,11 +1885,43 @@ def _layout_commit(poses: wp.array3d(dtype=wp.float64), half: wp.array3d(dtype=w
             adjacent[row,other,remove] = 0
 
 
+@wp.kernel
+def _layout_obstacle_geometry(vertices: wp.array4d(dtype=wp.float64), counts: wp.array2d(dtype=wp.int32),
+                              axes: wp.array4d(dtype=wp.float64), boxes: wp.array3d(dtype=wp.float64)):
+    row, column = wp.tid()
+    count = counts[row,column]
+    low_x, high_x = wp.float64(wp.inf), wp.float64(-wp.inf)
+    low_y, high_y = wp.float64(wp.inf), wp.float64(-wp.inf)
+    for i in range(count):
+        low_x,high_x = wp.min(low_x,vertices[row,column,i,0]),wp.max(high_x,vertices[row,column,i,0])
+        low_y,high_y = wp.min(low_y,vertices[row,column,i,1]),wp.max(high_y,vertices[row,column,i,1])
+        j = (i+1)%count
+        dx = vertices[row,column,j,0]-vertices[row,column,i,0]
+        dy = vertices[row,column,j,1]-vertices[row,column,i,1]
+        length = wp.sqrt(dx*dx+dy*dy)
+        ax,ay = wp.float64(0.),wp.float64(0.)
+        low,high = wp.float64(-wp.inf),wp.float64(wp.inf)
+        if length > wp.float64(1.e-9):
+            ax,ay = -dy/length,dx/length
+            low,high = wp.float64(wp.inf),wp.float64(-wp.inf)
+            for k in range(count):
+                value = ax*vertices[row,column,k,0]+ay*vertices[row,column,k,1]
+                low,high = wp.min(low,value),wp.max(high,value)
+        axes[row,column,i,0] = ax
+        axes[row,column,i,1] = ay
+        axes[row,column,i,2] = low
+        axes[row,column,i,3] = high
+    boxes[row,column,0] = low_x
+    boxes[row,column,1] = high_x
+    boxes[row,column,2] = low_y
+    boxes[row,column,3] = high_y
+
+
 # Isaac Sim 5.1 bundles Warp 1.8.2; use options supported there and standalone.
 wp.set_module_options({"fuse_fp": False})
 
 
-def _pack_layouts(plans, geometries, rules, device, statistics=None):
+def _pack_layouts(plans, geometries, rules, device, statistics=None, *, keep_device=False):
     """Fill independent role/path plans without host round-trips per object.
 
     A plan is (IDs, role positions/yaws, access region, path, reserved sweeps,
@@ -1718,24 +1970,12 @@ def _pack_layouts(plans, geometries, rules, device, statistics=None):
             p = np.asarray(polygon)
             k = len(p)
             vertices[row,column,:k], counts[row,column] = p,k
-            boxes[row,column] = (p[:,0].min(),p[:,0].max(),p[:,1].min(),p[:,1].max())
-            delta = np.roll(p,-1,axis=0)-p
-            normals = np.stack((-delta[:,1],delta[:,0]),axis=1)
-            lengths = np.linalg.norm(normals,axis=1)
-            normals /= np.maximum(lengths[:,None],1.e-30)
-            # Scalar SAT ignores degenerate edges. Give them an unbounded
-            # interval so they cannot accidentally certify separation.
-            degenerate = lengths <= _EPS
-            normals[degenerate] = 0.
-            projections = normals @ p.T
-            axes[row,column,:k] = np.column_stack((normals,projections.min(axis=1),projections.max(axis=1)))
-            axes[row,column,:k,2][degenerate] = -np.inf
-            axes[row,column,:k,3][degenerate] = np.inf
         if rules.reserve_blocker_front:
             gaps[row,len(polygons)-1] = 0.
     device = str(device)
-    buffers = [torch.as_tensor(a,device=device) for a in
-               (poses,half,placed,state,seeds,regions,areas,vertices,axes,boxes,counts,gaps,adjacent)]
+    buffers = [torch.empty(a.shape,dtype=torch.float64,device=device) if i in (8,9)
+               else torch.as_tensor(a,device=device) for i,a in enumerate(
+               (poses,half,placed,state,seeds,regions,areas,vertices,axes,boxes,counts,gaps,adjacent))]
     p,h,on,st,seed,reg,ar,v,ax,box,co,ga,adj = [wp.from_torch(t) for t in buffers]
     candidates = wp.empty((n,64,3),dtype=wp.float64,device=device)
     scores = wp.empty((n,64),dtype=wp.float64,device=device)
@@ -1745,6 +1985,7 @@ def _pack_layouts(plans, geometries, rules, device, statistics=None):
     cell_area = ((rules.x_range[1]-rules.x_range[0]-2*rules.edge_margin)
                  * (rules.y_range[1]-rules.y_range[0]-2*rules.edge_margin)/len(regions))
     stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if torch.device(device).type == 'cuda' else None
+    wp.launch(_layout_obstacle_geometry,dim=(n,obstacles),inputs=[v,co,ax,box],device=device,stream=stream)
     # Poll only once per 16 resident rounds. Finished rows are masked in both
     # kernels, independent of batch ordering or how slowly another row packs.
     for begin in range(0, 4*width+32, 16):
@@ -1763,7 +2004,11 @@ def _pack_layouts(plans, geometries, rules, device, statistics=None):
         statistics['evictions'] = statistics.get('evictions',0)+int(status[:,4].sum())
         statistics['rejected_plans'] = statistics.get('rejected_plans',0)+int((status[:,0]!=1).sum())
     result = buffers[0].cpu().numpy()
-    return [result[row,:len(plan[0])].copy() if status[row,0] == 1 else None for row,plan in enumerate(plans)]
+    packed = [result[row,:len(plan[0])].copy() if status[row,0] == 1 else None for row,plan in enumerate(plans)]
+    if keep_device:
+        return [(value,buffers[0][row,:len(plans[row][0])]) if value is not None else None
+                for row,value in enumerate(packed)]
+    return packed
 
 
 @njit(cache=True)
@@ -1894,10 +2139,10 @@ def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: r
 
 
 def sample_scenes(geometries, rules, streams, roles, active_ids, *, device="cpu", batch_size=512,
-                  statistics=None):
+                  statistics=None, keep_device=False):
     """Independent role/path plans with resident, batched clutter construction.
 
-    Only failed plans return to the CPU. Candidate generation, selection and
+    Only failed plans are resampled. Candidate generation, selection and
     bounded neighbor repair share device state. RNG depends on each plan's seed,
     never its row or the completion order of another environment.
     """
@@ -1908,7 +2153,7 @@ def sample_scenes(geometries, rules, streams, roles, active_ids, *, device="cpu"
         for _ in range(32):
             try:
                 return (yield from _scene_proposals(geometries, rules, streams[row], *roles[row],
-                                                    active_ids[row], checked=True))
+                                                    active_ids[row], checked=True, defer_paths=True))
             except RuntimeError:
                 if active_ids[row] is not None:
                     raise
@@ -1929,15 +2174,23 @@ def sample_scenes(geometries, rules, streams, roles, active_ids, *, device="cpu"
                 except RuntimeError as error:
                     results[row] = error
             if rows:
-                packed = _pack_layouts(plans, geometries, rules, device, statistics)
-                values = dict(zip(rows, packed))
+                paths = [(row,plan) for row,plan in zip(rows,plans) if isinstance(plan,_PathRequest)]
+                layouts = [(row,plan) for row,plan in zip(rows,plans) if not isinstance(plan,_PathRequest)]
+                values = {}
+                if paths:
+                    chosen = _choose_clearance_paths([plan for _,plan in paths],rules,device)
+                    values.update(zip((row for row,_ in paths),chosen))
+                if layouts:
+                    packed = _pack_layouts([plan for _,plan in layouts],geometries,rules,device,statistics,
+                                           keep_device=keep_device)
+                    values.update(zip((row for row,_ in layouts),packed))
             pending = rows
     return results
 
 
 def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: random.Random,
                  target_id: int | None = None, blocker_id: int | None = None,
-                 active_ids: Sequence[int] | None = None, *, checked=False) -> Generator[tuple, np.ndarray | None, SceneSample]:
+                 active_ids: Sequence[int] | None = None, *, checked=False, defer_paths=False):
     """Choose episode roles/count once, then sample whole-shelf clutter around them.
 
     The Target species appears only once. The requested count describes asset
@@ -2088,17 +2341,26 @@ def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rn
                     for index in (target, blocker)}
         initial = PlanarPose(blocker_x, blocker_y, yaws[blocker])
         path, sweeps = None, None
-        for candidate in _clearance_candidates(geometries[blocker], initial, access_region, rules, rng):
-            sweeps = _path_supported_clear(geometries[blocker], candidate, (polygons[target],), rules,
-                                           return_sweeps=True)
-            if sweeps is not None:
-                path = candidate
-                break
+        candidates = _clearance_candidates(geometries[blocker], initial, access_region, rules, rng)
+        if defer_paths:
+            path = yield _PathRequest(geometries[blocker],candidates,polygons[target])
+            if path is not None:
+                sweeps = _path_sweeps(geometries[blocker],path)
+        else:
+            for candidate in candidates:
+                sweeps = _path_supported_clear(geometries[blocker], candidate, (polygons[target],), rules,
+                                               return_sweeps=True)
+                if sweeps is not None:
+                    path = candidate
+                    break
         if path is None:
             continue
         packed = yield (ids, positions, yaws, access_region, path, sweeps, rng.getrandbits(32))
         if packed is None:
             continue
+        device_poses = None
+        if isinstance(packed,tuple):
+            packed, device_poses = packed
         for slot, index in enumerate(ids):
             positions[index] = (float(packed[slot, 0]), float(packed[slot, 1]),
                                 rules.shelf_top - geometries[index].lower[2])
@@ -2108,7 +2370,7 @@ def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rn
             else "translation")
         sample = SceneSample(fixed_ids if fixed_ids is not None else ids,
                              target, blocker, positions, yaws, access_region,
-                             (path[-1].end.x, path[-1].end.y), path, kind)
+                             (path[-1].end.x, path[-1].end.y), path, kind, device_poses, ids)
         # Construction enforces support, collision margins and cached global
         # metrics. validate_sample remains an independent test/debug oracle.
         return sample
@@ -2223,13 +2485,41 @@ def _robot_candidate_clearance(env, frames, joints, tcp, obstacle_centers, obsta
     return valid, height
 
 
+def _scene_boxes_tensor(env, samples, proposals):
+    """Compact active OBBs from device poses, with cached catalog/shelf geometry."""
+    proposed, _, slots = proposals
+    model = env.robot_pose_model
+    constants = model._tensor_constants(proposed.device,proposed.dtype)
+    if "scene_half" not in constants:
+        lower = proposed.new_tensor([g.lower for g in env.spawn_geometries])
+        upper = proposed.new_tensor([g.upper for g in env.spawn_geometries])
+        constants["scene_half"] = (upper-lower)*.5
+        constants["scene_center_z"] = (upper[:,2]+lower[:,2])*.5
+        constants["shelf_centers"] = proposed.new_tensor(np.asarray([b.center for b in model.shelf_boxes])).reshape(-1,3)
+        constants["shelf_rotations"] = proposed.new_tensor(np.asarray([b.rotation for b in model.shelf_boxes])).reshape(-1,3,3)
+        constants["shelf_half"] = proposed.new_tensor(np.asarray([b.half_extents for b in model.shelf_boxes])).reshape(-1,3)
+    ids = slots[:,:max(len(sample.active_ids) for sample in samples)]
+    lookup = ids.clamp_min(0)
+    selected = proposed.gather(1,lookup[...,None].expand(-1,-1,4))
+    centers = selected[...,:3]+proposed.new_tensor(model.base_origin)
+    centers[...,2] += constants["scene_center_z"][lookup]
+    c,s = selected[...,3].cos(),selected[...,3].sin()
+    zero,one = torch.zeros_like(c),torch.ones_like(c)
+    rotations = torch.stack((c,-s,zero,s,c,zero,zero,zero,one),-1).reshape(*c.shape,3,3)
+    n = len(samples)
+    return (torch.cat((centers,constants["shelf_centers"][None].expand(n,-1,-1)),1),
+            torch.cat((rotations,constants["shelf_rotations"][None].expand(n,-1,-1,-1)),1),
+            torch.cat((constants["scene_half"][lookup],constants["shelf_half"][None].expand(n,-1,-1)),1),
+            torch.cat((ids >= 0,torch.ones((n,len(model.shelf_boxes)),device=proposed.device,dtype=torch.bool)),1))
+
+
 @torch.no_grad()
-def _sample_robot_starts(env, samples, seeds):
+def _sample_robot_starts(env, samples, seeds, *, proposals=None):
     """Sample continuous starts with bounded batched GPU IK and OBB acceptance.
 
-    Returns one old-style start tuple or ``None`` per requested scene. Failed
-    rows can be resampled without discarding valid neighbors. Only metadata
-    packing and the final small accepted-pose transfer use host arrays; no
+    Returns one device-tensor start tuple or ``None`` per requested scene. Failed
+    rows can be resampled without discarding valid neighbors. Episode RNG and
+    metadata preparation plus bounded acceptance indices use host arrays; no
     per-environment nonlinear solver or live physics trial is used.
     """
     if len(samples) != len(seeds):
@@ -2251,16 +2541,9 @@ def _sample_robot_starts(env, samples, seeds):
     # Local generators keep each episode independent of reset subset/order.
     noise = torch.as_tensor(np.stack([np.random.default_rng(int(seed) ^ 0x5D2EA91C).random(
         (rules.max_attempts, 9), dtype=np.float32) for seed in seeds]), device=device)
-    obstacles = [_scene_collision_boxes(env, sample) for sample in samples]
-    max_obstacles = max(map(len, obstacles))
-    boxes = np.zeros((count, max_obstacles, 15), dtype=np.float32)
-    mask = np.zeros((count, max_obstacles), dtype=bool)
-    for row, values in enumerate(obstacles):
-        for column, (center, orientation, half, _) in enumerate(values):
-            boxes[row, column] = np.concatenate((center, orientation.reshape(-1), half))
-            mask[row, column] = True
-    boxes = torch.as_tensor(boxes, device=device)
-    obstacle_valid = torch.as_tensor(mask, device=device)
+    if proposals is None:
+        proposals = _episode_proposals(samples,len(env.spawn_geometries),device,dtype)
+    centers,rotations,half,obstacle_valid = _scene_boxes_tensor(env,samples,proposals)
     result = torch.zeros((count, len(model.joint_names) + 5), device=device, dtype=dtype)
     accepted = [False] * count
     # Bound pairwise collision scratch independently of the selected count.
@@ -2290,9 +2573,8 @@ def _sample_robot_starts(env, samples, seeds):
                 target.reshape(-1, 3), rotation.expand(len(pending) * width, -1, -1), arm.reshape(-1, 6))
             obstacle_rows = rows.repeat_interleave(width)
             clear, heights = _robot_candidate_clearance(
-                env, frames, joints, tcp, boxes[obstacle_rows, :, :3],
-                boxes[obstacle_rows, :, 3:12].reshape(-1, max_obstacles, 3, 3),
-                boxes[obstacle_rows, :, 12:], obstacle_valid[obstacle_rows])
+                env, frames, joints, tcp, centers[obstacle_rows],rotations[obstacle_rows],
+                half[obstacle_rows], obstacle_valid[obstacle_rows])
             actual = tcp[:, :3, 3] - origin
             valid &= clear & (actual >= lower[obstacle_rows]).all(-1) & (actual <= upper[obstacle_rows]).all(-1)
             valid = valid.reshape(len(pending), width)
@@ -2310,9 +2592,7 @@ def _sample_robot_starts(env, samples, seeds):
                 for index in selected:
                     accepted[pending[index]] = True
             pending = [row for row in pending if not accepted[row]]
-    values = result.cpu().numpy()
-    return [(values[row, :-5].astype(np.float64), tuple(regions_cpu[row]),
-             values[row, -5:-2].astype(np.float64), float(values[row, -2]), int(values[row, -1]))
+    return [(result[row, :-5],regions[row],result[row, -5:-2],result[row, -2],result[row, -1])
             if accepted[row] else None for row in range(count)]
 
 
@@ -2331,7 +2611,7 @@ def _check_physical_robot_starts(env, samples, starts, poses, origins):
     output = []
     for begin in range(0, len(starts), 128):
         selected = starts[begin:begin + 128]
-        q = torch.as_tensor(np.stack([start[0] for start in selected]), device=poses.device, dtype=poses.dtype)
+        q = torch.stack([torch.as_tensor(start[0],device=poses.device,dtype=poses.dtype) for start in selected])
         expected = model.forward_batch(q)
         actual = poses[begin:begin + len(selected)]
         positions = actual[..., :3] - origins[begin:begin + len(selected), None] + poses.new_tensor(model.base_origin)
@@ -2410,20 +2690,38 @@ def pack_object_states(default_state, sample, lower, upper, upright):
     return tuple(value[0] for value in pack_episode_states(default_state, [sample], lower, upper, upright))
 
 
-def pack_episode_states(default_state, samples, lower, upper, upright):
-    """Transfer CPU proposals together; vectorize off-center/upright conversion."""
-    m, p = len(samples), default_state.shape[0]
-    proposed = np.zeros((m, p, 4), dtype=np.float32)
+def _episode_proposals(samples, p, device, dtype):
+    """Keep XY/yaw on device; only IDs and static support heights come from metadata."""
+    m = len(samples)
     active = np.zeros((m, p), dtype=bool)
     slots = np.full((m, 40), -1, dtype=np.int64)
-    for row, sample in enumerate(samples):  # CPU sampler output; no device reads in this loop.
+    for row, sample in enumerate(samples):
         ids = list(sample.active_ids)
-        proposed[row, ids, :3] = [sample.positions[index] for index in ids]
-        proposed[row, ids, 3] = [sample.yaws[index] for index in ids]
         active[row, ids], slots[row, :len(ids)] = True, ids
-    proposed = torch.as_tensor(proposed, device=default_state.device, dtype=default_state.dtype)
-    active = torch.as_tensor(active, device=default_state.device)
-    slots = torch.as_tensor(slots, device=default_state.device)
+    if samples and all(sample.planar_poses is not None for sample in samples):
+        pairs = [(row,index) for row,s in enumerate(samples) for index in s.planar_ids]
+        indices = torch.tensor(pairs,device=device,dtype=torch.long)
+        heights = torch.tensor([s.positions[index][2] for s in samples for index in s.planar_ids],
+                               device=device,dtype=dtype)
+        planar = torch.cat([s.planar_poses for s in samples]).to(device=device,dtype=dtype)
+        values = torch.stack((planar[:,0],planar[:,1],heights,planar[:,2]),-1)
+        proposed = torch.zeros((m,p,4),device=device,dtype=dtype)
+        proposed[indices[:,0],indices[:,1]] = values
+    else:
+        proposed = np.zeros((m,p,4),dtype=np.float32)
+        for row,sample in enumerate(samples):
+            ids = list(sample.active_ids)
+            proposed[row,ids,:3] = [sample.positions[index] for index in ids]
+            proposed[row,ids,3] = [sample.yaws[index] for index in ids]
+        proposed = torch.as_tensor(proposed,device=device,dtype=dtype)
+    return proposed,torch.as_tensor(active,device=device),torch.as_tensor(slots,device=device)
+
+
+def pack_episode_states(default_state, samples, lower, upper, upright, *, proposals=None):
+    """Vectorize off-center/upright conversion without downloading device layouts."""
+    m, p = len(samples), default_state.shape[0]
+    proposed, active, slots = proposals if proposals is not None else _episode_proposals(
+        samples,p,default_state.device,default_state.dtype)
     rotation = torch.zeros((m, p, 4), device=default_state.device, dtype=default_state.dtype)
     rotation[..., 0], rotation[..., 3] = torch.cos(proposed[..., 3] * .5), torch.sin(proposed[..., 3] * .5)
     center = (lower + upper) * .5
@@ -2594,7 +2892,8 @@ def _build_episode_batch(env, runtime, ids):
                 # print(f"[Episode reset] sampling {len(pending)} independent episodes, proposal {attempt + 1}", flush=True)
                 proposals = sample_scenes(
                     env.spawn_geometries, env.spawn_rules, [streams[row] for row in pending],
-                    [roles[row] for row in pending], [fixed_ids[row] for row in pending], device=env.device)
+                    [roles[row] for row in pending], [fixed_ids[row] for row in pending], device=env.device,
+                    keep_device=True)
                 for row, sample in zip(pending, proposals):
                     if isinstance(sample, RuntimeError):
                         errors[row] = str(sample)
@@ -2604,7 +2903,9 @@ def _build_episode_batch(env, runtime, ids):
                     samples.append(sample)
                 if not candidates:
                     continue
-                starts = _sample_robot_starts(env, samples, [seeds[row] + 7_919 * (attempt + 1) for row in candidates])
+                proposed = _episode_proposals(samples,len(specs),env.device,default.dtype)
+                starts = _sample_robot_starts(env, samples, [seeds[row] + 7_919 * (attempt + 1) for row in candidates],
+                                              proposals=proposed)
                 feasible = [index for index, start in enumerate(starts) if start is not None]
                 for row, start in zip(candidates, starts):
                     if start is None:
@@ -2616,13 +2917,15 @@ def _build_episode_batch(env, runtime, ids):
                     continue
                 rows = torch.tensor(candidates, device=env.device, dtype=torch.long)
                 candidate_ids = ids[rows]
-                states, active, slots = pack_episode_states(default, samples, scene.lower, scene.upper, scene.upright)
-                positions = default.new_tensor(np.stack([start[0] for start in starts]))
+                selection = torch.tensor(feasible,device=env.device,dtype=torch.long)
+                states, active, slots = pack_episode_states(default, samples, scene.lower, scene.upper, scene.upright,
+                                                           proposals=tuple(t[selection] for t in proposed))
+                positions = torch.stack([torch.as_tensor(start[0],device=env.device,dtype=default.dtype) for start in starts])
                 batch.object_state[rows], batch.active[rows], batch.object_ids[rows] = states, active, slots
                 batch.joint_positions[rows] = positions
                 batch.access_region[rows] = default.new_tensor([sample.access_region for sample in samples])
-                batch.robot_regions[rows] = default.new_tensor([start[1] for start in starts])
-                batch.robot_tcp[rows] = default.new_tensor(np.stack([start[2] for start in starts]))
+                batch.robot_regions[rows] = torch.stack([torch.as_tensor(start[1],device=env.device,dtype=default.dtype) for start in starts])
+                batch.robot_tcp[rows] = torch.stack([torch.as_tensor(start[2],device=env.device,dtype=default.dtype) for start in starts])
                 _write_physical_reset(env, candidate_ids, states, positions, active)
                 env.sim.forward()  # FK only, never step or flush all environments' force buffers.
                 link_poses = robot.root_physx_view.get_link_transforms()[candidate_ids]

@@ -16,6 +16,76 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _edge_mean_forward(receiver, sender, edges, degree, output,
+                       M: tl.constexpr, D: tl.constexpr, K: tl.constexpr, C: tl.constexpr):
+    node = tl.program_id(0)
+    batch, i = node // M, node % M
+    j, d = tl.arange(0, K), tl.arange(0, C)
+    r = tl.load(receiver + node * D + d, d < D, other=0)
+    s = tl.load(sender + (batch * M + j[:, None]) * D + d[None, :],
+                (j[:, None] < M) & (d[None, :] < D), other=0)
+    valid = tl.load(edges + node * M + j, j < M, other=0)
+    count = tl.maximum(tl.load(degree + node), 1)
+    value = tl.sum(tl.where(valid[:, None], tl.maximum(r[None, :] + s, 0.), 0.), axis=0) / count
+    tl.store(output + node * D + d, value, d < D)
+
+
+@triton.jit
+def _edge_mean_backward(receiver, sender, edges, degree, gradient, grad_r, grad_s,
+                        M: tl.constexpr, D: tl.constexpr, K: tl.constexpr, C: tl.constexpr):
+    node = tl.program_id(0)
+    batch, i = node // M, node % M
+    j, d = tl.arange(0, K), tl.arange(0, C)
+    mask = (j[:, None] < M) & (d[None, :] < D)
+    address = (batch * M + j[:, None]) * D + d[None, :]
+    r = tl.load(receiver + node * D + d, d < D, other=0)
+    s = tl.load(sender + address, mask, other=0)
+    valid = tl.load(edges + node * M + j, j < M, other=0)
+    own_g = tl.load(gradient + node * D + d, d < D, other=0)
+    own_count = tl.maximum(tl.load(degree + node), 1)
+    dr = tl.sum(((r[None, :] + s > 0.) & valid[:, None]).to(tl.float32), axis=0) * own_g / own_count
+    r = tl.load(receiver + address, mask, other=0)
+    s = tl.load(sender + node * D + d, d < D, other=0)
+    valid = tl.load(edges + (batch * M + j) * M + i, j < M, other=0)
+    g = tl.load(gradient + address, mask, other=0)
+    count = tl.maximum(tl.load(degree + batch * M + j, j < M, other=1), 1)
+    ds = tl.sum(tl.where((r + s[None, :] > 0.) & valid[:, None], g / count[:, None], 0.), axis=0)
+    tl.store(grad_r + node * D + d, dr, d < D)
+    tl.store(grad_s + node * D + d, ds, d < D)
+
+
+class _EdgeMean(torch.autograd.Function):
+    """Fuse edge ReLU/masking/reduction; recompute signs in backward, never save pairs."""
+
+    @staticmethod
+    def forward(ctx, receiver, sender, edges, degree):
+        receiver, sender, edges, degree = (t.contiguous() for t in (receiver, sender, edges, degree))
+        b, m, d = receiver.shape
+        output = torch.empty_like(receiver)
+        _edge_mean_forward[(b * m,)](receiver, sender, edges, degree, output,
+                                     m, d, triton.next_power_of_2(m), triton.next_power_of_2(d))
+        ctx.save_for_backward(receiver, sender, edges, degree)
+        return output
+
+    @staticmethod
+    def backward(ctx, gradient):
+        receiver, sender, edges, degree = ctx.saved_tensors
+        b, m, d = receiver.shape
+        grad_r, grad_s = torch.empty_like(receiver), torch.empty_like(sender)
+        _edge_mean_backward[(b * m,)](receiver, sender, edges, degree, gradient.contiguous(), grad_r, grad_s,
+                                      m, d, triton.next_power_of_2(m), triton.next_power_of_2(d))
+        return grad_r, grad_s, None, None
+
+
+def _edge_mean(receiver, sender, edges, degree):
+    if receiver.is_cuda and receiver.dtype == torch.float32:
+        return _EdgeMean.apply(receiver, sender, edges, degree)
+    return (F.relu(receiver[:, :, None, :] + sender[:, None, :, :]) * edges[..., None]).sum(-2) / degree.clamp_min(1)
 
 @dataclass
 class ModelCfg:
@@ -162,8 +232,7 @@ class SceneGraphEncoder(nn.Module):
             relation = F.linear(spatial, weight[:, 2 * self.width:])
             receivers = F.linear(hidden, weight[:, :self.width], bias) - relation
             senders = F.linear(hidden, weight[:, self.width:2 * self.width]) + relation
-            messages = message[1](receivers[..., :, None, :] + senders[..., None, :, :])
-            aggregated = (messages * edges[..., None]).sum(-2) / degree.clamp_min(1)
+            aggregated = _edge_mean(receivers, senders, edges, degree)
             # Linear(mean(messages)) == mean(Linear(messages)): apply the
             # second affine map once per node, instead of once per edge.
             # Empty neighborhoods must not acquire the affine bias.

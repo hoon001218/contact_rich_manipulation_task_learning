@@ -370,6 +370,30 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(log_probability.shape, ())
         self.assertEqual(value.shape, ())
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA fused edge reduction")
+    def test_fused_edge_reduction_matches_dense_output_and_backward(self):
+        from contact_manipulation.config.ur5e.agents.model import _edge_mean
+        for batch, count, width in ((3, 5, 17), (17, 40, 64)):
+            receiver = torch.randn(batch, count, width, device="cuda", requires_grad=True)
+            sender = torch.randn_like(receiver, requires_grad=True)
+            with torch.no_grad():
+                receiver[0] = 0
+                sender[0] = 0  # ReLU at exactly zero must have zero gradient.
+            edges = torch.rand(batch, count, count, device="cuda") > .3
+            edges[:, -1] = False  # Empty neighborhoods, even with other valid nodes.
+            degree = edges.sum(-1, keepdim=True)
+            # Non-contiguous upstream gradients also occur in composite models.
+            gradient = torch.randn(width, count, batch, device="cuda").permute(2, 1, 0)
+            expected = (torch.relu(receiver[:, :, None] + sender[:, None]) * edges[..., None]).sum(-2) / degree.clamp_min(1)
+            expected_grad = torch.autograd.grad(expected, (receiver, sender), gradient)
+            actual = _edge_mean(receiver, sender, edges, degree)
+            actual_grad = torch.autograd.grad(actual, (receiver, sender), gradient)
+            torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-7)
+            for a, b in zip(actual_grad, expected_grad):
+                torch.testing.assert_close(a, b, rtol=3e-6, atol=5e-7)
+            self.assertEqual(actual_grad[0][0].count_nonzero(), 0)
+            self.assertEqual(actual_grad[1][0].count_nonzero(), 0)
+
     def test_factorized_edge_messages_match_dense_reference_outputs_and_gradients(self):
         optimized = self.model.scene_encoder.double()
         reference = copy.deepcopy(optimized)
@@ -687,6 +711,21 @@ class NativeLearningTests(unittest.TestCase):
             self.assertTrue(restored.alg.optimizer.state)
             for first, second in zip(runner.alg.optimizer.state.values(), restored.alg.optimizer.state.values()):
                 torch.testing.assert_close(first["exp_avg"], second["exp_avg"], rtol=0, atol=0)
+            # Play uses the native runner with strict weights/metadata checks,
+            # but skips the training optimizer and returns deterministic actions.
+            player = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+            player.load(checkpoint, map_location="cpu", load_cfg={
+                "actor": True, "critic": True, "iteration": True, "optimizer": False, "rnd": False,
+            })
+            self.assertFalse(player.alg.optimizer.state)
+            self.assertEqual(player.current_learning_iteration, 1)
+            policy = player.get_inference_policy(device="cpu")
+            with torch.inference_mode():
+                inputs = env.get_observations()
+                expected = runner.get_inference_policy(device="cpu")(inputs)
+                torch.testing.assert_close(policy(inputs), expected, rtol=0, atol=0)
+                torch.testing.assert_close(policy(inputs), expected, rtol=0, atol=0)
+                policy.reset(torch.ones(env.num_envs, dtype=torch.bool))
             runner.logger.writer.flush()
             runner.logger.writer.close()
 

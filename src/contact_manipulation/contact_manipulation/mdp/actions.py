@@ -97,6 +97,36 @@ def symmetric_matrix_sqrt(matrix: torch.Tensor, identity: torch.Tensor, iteratio
     return 0.5 * (root + root.mT) * scale.sqrt(), converged
 
 
+_sqrt_graphs = {}
+
+
+def _symmetric_matrix_sqrt_cuda(matrix, identity):
+    """Replay the same 32-iteration tensor operations without per-op Python launches."""
+    if matrix.requires_grad or identity.requires_grad:
+        return symmetric_matrix_sqrt(matrix, identity)
+    key = (str(matrix.device),matrix.dtype,identity.dtype,tuple(matrix.shape),tuple(identity.shape),
+           torch.backends.cuda.matmul.allow_tf32,torch.is_inference_mode_enabled())
+    if key not in _sqrt_graphs:
+        values, eye = matrix.clone(), identity.clone()
+        with torch.cuda.device(matrix.device):
+            stream = torch.cuda.Stream(device=matrix.device)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    symmetric_matrix_sqrt(values, eye)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = symmetric_matrix_sqrt(values, eye)
+        _sqrt_graphs[key] = values,eye,graph,outputs
+    values,eye,graph,outputs = _sqrt_graphs[key]
+    values.copy_(matrix)
+    eye.copy_(identity)
+    graph.replay()
+    # Callers own their results even after another replay or environment step.
+    return tuple(output.clone() for output in outputs)
+
+
 def implicit_cartesian_damping(
     jacobian: torch.Tensor,
     mass_matrix: torch.Tensor,
@@ -129,7 +159,8 @@ def implicit_cartesian_damping(
     inertia = 0.5 * (inertia + inertia.mT)
     root_gain = stiffness.sqrt()
     scaled_inertia = inertia / root_gain.unsqueeze(-1) / root_gain.unsqueeze(-2)
-    root, converged = symmetric_matrix_sqrt(scaled_inertia, identity)
+    sqrt = _symmetric_matrix_sqrt_cuda if scaled_inertia.is_cuda else symmetric_matrix_sqrt
+    root, converged = sqrt(scaled_inertia, identity)
     damping = 2.0 * damping_ratio * (root_gain.unsqueeze(-1) * root * root_gain.unsqueeze(-2))
     effective_damping = damping + dt * torch.diag_embed(stiffness)
     system = inertia + dt * effective_damping

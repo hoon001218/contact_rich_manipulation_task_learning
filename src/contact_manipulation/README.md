@@ -14,7 +14,8 @@ contact_manipulation/
 ├── pyproject.toml
 ├── README.md
 ├── scripts/
-│   └── train.py                     # Isaac Lab 예제의 native 학습 흐름
+│   ├── train.py                     # Isaac Lab 예제의 native 학습 흐름
+│   └── play.py                      # 저장된 checkpoint의 native 추론·GUI 재생
 └── contact_manipulation/
     ├── __init__.py                  # 패키지 import 시 Gym 등록
     ├── shelf_manipulation_env_cfg.py # 공통 Scene 및 MDP manager 설정
@@ -111,7 +112,7 @@ Mask 판정에 필요한 원래 값을 유지하므로 추가 running observatio
 | γ / GAE λ / PPO clip | 0.99 / 0.95 / 0.2 |
 | Value loss / entropy coefficient | 0.25 / 0.01 |
 | Max gradient norm / 초기 action std | 0.5 / 0.3 (tanh 이전) |
-| 추론 chunk / 학습 microbatch | 최대 512 / 1,024 sample |
+| 추론 chunk / 학습 microbatch | 최대 1,024 / 4,096 sample |
 | 학습 iteration / checkpoint 주기 | 1,000 / 50 |
 | Physics / control 주기 / timeout | 120 Hz / 30 Hz / 8 s |
 | 기본 환경 수 / 환경 간격 | 1 / 2.5 m |
@@ -268,13 +269,20 @@ OBB hull·clipping과 6×6 제어 행렬 계산의 반복은 고정 크기이며
 관절/body ID·센서 scale·질량·관성·catalog corner는 초기화/reset 때 저장한다.
 Newton–Schulz 제곱근과 `solve_ex(check_errors=False)`는 수치 실패를 환경별 GPU flag로
 돌려주고, 해당 환경을 실패 처리한다.
+제어의 제곱근 계산은 CUDA graph에 기존 32회 tensor 연산을 그대로 기록해 재실행한다.
+제어식·반복 횟수·수렴 판정과 PhysX/OSC 호출 순서는 유지하며 결과 buffer는 복사해 반환한다.
+CPU 또는 gradient가 필요한 입력은 기존 PyTorch 경로를 사용한다.
 
 GNN edge MLP의 첫 선형 연산을 node별 projection으로 분해해 `[N,40,40,134]`
 concatenation과 반복 projection을 제거했다. 두 번째 선형 연산은 message 평균 이후로 옮겨
 edge마다가 아닌 node마다 한 번 계산한다. 이웃이 없는 node에는 선형 bias가 유입되지 않게
 처리한다. 기존 dense 식과 출력·gradient가 일치하며 모델 파라미터와 checkpoint 구조도 동일하다.
-남는 pair activation은 rollout chunk와 PPO microbatch로 제한한다. 환경별 Python loop는
-사용하지 않으며 GPU에서 벡터화된 여러 환경을 한 chunk로 처리한다. PPO gradient 유효성 검사는
+CUDA FP32에서는 ReLU·edge mask·합산을 Triton kernel 하나로 처리하여
+`[B,40,40,64]` pair activation을 저장하지 않는다. Backward에서도 node별 입력으로
+ReLU의 부호를 재계산해 receiver/sender gradient를 구하며, 큰 pair gradient도 만들지 않는다.
+CPU 및 다른 dtype은 같은 PyTorch 식을 사용한다. 파라미터 이름·shape와 checkpoint는 유지한다.
+늘어난 메모리 여유를 사용해 추론 chunk는 1,024, PPO microbatch는 4,096으로 설정했다.
+Rollout·epoch·minibatch 수와 optimizer 갱신 횟수는 그대로다. PPO gradient 유효성 검사는
 minibatch당 한 번, 로그 수치의 CPU 전송은 update당 한 번 수행한다.
 
 `events.py`의 `TaskState`는 누적 조작량, 직전 속도·wrench, 두 step 이력을 저장한다.
@@ -293,7 +301,11 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 저장한다. 물체 pose는 reward·종료 조건에만 사용하며 초기 vision을 대신하지 않는다.
 정적 USD 기하와 로봇 FK 모델은 최초 한 번만 검사한다. Reset 준비 연산은 다음과 같이 나눈다.
 
-- **물체 배치:** 역할·구성·예약 경로는 CPU에서 준비하고, 환경×64개 후보의 위치·yaw 생성,
+- **물체 배치:** 역할·구성과 경로 후보 목록은 CPU에서 준비하고, 이동·pivot 경로의
+  endpoint 및 최대 5° 간격의 보수적 sweep을 GPU에서 함께 검사해 첫 유효 후보를 선택한다.
+  지원 영역·Target과의 충돌·회전 중 충돌 조건은 기존 scalar 기하 검사와 같다.
+  선택한 경로의 sweep은 예약 공간으로 유지하며, 예약 다각형의 SAT 축·투영·AABB도 GPU에서 계산한다.
+  환경×64개 후보의 위치·yaw 생성,
   충돌 판정·채점·부분 재배치는 환경 device에서 처리한다. 배치 상태와 누적 면적/이웃 관계를
   유지하며 16개 진행 단계마다 완료 여부만 CPU로 가져온다. 최종 전체 pairwise 기하 재검사는
   학습 경로에 없고, `validate_sample()`은 별도 검증용으로 유지한다.
@@ -303,6 +315,11 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
   계산하는 **후보 수**의 상한이다. 512로 낮추면 임시 메모리와 처리량을 함께 줄일 수 있다.
 - **물리 적용·vision:** 선택된 `[M,...]` 행을 asset별 한 번씩 쓰고 PhysX link pose를 묶어서
   확인한다. 이어서 공유 메시의 ray casting으로 가시성을 검증하고 승인한 행만 확정한다.
+
+배치의 XY/yaw tensor는 IK 충돌 OBB와 물리 초기 상태 생성까지 GPU에 유지한다.
+독립 검증·debug용 CPU pose 사본은 남지만 물리 적용을 위해 재업로드하지 않는다.
+IK 결과의 관절값·TCP·시작 영역도 tensor로 전달한다. 종류/instance ID와 지지 높이,
+독립 episode 난수 준비 및 후보 승인 인덱스의 CPU 처리는 남아 있다.
 
 각 layout에서 가상 시점은 최대 32회 제안하며, 실패한 환경만 최대 32개 layout까지
 재시도한다. 재시도 중 Target·Blocker, 물체 종류·instance 집합과 가시율 기준은 유지한다.
@@ -459,6 +476,12 @@ CPU sampler의 4·8개 스레드 실행은 동일한 작업에서 단일 스레�
 
 ## 실행
 
+2026-10-14 추가 최적화 후 RTX 3090에서 1,024개 환경·8 iteration을 실행했다.
+초기 환경 생성 시간을 제외한 총 학습 시간은 **113.14→91.10초**, 평균은 **14.14→11.39초**다.
+PPO update는 약 **3.30→1.03초**로 줄었다. 두 실행의 reset 수는 1,164/1,166으로 조금
+다르며, 장기 처리량은 episode 종료 빈도에 따라 달라진다. 같은 seed의 별도 배치 생성 비교는
+1,024개 기준 3.33→2.25초였다. 자세한 조건과 검증은 [개발 맥락](../../docs/CONTEXT.md)에 기록했다.
+
 Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별도로 설치할 수 있다.
 
 ```bash
@@ -491,3 +514,36 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 
 Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
 다른 checkout을 사용하면 `ISAACLAB_PATH`를 지정한다.
+
+저장된 정책을 GUI에서 재생하려면 저장소 루트에서 다음과 같이 실행한다.
+`--checkpoint`에 재생할 파일을 지정한다. 아래는 저장된 iteration 2,050 모델의 예시다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
+  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-13_23-18-25/model_2050.pt \
+  --num_envs 4 --real-time
+```
+
+`--checkpoint`를 생략하면 native `get_checkpoint_path()`로 최신 run의 마지막 checkpoint를
+선택한다. 특정 run은 `--load_run 2026-10-13_23-18-25`로 지정한다. 기본 환경 수는 1이고,
+episode 종료 시 학습과 같은 환경의 auto-reset으로 새 배치·초기 관측을 생성한다.
+`--real-time`은 실행이 빠를 때 30 Hz 제어 주기에 맞춰 기다리며 느린 reset을 가속하지 않는다.
+
+Play는 `RslRlVecEnvWrapper → OnPolicyRunner.load() → get_inference_policy()` 흐름을
+사용하며 탐색 noise 없이 정책의 `tanh(mean)` action을 적용한다. 모델·F/T metadata와
+state dict를 엄격하게 검사하고 optimizer는 불러오지 않는다. 학습 업데이트나 자동 모델
+export는 수행하지 않는다. 최적화 전후 모델 구조가 동일한 checkpoint는 재생할 수 있으나,
+현재 환경 설정을 사용하므로 과거의 배치·관측 모델까지 복원하는 기능은 아니다.
+필요한 설정 변경은 학습과 같은 Hydra `env.*`, `agent.*` 인자로 전달한다.
+
+GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`을 사용한다.
+영상은 다음과 같이 저장하며 checkpoint 옆 `videos/play/`에 생성된다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
+  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-13_23-18-25/model_2050.pt \
+  --num_envs 1 --headless --video --video_length 300
+```
+
+영상 저장에만 렌더링을 활성화하며 정책의 초기 vision은 계속 GPU mesh ray casting을 사용한다.
+`--max_steps`와 `--video_length`를 함께 지정하면 더 짧은 길이에서 종료한다.

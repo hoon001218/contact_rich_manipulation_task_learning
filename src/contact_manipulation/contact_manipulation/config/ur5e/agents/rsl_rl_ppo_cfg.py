@@ -12,7 +12,7 @@ from .model import ModelCfg
 class ContactActorCfg:
     class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactActor"
     model_cfg: dict = asdict(ModelCfg())
-    max_forward_batch_size: int = 512
+    max_forward_batch_size: int = 1024
     obs_normalization: bool = False
     distribution_cfg: dict = {"class_name": "tanh_gaussian", "init_std": ModelCfg().initial_std}
     # Compatibility with Isaac Lab's native RSL-RL configuration migration.
@@ -22,7 +22,7 @@ class ContactActorCfg:
 @configclass
 class ContactCriticCfg:
     class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactCritic"
-    max_forward_batch_size: int = 512
+    max_forward_batch_size: int = 1024
     obs_normalization: bool = False
     distribution_cfg: dict | None = None
     stochastic: bool = False
@@ -31,7 +31,7 @@ class ContactCriticCfg:
 @configclass
 class ContactPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name = "contact_manipulation.config.ur5e.agents.ppo:ContactManipulationPPO"
-    max_microbatch_size: int = 1024
+    max_microbatch_size: int = 4096
     num_learning_epochs = 4
     num_mini_batches = 4
     learning_rate = 3.0e-4

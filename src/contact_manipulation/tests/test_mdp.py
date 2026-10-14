@@ -556,6 +556,35 @@ class ActionContractTests(unittest.TestCase):
 
 
 class PhysicalControllerTests(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA graph physical damping")
+    def test_graphed_damping_matches_eager_and_handles_changing_inputs(self):
+        torch.manual_seed(191)
+        n = 128
+        eye = torch.eye(6,device='cuda').expand(n,-1,-1)
+        raw = torch.randn(n,6,6,device='cuda')
+        mass = raw @ raw.mT + .1*eye
+        jacobian = torch.randn_like(mass)
+        jacobian[:4,-1] *= 1.e-4  # Near-singular arm configurations.
+        stiffness = torch.rand(n,6,device='cuda')*100 + 10
+        velocity = torch.randn(n,6,device='cuda')*.1
+        error = torch.randn_like(velocity)*.01
+        self.addCleanup(setattr,torch.backends.cuda.matmul,'allow_tf32',torch.backends.cuda.matmul.allow_tf32)
+        with torch.inference_mode():
+            for tf32 in (False,True):
+                torch.backends.cuda.matmul.allow_tf32 = tf32
+                previous = None
+                for scale in (1.,.7):
+                    args = (jacobian*scale,mass,stiffness*scale,velocity*scale,error*scale,1/120,eye)
+                    with patch.object(control,'_symmetric_matrix_sqrt_cuda',control.symmetric_matrix_sqrt):
+                        expected = control.implicit_cartesian_damping(*args)
+                    actual = control.implicit_cartesian_damping(*args)
+                    for a,b in zip(actual,expected):
+                        torch.testing.assert_close(a,b,rtol=0,atol=0,equal_nan=True)
+                    if previous is not None:
+                        for value,snapshot in previous:
+                            torch.testing.assert_close(value,snapshot,rtol=0,atol=0,equal_nan=True)
+                    previous = [(value,value.clone()) for value in actual]
+
     def test_coupled_matrix_square_root_matches_eigen_reference(self):
         torch.manual_seed(17)
         basis, _ = torch.linalg.qr(torch.randn(128, 6, 6))
@@ -1164,6 +1193,40 @@ class EpisodeLayoutTests(unittest.TestCase):
         for index in sample.active_ids:
             self.assertAlmostEqual(sample.positions[index][2] + catalog[index].lower[2], rules.shelf_top)
 
+    def test_device_layout_feeds_physics_and_collision_boxes_without_host_pose_reads(self):
+        import random
+        catalog, rules = self.catalog(), task.SpawnRules()
+        sample = task.sample_scene(catalog,rules,random.Random(1))
+        # Catalog storage, active slots, and packing order need not be identical.
+        order = sample.active_ids[::-1]
+        for device in ['cpu']+(['cuda:0'] if torch.cuda.is_available() else []):
+            lower = torch.tensor([g.lower for g in catalog],device=device)
+            upper = torch.tensor([g.upper for g in catalog],device=device)
+            upright = torch.zeros((len(catalog),4),device=device)
+            upright[:,0] = 1
+            default = torch.zeros((len(catalog),13),device=device)
+            default[:,0],default[:,3] = 5.,1.
+            expected = task.pack_episode_states(default,[sample],lower,upper,upright)
+            resident = dataclasses.replace(sample,planar_ids=order,planar_poses=torch.tensor(
+                [(*sample.positions[i][:2],sample.yaws[i]) for i in order],device=device,dtype=torch.float64))
+            cache = {}
+            model = SimpleNamespace(base_origin=np.array([.1,.2,0.]),
+                shelf_boxes=[SimpleNamespace(center=np.zeros(3),rotation=np.eye(3),half_extents=np.ones(3),path='shelf')],
+                _tensor_constants=lambda *args: cache)
+            env = SimpleNamespace(robot_pose_model=model,spawn_geometries=catalog)
+            old_boxes = task._scene_collision_boxes(env,sample)
+            with patch.object(torch.Tensor,'cpu',side_effect=AssertionError('host pose transfer')), \
+                 patch.object(torch.Tensor,'numpy',side_effect=AssertionError('host pose transfer')):
+                proposed = task._episode_proposals([resident],len(catalog),device,torch.float32)
+                actual = task.pack_episode_states(default,[resident],lower,upper,upright,proposals=proposed)
+                centers,rotations,half,valid = task._scene_boxes_tensor(env,[resident],proposed)
+            for a,b in zip(actual,expected):
+                torch.testing.assert_close(a,b,rtol=0,atol=0)
+            for tensor,column in ((centers,0),(rotations,1),(half,2)):
+                torch.testing.assert_close(tensor[0],torch.tensor(np.array([b[column] for b in old_boxes]),
+                    device=device,dtype=tensor.dtype),rtol=2e-6,atol=2e-7)
+            self.assertTrue(valid.all())
+
     def test_too_small_selected_species_capacity_is_rejected_before_layout(self):
         import random
         with self.assertRaisesRegex(RuntimeError, "cannot meet whole-shelf density"):
@@ -1193,6 +1256,32 @@ class EpisodeLayoutTests(unittest.TestCase):
         np.testing.assert_allclose(bounds, (-.44, -.30, .02, .18, 1.25, 1.33))
         self.assertGreater(task.elbow_above_chord((0,0,1), (.3,0,1.4), (.6,0,1)), 0)
         self.assertLess(task.elbow_above_chord((0,0,1), (.3,0,.6), (.6,0,1)), 0)
+
+    def test_batched_path_selection_matches_scalar_sweeps(self):
+        import random
+        catalog = self.catalog()
+        rules = dataclasses.replace(task.SpawnRules(), x_range=(-.4,.4), y_range=(-.4,.4))
+        rng = random.Random(918)
+        requests, expected = [], []
+        for k in range(8):
+            geometry = catalog[4*k]
+            initial = task.PlanarPose(.05,rng.uniform(-.15,.15),rng.uniform(-math.pi,math.pi))
+            access = (-.01,.4,-.06,.06)
+            target = task.rectangle_polygon((-.12,-.02,-.05,.05))
+            candidates = task._clearance_candidates(geometry,initial,access,rules,rng)
+            good = [task._path_supported_clear(geometry,path,(target,),rules) for path in candidates]
+            requests.append(task._PathRequest(geometry,candidates,target))
+            expected.append(next((p for p,v in zip(candidates,good) if v),None))
+            # Check every candidate, including rejected mid-rotation collisions.
+            requests.extend(task._PathRequest(geometry,[p],target) for p in candidates)
+            expected.extend(p if v else None for p,v in zip(candidates,good))
+        bar = task.ObjectGeometry('bar',(-.10,-.01,0.),(.10,.01,.1))
+        path = (task.PlanarMotion(task.PlanarPose(0.,0.,0.),task.PlanarPose(0.,0.,math.pi/2),(0.,0.)),)
+        post = task.rectangle_polygon((.052,.065,.052,.065))
+        requests.append(task._PathRequest(bar,[path],post))
+        expected.append(None)  # Clear endpoints, but collision halfway through the pivot.
+        for device in ['cpu']+(['cuda:0'] if torch.cuda.is_available() else []):
+            self.assertEqual(task._choose_clearance_paths(requests,rules,device),expected)
 
     def test_pivot_sweep_detects_mid_motion_obstacle(self):
         # Endpoints clear a thin post, but the rotating long bar crosses it.
@@ -1516,7 +1605,7 @@ class EpisodeResetTests(unittest.TestCase):
                 {index: 0. for index in range(4)}, (-.8, -.5, -.1, .1), (-.7, -.2),
             )
 
-        def sample_robot_start(env, samples, seeds):
+        def sample_robot_start(env, samples, seeds, **kwargs):
             return [(np.full(12, sample.positions[0][0]), (-.4, -.2, -.1, .1, 1.2, 1.3),
                      np.array([-.3, 0., 1.25]), .08, 1) for sample in samples]
 
