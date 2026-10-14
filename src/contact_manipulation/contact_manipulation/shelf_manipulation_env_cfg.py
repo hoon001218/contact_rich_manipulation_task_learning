@@ -27,14 +27,15 @@ class ShelfManipulationSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """One 18D action: TCP delta6, stiffness6, independent hand joints6."""
+    """Ordered native action terms: arm delta6/gain6, then independent hand joints6."""
 
-    manipulation = mdp.ContactManipulationActionCfg()
+    arm_action = mdp.ArmOscActionCfg()
+    hand_action = mdp.HandPositionActionCfg()
 
 
 @configclass
 class ObservationsCfg:
-    """Initial geometry and current/previous sensor samples: 544D, without masks/role IDs."""
+    """Initial geometry and current/previous sensor samples: 444D, without masks/role IDs."""
 
     @configclass
     class PolicyCfg(ObservationGroupCfg):

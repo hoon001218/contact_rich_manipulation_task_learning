@@ -1,8 +1,9 @@
 """Native RSL-RL interfaces for a shared GNN/attention policy.
 
 The native runner owns rollout storage, GAE, logging, and checkpoint files.
-Only shared network construction, final-state timeout values, and PPO gradient
-accumulation differ. Rollout and update batches are bounded independently.
+Shared network construction and final-state timeout values extend native PPO.
+Native update is used whenever the minibatch fits; larger batches use gradient
+accumulation. Rollout and update batches are bounded independently.
 """
 
 from __future__ import annotations
@@ -390,6 +391,13 @@ class ContactManipulationPPO(PPO):
             group["lr"] = self.learning_rate
 
     def update(self):
+        """Use native PPO unless a minibatch needs memory-bounded accumulation."""
+        minibatch_size = self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches
+        if self.max_microbatch_size is None or minibatch_size <= self.max_microbatch_size:
+            return super().update()
+        return self._update_microbatches()
+
+    def _update_microbatches(self):
         """Accumulate native PPO losses, then clip/step once per original minibatch.
 
         Splitting changes memory use only. Unequal final chunks contribute their

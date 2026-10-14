@@ -21,6 +21,18 @@ from rsl_rl.utils.logger import Logger
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from tensordict import TensorDict
 
+# Use the actual checkout math implementation without starting Kit for CPU tests.
+# Production imports the public Isaac Lab module normally after AppLauncher.
+if "isaaclab.utils.math" not in sys.modules:
+    import importlib.util
+    import os
+    lab_root = Path(os.environ.get("ISAACLAB_PATH", Path(__file__).resolve().parents[3] / "IsaacLab"))
+    math_path = lab_root / "source/isaaclab/isaaclab/utils/math.py"
+    spec = importlib.util.spec_from_file_location("isaaclab.utils.math", math_path)
+    lab_math = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = lab_math
+    spec.loader.exec_module(lab_math)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contact_manipulation.config.ur5e.agents.model import (
     ContactManipulationPolicy, build_policy_masks,
@@ -89,7 +101,7 @@ class ModelTests(unittest.TestCase):
         return self.model(values, masks=self.masks(values))
 
     def test_default_observation_layout_excludes_mask_channels(self):
-        self.assertEqual(ModelCfg().observation_dim, 544)
+        self.assertEqual(ModelCfg().observation_dim, 444)
         self.assertEqual(asdict(ModelCfg())["history_steps"], 2)
         self.assertEqual(asdict(ModelCfg())["activation"], "relu")
         self.assertFalse(any(isinstance(module, torch.nn.SiLU) for module in self.model.modules()))
@@ -665,7 +677,7 @@ class NativeLearningTests(unittest.TestCase):
         split.max_microbatch_size = 4
         torch.manual_seed(92)
         with patch.object(full.optimizer, "step", wraps=full.optimizer.step) as full_steps:
-            full_metrics = full.update()
+            full_metrics = full._update_microbatches()
         torch.manual_seed(92)
         with patch.object(split.optimizer, "step", wraps=split.optimizer.step) as split_steps, \
              patch.object(split.actor.policy, "evaluate_actions", wraps=split.actor.policy.evaluate_actions) as forwards:
@@ -683,10 +695,20 @@ class NativeLearningTests(unittest.TestCase):
             torch.testing.assert_close(first["exp_avg"], second["exp_avg"], rtol=5e-4, atol=2e-8)
             torch.testing.assert_close(first["exp_avg_sq"], second["exp_avg_sq"], rtol=1e-3, atol=2e-10)
 
+    def test_native_update_is_used_when_minibatch_fits_memory_limit(self):
+        for limit, native_expected in ((None, True), (6, True), (5, False)):
+            algorithm, _ = self.paired_algorithms(max_microbatch_size=limit)
+            with self.subTest(limit=limit), patch.object(PPO, "update", return_value={"value": 1.}) as native, \
+                 patch.object(algorithm, "_update_microbatches", return_value={"value": 2.}) as split:
+                result = algorithm.update()
+                self.assertEqual(native.call_count, int(native_expected))
+                self.assertEqual(split.call_count, int(not native_expected))
+                self.assertEqual(result["value"], 1. if native_expected else 2.)
+
     def test_unsplit_shared_loss_matches_native_ppo_update(self):
         extension, native = self.paired_algorithms(max_microbatch_size=None, entropy_coef=0.)
         torch.manual_seed(16)
-        extension_metrics = extension.update()
+        extension_metrics = extension._update_microbatches()
         torch.manual_seed(16)
         native_metrics = PPO.update(native)
         for name in ("value", "surrogate"):

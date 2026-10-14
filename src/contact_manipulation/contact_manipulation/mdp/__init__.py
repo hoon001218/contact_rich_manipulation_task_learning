@@ -7,7 +7,7 @@ from .terminations import *  # noqa: F401, F403
 
 
 def __getattr__(name):
-    if name in ("ContactManipulationAction", "ContactManipulationActionCfg"):
+    if name in ("ArmOscActionCfg", "HandPositionActionCfg"):
         from . import actions
         return getattr(actions, name)
     raise AttributeError(name)

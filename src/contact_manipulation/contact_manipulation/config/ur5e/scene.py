@@ -1,6 +1,6 @@
 """Native scene assets and once-only USD geometry/kinematics inspection.
 
-The simulator clones one authored robot, shelf and fixed 40-body object pool.
+The simulator clones one authored robot, shelf and fixed 30-body object pool.
 Episode roles and poses are selected by MDP reset events; no prim topology is
 changed during reset. This module has no dependency on the previous project.
 """
@@ -17,6 +17,7 @@ from xml.etree import ElementTree
 
 import numpy as np
 import torch
+import warp as wp
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 import isaaclab.sim as sim_utils
@@ -76,8 +77,8 @@ ASSET_SPECS = (
 )
 # Load a reusable pool so non-Target assets can occupy every surrounding slot,
 # identities can change on reset without rebuilding USD or PhysX topology.
-MAX_ACTIVE_OBJECTS = 40
-OBJECT_COPIES_PER_ASSET = 4
+MAX_ACTIVE_OBJECTS = 30
+OBJECT_COPIES_PER_ASSET = 3
 OBJECT_SPECS = tuple(
     ObjectSpec(
         name=spec.name if copy_index == 0 else f"{spec.name}_copy_{copy_index + 1:02d}",
@@ -684,6 +685,111 @@ def _box_from_usd(prim: Usd.Prim, matrix: np.ndarray, cache: UsdGeom.BBoxCache):
     return center, rotation, half_extents
 
 
+_ArmVector = wp.types.vector(length=6, dtype=wp.float32)
+_ArmMatrix = wp.types.matrix(shape=(6, 6), dtype=wp.float32)
+_ArmPoints = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
+
+
+@wp.func
+def _ik_orientation_error(target: wp.mat33, current: wp.mat33):
+    relative = target * wp.transpose(current)
+    vector = 0.5 * wp.vec3(relative[2, 1] - relative[1, 2], relative[0, 2] - relative[2, 0],
+                            relative[1, 0] - relative[0, 1])
+    sine = wp.length(vector)
+    cosine = wp.clamp(0.5 * (relative[0, 0] + relative[1, 1] + relative[2, 2] - 1.0), -1.0, 1.0)
+    angle = wp.atan2(sine, cosine)
+    if cosine < -0.9999 and sine < 1.0e-4:
+        index = int(0)
+        for k in range(1, 3):
+            if relative[k, k] > relative[index, index]:
+                index = k
+        axis = wp.vec3(relative[0, index], relative[1, index], relative[2, index])
+        axis[index] += 1.0
+        return axis * (angle / wp.max(wp.length(axis), 1.0e-8))
+    return vector * (angle / wp.max(sine, 1.0e-8))
+
+
+@wp.kernel(enable_backward=False)
+def _arm_ik_kernel(targets: wp.array(dtype=wp.vec3), orientations: wp.array(dtype=wp.mat33),
+                   seeds: wp.array(dtype=_ArmVector), before: wp.array(dtype=wp.mat44),
+                   after: wp.array(dtype=wp.mat44), axes: wp.array(dtype=wp.vec3),
+                   skew: wp.array(dtype=wp.mat33), skew2: wp.array(dtype=wp.mat33),
+                   limits: wp.array(dtype=wp.vec2), root: wp.mat44, tcp_offset: wp.mat44,
+                   tcp_owner: int, iterations: int, result: wp.array(dtype=_ArmVector)):
+    row = wp.tid()
+    arm = seeds[row]
+    for j in range(6):
+        arm[j] = wp.clamp(arm[j], limits[j][0] + 1.0e-6, limits[j][1] - 1.0e-6)
+    for iteration in range(iterations):
+        frame = root
+        tcp = root * tcp_offset
+        origins, directions = _ArmPoints(), _ArmPoints()
+        for j in range(6):
+            joint = frame * before[j]
+            axis = wp.transform_vector(joint, axes[j])
+            for k in range(3):
+                origins[j, k] = joint[k, 3]
+                directions[j, k] = axis[k]
+            rotation = wp.identity(n=3, dtype=float) + wp.sin(arm[j]) * skew[j] + (1.0 - wp.cos(arm[j])) * skew2[j]
+            motion = wp.mat44(rotation[0, 0], rotation[0, 1], rotation[0, 2], 0.0,
+                              rotation[1, 0], rotation[1, 1], rotation[1, 2], 0.0,
+                              rotation[2, 0], rotation[2, 1], rotation[2, 2], 0.0,
+                              0.0, 0.0, 0.0, 1.0)
+            frame = joint * motion * after[j]
+            if j + 1 == tcp_owner:
+                tcp = frame * tcp_offset
+        position = wp.vec3(tcp[0, 3], tcp[1, 3], tcp[2, 3])
+        rotation = wp.mat33(tcp[0, 0], tcp[0, 1], tcp[0, 2], tcp[1, 0], tcp[1, 1], tcp[1, 2],
+                            tcp[2, 0], tcp[2, 1], tcp[2, 2])
+        translation = targets[row] - position
+        angular = _ik_orientation_error(orientations[row], rotation)
+        # Only stop well inside the original acceptance tolerances.
+        if wp.length_sq(translation) <= 1.0e-12 and wp.length_sq(angular) <= 1.0e-10:
+            break
+        error = _ArmVector(translation[0], translation[1], translation[2],
+                           0.25 * angular[0], 0.25 * angular[1], 0.25 * angular[2])
+        jacobian = _ArmMatrix()
+        for j in range(6):
+            axis = wp.vec3(directions[j, 0], directions[j, 1], directions[j, 2])
+            origin = wp.vec3(origins[j, 0], origins[j, 1], origins[j, 2])
+            linear = wp.cross(axis, position - origin)
+            for k in range(3):
+                jacobian[k, j] = linear[k]
+                jacobian[k + 3, j] = 0.25 * axis[k]
+        system = jacobian * wp.transpose(jacobian)
+        for j in range(6):
+            system[j, j] += 0.0001
+        # The damped system is positive definite. Cholesky needs no pivot or
+        # host/library dispatch; all six-joint work stays in this CUDA thread.
+        lower = _ArmMatrix()
+        for i in range(6):
+            for j in range(i + 1):
+                value = system[i, j]
+                for k in range(j):
+                    value -= lower[i, k] * lower[j, k]
+                if i == j:
+                    lower[i, j] = wp.sqrt(wp.max(value, 1.0e-12))
+                else:
+                    lower[i, j] = value / lower[j, j]
+        forward, correction = _ArmVector(), _ArmVector()
+        for i in range(6):
+            value = error[i]
+            for j in range(i):
+                value -= lower[i, j] * forward[j]
+            forward[i] = value / lower[i, i]
+        for backward in range(6):
+            i = 5 - backward
+            value = forward[i]
+            for j in range(i + 1, 6):
+                value -= lower[j, i] * correction[j]
+            correction[i] = value / lower[i, i]
+        delta = wp.transpose(jacobian) * correction
+        for j in range(6):
+            arm[j] = wp.clamp(arm[j] + wp.clamp(delta[j], -0.35, 0.35),
+                              limits[j][0] + 1.0e-6, limits[j][1] - 1.0e-6)
+    result[row] = arm
+
+
 class RobotPoseModel:
     """Exact USD joint-frame FK and bounded IK for the mounted open hand.
 
@@ -1014,13 +1120,14 @@ class RobotPoseModel:
 
     @torch.no_grad()
     def solve_batch(self, target_positions, target_rotations, arm_seeds, *, iterations=48):
-        """Reuse CUDA graphs for fixed IK work; CPU follows the same equations.
+        """Fuse FP32 CUDA IK per candidate; retain tensor solvers as the oracle.
 
-        Bucketing to powers of two bounds graph count for asynchronous resets.
-        Graphs contain kinematics/IK only, not PhysX or rendering. Their output
-        buffers are reused by the next same-size solve, so callers consume or
-        copy accepted rows before issuing another batch.
+        The kernel uses the same damped Jacobian solve and joint limits, with
+        early exit strictly inside the pose tolerances. Other CUDA dtypes keep
+        the fixed-iteration graph path. CPU follows the tensor equations.
         """
+        if target_positions.is_cuda and target_positions.dtype == torch.float32:
+            return self._solve_batch_fused(target_positions, target_rotations, arm_seeds, iterations=iterations)
         if target_positions.device.type != "cuda":
             return self._solve_batch_eager(target_positions, target_rotations, arm_seeds, iterations=iterations)
         count = target_positions.shape[0]
@@ -1053,6 +1160,32 @@ class RobotPoseModel:
         seeds[:count].copy_(arm_seeds)
         graph.replay()
         return tuple(output[:count] for output in outputs)
+
+    def _solve_batch_fused(self, target_positions, target_rotations, arm_seeds, *, iterations):
+        wp.init()
+        constants = self._tensor_constants(target_positions.device, target_positions.dtype)
+        cache = constants.get("warp_ik")
+        if cache is None:
+            # Small static transforms cross to host only once, during setup.
+            cache = [wp.from_torch(constants[name].contiguous(), dtype=dtype) for name, dtype in (
+                ("before", wp.mat44), ("after", wp.mat44), ("axes", wp.vec3),
+                ("skew", wp.mat33), ("skew2", wp.mat33), ("limits", wp.vec2))]
+            cache += [wp.mat44(*constants[name].cpu().flatten().tolist()) for name in ("root", "tcp_offset")]
+            constants["warp_ik"] = cache
+        arm = torch.empty_like(arm_seeds, memory_format=torch.contiguous_format)
+        wp.launch(_arm_ik_kernel, dim=len(arm), inputs=[
+            wp.from_torch(target_positions.contiguous(), dtype=wp.vec3),
+            wp.from_torch(target_rotations.contiguous(), dtype=wp.mat33),
+            wp.from_torch(arm_seeds.contiguous(), dtype=_ArmVector), *cache,
+            constants["tcp_owner"], iterations, wp.from_torch(arm, dtype=_ArmVector)],
+            stream=wp.stream_from_torch(torch.cuda.current_stream(arm.device)))
+        frames, joints, tcp = self.arm_forward_batch(arm)
+        valid = ((target_positions - tcp[:, :3, 3]).norm(dim=-1) <= 5.e-4)
+        valid &= self._rotation_error_batch(target_rotations, tcp[:, :3, :3]).norm(dim=-1) <= .01
+        valid &= torch.isfinite(arm).all(-1)
+        positions = constants["default"].expand(len(arm), -1).clone()
+        positions[:, constants["arm_ids"]] = arm
+        return positions, valid, frames, joints, tcp
 
     @torch.no_grad()
     def _solve_batch_eager(self, target_positions, target_rotations, arm_seeds, *, iterations=48):
@@ -1215,45 +1348,37 @@ class FlatBoxUsdCfg(sim_utils.UsdFileCfg):
 
 
 class TaskObjectPool(RigidObjectCollection):
-    """Apply countergravity at parked bodies' COM in every physics substep.
+    """Native collection with persistent countergravity for isolated parked objects.
 
-    Task objects retain native gravity and get zero countergravity. A live GPU
-    simulation/switch is avoided, and world COM application prevents torque on
-    assets with off-center pivots or COMs. Other external wrenches stay separate.
+    The permanent wrench composer is reserved for parking. Transient task forces
+    can use the native instantaneous composer and are added by the parent class.
+    Active objects retain gravity and receive zero parking force.
     """
 
     def __init__(self, cfg):
         self.parked_mask: torch.Tensor | None = None
         self.gravity: torch.Tensor | None = None
-        self._parking_force: torch.Tensor | None = None
+        self._countergravity: torch.Tensor | None = None
         super().__init__(cfg)
 
     def write_object_link_pose_to_sim(self, object_pose, env_ids=None, object_ids=None) -> None:
         super().write_object_link_pose_to_sim(object_pose, env_ids=env_ids, object_ids=object_ids)
-        # Isaac Lab 2.3 updates link poses and any combined COM-state cache,
-        # but not the separate COM-pose cache. Repeated resets at one physics
-        # timestamp would otherwise apply countergravity at a stale point and
-        # spin parked bodies whose mass center differs from their link origin.
+        # Installed SDK does not invalidate the separate COM-pose cache on writes.
         self._data._object_com_pose_w.timestamp = -1.0
 
-    def write_data_to_sim(self) -> None:
-        super().write_data_to_sim()
+    def refresh_parking(self):
         if self.parked_mask is None:
             return
-        if self._parking_force is None:
-            # Native mass tensors can reside on CPU: transfer once after PhysX
-            # initialization and reuse the shaped force/index buffers thereafter.
+        if self._countergravity is None:
             self._countergravity = -self.data.default_mass.to(self.device) * self.gravity
-            self._parking_force = torch.empty_like(self._countergravity)
-            self._parking_indices = torch.arange(self.root_physx_view.count, device=self.device, dtype=torch.int32)
-        torch.mul(self._countergravity, self.parked_mask[..., None], out=self._parking_force)
-        self.root_physx_view.apply_forces_and_torques_at_position(
-            force_data=self.reshape_data_to_view(self._parking_force).contiguous(),
-            torque_data=None,
-            position_data=self.reshape_data_to_view(self.data.object_com_pos_w).contiguous(),
-            indices=self._parking_indices,
-            is_global=True,
+        composer = self.permanent_wrench_composer
+        # Refresh conversion frames after repeated pose writes at one timestamp.
+        composer.reset()
+        composer.set_forces_and_torques(
+            forces=self._countergravity * self.parked_mask[..., None], is_global=True,
         )
+        # No position offset: native collection applies the force at the COM.
+        # No custom write_data_to_sim or direct PhysX force submission is needed.
 
 
 def make_object_collection_cfg() -> RigidObjectCollectionCfg:

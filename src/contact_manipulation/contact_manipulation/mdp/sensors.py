@@ -64,9 +64,9 @@ class InitialVisionCfg:
 class VisionSnapshot:
     """Accepted virtual-view snapshot; optional ray depth/masks, never rendered RGB."""
 
-    geometry_b: torch.Tensor       # [40,10], observed visible-surface OBBs
-    geometry_valid: torch.Tensor  # [40]
-    observed_ids: torch.Tensor     # [40], native collection indices or -1
+    geometry_b: torch.Tensor       # [30,10], observed visible-surface OBBs
+    geometry_valid: torch.Tensor  # [30]
+    observed_ids: torch.Tensor     # [30], native collection indices or -1
     rgb: torch.Tensor | None       # Always None: geometric perception does not produce RGB
     depth: torch.Tensor | None     # Optional debug [H,W,1]
     role_masks: torch.Tensor | None  # Optional debug [H,W,2], target then blocker
@@ -101,6 +101,8 @@ def fit_visible_obbs(points: torch.Tensor, object_ids: torch.Tensor, capacity: i
     neither their catalog extents nor their true object poses complete the fit.
     Ideal geometric rays have no depth outliers, so bounds use surface extrema.
     """
+    if points.is_cuda and points.dtype == torch.float32:
+        return _fit_visible_obbs_cuda(points, object_ids, capacity, min_points)
     batch, rays, _ = points.shape
     stride = capacity + 1  # Extra reduction bucket for background.
     labels = torch.where(object_ids >= 0, object_ids.long(), capacity)
@@ -217,35 +219,46 @@ class SensorReader:
 
 # Native classes are imported only by the scene configuration after AppLauncher.
 import isaaclab.sim as sim_utils
-from isaaclab.sensors import ContactSensor, ContactSensorCfg, FrameTransformer, SensorBase
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.warp import convert_to_warp_mesh
 from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 
-class _ReplicaSensorBase(SensorBase):
-    """Use actual PhysX counts when Fabric cloning has only one USD template."""
+class TaskContactSensor(ContactSensor):
+    """Native contact buffers with a synchronous, whole-batch update fast path.
 
-    def _initialize_impl(self):
-        super()._initialize_impl()
-        from isaacsim.core.simulation_manager import SimulationManager
-        count = SimulationManager.get_physics_sim_view().create_rigid_body_view(
-            self.cfg.prim_path.replace(".*", "*")
-        ).count
-        if count < 1:
-            raise RuntimeError(f"No physical sensor body: {self.cfg.prim_path}")
-        if count != self._num_envs:
-            self._num_envs = count
-            self._is_outdated = torch.ones(count, dtype=torch.bool, device=self._device)
-            self._timestamp = torch.zeros(count, device=self._device)
-            self._timestamp_last_update = torch.zeros_like(self._timestamp)
+    These sensors sample every physics tick. Discovering outdated CUDA rows
+    with nonzero() is redundant: after update every row is due. Keep native
+    force acquisition/history and fall back for other sensor configurations.
+    """
 
+    def _whole_batch_updates(self):
+        return (self.cfg.update_period == 0.0 and not self.cfg.track_air_time
+                and not self.cfg.track_pose)
 
-class TaskContactSensor(ContactSensor, _ReplicaSensorBase):
-    """Native force/history buffers with correct physical replica counts."""
+    def update(self, dt, force_recompute=False):
+        if not self._whole_batch_updates():
+            return super().update(dt, force_recompute)
+        self._timestamp.add_(dt)
+        self._task_outdated = True
+        if force_recompute or self._is_visualizing or self.cfg.history_length > 0:
+            self._update_outdated_buffers()
 
+    def _update_outdated_buffers(self):
+        if not self._whole_batch_updates():
+            return super()._update_outdated_buffers()
+        if getattr(self, "_task_outdated", True):
+            self._update_buffers_impl(range(self._num_envs))
+            self._timestamp_last_update.copy_(self._timestamp)
+            self._is_outdated.fill_(False)
+            self._task_outdated = False
 
-class TaskFrameTransformer(FrameTransformer, _ReplicaSensorBase):
-    """Native EEF transforms with correct physical replica counts."""
+    def reset(self, env_ids=None):
+        # Preserve completed samples of other rows before clearing selected
+        # histories. Do not read stale PhysX contacts back into reset rows.
+        self._update_outdated_buffers()
+        super().reset(env_ids)
 
 
 class ForbiddenContactSensor(TaskContactSensor):
@@ -321,6 +334,77 @@ import warp as wp
 
 
 @wp.kernel(enable_backward=False)
+def _surface_moments(points: wp.array2d(dtype=wp.vec3), labels: wp.array2d(dtype=wp.int32),
+                     moments: wp.array3d(dtype=wp.float32)):
+    row, ray = wp.tid()
+    obj = labels[row, ray]
+    if obj >= 0 and obj < moments.shape[1]:
+        point = points[row, ray]
+        wp.atomic_add(moments, row, obj, 0, 1.0)
+        for k in range(3):
+            wp.atomic_add(moments, row, obj, k + 1, point[k])
+
+
+@wp.kernel(enable_backward=False)
+def _surface_covariance(points: wp.array2d(dtype=wp.vec3), labels: wp.array2d(dtype=wp.int32),
+                        means: wp.array2d(dtype=wp.vec3), covariance: wp.array3d(dtype=wp.float32)):
+    row, ray = wp.tid()
+    obj = labels[row, ray]
+    if obj >= 0 and obj < means.shape[1]:
+        p = points[row, ray] - means[row, obj]
+        wp.atomic_add(covariance, row, obj, 0, p[0] * p[0])
+        wp.atomic_add(covariance, row, obj, 1, p[1] * p[1])
+        wp.atomic_add(covariance, row, obj, 2, p[0] * p[1])
+
+
+@wp.kernel(enable_backward=False)
+def _surface_extents(points: wp.array2d(dtype=wp.vec3), labels: wp.array2d(dtype=wp.int32),
+                     means: wp.array2d(dtype=wp.vec3), cosine: wp.array2d(dtype=wp.float32),
+                     sine: wp.array2d(dtype=wp.float32), lower: wp.array3d(dtype=wp.float32),
+                     upper: wp.array3d(dtype=wp.float32)):
+    row, ray = wp.tid()
+    obj = labels[row, ray]
+    if obj >= 0 and obj < means.shape[1]:
+        p = points[row, ray] - means[row, obj]
+        c, s = cosine[row, obj], sine[row, obj]
+        projected = wp.vec3(c * p[0] + s * p[1], -s * p[0] + c * p[1], p[2])
+        for k in range(3):
+            wp.atomic_min(lower, row, obj, k, projected[k])
+            wp.atomic_max(upper, row, obj, k, projected[k])
+
+
+def _fit_visible_obbs_cuda(points, object_ids, capacity, min_points):
+    """Ignore background rays before atomics; retain centered visible-point PCA."""
+    wp.init()
+    n, rays, _ = points.shape
+    labels = object_ids.to(dtype=torch.int32).contiguous()
+    values = points.contiguous()
+    stream = wp.stream_from_torch(torch.cuda.current_stream(points.device))
+    moments = points.new_zeros((n, capacity, 4))
+    common = [wp.from_torch(values, dtype=wp.vec3), wp.from_torch(labels)]
+    wp.launch(_surface_moments, dim=(n, rays), inputs=[*common, wp.from_torch(moments)], stream=stream)
+    counts = moments[..., 0]
+    mean = (moments[..., 1:] / counts[..., None].clamp_min(1)).contiguous()
+    covariance = points.new_zeros((n, capacity, 3))
+    wp.launch(_surface_covariance, dim=(n, rays), inputs=[*common, wp.from_torch(mean, dtype=wp.vec3),
+              wp.from_torch(covariance)], stream=stream)
+    yaw = .5 * torch.atan2(2 * covariance[..., 2], covariance[..., 0] - covariance[..., 1])
+    cosine, sine = yaw.cos(), yaw.sin()
+    lower = points.new_full((n, capacity, 3), float('inf'))
+    upper = points.new_full((n, capacity, 3), -float('inf'))
+    wp.launch(_surface_extents, dim=(n, rays), inputs=[*common, wp.from_torch(mean, dtype=wp.vec3),
+              wp.from_torch(cosine), wp.from_torch(sine), wp.from_torch(lower), wp.from_torch(upper)], stream=stream)
+    valid = counts >= min_points
+    midpoint = torch.where(valid[..., None], (lower + upper) * .5, 0.)
+    center = mean + torch.stack((cosine * midpoint[..., 0] - sine * midpoint[..., 1],
+                                sine * midpoint[..., 0] + cosine * midpoint[..., 1], midpoint[..., 2]), -1)
+    quaternion = torch.stack((torch.cos(yaw * .5), torch.zeros_like(yaw), torch.zeros_like(yaw),
+                               torch.sin(yaw * .5)), -1)
+    geometry = torch.cat((center, quaternion, (upper - lower).clamp_min(.004)), -1)
+    return torch.where(valid[..., None], geometry, 0.), valid
+
+
+@wp.kernel(enable_backward=False)
 def _initial_viewpoints(
     seeds: wp.array(dtype=wp.int64),
     role_positions: wp.array2d(dtype=wp.vec3),
@@ -360,13 +444,40 @@ def _initial_ray_frames(
     eyes: wp.array(dtype=wp.vec3),
     orientations: wp.array(dtype=wp.quat),
     frames: wp.array2d(dtype=wp.transform),
+    mesh_bounds: wp.array2d(dtype=wp.vec3),
+    projected: wp.array2d(dtype=wp.vec4), width: int, height: int,
 ):
     view, slot = wp.tid()
     body = active_ids[view, slot]
     if body >= 0:
         # Shared by every pixel; no inverse pose or local-origin work in the ray loop.
-        frames[view, slot] = wp.transform_multiply(wp.transform_inverse(poses[view, body]),
-                                                  wp.transform(eyes[view], orientations[view]))
+        frame = wp.transform_multiply(wp.transform_inverse(poses[view, body]),
+                                      wp.transform(eyes[view], orientations[view]))
+        frames[view, slot] = frame
+        camera_from_body = wp.transform_inverse(frame)
+        lower, upper = mesh_bounds[body, 0], mesh_bounds[body, 1]
+        bounds = wp.vec4(1.0e10, -1.0e10, 1.0e10, -1.0e10)
+        crosses_eye = bool(False)
+        for corner in range(8):
+            point = lower
+            if corner & 1:
+                point[0] = upper[0]
+            if corner & 2:
+                point[1] = upper[1]
+            if corner & 4:
+                point[2] = upper[2]
+            point = wp.transform_point(camera_from_body, point)
+            if point[2] <= 1.0e-5:
+                crosses_eye = True
+            else:
+                x = float(width) + 0.75 * float(width) * point[0] / point[2]
+                y = float(height) + 0.75 * float(width) * point[1] / point[2]
+                bounds = wp.vec4(wp.min(bounds[0], x - 1.0), wp.max(bounds[1], x + 1.0),
+                                 wp.min(bounds[2], y - 1.0), wp.max(bounds[3], y + 1.0))
+        if crosses_eye:
+            bounds = wp.vec4(-1.0e10, 1.0e10, -1.0e10, 1.0e10)
+        projected[view, slot] = bounds
+
 
 
 @wp.kernel(enable_backward=False)
@@ -375,6 +486,7 @@ def _initial_surface_rays(
     frames: wp.array2d(dtype=wp.transform),
     active_ids: wp.array2d(dtype=wp.int32),
     role_slots: wp.array2d(dtype=wp.int32),
+    projected: wp.array2d(dtype=wp.vec4),
     directions: wp.array(dtype=wp.vec3),
     roles: wp.array2d(dtype=wp.int32),
     width: int, height: int, far: float,
@@ -403,11 +515,17 @@ def _initial_surface_rays(
         body = active_ids[env, slot]
         if body < 0:
             break  # Compact active IDs followed by padding.
+        bounds = projected[env, slot]
+        if float(x) + 0.5 < bounds[0] or float(x) + 0.5 > bounds[1] or float(y) + 0.5 < bounds[2] or float(y) + 0.5 > bounds[3]:
+            continue
         is_target = body == roles[env, 0]
         is_blocker = body == roles[env, 1]
         frame = frames[env, slot]
         local_direction = wp.transform_vector(frame, directions[ray])
-        query = wp.mesh_query_ray(meshes[body], wp.transform_get_translation(frame), local_direction, far)
+        limit = far
+        if in_image and not is_target and not is_blocker:
+            limit = best
+        query = wp.mesh_query_ray(meshes[body], wp.transform_get_translation(frame), local_direction, limit)
         if query.result and query.t > 0.02:
             if is_target:
                 silhouettes[env, ray, 0] = 1
@@ -497,7 +615,7 @@ class InitialVisionSensor:
         self.env, self.cfg = env, env.cfg.initial_vision
         self.cfg.__post_init__()
         self.capacity = self.cfg.ray_batch_size
-        self.meshes, identifiers = [], []
+        self.meshes, identifiers, bounds = [], [], []
         self.specs = OBJECT_SPECS
         stage, device = env.scene.stage, env.device
         origin_path = env.scene.env_prim_paths[0]
@@ -511,25 +629,26 @@ class InitialVisionSensor:
             rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
             triangles = _visual_triangles(root, np.linalg.inv(rigid))
             if triangles is None:
-                return 0
+                raise RuntimeError(f"No visible triangles under {root.GetPath()}.")
             points, indices = triangles
-            mesh = wp.Mesh(points=wp.array(points, dtype=wp.vec3, device=device),
-                           indices=wp.array(indices.flatten(), dtype=wp.int32, device=device))
+            mesh = convert_to_warp_mesh(points, indices, device=device)
             self.meshes.append(mesh)  # Own buffers for the entire simulation lifetime.
-            cache[key] = mesh.id
-            return mesh.id
+            cache[key] = (mesh.id, np.stack((points.min(0), points.max(0))))
+            return cache[key]
         for spec in OBJECT_SPECS:
             root = stage.GetPrimAtPath(f'{origin_path}/{spec.name}')
             bodies = [prim for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies())
                       if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
             if len(bodies) != 1:
                 raise RuntimeError(f'Initial perception needs one physical body for {spec.name}.')
-            identifier = add(bodies[0], spec.asset_name)
+            identifier, bound = add(bodies[0], spec.asset_name)
             if not identifier:
                 raise RuntimeError(f'No visible surface for object {spec.name}.')
             identifiers.append(identifier)
+            bounds.append(bound)
         self.object_count = len(identifiers)
         self.mesh_ids = wp.array(identifiers, dtype=wp.uint64, device=device)
+        self.mesh_bounds = wp.array(np.asarray(bounds), dtype=wp.vec3, device=device)
         width, height = self.cfg.ray_width, self.cfg.ray_height
         self.intrinsics = torch.tensor([[.75 * width, 0., width * .5],
                                         [0., .75 * width, height * .5], [0., 0., 1.]], device=device)
@@ -556,8 +675,8 @@ class InitialVisionSensor:
         return result
 
     @torch.no_grad()
-    def capture_batch(self, requests, *, retain_images=False):
-        return self._capture_pool(requests, retain_images) if requests else []
+    def capture_batch(self, requests, *, retain_images=False, object_poses=None, root_poses=None):
+        return self._capture_pool(requests, retain_images, object_poses, root_poses) if requests else []
 
     def _trace(self, poses, active_ids, eyes, orientations, roles):
         width, height = self.cfg.ray_width, self.cfg.ray_height
@@ -569,6 +688,7 @@ class InitialVisionSensor:
         poses = poses[..., [0, 1, 2, 4, 5, 6, 3]].contiguous()
         quaternions = orientations[:, [1, 2, 3, 0]].contiguous()
         frames = torch.empty((*active_ids.shape, 7), device=device)
+        projected = torch.empty((*active_ids.shape, 4), device=device)
         matches = active_ids[..., None] == roles[:, None]
         role_slots = torch.where(matches.any(1), matches.int().argmax(1), -1).int().contiguous()
         execution = (dict(stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
@@ -576,10 +696,11 @@ class InitialVisionSensor:
         wp.launch(kernel=_initial_ray_frames, dim=active_ids.shape, inputs=[
             wp.from_torch(poses, dtype=wp.transform), wp.from_torch(active_ids),
             wp.from_torch(eyes.contiguous(), dtype=wp.vec3), wp.from_torch(quaternions, dtype=wp.quat),
-            wp.from_torch(frames, dtype=wp.transform)], **execution)
+            wp.from_torch(frames, dtype=wp.transform), self.mesh_bounds,
+            wp.from_torch(projected, dtype=wp.vec4), width, height], **execution)
         launch = dict(kernel=_initial_surface_rays, dim=(count, 4 * width * height), inputs=[
             self.mesh_ids, wp.from_torch(frames, dtype=wp.transform), wp.from_torch(active_ids),
-            wp.from_torch(role_slots),
+            wp.from_torch(role_slots), wp.from_torch(projected, dtype=wp.vec4),
             wp.from_torch(self.directions, dtype=wp.vec3), wp.from_torch(roles), width, height, 2.5,
             wp.from_torch(depths), wp.from_torch(labels), wp.from_torch(silhouettes)])
         wp.launch(**launch, **execution)
@@ -615,10 +736,11 @@ class InitialVisionSensor:
             wp.from_torch(eyes, dtype=wp.vec3), wp.from_torch(rotations, dtype=wp.quat)], **execution)
         return eyes, rotations[..., [3, 0, 1, 2]].contiguous()
 
-    def _capture_pool(self, requests, retain_images):
+    def _capture_pool(self, requests, retain_images, object_poses=None, root_poses=None):
         env, cfg = self.env, self.cfg
         ids = [int(request['env_id']) for request in requests]
-        objects = env.scene['object_collection'].data.object_link_pose_w[ids]
+        objects = (env.scene['object_collection'].data.object_link_pose_w[ids]
+                   if object_poses is None else object_poses)
         robot = env.scene['robot'].data
         origins = env.scene.env_origins[ids]
         # Compute in environment-local coordinates to avoid large-grid precision loss.
@@ -638,8 +760,8 @@ class InitialVisionSensor:
         roles = torch.tensor([[r['target_id'], r['blocker_id']] for r in requests], device=env.device, dtype=torch.int32)
         role_positions = objects.gather(1, roles.long()[..., None].expand(-1, -1, 3))
         candidate_eyes, candidate_rotations = self._viewpoints(requests, role_positions)
-        roots = robot.root_pos_w[ids] - origins
-        inverse_roots = quat_conjugate(robot.root_quat_w[ids])
+        roots = (robot.root_pos_w[ids] if root_poses is None else root_poses[:, :3]) - origins
+        inverse_roots = quat_conjugate(robot.root_quat_w[ids] if root_poses is None else root_poses[:, 3:7])
         results, outputs = [None] * len(ids), [None] * len(ids)
         metadata = objects.new_zeros((len(ids), 6))
         next_attempt = [0] * len(ids)

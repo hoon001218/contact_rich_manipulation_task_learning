@@ -9,7 +9,7 @@ from isaaclab.utils import configclass
 
 from ...shelf_manipulation_env_cfg import ShelfManipulationEnvCfg, ShelfManipulationSceneCfg
 from ...mdp.sensors import (
-    TaskFrameTransformer, make_forbidden_contact_cfg, make_tactile_contact_cfg,
+    make_forbidden_contact_cfg, make_tactile_contact_cfg,
 )
 from .scene import (
     DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES, FORBIDDEN_CONTACT_BODY_NAMES,
@@ -39,7 +39,6 @@ class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
     robot = make_ur5e_hand_cfg()
     object_collection = make_object_collection_cfg()
     ee_frame = FrameTransformerCfg(
-        class_type=TaskFrameTransformer,
         prim_path="{ENV_REGEX_NS}/Robot/base_link", debug_vis=False,
         target_frames=[FrameTransformerCfg.FrameCfg(
             prim_path="{ENV_REGEX_NS}/Robot/ROASRightHand/right_plam_force_sensor", name="end_effector",
@@ -50,7 +49,7 @@ class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
     for _name in TACTILE_BODY_NAMES:
         locals()[f"contact_{_name}"] = make_tactile_contact_cfg(_name)
     for _name in FORBIDDEN_CONTACT_BODY_NAMES:
-        locals()[f"forbidden_{_name}"] = make_forbidden_contact_cfg(_name, history_length=4)
+        locals()[f"forbidden_{_name}"] = make_forbidden_contact_cfg(_name, history_length=2)
     del _name
     # Run last, after all collider/contact edits and before native cloning.
     shared_geometry = AssetBaseCfg(prim_path="/World/SharedGeometry", spawn=SharedGeometryCfg())
@@ -65,8 +64,9 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
     )
 
     def __post_init__(self):
-        self.sim.dt = 1.0 / 120.0
-        self.decimation = 4
+        # Match Sweeping-Policy: 100 Hz physics / 50 Hz policy.
+        self.sim.dt = 0.01
+        self.decimation = 2
         self.sim.render_interval = self.decimation
         self.sim.physx.bounce_threshold_velocity = 0.05
         self.episode_length_s = 8.0

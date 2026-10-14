@@ -31,7 +31,7 @@ class ContactCriticCfg:
 @configclass
 class ContactPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name = "contact_manipulation.config.ur5e.agents.ppo:ContactManipulationPPO"
-    max_microbatch_size: int = 4096
+    max_microbatch_size: int = 8192
     num_learning_epochs = 4
     num_mini_batches = 4
     learning_rate = 3.0e-4

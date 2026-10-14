@@ -3,7 +3,7 @@
 Initial camera geometry is frozen in robot-base coordinates. Only its reference
 frame changes with the measured EEF pose. Slots 0/1 are target/blocker; history
 contains the current and previous sample, newest first. All quaternions use
-``(w, x, y, z)``. This module has no Isaac Sim dependency.
+``(w, x, y, z)``. Quaternion operations use Isaac Lab tensor utilities.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 import math
 
 import torch
+
+from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, quat_mul as _lab_quat_mul
 
 __all__ = [
     "prepare_initial_geometry", "geometry_in_eef_frame", "pack_policy_observation",
@@ -22,23 +24,16 @@ SI_200_8_RANGES = (200.0, 200.0, 360.0, 8.0, 8.0, 8.0)
 SI_200_8_RESOLUTION = (0.1, 0.1, 0.1, 0.005, 0.005, 0.005)
 
 
-def quat_conjugate(quaternion: torch.Tensor) -> torch.Tensor:
-    return torch.cat((quaternion[..., :1], -quaternion[..., 1:]), dim=-1)
+# Preserve broadcastable task tensors while using Isaac Lab's quaternion math.
 
 
 def quat_apply(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
-    """Rotate vectors with broadcastable, unit quaternions."""
-    twice_cross = 2.0 * torch.linalg.cross(quaternion[..., 1:], vector, dim=-1)
-    return vector + quaternion[..., :1] * twice_cross + torch.linalg.cross(
-        quaternion[..., 1:], twice_cross, dim=-1
-    )
+    shape = torch.broadcast_shapes(quaternion.shape[:-1], vector.shape[:-1])
+    return _lab_quat_apply(quaternion.expand(*shape, 4), vector.expand(*shape, 3))
 
 
 def quat_mul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    scalar = left[..., :1] * right[..., :1] - (left[..., 1:] * right[..., 1:]).sum(-1, keepdim=True)
-    vector = (left[..., :1] * right[..., 1:] + right[..., :1] * left[..., 1:]
-              + torch.linalg.cross(left[..., 1:], right[..., 1:], dim=-1))
-    return torch.cat((scalar, vector), dim=-1)
+    return _lab_quat_mul(*torch.broadcast_tensors(left, right))
 
 
 def prepare_initial_geometry(
@@ -47,7 +42,7 @@ def prepare_initial_geometry(
     target_indices: torch.Tensor,
     blocker_indices: torch.Tensor,
     *,
-    capacity: int = 40,
+    capacity: int = 30,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reserve role slots and compact observed distractors **once on reset**.
 
@@ -128,7 +123,7 @@ def pack_policy_observation(geometry_eef: torch.Tensor, history: torch.Tensor) -
     """Concatenate preordered/padded geometry and newest-first [N, 2, 72] history.
 
     The producer zeroes missing geometry/history before this operation. There
-    are no mask or role channels. With 40 geometry slots the result is 544D.
+    are no mask or role channels. With 30 geometry slots the result is 444D.
     """
     if geometry_eef.ndim != 3 or geometry_eef.shape[-1] != 10:
         raise ValueError("Geometry must have shape [N, M, 10].")

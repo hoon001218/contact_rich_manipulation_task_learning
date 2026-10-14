@@ -289,46 +289,39 @@ network weight shape가 같아도 관측 규약을 검증하며 이전 checkpoin
 것과 목표 누적은 별개다. Examples의 robot-root reference 구현을 따라 증분은
 **base 기준**이며 매 policy step의 실제 TCP pose에서 position과 orientation
 목표를 새로 만든다. 회전 증분은 base 축 기준으로 현재 quaternion에 left-multiply한다.
-기본 scale은 위치 축별 ±15 mm·회전 축별 ±0.08 rad, 강성은 병진 100–800 N/m·
-회전 5–40 N·m/rad, damping ratio는 1이다. 현재 inertia decoupling은 꺼진
-설정만 지원하며 이를 물리 Cartesian stiffness로 사용한다. Arm의 기존
-PD/mimic PD hold를 비활성화하고 OSC torque를 적용하며 hand의 독립 6개
-관절만 position target으로 제어한다.
-Hand의 authored mimic constraint는 유지한다. TCP Jacobian의 COM→link origin 이동과
-world→base 변환, native effort limit clamp를 적용한다. 이 수치는 실기 허용치나
-검증된 제어 gain이 아니며, spawn-only 스크립트의 PD hold와 학습 제어를 구분한다.
+기본 scale은 위치 축별 ±15 mm·회전 축별 ±0.08 rad다.
+현재 제어는 사용자의 "예제들처럼 controller class 사용" 요청에 따라 native action 두 개로 나뉜다.
 
-SDK의 unit-mass `2√K` explicit damping은 실제 가벼운 wrist rotational inertia에서
-120 Hz 이산화와 맞지 않아 새 제어의 기준으로 사용하지 않는다. Native arm
-mass matrix `M`과 TCP Jacobian `J`로 coupled task inertia
-`Λ=(J M⁻¹ Jᵀ)⁻¹`를 구하고 inverse-inertia eigenvalue floor `1e−6`을 적용한다.
-대각 물리 stiffness `K`에 대해 coupled critical damping matrix를 계산한다.
+- `arm_action`: `ArmOscAction(OperationalSpaceControllerAction)`의 12D.
+  `OperationalSpaceController`가 `pose_rel`·`variable_kp`를 받아 토크를 계산한다.
+- `hand_action`: `HandPositionAction(JointPositionToLimitsAction)`의 6D.
+  Native joint-position action이 PhysX `ImplicitActuator` PD의 목표 위치를 설정한다.
 
-$$
-D=2\zeta\Lambda^{1/2}
-\left(\Lambda^{-1/2}K\Lambda^{-1/2}\right)^{1/2}\Lambda^{1/2},
-\qquad \zeta=1.
-$$
+연구 adapter는 normalized input 매핑, workspace/effort 제한, PhysX COM Jacobian과
+velocity를 TCP link origin/base 축으로 맞추는 변환만 추가한다. 목표 pose 생성과
+spring/damping/관성 분리/중력 보상은 native OSC가 수행한다.
+Custom backward-Euler damping, matrix geometric mean, 32회 Newton–Schulz,
+별도 damping CUDA graph는 제거했다. 제어에서 실제 TCP velocity를 native OSC에 전달한다.
 
-매 physics substep의 `dt=1/120 s`에 spring/damper를 backward Euler로 계산한다.
-`e`는 측정 TCP와 latch한 목표 사이의 base-frame pose error, `v`는 같은
-TCP origin/base 축의 twist다.
+기본값은 full inertia decoupling·gravity compensation 활성화, damping ratio 1이다.
 
 $$
-v_{next}=(\Lambda+dtD+dt^2K)^{-1}(\Lambda v+dtKe),
-\qquad \tau=J^T\left[Ke-(D+dtK)v_{next}\right]+G.
+\Lambda=(J M^{-1}J^T)^{-1},\qquad
+\tau=J^T\Lambda\left[K_p e-2\sqrt{K_p}v\right]+G.
 $$
 
-SDK OSC의 spring·gravity 계산에서 explicit damping을 제외하고 위 보정항을
-적용한 뒤 native effort limit로 clamp한다. `damping_ratio=1`은 관성 반영
-critical matrix의 비율이며 unit-mass scalar `2√K`를 뜻하지 않는다. 이 선형
-substep 계산의 안정화와 실제 접촉·비선형 task의 성능 검증은 구분한다.
+병진 gain 100–800·회전 gain 5–40은 **관성 정규화 gain(s⁻²)**이다.
+이전 controller의 물리 강성 N/m·N·m/rad와 구별해야 한다. 숫자 범위와 action/observation
+채널 순서는 유지하지만 제어 응답이 달라졌으며, 기존 checkpoint와 같은 제어 동역학을
+유지하는 변경은 아니다. 이 값은 native controller 실행 검증의 초기 설정이며 학습 성능에
+대한 최종 gain 결정은 아니다. F/T 자중·관성 보상은 센서 처리이며 이 제어 변경과 별도로 유지한다.
 
-Hand 6D는 soft limit 안의 **원하는 절대 관절 목표**다. 실제 PD target은 매
-physics substep의 측정 q에서 `min(native velocity limit, hand_target_rate)`×dt만큼
-목표 방향으로 제한한다. 기본 `hand_target_rate=1 rad/s`이며 reset 직후 큰
-목표 위치 오차가 한 번에 적용되지 않게 한다. `hand_command`와 rate-bounded
-`hand_applied_command`는 별도다. Policy action의 차원·의미는 바꾸지 않는다.
+Arm actuator PD gain은 0이고, hand의 authored mimic constraint는 유지한다.
+Hand 6D는 soft limit 안의 원하는 절대 관절 목표다. 실제 PD target은 매 physics substep의
+측정 q에서 `min(native velocity limit, target_rate)`×dt만큼 목표 방향으로 제한한다.
+기본 `target_rate=1 rad/s`이며 이는 position lead 제한이지 실제 속도 상한의 보장은 아니다.
+Native ActionManager가 action을 처리한 뒤 physics substep마다 두 term을 적용한다.
+부분 reset은 해당 행의 action/effort/invalid flag만 초기화한다.
 
 ## 4. Reward 기준점과 사용자 교정
 
@@ -3015,3 +3008,303 @@ pose 읽기 부재, CUDA graph 제어의 결과/수명 검사를 추가했다.
 재현 자료는 `/tmp/contact_gnn_opt_bench.{py,json,log}`, `/tmp/contact_layout_opt_bench.{py,json,log}`,
 `/tmp/contact_compute_opt_final_native_1024.log`, `/tmp/contact_hotspots_compute_opt_final_1024.json`,
 `/tmp/contact_opt_final_cpu_tests.log`, `/tmp/contact_opt_final_gpu_tests.log`에 있다.
+
+### 2026-10-14 센서 동기화·reset·IK·step 연산 추가 최적화
+
+사용자는 1024환경에서 iteration당 1–2초를 목표로, 앞서 검토한 GPU 연산 최적화를
+적용하도록 요청했다. 새 파일 없이 기존 `contact_manipulation` 파일 안에서 수정했다.
+Native manager/runner/logging, rollout 32, PPO 4 epochs×4 minibatches, 물리 120 Hz·제어
+30 Hz, GNN·attention과 current/previous 직접 concat 구조, MDP와 배치 승인 조건은 유지했다.
+
+반영 내용:
+
+- `sensors.py`: 17 tactile·9 forbidden contact sensor가 매 physics tick 전체 환경을
+  갱신한다는 조건에서, 갱신할 행을 찾는 native `nonzero()` 동기화를 생략한다.
+  Native contact force/history 및 partner별 접촉 판정을 그대로 사용하고, 다른 sensor
+  설정은 native 경로로 돌아간다. 부분 reset은 완료된 비선택 행의 history를 보존하고
+  reset 행에 이전 PhysX 접촉을 다시 읽어 넣지 않는다.
+- `scene.py`: 비활성 물체의 중력 상쇄 force·COM을 reset에서 갱신하고 PhysX에 넘기는
+  GPU 메모리를 재사용한다. 매 substep의 COM 조회·force 재계산·reshape 복사를 제거했다.
+  물체의 native gravity와 simulation flag는 유지한다. 비활성 물체의 물리 비용 전체가
+  제거된 것은 아니다.
+- `events.py`: 배치 pose를 GPU에 유지하고 CPU 위치/yaw dictionary는 debug 요청 때만
+  생성한다. 정적 지지 높이는 pose 다운로드 없이 사용한다. 이동·회전·pivot 경로 후보는
+  Numba 배열로 생성해 Python 객체/중첩 loop를 줄이고, 선택한 후보만 경로 객체로 만든다.
+  후보 내용·shuffle 순서·후속 RNG 상태가 기존 scalar 경로와 같은지 검사했다.
+  GPU 배치 kernel의 인자는 `record_cmd=True`로 batch마다 한 번 준비해 재사용한다.
+  64개 위치 후보, 16단계마다 완료 확인, 실패 시 부분 재배치/재시도 조건은 유지했다.
+- `scene.py/events.py`: FP32 CUDA IK의 FK·Jacobian·damped 6×6 solve를 후보별 Warp kernel로
+  묶었다. 최대 48회이며 위치 오차 1e−6 m·회전 오차 1e−5 rad 안에서 조기 종료한다.
+  기존 승인 오차 5e−4 m·0.01 rad와 elbow/전완 방향/hand–arm 충돌 검사는 유지한다.
+  초기 자세 후보 난수도 GPU에서 생성한다. 이전 NumPy 방식과 같은 seed의 시작 자세는
+  달라질 수 있다. CPU tensor 식은 검증 기준으로 유지한다.
+- `events.py/sensors.py`: 제안한 물체 pose로 초기 가시성을 먼저 확인한 다음 통과한
+  장면만 IK와 실제 물리 쓰기/FK 검사를 수행한다. Ray 관측이 물체만 검사하므로 가능한
+  순서 변경이다. 관측 pose는 실제 writer와 같은 좌표 변환을 사용한다.
+- `sensors.py`: 공유 메시 bounds를 시점에 투영하여 물체를 통과할 수 없는 ray의
+  mesh query를 건너뛴다. Bounds가 eye plane을 가로지르면 생략하지 않는다.
+  일반 물체는 현재 가장 가까운 hit까지만 검사하고, Target/Blocker의 고립 실루엣은
+  기존 far 범위를 유지한다. 보이는 표면 OBB 추정은 배경 ray에 대한 atomic 연산을
+  제거했다. 160×120 해상도, 실제 메시, 40%/95% 가시율, 관측된 표면만의 PCA는 유지한다.
+- `events.py/actions.py`: 활성 물체의 투영 hull·clipping·면적을 하나의 Warp kernel로
+  계산한다. 매 step의 기하 변환·F/T 보상·동적 sample, 전체 implicit damping solve를
+  각각 CUDA graph로 재실행한다. PhysX 읽기/쓰기와 OSC 호출은 graph 밖에 둔다.
+  결과는 clone하여 다음 replay가 이전 결과를 덮어쓰지 않게 한다.
+- `rsl_rl_ppo_cfg.py`: 학습 microbatch 4096→8192. 1024환경의 기본 설정에서 backward
+  chunk는 32→16회가 되며, rollout sample·epoch·minibatch·optimizer step 수는 같다.
+
+검증 중 force buffer를 reset마다 교체하던 구현으로 한 번 CUDA 719 오류가 발생했다.
+Force/position buffer를 고정 메모리에 복사하는 방식으로 수정했다. 오류의 단일 원인이
+이것이었다고 확정하지 않으며, 이후 동일 1024환경의 16 iteration 정상 종료를 반복 확인했다.
+초기화 시 모든 물체의 중력을 끄고 활성 물체에만 중력을 적용하는 대안도 별도 `/tmp`
+복사본에서 시험했다. 물리 호출 시간은 약 2% 줄었으나 전체 8 iteration 평균은
+9.24→9.75초로 늘어 채택하지 않았다. 이 대안은 저장소 코드에 포함하지 않았다.
+
+전체 CPU 검사 181개 중 174개 통과, CUDA/native USD용 7개 skip.
+별도 RTX 3090에서는 Isaac Sim 내장 Warp 1.8.2로 관련 검사 37개가 모두 통과했다.
+제어 graph의 TF32 on/off·근특이 입력·결과 수명, F/T/기하 graph의 측정값 변경 및 부분 reset,
+IK 목표 도달/불가능한 목표 거절, 가림 query 생략 전후 일치, 관측 표면 PCA와 CPU 비교,
+배치 경로 scalar oracle·후보 순서·센서 history·고정 force buffer를 포함한다.
+
+CPU 역할/구성 선정, 선택된 경로의 sweep 생성, reset/시점 후보 큐와 일부 완료 상태
+GPU→CPU 읽기는 남는다. 전체 실행이 GPU-only이거나 모든 조건 재시도가 제거된 것은 아니다.
+
+최종 native 검증은 RTX 3090에서 1024환경·seed 0·16 iteration으로 정상 종료(exit 0)했다.
+이번 수정 전 코드를 별도 복사한 baseline도 같은 장비·설정으로 8 iteration 실행했다.
+아래 iteration 평균은 native logger의 collection+learning 합이며 초기 환경 생성은 제외한다.
+
+| 구간 | 이번 수정 전 | 최종 |
+|---|---:|---:|
+| 첫 8 iteration 평균 | 11.147 s | 9.065 s |
+| Iteration 1–7 PPO 평균 | 1.027 s | 0.914 s |
+| Iteration 1–7 MDP 상태 갱신 평균 | 0.237 s | 0.101 s |
+| Iteration 1–7 기하·센서 읽기/변환 평균 | 0.805 s | 0.675 s |
+| Iteration 1–7 IK 준비 전체 평균 | 0.854 s | 0.427 s |
+| Iteration 1–7 배치 생성 평균 | 1.065 s | 0.970 s |
+| Iteration 1–7 vision 전체 평균 | 0.588 s | 0.650 s |
+
+첫 8 iteration 시간은 약 18.7% 감소했다. Vision 전체 시간은 이 짧은 실행에서 개선이
+확인되지 않았다. 각 구간은 host wall time이며 GPU 완료 대기·후보 재시도와 결과 조립을
+포함한다. 서로 포함된 구간이 있으므로 표를 합산하지 않는다. 같은 seed라도 GPU IK 난수와
+수치 계산 차이로 승인 자세·접촉·reset·학습 궤적이 바뀌므로 동일 작업량의 microbenchmark는 아니다.
+
+최종 16 iteration 평균은 **9.534초**(범위 7.356–14.006초)이며, logging/checkpoint를
+포함한 전체 학습 시간은 153.08초였다. **1–2초 목표는 달성하지 못했다.**
+최초 iteration을 제외한 15회에서 물리 step 호출은 평균 2.916초(128회/iteration),
+action 적용 0.988초, reset 전체 3.121초, PPO 0.910초였다.
+마지막 iteration은 reset 제외 env.step이 약 5.234초로, ray casting만 제거해도 목표에
+도달할 수 있는 상태가 아니다. 물리 비용과 CPU reset 준비·시점 큐 처리의 추가 개선이 필요하다.
+
+학습 종료 후 비활성 물체 최대 위치 오차는 2.38e−7 m, 6D 속도 norm 최대는 9.73e−6이었다.
+PyTorch peak allocated/reserved는 약 2.30/2.79 GiB이며 PhysX·Isaac Sim 메모리는 포함하지 않는다.
+16 iteration 검증은 장시간 학습 안정성이나 최종 정책 성능 검증을 대신하지 않는다.
+
+재현 자료: `/tmp/contact_baseline_1024.{json,log}`, `/tmp/contact_release_1024.{json,log}`,
+`/tmp/contact_perf_verified.py`, `/tmp/contact_release_cpu.log`, `/tmp/contact_release_gpu.log`.
+
+### 2026-10-14 events.py의 Python 데이터 반복 처리 축소
+
+사용자는 `events.py`의 많은 반복문을 tensor/적절한 자료형으로 정리할 필요를 지적하고,
+USD에 physics 속성이 있는데 별도 convex hull 계산이 필요한 이유를 질문했다.
+기존 파일 안에서 아래 변경을 추가했다. 환경별 독립 배치·밀집도·경로 여유·물리/학습 설정은 유지한다.
+
+- 선택된 경로의 회전 구간별 pose·네 꼭짓점 생성은 `_motion_envelopes` Numba 함수로
+  묶었다. 결과는 `_SweepPolygons(vertices, counts)` 배열로 `_pack_layouts`까지 전달한다.
+  이전의 구간/꼭짓점별 Python tuple 생성→NumPy→tuple→NumPy 변환을 학습 경로에서 제거했다.
+  경로 후보 검사 자체는 기존 GPU kernel을 사용한다. 이 변경이 sweep 준비까지 GPU로
+  옮겼다는 뜻은 아니다. 작은 가변 길이 sweep 준비는 컴파일된 CPU 배열 연산이다.
+- `_pack_layouts`는 물체별 half extent 조회를 catalog 배열의 일괄 인덱싱으로 바꾸고,
+  예약 sweep을 polygon별 변환 없이 배열 블록으로 복사한다. Scalar/debug용 임의 다각형
+  입력은 유지한다. 축·충돌·점유율과 후보 진행/부분 재배치는 기존 device kernel을 사용한다.
+- `_episode_proposals`는 환경×물체의 `(row, id)` Python tuple 목록 대신 평탄화한 ID와
+  길이/offset 배열을 사용한다. 정적 지지 높이는 catalog당 한 번 계산하여 GPU에 캐시하고
+  인덱싱한다. 높이를 float32로 먼저 빼면 원래 Python double 식을 마지막에 cast할 때와
+  약 1.2e−7 m 차이가 생겨, 기존 순서대로 한 번 계산한 후 캐시하도록 했다.
+- 로봇 시작 영역은 blocker pose·half extent의 GPU tensor에서 회전된 box의 앞 경계를
+  직접 계산한다. 공통 규칙 검사는 환경별 반복 대신 batch당 한 번 한다. 빈 시작 영역과
+  비정상 수치는 계속 거절하며, IK·elbow/전완·hand–arm 충돌 승인 조건은 유지한다.
+  FP32 tensor로 범위를 계산하므로 이전 double 계산 후 cast와 작은 반올림 차이는 가능하다.
+
+Convex hull의 용도:
+
+1. 배치 중 이동/pivot 경로가 지나가는 영역을 확보한다. 직선 이동은 두 끝 footprint의
+   hull, 회전은 최대 5° 구간의 끝 footprint hull과 corner arc 오차 여유를 사용한다.
+   시작/끝 pose만 겹치지 않더라도 회전 중 다른 물체에 닿는 경우를 제외하기 위한 계산이다.
+2. Reward의 clearance 계산에서는 기울어진 3D OBB의 XY 투영 외곽과 A₀ 교차 면적을 구한다.
+   기울어진 box의 평면 투영은 항상 네 꼭짓점 사각형이 아니므로 전체 투영 hull이 필요하다.
+3. USD의 collider는 실제 PhysX 접촉/동역학 계산에 사용된다. 위 코드가 물리 collision
+   mesh를 매 reset 다시 cooking하는 것은 아니다. USD physics 속성이 선반 점유율이나
+   재배치 경로의 여유를 자동으로 정의하지 않는다. 현재 배치용 box/sweep은 실제 collider의
+   보수적인 근사이며, 가용 공간을 실제보다 좁게 판단할 수 있고 조작의 물리적 성공 보장은 아니다.
+
+Python의 환경별 generator/역할·구성 선정, 후보 완료 큐와 `.cpu()`/`.tolist()` 승인 확인은
+아직 남아 있다. Warp의 GPU thread 내부 반복, Numba의 컴파일된 CPU 반복, 제어 시간축의
+substep 반복은 Python으로 개별 물체 데이터를 반복 처리하는 비용과 구분해야 한다.
+남은 generator/queue를 공통 batch state와 mask로 전환하는 것은 추가 구조 개선 지점이다.
+
+CPU 전체 검사 184개 중 177개 통과, CUDA/native USD용 7개 skip.
+Isaac Sim 내장 Warp 1.8.2 GPU 관련 검사 40개가 모두 통과했다. 새 검사는 이동·pivot·
+다단계 sweep과 scalar hull의 일치, 배열/tuple 경로의 동일 packing, device pose의 host
+읽기 없이 캐시 높이 사용, 회전 box의 GPU 시작 영역과 scalar footprint 범위의 일치를 포함한다.
+
+RTX 3090·Warp 1.8.2에서 실제 catalog의 동일 seed 1024개 배치를 비교했다. 모든 역할·
+active ID·생성 XY/yaw가 변경 전과 정확히 일치했다. JIT warm-up 후 다른 검증 작업 없이
+실행 순서를 번갈아 3회씩 측정한 배치 생성 시간은 평균 **1.721→1.567초(약 9% 감소)**였다.
+별도 cProfile에서 Python 수준 호출 수는 약 215만→163만 회로 줄었다. 이 수치는 배치 생성만의
+비교이며 전체 iteration의 개선율이 아니다.
+
+실제 1024환경·8 iteration도 exit 0으로 종료했다. Native collection+learning 평균은
+**9.184초**, logging/checkpoint 포함 학습 시간은 74.03초였다. 직전 코드의 첫 8 iteration
+평균 9.065초와 비슷하며, 이번 변경으로 전체 iteration 시간이 개선됐다고 결론내리지 않는다.
+FP32 시작 영역 계산과 물리/학습 궤적 차이, 실행별 변동이 있는 단기 측정이다.
+비활성 물체 위치 오차 최대 2.38e−7 m, 6D 속도 norm 최대 9.77e−6도 확인했다.
+연구 조건·물리 주기·epoch를 완화하지 않았고, 1–2초/iteration 목표는 아직 달성하지 못했다.
+
+재현 자료: `/tmp/contact_array_bench.py`, `/tmp/contact_array_bench_final.log`,
+`/tmp/contact_array_bench.json`, `/tmp/contact_arrays_cpu.log`, `/tmp/contact_arrays_gpu.log`,
+`/tmp/contact_arrays_native_1024.{json,log}`. 비교 원본은 `/tmp/contact_events_before_arrays.py`다.
+
+### 2026-10-14 — Isaac Lab controller/action class로 제어 경로 통일
+
+사용자가 UR5e는 OSC, hand는 joint position controller를 사용하고 예제의 controller
+class를 따라야 한다고 명시했다. `ActionsCfg`를 `arm_action` 12D와 `hand_action` 6D로
+분리했다. `ArmOscAction`은 native `OperationalSpaceControllerAction`을 상속하고,
+`HandPositionAction`은 native `JointPositionAction`을 상속한다. 두 클래스 모두 부모의
+`apply_actions()`를 호출한다. OSC 수식은 복제하지 않고, native 클래스가 실제 TCP 속도·
+Jacobian·mass matrix·gravity를 이용해 계산한다. 커스텀 implicit damping과 32회
+Newton–Schulz 계산은 삭제했다. 새 파일 없이 `mdp/actions.py`는 207줄로 정리했다.
+
+Native OSC 예제처럼 full inertia decoupling을 사용한다. 이에 따라 기존 숫자 범위의
+stiffness 채널은 물리 강성이 아닌 관성 정규화 gain이 된다. 현재 제어 규약은 위
+"Action과 제어" 절을 따른다. 이전 custom controller 기록은 당시 실험 이력으로 남긴다.
+관측의 관절 순서·18D action 순서와 F/T 보상은 유지한다. MDP는 native ActionManager의
+전체 action tensor와 두 term의 환경별 invalid flag를 사용한다.
+
+검증:
+
+- CPU 검사 178개 중 171개 통과, native/CUDA 의존 검사 7개 skip.
+- Isaac Sim에서 native OSC의 상대 목표 latch·관성/감쇠 계산과 부분 reset 후
+  transition CUDA graph 일치 검사를 통과했다.
+- 64개 독립 초기 자세에 최소·중간·최대 gain을 분배하여 목표를 고정하고 120 Hz에서
+  240 step(2초)을 실행했다. 최대 위치 오차 0.0477 mm, 회전 오차 0.003323 rad(0.190°),
+  최대 arm 관절 속도 0.009463 rad/s였다. 초기 workspace clipping·torque saturation·
+  invalid control은 없었다. Native OSC 출력과 적용 토크 일치 및 선택 reset도 검사했다.
+- RTX 3090에서 1024환경·8 iteration(seed 0) 학습을 exit 0으로 완료했다.
+  collection+learning은 평균 7.621초/iteration(6.496–12.482초), 총 학습 61.31초였다.
+  직전 9.184초와 비교하면 이번 실행의 전체 시간은 줄었지만 제어 응답과 reset 빈도도
+  바뀌었으므로 동일 궤적의 연산 최적화 결과로 해석하지 않는다. 첫 iteration을 제외한
+  action 적용 시간은 arm+hand 약 1.080초/iteration으로 직전 약 0.990초보다 짧지 않았다.
+  Native inverse 등 제어 계산이 없어지는 변경은 아니다. 1–2초 목표는 아직 미달이다.
+
+이는 짧은 실행 및 비접촉 hold 검증이며 장기 접촉 안정성·학습 수렴을 검증한 것은 아니다.
+재현 자료: `/tmp/contact_native_controller_check.{py,json,log}`,
+`/tmp/contact_native_action_unit.{py,log}`, `/tmp/contact_native_actions_cpu.log`,
+`/tmp/contact_native_actions_profile.py`, `/tmp/contact_native_actions_1024.{json,log}`.
+
+### 2026-10-14 — Native 기능 재사용 점검과 불필요한 재구현 제거
+
+사용자가 controller 외에도 직접 만든 부분을 점검하고, 공식 예제의 흐름과 Isaac Lab
+기능을 최대한 사용하도록 요청했다. 앞으로 일반 기능은 설치된 checkout의 public
+class/config 및 예제를 먼저 확인하고, 연구 요구나 검증된 병목이 있는 부분만 확장한다.
+검토 표와 구체적인 공식 소스 링크는 `src/contact_manipulation/README.md`의
+"Native 기능과 연구 확장의 경계"에 기록했다. 기존 프로젝트와 새 파일 수는 건드리지 않았다.
+
+이번 변경:
+
+1. Hand의 수동 soft-limit affine mapping을 제거했다. 공식 in-hand 예제가 사용하는
+   `JointPositionToLimitsAction`이 입력 clipping·관절 한계 변환·position target 적용을 맡는다.
+   연구 adapter에는 nonfinite 처리·측정 q 기준 position lead 제한·선택 reset만 남긴다.
+2. 관측·기하·F/T 보상에서 사용하는 tensor quaternion 곱/회전/켤레는
+   `isaaclab.utils.math`를 호출한다. Native 함수의 동일-shape 요구를 맞추는 broadcasting만
+   adapter로 남긴다. CPU 검사도 수식 복사본 대신 checkout의 실제 math 모듈을 로드한다.
+3. `FrameTransformerCfg`가 native `FrameTransformer`를 직접 생성한다.
+   현재 `clone_in_fabric=False`의 USD cloning에서는 `_ReplicaSensorBase`와
+   `TaskFrameTransformer`가 필요 없어 삭제했다. `ContactSensor`는 native 초기화·force/history를
+   사용하고, 측정된 hot path의 전체 행 update 최적화와 금지 접촉 필터 구성만 유지한다.
+4. 비활성 물체의 중력 상쇄는 `permanent_wrench_composer.set_forces_and_torques()`에
+   등록한다. 직접 PhysX force를 제출하던 `write_data_to_sim()` 재구현과 COM/force/index
+   캐시를 제거했다. Force 적용과 instantaneous wrench 합성은 native collection에 맡긴다.
+   Permanent composer는 주차용으로 예약한다. 같은 timestamp에서 pose를 다시 쓰면 composer의
+   frame cache도 reset한다. SDK의 별도 COM-pose cache 무효화 누락에 대한 작은 보정은 유지한다.
+5. Minibatch가 상한 이내이면 `super().update()`로 native RSL-RL PPO를 실행한다.
+   기본 1024환경 × 32 step ÷ 4 minibatches = 8192이므로 native 경로다.
+   상한을 넘을 때만 기존 microbatch gradient accumulation을 쓴다. 공유 GNN/attention,
+   bounded tanh-Gaussian, reset 직전 상태의 timeout bootstrap은 연구 adapter로 남긴다.
+6. Warp mesh 생성도 공식 `convert_to_warp_mesh()`를 사용한다.
+
+대조 후 유지한 연구 코드:
+
+- 배치/초기 자세: 기본 uniform reset 및 DifferentialIKController는 FK를 포함한 후보 탐색,
+  Target·Blocker 조건, elbow·충돌·재배치 경로를 정의하지 않는다. 물리 scene에 후보를 쓰지
+  않고 검증하는 GPU FK/IK·배치 sampler를 유지한다.
+- Vision: 기본 RayCaster는 정적 단일 mesh 제약이 있지만 **MultiMeshRayCasterCamera와
+  raycast_dynamic_meshes는 동적 mesh를 지원한다.** Custom 유지 이유를 동적 mesh 미지원으로
+  설명하면 안 된다. 후보 pose 입력, 무가림 role 실루엣 분모, object-only projected culling,
+  ray별 depth/label 일관성과 visible-surface OBB라는 차이 때문에 현재 fused 구현을 유지한다.
+  Native dynamic kernel의 atomic depth와 label 쓰기 관련 FIXME도 확인했다.
+- History: native CircularBuffer/ObservationManager는 첫 sample을 과거에도 반복한다.
+  우리 규약의 previous=0, newest-first와 reset 이전 terminal observation 보존을 위해
+  두 sample을 TaskState에서 관리한다. 보상/종료 시 공유하는 누적 상태도 연구 전용이다.
+- F/T: 원시 반력은 native articulation에서 읽고 SI-200-8 측정 모델과 Newton–Euler 보상은
+  연구 코드로 유지한다. GNN/attention과 연구 reward/termination 수식도 동일하다.
+
+Native 전환 중 확인한 차이:
+
+- Native PPO는 기존 별도 update의 추가 loss 지표 대신 value/surrogate/entropy를 기록한다.
+  SDK 내부 minibatch별 `.item()`과 선형대수 동기화까지 제거한 구현이라고 주장하지 않는다.
+- Native permanent wrench는 world force를 local axes로 바꿔 저장한다. 최초 1024환경
+  8 iteration 학습은 완료했지만, 격리된 주차 물체의 최대 이동 0.2685 mm가 예전 임시
+  profiler의 0.1 mm 기준을 넘어 후속 assertion이 실패했다. 이를 숨기지 않고 별도 진단했다.
+  4환경·960 physics step(8초)에서 추가 torque·각속도는 0, 최대 이동 0.1335 mm,
+  선속도 약 4.03e−5 m/s, 회전된 force의 차이는 약 1e−6 N 이하였다. FP32 local/world
+  force 변환을 포함한 native 경로의 수치 오차로 판단한다. 검증 기준을 비활성 주차 물체에
+  한해 위치 1 mm·속도 1e−3로 명시했다. 물체 간 주차 간격 0.32 m보다 충분히 작으며,
+  각 episode reset에서 pose/속도가 다시 초기화된다. Active 물체의 중력이나 접촉 조건은
+  완화하지 않았다. 이 미세 오차가 완전히 사라졌다고 주장하지 않는다.
+
+최종 검증: CPU 검사 180개 중 172개 통과·native/CUDA 8개 skip. Isaac Sim 내에서
+native OSC, hand limit mapping/lead/reset, transition CUDA graph, contact update 및
+parking composer 위임 검사 5개 통과. Native FrameTransformer의 1024행 출력도 검사했다.
+1024환경·8 iteration에서 microbatch fallback을 호출하면 실패하도록 계측하여 기본 PPO가
+실제로 native update를 사용하는 것을 확인했고, 실행은 exit 0으로 완료했다.
+평균 7.628초/iteration, 총 학습 61.35초였다. 기존 7.621초 수준과
+유사하며 이번 구조 정리를 학습 속도의 획기적 개선으로 주장하지 않는다.
+주차 물체 최대 이동 0.2685 mm·속도 norm 7.014e−5로 명시한 검증 범위 안이었다.
+
+자료: `/tmp/contact_native_reuse_cpu.log`, `/tmp/contact_native_reuse_profile.py`,
+`/tmp/contact_native_reuse_1024.{json,log}`, `/tmp/contact_native_parking_diagnostic.{py,log}`.
+최초 주차 assertion 실패 기록은 `/tmp/contact_native_reuse_first_1024.{json,log}`에 보존했다.
+
+### 2026-10-14 Sweeping-Policy 예제와 실행 주기 일치
+
+사용자가 예제와 같은 주기를 요청하여 새 프로젝트의 `ur5e_env_cfg.py`를
+`sim.dt=0.01`, `decimation=2`, `render_interval=2`로 변경했다.
+물리 및 OSC/hand 적용은 100 Hz, 정책은 50 Hz다. 이전 120 Hz/30 Hz 설정을 대체한다.
+금지 접촉 sensor의 history_length도 2로 맞춰 현재 정책 step의 모든 물리 substep만 검사한다.
+Hand 목표 제한은 physics dt, MDP 시간·차분 및 play pacing은 env.step_dt를 사용한다.
+Episode timeout은 기존 8초(이제 400 policy step), rollout은 기존 32 step(0.64초)이다.
+제어 방식·solver·reward 계수·PPO 설정은 이번 주기 변경의 대상이 아니다.
+
+두 Sweeping-Policy 예제의 dt/decimation/render_interval과 실제 설정 메서드의 결과를 비교했다.
+기존 reward·state·sensor runtime·native adapter CPU 검사 35개가 통과했고 diff 공백 검사도 통과했다.
+새 주기로 Isaac Sim 실행 및 처리량은 아직 측정하지 않았다. 앞선 7.628초/iteration 기록은
+120 Hz/30 Hz 실행의 결과이며 새 설정의 성능으로 인용하지 않는다.
+
+### 2026-10-14 물체 pool 및 관측 슬롯 30개로 축소
+
+물리 step 비용을 줄이기 위한 사용자 요청에 따라 새 프로젝트의 물리 pool을
+10종×4개=40개에서 10종×3개=30개로 축소했다. 1024환경에서 물체 rigid body는
+40,960개에서 30,720개로 줄어든다. Target 종류의 중복 금지는 유지하므로 실제 선반의
+active 물체 상한은 28개다. 매 episode를 정확히 30개로 채우는 설정은 아니다.
+
+MDP·spawn rules·reset 버퍼·초기 vision·GNN의 기본 관측 슬롯을 모두 30개로 맞췄다.
+Observation은 30×10+2×72=444D이며 Target/Blocker 슬롯 0/1과 action 18D는 유지한다.
+기존 40-slot checkpoint와 model_cfg가 달라 기본 resume/play는 호환되지 않는다.
+선반 전체 점유율 35%·지역 점유율 10%, 역할·가시성 조건은 변경하지 않았다.
+
+검증: 기존 CPU 검사 180개 중 172개 통과, Isaac Sim/CUDA 필요 검사 8개 skip.
+기존에 실제 USD에서 추출해 저장한 catalog의 네 번째 복제본을 제외한 30개 형상으로
+seed 0–15의 배치 생성 및 validate_sample을 확인했다. 16/16개 배치가 통과했고
+active 수는 15–18개, 최소 전체 점유율은 35.07%였다. 작성된 catalog도 10종×3개임을 확인했다.
+실제 Isaac Sim의 새 pool 생성·학습 처리량은 아직 측정하지 않았다.
+CPU 결과는 `/tmp/contact_30_objects_cpu.log`에 기록했다.
