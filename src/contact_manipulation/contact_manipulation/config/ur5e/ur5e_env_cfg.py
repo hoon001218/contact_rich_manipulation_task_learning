@@ -3,17 +3,17 @@
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.controllers import OperationalSpaceControllerCfg
+from isaaclab.envs.mdp import JointPositionToLimitsActionCfg, OperationalSpaceControllerActionCfg
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.utils import configclass
 
 from ...shelf_manipulation_env_cfg import ShelfManipulationEnvCfg, ShelfManipulationSceneCfg
-from ...mdp.sensors import (
-    make_forbidden_contact_cfg, make_tactile_contact_cfg,
-)
+from ...mdp.sensors import make_tactile_contact_cfg
 from .scene import (
-    DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES, FORBIDDEN_CONTACT_BODY_NAMES,
-    make_object_collection_cfg, make_ur5e_hand_cfg, SharedGeometryCfg,
+    DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES,
+    make_object_collection_cfg, make_ur5e_hand_cfg, spawn_shelf, SharedGeometryCfg,
 )
 
 
@@ -21,20 +21,16 @@ from .scene import (
 class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
     """One authored template and fixed object pool, without rendered perception."""
 
-    ground = AssetBaseCfg(
-        prim_path="/World/Ground", spawn=sim_utils.GroundPlaneCfg(), collision_group=-1,
-    )
-    light = AssetBaseCfg(
-        prim_path="/World/Light",
-        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
-    )
-    shelf = AssetBaseCfg(
+    shelf = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Shelf",
         spawn=sim_utils.UsdFileCfg(
+            func=spawn_shelf,
             usd_path=os.environ.get("CONTACT_MANIPULATION_SHELF_USD_PATH", DEFAULT_SHELF_USD_PATH),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=False, disable_gravity=False),
+            # Match examples/Sweeping-Policy; PhysX derives inertia from the colliders.
+            mass_props=sim_utils.MassPropertiesCfg(mass=100.0),
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=SHELF_POSITION),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=SHELF_POSITION),
     )
     robot = make_ur5e_hand_cfg()
     object_collection = make_object_collection_cfg()
@@ -44,13 +40,7 @@ class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
             prim_path="{ENV_REGEX_NS}/Robot/ROASRightHand/right_plam_force_sensor", name="end_effector",
         )],
     )
-    # Assign one native sensor per physical tactile link; loops construct only
-    # configuration attributes, never per-environment tensors or simulation data.
-    for _name in TACTILE_BODY_NAMES:
-        locals()[f"contact_{_name}"] = make_tactile_contact_cfg(_name)
-    for _name in FORBIDDEN_CONTACT_BODY_NAMES:
-        locals()[f"forbidden_{_name}"] = make_forbidden_contact_cfg(_name, history_length=2)
-    del _name
+    tactile_contact = make_tactile_contact_cfg(TACTILE_BODY_NAMES)
     # Run last, after all collider/contact edits and before native cloning.
     shared_geometry = AssetBaseCfg(prim_path="/World/SharedGeometry", spawn=SharedGeometryCfg())
 
@@ -64,12 +54,45 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
     )
 
     def __post_init__(self):
-        # Match Sweeping-Policy: 100 Hz physics / 50 Hz policy.
-        self.sim.dt = 0.01
-        self.decimation = 2
-        self.sim.render_interval = self.decimation
-        self.sim.physx.bounce_threshold_velocity = 0.05
-        self.episode_length_s = 8.0
-        self.num_rerenders_on_reset = 0  # Initial perception does not render.
-        self.viewer.eye = (1.6, -2.0, 2.0)
-        self.viewer.lookat = (-0.5, 0.0, 1.05)
+        super().__post_init__()
+        # Match Sweeping-Policy's OSC specialization: the native controller
+        # supplies arm efforts, so implicit position/velocity drives stay off.
+        self.scene.robot.actuators["arm"].stiffness = 0.0
+        self.scene.robot.actuators["arm"].damping = 0.0
+        self.actions.arm_action = OperationalSpaceControllerActionCfg(
+            asset_name="robot",
+            joint_names=[
+                "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
+            ],
+            body_name="right_plam_force_sensor",
+            position_scale=1.0,
+            orientation_scale=1.0,
+            stiffness_scale=100.0,
+            controller_cfg=OperationalSpaceControllerCfg(
+                target_types=["pose_rel"],
+                impedance_mode="variable_kp",
+                motion_control_axes_task=(1, 1, 1, 1, 1, 1),
+                contact_wrench_control_axes_task=(0, 0, 0, 0, 0, 0),
+                inertial_dynamics_decoupling=True,
+                partial_inertial_dynamics_decoupling=False,
+                gravity_compensation=False,
+                motion_stiffness_task=100.0,
+                motion_damping_ratio_task=1.0,
+                motion_stiffness_limits_task=(50.0, 200.0),
+                nullspace_control="none",
+            ),
+            nullspace_joint_pos_target="none",
+        )
+        self.actions.hand_action = JointPositionToLimitsActionCfg(
+            asset_name="robot",
+            joint_names=[
+                "right_thumb_1_joint", "right_thumb_2_joint", "right_index_1_joint",
+                "right_middle_1_joint", "right_ring_1_joint", "right_little_1_joint",
+            ],
+            preserve_order=True,
+            rescale_to_limits=True,
+        )
+        # Select the same independent joints as the action terms; omit mimic joints.
+        self.rewards.motion.params["arm_cfg"].joint_names = self.actions.arm_action.joint_names.copy()
+        self.rewards.motion.params["hand_cfg"].joint_names = self.actions.hand_action.joint_names.copy()

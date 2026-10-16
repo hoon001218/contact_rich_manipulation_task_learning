@@ -1,11 +1,12 @@
 # Contact Manipulation
 
-Sweeping-Policy 예제의 구조를 기준으로 새로 시작하는 Isaac Lab 프로젝트다.
+Sweeping-Policy의 **`min` branch 구조**를 기준으로 구성한 Isaac Lab 연구 프로젝트다.
 **장면·센서 생성, episode reset, MDP, GNN·attention 정책과 native PPO를 연결한 프로젝트다.**
 기존 `src/contact_rearrangement`와 별도 패키지이고, 해당 패키지를 import하지 않는다.
 
-참조한 코드는 [Sweeping-Policy](../../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/)와
-[Isaac Lab manager-based 템플릿](../../IsaacLab/tools/template/templates/tasks/manager-based_single-agent/env_cfg)이다.
+주요 구조 기준은 [Sweeping-Policy/min](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/tree/min)이다.
+로컬 [Sweeping-Policy 예제](../../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/)와
+[Isaac Lab manager-based 템플릿](../../IsaacLab/tools/template/templates/tasks/manager-based_single-agent/env_cfg)도 함께 참고한다.
 
 ## 디렉터리 구조
 
@@ -18,7 +19,7 @@ contact_manipulation/
 │   └── play.py                      # 저장된 checkpoint의 native 추론·GUI 재생
 └── contact_manipulation/
     ├── __init__.py                  # 패키지 import 시 Gym 등록
-    ├── shelf_manipulation_env_cfg.py # 공통 Scene 및 MDP manager 설정
+    ├── shelf_manipulation_env_cfg.py # 공통 world·MDP term·시뮬레이션 설정
     ├── config/
     │   ├── __init__.py
     │   └── ur5e/
@@ -33,7 +34,6 @@ contact_manipulation/
     └── mdp/
         ├── __init__.py
         ├── events.py               # reset, 배치 상태, 공통 기하 계산
-        ├── actions.py              # native OSC·joint-position action의 연구 입력 변환
         ├── sensors.py              # 실제 F/T·contact reader와 기하 기반 초기 vision
         ├── observations.py         # observation 계산
         ├── rewards.py              # reward 계산
@@ -42,17 +42,26 @@ contact_manipulation/
 
 ## 예제와의 대응
 
-| Sweeping-Policy | 새 프로젝트 | 역할 |
+| Sweeping-Policy/min | 현재 프로젝트 | 역할 |
 |---|---|---|
-| `shelf_sweep_env_cfg.py` | `shelf_manipulation_env_cfg.py` | 장면과 각 manager 설정 조합 |
-| `config/ur5e/joint_pos_env_cfg.py` | `config/ur5e/ur5e_env_cfg.py` | 로봇·센서·제어 설정 구체화 |
+| `shelf_sweep_random_env_cfg.py` | `shelf_manipulation_env_cfg.py` | 공통 world, 각 manager의 term, physics/policy 주기·episode 길이 |
+| `config/ur5e/osc_random_sweep_env_cfg.py` 및 hand 변형 cfg | `config/ur5e/ur5e_env_cfg.py` | 공통 cfg 상속, robot·shelf·object·sensor·공식 action 구성 |
 | `config/ur5e/__init__.py` | 동일 위치 | Gym 등록과 설정 파일 연결 |
 | `config/ur5e/agents/rsl_rl_ppo_cfg.py` | 동일 위치 | 정책 및 PPO 설정 |
 | `mdp/*.py` | 동일 위치 | 연구에 필요한 MDP 함수 |
+| `src/ur5e*.py`, `src/shelf_utils.py` | `config/ur5e/scene.py` | Asset 생성과 기하 준비; 기존 파일에 모아 관리 |
+| `train.py`, `play.py` → Isaac Lab 실행 파일 | `scripts/train.py`, `scripts/play.py` | AppLauncher·Hydra·Gym·native wrapper/runner 흐름 |
 
 로봇별 설정은 `ur5e_env_cfg.py`에서 구체화한다. Arm에는 연구 설계에 따라
 가변 stiffness의 OSC torque 제어를, hand에는 독립 6관절 position 제어를 사용한다.
 에셋 로딩은 예제의 `src/ur5e.py`, `src/shelf_utils.py`를 참고해 `scene.py`에 모았다.
+공통 cfg의 observation은 `initial_scene` 100D, `current` 72D, `previous` 72D 순서로
+각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총 244D로 연결한다.
+세 함수는 같은 step의 캐시를 조회하므로 센서 읽기·이력 갱신·기하 계산을 반복하지 않는다.
+
+새 기능도 **cfg에서 선언 → native manager가 호출 → 해당 `mdp` 함수에서 연구 계산**하는
+흐름을 따른다. `min`의 환경별 파생 cfg와 asset 설정 방식은 참고하되, 이 과제에 없는
+command/curriculum이나 별도의 environment subclass는 추가하지 않는다.
 
 ## Native 기능과 연구 확장의 경계
 
@@ -63,9 +72,9 @@ contact_manipulation/
 | 영역 | 현재 사용하는 native 기능 | 남겨 둔 연구 확장 |
 |---|---|---|
 | 환경·학습 흐름 | `ManagerBasedRLEnv`, 각 Manager, `InteractiveScene`, `OnPolicyRunner` | Scene/MDP 설정과 함수 |
-| 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, `ImplicitActuator` | 18D 입력 변환, TCP 보정, 제한 처리 |
+| 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및 18D 입력 설정 |
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
-| EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 매 physics tick 전체 행 갱신 최적화, 금지 접촉 상대 필터 |
+| EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
 | 물체 주차 | `RigidObjectCollection.permanent_wrench_composer` | parked mask와 중력 상쇄 force 계산; transient force는 instantaneous composer 사용 |
 | PPO | 기본 `PPO.update()`, storage·GAE·logger·checkpoint | 공유 GNN/attention actor–critic, terminal 관측 bootstrap, 큰 minibatch의 gradient accumulation |
 | 초기 vision | `convert_to_warp_mesh`, Warp mesh query | 후보 pose의 object-only raycast, 두 역할의 무가림 실루엣과 가시성, 관측 표면 OBB |
@@ -85,7 +94,9 @@ contact_manipulation/
 - Native observation history는 reset 후 첫 sample을 과거 슬롯에도 반복한다. 우리 규약은
   reset 시 previous=0, current/previous 순서와 reset 직전 terminal 관측 보존이므로
   `TaskState`의 두 sample 저장을 유지한다.
-- F/T 원시 반력은 native articulation API에서 읽는다. SI-200-8 양자화·범위와 hand 링크의
+- F/T 원시 반력은 public `ArticulationData.body_incoming_joint_wrench_b`에서 읽는다.
+  Quaternion 부호 정규화와 물리 FK 검사의 회전 변환도 `isaaclab.utils.math`를 사용한다.
+  SI-200-8 양자화·범위와 hand 링크의
   자중/운동 관성 보상, OBB 조작량·clearance 등은 연구 수식이다.
 - 설치된 RSL-RL은 기본 Gaussian을 제공한다. 기존 bounded tanh-Gaussian과 그 log-prob,
   GNN/attention은 연구 모델로 유지한다. PPO 알고리즘 자체의 기본 실행은 native에 위임한다.
@@ -117,10 +128,23 @@ scripts/train.py
 초기 vision·이력·경과 시간과 timeout을 일치시키기 위해 `init_at_random_ep_len=False`로 시작한다.
 `commands`와 `curriculum`은 Isaac Lab 기본값인 `None`으로 두었다.
 
+`min`의 실행 스크립트는 task를 등록하고 `runpy`로 Isaac Lab 스크립트를 호출한다.
+우리 스크립트는 같은 실행 순서를 직접 사용하며 다음 차이만 유지한다.
+
+- Train: 위 episode clock 규칙 때문에 stock 학습의 무작위 초기 episode counter를 사용하지 않는다.
+- Play: 현재 graph 모델에서 지원하지 않는 JIT/ONNX export를 실행하지 않고 native inference로 재생한다.
+- 모델 연결: 공유 GNN·attention, bounded action 분포와 checkpoint 계약을 RSL-RL adapter에서 처리한다.
+
+Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 첫 함수가 물체·로봇의
+초기 상태와 vision을 준비하고, 두 번째가 초기 snapshot·이력·누적량을 초기화한다.
+이후 reward·termination·observation은 한 control step당 한 번 갱신되는 `TaskState`를 공유한다.
+이 부분은 initial vision 고정, previous=0 reset 규칙, 누적 조작량과 terminal observation을
+일치시키기 위한 연구 구현이다. 별도 `env.step()`이나 `_reset_idx()` override는 없다.
+
 ## 모델과 PPO
 
 ```text
-초기 vision 기하 [N,30,10] ── 2-layer GNN (64D)
+초기 vision 기하 [N,10,10] ── 2-layer GNN (64D)
                              ├─ Target / Blocker embedding
                              ├─ Target / Blocker 조건부 attention → scene 320D
                              └─ valid object mean pooling
@@ -157,7 +181,7 @@ Mask 판정에 필요한 원래 값을 유지하므로 추가 running observatio
 | γ / GAE λ / PPO clip | 0.99 / 0.95 / 0.2 |
 | Value loss / entropy coefficient | 0.25 / 0.01 |
 | Max gradient norm / 초기 action std | 0.5 / 0.3 (tanh 이전) |
-| 추론 chunk / 학습 microbatch | 최대 1,024 / 8,192 sample |
+| 추론 chunk / 학습 microbatch | 최대 8,192 / 8,192 sample |
 | 학습 iteration / checkpoint 주기 | 1,000 / 50 |
 | Physics / policy 주파수 / timeout | 100 Hz / 50 Hz / 8 s |
 | 기본 환경 수 / 환경 간격 | 1 / 2.5 m |
@@ -176,11 +200,12 @@ multi-GPU 및 JIT/ONNX export는 구현하지 않았다.
 ## MDP
 
 기준은 [기존 연구 설계](../../docs/CONTEXT.md)다. MDP 구현은 기존 네 개 모듈과
-`actions.py`, `sensors.py`에 모았다. 공통 상태·배치 sampler·reset을 별도 파일로 분리하지 않았다.
+`sensors.py`에 모았다. 제어는 UR5e env cfg의 공식 ActionCfg에 설정하며,
+공통 상태·배치 sampler·reset을 별도 파일로 분리하지 않았다.
 
 | 영역 | 구현 |
 |---|---|
-| Observation | 초기 vision 기하 30×10 + 현재·직전 sample 2×72 = **444D** |
+| Observation | 초기 vision 기하 10×10 + 현재·직전 sample 2×72 = **244D** |
 | 물체 정보 | 현재 EEF 기준 위치·quaternion·OBB extent. 초기 추정값은 episode 내내 고정 |
 | 슬롯 | Target 0, Blocker 1, 나머지 관측 물체와 zero padding. Role ID·mask 채널 없음 |
 | 72D sample | 12관절 q/dq 24 + base 기준 EEF pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
@@ -188,69 +213,163 @@ multi-GPU 및 JIT/ONNX export는 구현하지 않았다.
 | Tactile | 마지막 physics sample의 normal force norm > 0.01 N이면 1, 미접촉 0, 결측 −1 |
 | Action | Base 축 TCP 증분 6 + stiffness 6 + hand 독립 관절 위치 6 = **18D** |
 
-Action은 축별 위치 ±15 mm, rotation vector ±0.08 rad,
-`arm_action` 12D와 `hand_action` 6D를 native ActionManager가 순서대로 처리한다.
-- Arm: `ArmOscAction(OperationalSpaceControllerAction)` → Isaac Lab `OperationalSpaceController`.
-- Hand: `HandPositionAction(JointPositionToLimitsAction)` → native `ImplicitActuator`의 position PD.
+제어는 [UR5e 환경 cfg](contact_manipulation/config/ur5e/ur5e_env_cfg.py)의 `__post_init__`에서
+공식 `OperationalSpaceControllerActionCfg`와 `JointPositionToLimitsActionCfg`로 설정한다.
+공통 `ActionsCfg`는 두 term을 `MISSING`으로 선언한다. 별도 custom action/controller 클래스는 없다.
+`ActionManager.process_action → native process_actions/set_command → physics substep의
+native apply_actions/compute → scene.write_data_to_sim` 순서로 실행한다.
 
-OSC는 `pose_rel`, `variable_kp`, full inertia decoupling, gravity compensation,
-damping ratio 1을 사용한다. Gain 범위는 병진 100–800, 회전 5–40이며,
-**관성으로 정규화된 gain(s⁻²)**이다. 이전 custom controller의 물리 강성
-N/m·N·m/rad와 같은 의미가 아니다. Native 계산은
-`τ = Jᵀ Λ [Kp e − 2√Kp v] + G`, `Λ = (J M⁻¹ Jᵀ)⁻¹`이고 custom damping은 없다.
+OSC 설정은 원격 `min` branch의
+[`UR5eSweepKpOSCRelativeObsEnvCfg`](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py)를 따른다.
+제어 body는 우리 hand의 `right_plam_force_sensor`이며 Robotiq 전용 offset은 사용하지 않는다.
 
-TCP 목표는 native OSC가 매 policy step의 측정 pose에서 생성하고 physics substep 동안 유지한다.
-연구 adapter는 입력 정규화·축별 gain 매핑·workspace/effort 제한과 TCP의 COM→link 좌표 보정만 수행한다.
-Hand는 soft limit 범위의 절대 관절 목표를 사용하며, 측정 위치에서 `1 rad/s × physics_dt` 이하로
-PD target의 lead를 제한한다(실제 관절 속도의 보장은 아니다).
-Arm PD gain은 asset 설정에서 0이며 mimic 관절에는 별도 action을 주지 않는다.
-Action 18D와 observation 444D의 채널 순서는 유지하지만 제어 응답이 바뀌므로,
-이전 controller로 학습한 checkpoint를 같은 동역학의 continuation으로 해석하면 안 된다.
+| 입력/설정 | 현재 native 동작 |
+|---|---|
+| Arm 앞 6D | Base 축 `pose_rel`; position/orientation scale 모두 1.0 (m, rad) |
+| Arm 뒤 6D | `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
+| 현재 bounded 정책의 Kp 범위 | raw action ∈ [−1,1]이므로 실제 50–100; 200은 native 상한 |
+| OSC | Full inertia decoupling, damping ratio 1, gravity compensation=False, nullspace 없음 |
+| Hand 6D | [−1,1]을 각 관절의 live soft limit 범위에 매핑하여 position target으로 전달 |
+
+Scale 1.0은 위치 action 0.01이 1 cm, 회전 action 0.01이 0.01 rad라는 뜻이다.
+이전의 ±15 mm/±0.08 rad 제한과 축별 gain 매핑, workspace 목표 clipping,
+COM→TCP Jacobian/속도 보정, hand 측정 위치 기준 lead 제한, custom effort clipping은 제거했다.
+Native 예제의 frame 처리와 asset의 기존 actuator/PhysX 제한을 그대로 사용한다.
+F/T 자중·관성 보상은 센서 처리이므로 유지한다. Action/적용 torque의 nonfinite는 MDP에서 검사한다.
+Arm actuator PD gain은 0이고 mimic 관절에는 별도 action을 주지 않는다.
+예제처럼 OSC 환경의 `__post_init__`에서도 arm stiffness/damping=0을 명시한다.
+팔은 `min`과 동일하게 `ImplicitActuatorCfg`를 유지한다. `velocity_limit_sim`은
+shoulder/elbow 3.14·wrist 6.28 rad/s, `effort_limit_sim`은 각각 150·28 N·m로 설정한다.
+별도의 OSC 출력 토크 clamp는 추가하지 않는다. 이는 feed-forward 명령 자체를 같은
+범위로 clipping한다는 뜻은 아니다. `IdealPDActuatorCfg`는 진단 비교에만 사용했으며,
+2026-10-16 사용자 결정에 따라 실제 학습 구성에는 적용하지 않는다.
+속도 초과 자체에 대한 episode 종료는 연구 MDP에 추가하지 않는다.
+
+Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
+이전 custom controller checkpoint는 새 action-contract metadata 검사에서 거절하며 새 학습을 시작한다.
 
 | Reward | Discrete step 값 |
 |---|---|
-| Clearance | `exp(−blocked_area / blocker_area)`; 초기 접근영역 A₀와 Blocker의 실제 footprint 교차 면적 |
-| Rearrangement | `exp(−2·L_OBB)`; 모든 active 물체의 평균 8-corner 이동거리 합을 누적 |
-| Motion | `(exp(−C_acc) + exp(−C_increase)) / 2`; 12관절 가속도 및 힘·토크 norm 증가율 |
+| Clearance | `exp(−a_C·x_C)`, `x_C = blocked_area / blocker_area` |
+| Rearrangement | `exp(−a_R·x_R)`, `x_R = ΔL_OBB` (이번 step의 이동량, m) |
+| Motion | `0.5·exp(−a_acc·x_acc) + 0.5·exp(−a_FT·x_FT)` |
 | Time | `−∫[t,t+dt] 0.02(exp(0.7s)−1) ds` |
 | Terminal | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
 
-Motion의 정규화 기준은 arm 5 / hand 10 rad/s², 힘 증가율 200 N/s,
-토크 증가율 10 N·m/s다. 일정한 속도·하중과 하중 감소에는 이 비용이 없다.
-F/T 증가율은 world 축·episode 초기 sensor 원점으로 변환한 보상값을 비교한다.
-각 reward weight는 `RewardsCfg`에서 설정하며 기본 1이다. 함수는 `step_dt`로 나눈
-값을 반환하므로 native RewardManager의 `weight × dt` 후 위 discrete 값이 지급된다.
+**Clearance·Rearrangement·Motion의 바깥 함수는 `exp(−a·x)`로 유지한다.**
+수식 검토의 대상은 x에 넣는 물리량과 집계 방식이다. 이전 선형 조작량 비용과 pseudo-Huber
+Motion 비용은 의도를 잘못 해석한 변경이어서 제거했다. `exp(−a·x)−1`로 이동시키지도 않는다.
 
-성공은 모든 non-target의 A₀ 교차 면적 합 ≤ 1e−5 m², Target 이동 ≤ 2 cm·회전 ≤
+Clearance의 분모는 **현재 Blocker의 XY 투영 footprint 전체 면적**이다. x_C는 초기 접근영역
+A₀와 Blocker의 교차 면적을 이 분모로 나눈 0~1 값이다. Target·주변 물체의 overlap은 제외한다.
+GPU 다각형 clipping도 Blocker에 대해서만 수행한다.
+
+Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개의 변위 norm을 평균한 뒤
+물체끼리 합산한 이번 step의 이동량이다. 회전·pivot·왕복 이동, Target·Blocker·초기 vision에
+보이지 않은 물체도 privileged pose로 반영한다. 누적 `path_length`는 진단용이며 보상에 넣지
+않는다. **멈춘 step에는 x_R=0, 보상=1**로 돌아와 과거 이동량 때문에 계속 보상이 낮아지지
+않는다. 지수 점수이므로 누적 보상 감소가 전체 이동거리와 정확히 선형 비례하지는 않는다.
+
+Motion의 x는 정규화한 변화량의 RMS다. n_A/n_H는 선택된 arm/hand 독립 관절 수(각각 6)다.
+
+```text
+x_acc = sqrt((sum(arm_joint_acc²)/5² + sum(hand_joint_acc²)/10²) / (n_A+n_H))
+x_FT  = sqrt(((Δ⁺‖F‖/(dt·200))² + (Δ⁺‖τ‖/(dt·10))²) / 2)
+```
+
+공식 `isaaclab.envs.mdp.rewards.joint_acc_l2`로 arm/hand 제곱합을 얻고, 관절 수로 나눈 뒤
+제곱근을 취한다. 관절이 많다는 이유만으로 지수가 커지지 않게 하며 제곱합을 그대로 넣던
+기존 정의와 다르다. 모든 관절이 각 기준 가속도라면 x_acc=1이다. Mimic/passive 관절은 제외한다.
+`joint_acc`는 Isaac Lab이 갱신한 **마지막 10 ms physics substep의 가속도**다. 20 ms policy
+구간 평균이나 두 substep의 제곱 가속도 적분이 아니다. 별도 속도 이력은 없다.
+
+`Δ⁺`는 양의 증가량만 뜻한다. F/T는 world 축·episode 초기 sensor 원점으로 변환한 보상값을
+비교한다. 일정 속도이면 가속도 점수 1, 일정 하중·하중 감소이면 F/T 점수 1이다.
+Raw 정규화 증가율 제곱합은 `wrench_rate_cost`에 진단용으로 유지한다.
+
+기존 계수를 기준으로 `a_C=1, a_R=2, a_acc=1, a_FT=1`을 사용한다. 기준은 arm 5/hand
+10 rad/s², 힘 증가율 200 N/s·토크 증가율 10 N·m/s다. **RMS로 바꿔도 포화가 자동으로 해결되는
+것은 아니다.** 이전 131,072 transition 표본에 대입하면 a_acc=1에서 가속도 점수의 약83%가
+0.01 미만이었다. a_acc=0.1/0.05는 비교 후보이며 이번 수정에서 자동으로 적용하지 않았다.
+이 수치는 이전 정책 표본의 재계산이고 현재 수식의 학습 결과가 아니다.
+
+`RewardsCfg`는 Clearance/Rearrangement/Motion/Time/Terminal의 5개 term이며 외부 weight는
+모두 1이다. 함수가 discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다.
+세 quality score는 step당 최대 1이고, Time은 위의 적분값을 지급한다. 이 구조는 현재 50 Hz
+기준이다. 양의 baseline 및 step별 ΔL 때문에 전체 return의 제어주기 불변성을 주장하지 않는다.
+Time·Terminal·γ는 유지한다. 직전 선형/pseudo-Huber 보상으로 실행한 run의 scale과 weight는
+현재 설정의 근거로 사용하지 않으며, 비교 학습은 같은 제어 설정을 고정한 새 run으로 수행한다.
+
+성공은 **지정 Blocker의** A₀ 교차 면적 ≤ 1e−5 m², Target 이동 ≤ 2 cm·회전 ≤
 0.15 rad, 물체 선속도 ≤ 0.015 m/s·각속도 ≤ 0.1 rad/s를 5 step 연속 만족할 때다.
+다른 물체의 overlap은 성공 gate에 넣지 않으며, 모든 active 물체의 안정화·안전 조건은 유지한다.
 낙하 6 cm, lift 4 cm, tilt 50°, workspace 이탈, 보상 F/T 80 N·4 N·m 초과,
-raw F/T 측정 범위 초과, arm/spacer 금지 접촉, 유효하지 않은 물리·제어 상태는 실패다.
+raw F/T 측정 범위 초과, 선반의 초기 위치 대비 **1 cm 초과 이동** 또는 초기 회전 대비
+**2° 초과 회전**, 유효하지 않은 물리·제어 상태는 실패다. 선반은 `RigidObject`로 관리하며
+Sweeping-Policy 예제와 같은 100 kg dynamic body다. 관성은 PhysX가 충돌 형상에서 계산한다.
+선반 pose는 종료 조건에만 사용하며 observation에 추가하지 않는다.
+부분 reset 시 해당 환경의 선반 pose·속도를 복원하고 초기 pose 기준도 해당 행만 갱신한다.
 Timeout은 native truncation 항으로 유지한다.
 
 ## 병렬 계산과 reset 연결
 
 ```text
-환경 생성 1회: robot / shelf / 물체 pool / 17 tactile / 금지 접촉 / 공유 ray-casting mesh 준비
-reset(env_ids): 선택 환경마다 새 Target/Blocker·물체 배치 생성
-              → 제안한 물체 pose로 GPU ray casting·가시성 검증
-              → 통과한 행만 GPU 배치 IK·elbow-up·전체 로봇 충돌 검사
-              → 선택 행의 물리 상태를 tensor로 일괄 적용·실제 FK 확인
-              → 실패한 행만 같은 역할·구성으로 재시도
+환경 생성 1회: robot / shelf / 물체 pool / tactile 17링크 통합 센서 / 공유 ray-casting mesh 준비
+새 scene round: Target/Blocker·물체 배치 1개 생성
+              → 한 장면의 GPU ray casting·가시성 검증·template 저장
+reset(env_ids): 공통 초기 배치·vision 복사
+              → 선택 환경마다 Blocker 앞 EEF 위치를 새로 샘플링
+              → GPU 배치 IK·elbow-up·전체 로봇 충돌 검사
+              → 물체·선반·로봇 상태를 선택 행에 일괄 적용
               → reset_mdp: 초기 vision·역할·누적 reward·직전 이력 확정
+400 step 경계: 전체 환경 timeout → 다음 scene round
 ```
 
-전체 초기화와 일부 환경의 auto-reset은 **같은 생성 경로**를 사용한다. 매 episode마다 해당
-환경의 물체 배치·역할·로봇 자세·가상 시점을 새로 샘플링한다. 기존 공통 배치와 4개 초기 상태
-모음은 제거했다. Seed는 기본 seed, 환경 ID, 해당 환경의 reset 횟수로 정하므로 다른 환경의
-종료 시점이나 reset 대상의 순서가 그 환경의 난수열을 바꾸지 않는다.
+공통 배치·역할·가상 시점은 8초 round마다 교체한다. 중간 auto-reset에서는 해당 환경만
+저장된 초기 배치로 복원하며, 로봇 자세는 매번 새로 생성한다. 고정 자세 후보 bank는 없다.
+배치 seed는 기본 seed와 공통 round 번호로, 로봇 seed는 기본 seed·환경 ID·reset 횟수로
+정한다. 다른 환경의 reset 대상 순서는 로봇의 난수열을 바꾸지 않는다.
 
-배치 전에 Target/Blocker를 정하고, Target과 같은 종류는 추가 spawn하지 않는다.
-10종 중 4–10종을 골라 **선반 전체 점유율 ≥35%**, 2×3 분할 영역별 ≥10%를 만족하도록
-개수를 늘린다. Footprint 면적을 가장자리 여유를 제외한 선반 면적으로 나눈 기준이다.
-복제 개수는 적게 사용된 종류부터 균형 있게 추가한다. 10종×3개인 **30개 고정 물리 pool**을
-생성하며, 불가능한 종류 조합은 점유율을 낮추지 않고 제한된 횟수 안에서 다시 제안한다.
-Target 종류를 하나만 쓰므로 이 pool의 active 개수 상한은 28개이고 관측 capacity는 30개다.
-이전 40-slot checkpoint는 모델 설정과 observation 크기가 달라 기본 resume/play와 호환되지 않는다.
+공통 장면의 proposal·충돌 OBB·로봇 시작 영역과 역할 mask·local corner·초기 vision 정렬은
+캐시해 부분 reset에서 재사용한다. 새 template에서는 다시 검증·계산하며, 시작 영역은
+robot/spawn 설정이 달라져도 갱신한다. Native `reset_scene → reset_task`의 같은 reset 대상에만
+검증 재사용을 허용하고, 외부 `SceneBatch` reset은 기존 검증을 수행한다. Catalog와 template은
+생성 후 수정하지 않는 입력이다. 로봇·선반의 실제 초기 pose 검사는 매 reset마다 유지한다.
+CUDA IK 요청은 먼저8개 후보를 검사하고, 남은 후보는32환경 이하에서 최대32개씩,
+더 큰 요청은8개씩 처리한다. GPU accepted mask로 이미 성공한 행의 IK·충돌 검사를 건너뛰고,
+후보 탐색 종료 후 한 번만 결과를 CPU로 전달한다. Native reset은 관절값·TCP·시작 영역을
+batched tensor로 직접 적용한다. 전체 동시 후보 수는 `ik_batch_size` 이하로 제한하고,
+고정 크기 CUDA graph 캐시는 최대8개다. Graph buffer는 일반 tensor로 생성해 학습과
+play의 InferenceMode 전환을 지원한다. 절대 후보 번호별 난수·branch와 첫 유효 후보 선택은 유지한다.
+
+충돌 검사는 CUDA FP32 Warp kernel에서 collider 변환·ground/elbow·scene/self collision을
+통합한다. IK 실패 후보, AABB로 분리된 pair, 첫 충돌 이후의 불필요한 검사를 생략한다.
+Scene15mm·self2mm 여유는 유지한다. 거의 평행한 축은 원래 좌표의 FP64 projection으로
+계산해 FP32 상쇄로 겹침을 놓치던 문제를 보정한다. CPU·다른 dtype은 eager 수식을 사용한다.
+
+Reset snapshot은 초기 OBB·로봇/선반 pose·관절값만 읽는다. 초기화 시 버리는 F/T·tactile·action과
+가속도·물체 속도는 계산하지 않는다. 정상 step의 F/T 자중·관성 보상은 유지하며, 고정 local COM은
+한 번 GPU에 저장하고 현재 link pose로 world COM을 계산한다. COM·질량·관성을 randomize한다면
+이 고정 property cache를 함께 갱신해야 한다.
+
+2026-10-15 RTX3090·1,024환경·10물체의 전체 최적화 후30 iteration에서 초기 compile 회차와
+profiler 적용 회차를 제외한28회 평균은 **1.84초/iteration**이었다(1.73~2.02초).
+직전14회 측정3.21초 대비 같은 iteration14개 비교는3.21→1.85초, 약42.5% 감소다.
+Reset은1.02→0.31초, PPO update는0.32→0.23초로 줄었다. Native PhysX partition은1이며,
+100Hz physics/50Hz policy, solver16/2, rollout32·PPO4epochs/4minibatches는 유지했다.
+짧은 새 학습의 비교이므로 trajectory와 reset 행 수는 완전히 같지 않다. 상세 계측은
+`outputs/contact_manipulation/full_optimization_20261015/comparison.json`에 있다.
+
+현재 실험은 **10종을 하나씩, 총 10개** 생성하고 매 episode 모두 배치한다.
+배치 전에 Target/Blocker를 정하고, 나머지 8개를 주변 물체로 사용한다. 중복 물체는 없다.
+물리 pool과 관측 capacity 모두 10개다.
+
+선반 전체 점유율은 **≥20%**, 2×3 분할 영역별 점유율은 **≥10%**다.
+Footprint 면적 합을 가장자리 여유를 제외한 선반 면적으로 나눈 기준이다.
+실제 USD에서 측정한 10종의 합산 점유율은 약 21.85%여서 이전 35% 조건은 달성 불가능하다.
+이번 10개 실험에 맞춰 전체 점유율 기준만 20%로 낮췄으며 선반 범위와 역할·가시성 조건은 유지한다.
+
+이전 30/40-slot checkpoint는 모델 설정과 observation 크기가 달라 기본 resume/play와 호환되지 않는다.
 
 배치 생성은 CPU의 역할·물체 구성·조작 경로 준비와 Warp의 주변 물체 배치로 나눈다.
 Blocker는 footprint 차단율을 만족하는 Y 구간 안에서 샘플링한다. 물체 높이와 전체 점유율은
@@ -313,7 +432,7 @@ Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright
 물체는 padding으로 남기며, 물체의 정답 pose·전체 크기로 가려진 부분을 채우지 않는다.
 이상적인 교차점에는 depth outlier가 없으므로 이전 depth의 1–99% quantile 대신 표면 extrema를
 사용한다. CUDA에서는 배경 ray를 제외한 count·moment·bounds를 Warp atomic 연산으로 계산한다. 초기 기하는
-기존처럼 episode 중 고정되고 현재 EEF frame으로만 재표현한다. Actor 444D 규약은 유지한다.
+기존처럼 episode 중 고정되고 현재 EEF frame으로만 재표현한다. Actor 244D 규약은 유지한다.
 
 `initial_vision.ray_batch_size=32`개 episode 요청을 처리하고, 완료한 자리에 다음 요청을 넣는다.
 `ray_candidates_per_env=4`개 시점을 환경마다 한꺼번에 평가하므로 기본 최대 128개 시점을
@@ -332,11 +451,13 @@ GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 �
 물체 association도 이상적이므로 실물 vision과의 차이는 별도로 검증해야 한다.
 
 50 mm 연결부 중앙 fixed joint의 실제 reaction을 F/T로 읽고, SI-200-8 변환·보상은 MDP에서
-한 번 적용한다. 17개 tactile sensor는 각 링크에 독립적으로 연결한다. Arm·spacer 금지 접촉은
-9개 sensor가 물체별 partner force와 최근 4개 physics substep을 검사한다.
+한 번 적용한다. Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
+`net_forces_w`의 `[N,17,3]`를 `TACTILE_BODY_NAMES` 순서로 정렬하고, 링크별 0.01 N
+기준으로 `[N,17]` binary observation을 만든다. 힘을 링크끼리 합치지 않는다.
+기존 arm·spacer 금지 접촉 센서는 제거했으며, 선반 이동 여부를 종료 조건으로 사용한다.
 부분 reset 직후 해당 행의 측정값은 무효이며, 다음 물리 step의 새 측정부터 유효하다.
 
-Step 계산은 `[N,30,...]`, `[N,12]`, `[N,17]`, `[N,18]` 텐서로 처리한다.
+Step 계산은 `[N,10,...]`, `[N,12]`, `[N,17]`, `[N,18]` 텐서로 처리한다.
 환경별 Python loop, `.item()`, `.cpu()`, `bool(tensor)`를 step 경로에서 사용하지 않는다.
 OBB hull·clipping은 고정 크기로 병렬 처리하고, 6×6 제어 행렬 계산은 native OSC에 맡긴다.
 관절/body ID·센서 scale·질량·관성·catalog corner는 초기화/reset 때 저장한다.
@@ -348,24 +469,58 @@ Action/effort의 nonfinite flag는 환경별 실패 판정으로 연결한다.
 OBB footprint의 hull·clipping·면적은 활성 물체만 하나의 Warp kernel에서 계산한다.
 CPU는 기존 PyTorch 식을 검증 기준으로 유지한다.
 
-17 tactile·9 forbidden 센서는 매 physics tick 전체 환경을 갱신하는 특성을 사용해 native
-`nonzero()` 인덱스 탐색을 생략한다. Native force/history buffer와 접촉 상대별 판정은 유지한다.
+Tactile 통합 센서 1개는 전체 환경의 갱신 시점이 같은 특성을 사용해 native `nonzero()`
+인덱스 탐색을 생략한다. Observation을 읽을 때 최신 native force buffer를 조회한다.
+선반 위치·회전 비교도 GPU tensor로 처리하고, quaternion 내적의 절댓값을 사용해
+`q`와 `-q`를 같은 회전으로 취급한다. 전체 scene sensor는 tactile과 EEF frame의 2개다.
 비활성 물체의 중력 상쇄는 reset 시 native permanent wrench composer에 설정한다.
 매 step force 적용과 transient wrench 합성은 native collection이 수행한다.
+전부 활성 상태면 composer를 비활성으로 유지하여 매 physics step의 0-force 제출을 생략한다.
 실행 중 simulation/gravity flag를 전환하지 않는다. Permanent composer는 주차용으로 예약한다.
 
-GNN edge MLP의 첫 선형 연산을 node별 projection으로 분해해 `[N,30,30,134]`
+YCB 4종은 native `CollisionPropertiesCfg(contact_offset=0.005)`를 사용한다.
+기존 6종의 자동 offset은 유지한다(현재 PhysX 측정 약 1.962 mm). Rest offset은 0이다.
+공유 USD는 최종 충돌 설정을 bake한 reference로 교체하여 원본의 20 mm 설정이
+instance 생성 뒤 되살아나지 않도록 한다. 매 step이나 reset에서 offset을 변경하지 않는다.
+
+Hand의 `right_plam_1`과 네 `right_*_2` 링크는 각각 **2개 저정점 convex collider**를
+사용한다. 관절 쪽 돌출부와 센서 쪽 본체를 분리하고, 본체를 pad 표면 뒤로 물려
+tactile 접촉면을 확보한다. 기존 5×128개 분해 형상을 5×2개로 대체하여 실제 PhysX의
+로봇 전체 shape 수는 676→46개다. UR5e, 17개 tactile 링크와 collider, F/T 연결,
+관절·질량·COM·관성은 유지한다. 이는 상세 CAD의 충돌 근사이며 미세한 홈까지 보존하지는 않는다.
+형상 생성은 최초 template 구성 때만 수행하고 복제 환경에서 공유한다.
+
+GNN edge MLP의 첫 선형 연산을 node별 projection으로 분해해 `[N,10,10,134]`
 concatenation과 반복 projection을 제거했다. 두 번째 선형 연산은 message 평균 이후로 옮겨
 edge마다가 아닌 node마다 한 번 계산한다. 이웃이 없는 node에는 선형 bias가 유입되지 않게
 처리한다. 기존 dense 식과 출력·gradient가 일치하며 모델 파라미터와 checkpoint 구조도 동일하다.
 CUDA FP32에서는 ReLU·edge mask·합산을 Triton kernel 하나로 처리하여
-`[B,30,30,64]` pair activation을 저장하지 않는다. Backward에서도 node별 입력으로
+`[B,10,10,64]` pair activation을 저장하지 않는다. Backward에서도 node별 입력으로
 ReLU의 부호를 재계산해 receiver/sender gradient를 구하며, 큰 pair gradient도 만들지 않는다.
 CPU 및 다른 dtype은 같은 PyTorch 식을 사용한다. 파라미터 이름·shape와 checkpoint는 유지한다.
-늘어난 메모리 여유를 사용해 추론 chunk는 1,024, PPO microbatch는 8,192로 설정했다.
+Forward batch 상한과 PPO microbatch는 8,192다. 기본 PPO minibatch를 다시 1,024개씩
+나누지 않으며, 1,024환경 rollout은 실제 입력 1,024개를 한 번에 처리한다.
 Rollout·epoch·minibatch 수와 optimizer 갱신 횟수는 그대로다.
 기본 PPO 경로는 native의 gradient clipping과 loss 전송 방식을 따른다.
 따라서 native update 내부의 minibatch별 `.item()`까지 제거한 구현은 아니다.
+
+CUDA에서는 `agent.actor.compile_model=true`가 기본이며, GNN·attention·mask·마지막 MLP의
+순수 tensor forward를 Inductor로 compile한다. 모델 구조와 checkpoint key는 유지한다.
+최초 추론/학습 compile 시간이 추가된다. CUDA graph를 쓰는 `reduce-overhead`는 native 학습의
+InferenceMode 전환에서 오류가 재현되어 사용하지 않는다. CPU는 eager이며,
+`agent.actor.compile_model=false`로 CUDA에서도 eager 실행을 비교할 수 있다.
+
+2026-10-15 RTX 3090·1,024환경·10물체·30 iteration 측정에서 forward 분할 상한만
+1,024→8,192로 늘렸을 때 collection+learning 평균은 **2.961→2.280초**였다
+(최초 iteration 제외, 공통 scene 교체와 부분 reset 포함). PPO update는 **0.926→0.313초**다.
+모델 구조·학습 수식은 같지만 GPU batch shape에 따른 수치 차이로 학습 trajectory가
+bitwise 동일하지는 않다. 위 값은 짧은 처리량 측정이며 장기 학습 성능 비교는 아니다.
+
+콘솔·TensorBoard 기록 약 **7.3 ms**, episode 로그 집계 **7.2 ms**, NaN 검사 **4.6 ms**로
+합계 약 19 ms/iteration이었다. Native logger와 기본 NaN 검사는 유지한다.
+Checkpoint는 50 iteration마다 및 마지막에 저장한다. Native 출력의 `Iteration time`에는
+콘솔·TensorBoard 기록과 checkpoint 저장이 빠지므로 실제 wall time과 구분해야 한다.
+기본 학습에 별도 profiler·강제 CUDA 동기화·센서 debug visualization은 켜져 있지 않다.
 
 `events.py`의 `TaskState`는 누적 조작량, 직전 속도·wrench, 두 step 이력을 저장한다.
 Native `common_step_counter`가 바뀐 경우에만 갱신하여 observation/reward/termination의
@@ -377,11 +532,28 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 - `env.task_scene_data`: `SceneBatch`. Active collection IDs, Target/Blocker IDs, 승인한 초기
   vision 기하와 association, catalog OBB, A₀·workspace, F/T distal body 이름을 담는다.
 - `env.task_sensor_reader()`: 완료된 physics sample의 `SensorBatch`. 이상적 joint reaction,
-  유효성, tactile 17채널, partner별 force history에서 판정한 금지 접촉을 반환한다.
+  유효성과 tactile 17채널을 반환한다. 선반 pose는 native rigid-body data에서 별도로 읽는다.
 
 `EventCfg.reset_scene`에서 배치·로봇 pose·vision을 확정한 뒤 `reset_mdp`가 이 데이터를
 저장한다. 물체 pose는 reward·종료 조건에만 사용하며 초기 vision을 대신하지 않는다.
-정적 USD 기하와 로봇 FK 모델은 최초 한 번만 검사한다. Reset 준비 연산은 다음과 같이 나눈다.
+정적 USD 기하와 로봇 FK 모델은 최초 한 번만 검사한다.
+
+전체 환경은 **8초(400 policy step)의 공통 scene round** 동안 같은 초기 물체 배치와
+가상 카메라 시점·vision 정보를 공유한다. 움직이기 시작한 뒤 물리 상태는 환경별로 독립적이다.
+중간 성공·실패 시 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
+**로봇은 매 reset마다 Blocker 앞 허용 영역에서 EEF 위치를 연속적으로 다시 샘플링**하며,
+GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 고정된 자세 후보 bank를 사용하지 않는다.
+카메라 관측은 robot-base frame으로 캐시하고 각 환경의 EEF frame으로 변환한다.
+Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세 때문에 재촬영하지 않는다.
+
+공통 round 경계는 `scene_time_out` termination term으로 전체 환경을 truncate한다.
+최근에 재시작한 episode도 이 경계에서 종료하며, 실패 벌점 대신 기존 timeout bootstrap을 쓴다.
+`ManagerBasedRLEnv.step/_reset_idx`는 그대로 사용한다. 새 round의 배치·vision은 env_0에서
+한 장면만 준비해 공유하고, 로봇 시작 자세는 모든 환경에 대해 새로 계산한다.
+배치·시점 후보가 가시성/IK 검사를 통과하지 못하면 제한된 재시도는 여전히 필요하다.
+공통 round 길이는 `episode_length_s`를 따른다.
+
+Reset 준비 연산은 다음과 같이 나눈다.
 
 - **물체 배치:** 역할·구성과 경로 후보 목록은 CPU에서 준비하고, 이동·pivot 경로의
   endpoint 및 최대 5° 간격의 보수적 sweep을 GPU에서 함께 검사해 첫 유효 후보를 선택한다.
@@ -401,7 +573,8 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 - **Vision·물리 적용:** 물체-only ray casting은 제안 pose를 직접 사용하므로 IK/PhysX 쓰기 전에
   검사한다. 보수적인 물체 투영 영역 밖 ray는 mesh query를 건너뛰며, 실제 메시·해상도·가시성
   기준은 유지한다. 보이는 표면의 OBB는 배경 ray를 제외한 GPU atomic reduction으로 추정한다.
-  가시성·IK를 통과한 `[M,...]` 행을 asset별 한 번씩 쓰고 PhysX link pose를 검증한다.
+  공통 template 생성 시 PhysX link pose와 IK 모델의 일치를 검증한다. 이후 매 reset은
+  충돌 검사를 통과한 새 관절값과 캐시된 물체 상태를 `[M,...]`로 묶어 asset별 한 번씩 쓴다.
 
 배치의 XY/yaw tensor는 IK 충돌 OBB와 물리 초기 상태 생성까지 GPU에 유지한다.
 독립 검증·debug용 CPU pose 사본은 실제로 조회할 때만 생성한다.
@@ -409,11 +582,12 @@ IK 결과의 관절값·TCP·시작 영역도 tensor로 전달한다. 종류/ins
 역할·경로 후보 준비 및 후보 승인 인덱스의 CPU 처리는 남아 있다.
 물리 pose 조립의 ID/slot은 평탄화한 배열로 준비하며 지지 높이는 catalog별 GPU tensor로 캐시한다.
 GPU IK 난수 생성기로 바뀌어 이전 코드와 같은 seed의 구체적인 시작 자세는 달라진다.
-각 환경/episode의 독립성과 동일 버전에서의 재현성은 유지한다.
+로봇 자세의 환경/episode별 독립 난수와 동일 버전에서의 재현성은 유지한다.
+물체 배치·역할·시점은 공통 round의 seed로 선택한다.
 
-각 layout에서 가상 시점은 최대 32회 제안하며, 실패한 환경만 최대 32개 layout까지
-재시도한다. 재시도 중 Target·Blocker, 물체 종류·instance 집합과 가시율 기준은 유지한다.
-1024개 초기 reset에서는 기존 layout 8회 한도로 드문 실패가 남아 한도를 늘렸다.
+각 공통 layout에서 가상 시점은 최대 32회 제안하며, 최대 32개 layout까지 재시도한다.
+재시도 중 Target·Blocker, 물체 종류·instance 집합과 가시율 기준은 유지한다.
+부분 reset은 layout/vision 검사를 생략하고, 실패한 로봇 IK 행만 재시도한다.
 
 장면 복제는 Isaac Lab의 기본 USD cloner(`clone_in_fabric=False`, `replicate_physics=True`)를
 사용한다. 따라서 GUI Stage에서 모든 `env_*`를 확인할 수 있다. 마지막 scene spawner가
@@ -422,21 +596,47 @@ env_0의 완성된 rigid body 기하를 임시 USD에 저장하고 instance로 �
 기존 nested instance를 먼저 펼치고 외부 material binding을 함께 옮겨 로봇 메시·재질 누락을
 방지한다. 임시 USD는 프로세스 종료 시 제거하며 원본 에셋은 수정하지 않는다.
 
-배치의 종류·밀집도·충돌·가시성 기준을 낮추거나 승인된 장면을 다른 episode에 재사용하지 않는다.
-Reset하지 않는 환경을 임시 촬영 장면으로 쓰거나 전체 scene의 force buffer를 flush하지 않으며,
-준비 실패 시 선택 행의 물리 상태를 복구한다. 물체 기하·F/T 보상·vision 정렬도 선택 행만 계산한다.
+배치의 종류·밀집도·충돌·가시성 기준은 유지하고, 승인된 장면을 공통 round 안에서 재사용한다.
+새 장면의 staging은 전체 환경이 reset되는 경계에서만 수행한다. 부분 reset에서는
+로봇 자세 탐색을 완료한 뒤 선택 행만 쓰며, 미선택 환경의 물리 상태·episode 이력을 유지한다.
+물체 기하·F/T 보상·vision 정렬도 선택 행만 계산한다.
 CPU 배치 탐색과 reset 시 metadata 전송은 남아 있다. 환경별 SciPy IK는 GPU 배치로 대체했고,
 초기 관측의 렌더링 경로는 제거했다. 이 탐색·기하 조회·CPU/GPU 동기화는 매 step에 실행하지 않는다.
-Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 총 reset 비용에는 생성할 episode 수와
-배치·IK·가시성 재시도 횟수가 영향을 준다.
+Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 배치/vision 생성은 공통 round당
+한 장면에 대해서만 수행하며, IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
 질량/관성은 고정 asset 값으로 캐시하므로 향후 dynamics randomization을 추가하면 이 캐시도 갱신해야 한다.
 
 Auto-reset 전 마지막 관측은 `extras["terminal_observation"]`에 보존한다.
 `ppo.py`가 이 관측으로 timeout value를 계산하며 같은 step의 물리적 성공·실패는 bootstrap에서 제외한다.
 Native reset의 `terminal_env_ids`를 재사용해 종료 환경이 없는 step의 추가 critic 추론을 생략한다.
+공통 round 경계 전에는 timeout이 불가능하다는 host metadata로 실패 종료 때의 불필요한
+terminal critic 추론도 생략한다. 이는 `init_at_random_ep_len=False`와 native episode counter
+증가·reset 규칙을 전제로 한다. 외부 코드에서 episode counter를 임의로 채우는 방식은 지원하지 않는다.
 Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않는다.
 
 ## 검증과 남은 구현
+
+현재 CPU 검사는 **198개 통과·14개 skip**이다. Exp 보상 GPU 4환경·64 policy step에서
+5개 native reward term, 공식 joint_acc_l2 기반 RMS, score 범위와 dt 처리, 자동 reset 6회를
+확인했다. 자료는 `outputs/contact_manipulation/reward_exp_20261015/`에 있다.
+
+전체 최적화 후 GPU 회귀 검사는 **205개 통과·7개 skip**이다. 실제4환경·410 step에서
+기존 F/T 보상 결과와의 일치, 정상 경로의 반복 COM 조회 제거, 부분 reset의 다른 행 보존,
+400 step 장면 교체를 확인했다. 초기 compile을 제외한1,024환경30 iteration 학습도 완료했다.
+
+앞선 구조 정리에서는 세 observation term의 호출 순서와 부분 reset 후에도 244D 값·이력·
+terminal snapshot이 보존되는지 검증했다. GPU 4환경·410 policy step에서 기존 packing과의 정확한 일치 및 부분/common reset을,
+1,024환경·4 iteration에서 구조 변경 전 native checkpoint의 이어 학습을 확인했다.
+자료는 `outputs/contact_manipulation/min_structure_20261015/`에 있다.
+
+Reset cache 변경은 실제 GPU IK84개 비교에서 첫 유효 후보와 성공/실패가 정확히 같았고
+선택 자세는1e-5 허용 오차로 일치했다. 별도4환경·410 step에서 초기 vision packing 일치,
+부분 reset의 다른 행 보존,400 step 장면 교체 시 cache 갱신을 확인했다.
+
+앞선 native/min action 전환 때에는 Isaac Sim 내 controller 검사 3개,
+1,024환경·16 iteration 학습과 새 action-contract checkpoint 저장을 확인했다.
+그 초기 학습 평균은 최초 iteration 제외 약 3.81초였다.
+아래의 이전 성능·checkpoint 기록은 당시 제어 구성에서 측정한 개발 이력이다.
 
 MDP 테스트는 `tests/test_mdp.py`, 모델·PPO 테스트는 `tests/test_learning.py`에 모았다.
 Isaac Lab Python 환경에서 다음과 같이 실행한다.
@@ -593,7 +793,7 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless
 ```
 
-1,024개 병렬 환경 학습은 다음과 같이 실행한다. 초기 독립 배치·가시성 탐색 때문에
+1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비로
 첫 학습 로그까지 수 분이 걸릴 수 있다. 한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
 
 ```bash
@@ -613,23 +813,24 @@ Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
 다른 checkout을 사용하면 `ISAACLAB_PATH`를 지정한다.
 
 저장된 정책을 GUI에서 재생하려면 저장소 루트에서 다음과 같이 실행한다.
-`--checkpoint`에 재생할 파일을 지정한다. 아래는 저장된 iteration 2,050 모델의 예시다.
+`--checkpoint`에 재생할 파일을 지정한다. 아래는 현재 native/min action 구성의 검증용 모델이다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
-  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-13_23-18-25/model_2050.pt \
+  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-15_14-05-26_native_min_actions/model_15.pt \
   --num_envs 4 --real-time
 ```
 
 `--checkpoint`를 생략하면 native `get_checkpoint_path()`로 최신 run의 마지막 checkpoint를
-선택한다. 특정 run은 `--load_run 2026-10-13_23-18-25`로 지정한다. 기본 환경 수는 1이고,
-episode 종료 시 학습과 같은 환경의 auto-reset으로 새 배치·초기 관측을 생성한다.
+선택한다. 특정 run은 `--load_run 2026-10-15_14-05-26_native_min_actions`로 지정한다. 기본 환경 수는 1이고,
+중간 episode 종료 시 공유 배치를 복원하고 로봇 자세를 다시 샘플링한다.
+공통 round 경계에서는 학습과 동일하게 새 배치·초기 관측으로 교체한다.
 `--real-time`은 실행이 빠를 때 환경의 정책 주기(기본 50 Hz)에 맞춰 기다리며 느린 reset을 가속하지 않는다.
 
 Play는 `RslRlVecEnvWrapper → OnPolicyRunner.load() → get_inference_policy()` 흐름을
-사용하며 탐색 noise 없이 정책의 `tanh(mean)` action을 적용한다. 모델·F/T metadata와
+사용하며 탐색 noise 없이 정책의 `tanh(mean)` action을 적용한다. 모델·F/T·action-contract metadata와
 state dict를 엄격하게 검사하고 optimizer는 불러오지 않는다. 학습 업데이트나 자동 모델
-export는 수행하지 않는다. 최적화 전후 모델 구조가 동일한 checkpoint는 재생할 수 있으나,
+export는 수행하지 않는다. 모델 구조와 action 계약이 모두 같은 checkpoint를 재생할 수 있으며,
 현재 환경 설정을 사용하므로 과거의 배치·관측 모델까지 복원하는 기능은 아니다.
 필요한 설정 변경은 학습과 같은 Hydra `env.*`, `agent.*` 인자로 전달한다.
 
@@ -638,7 +839,7 @@ GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`�
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
-  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-13_23-18-25/model_2050.pt \
+  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-15_14-05-26_native_min_actions/model_15.pt \
   --num_envs 1 --headless --video --video_length 300
 ```
 

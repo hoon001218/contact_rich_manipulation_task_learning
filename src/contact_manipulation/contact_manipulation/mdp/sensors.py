@@ -64,9 +64,9 @@ class InitialVisionCfg:
 class VisionSnapshot:
     """Accepted virtual-view snapshot; optional ray depth/masks, never rendered RGB."""
 
-    geometry_b: torch.Tensor       # [30,10], observed visible-surface OBBs
-    geometry_valid: torch.Tensor  # [30]
-    observed_ids: torch.Tensor     # [30], native collection indices or -1
+    geometry_b: torch.Tensor       # [10,10], observed visible-surface OBBs
+    geometry_valid: torch.Tensor  # [10]
+    observed_ids: torch.Tensor     # [10], native collection indices or -1
     rgb: torch.Tensor | None       # Always None: geometric perception does not produce RGB
     depth: torch.Tensor | None     # Optional debug [H,W,1]
     role_masks: torch.Tensor | None  # Optional debug [H,W,2], target then blocker
@@ -150,7 +150,7 @@ class SensorReader:
 
     def __init__(self, env):
         from ..config.ur5e.scene import (
-            FORCE_TORQUE_BODY_NAME, TACTILE_BODY_NAMES, FORBIDDEN_CONTACT_BODY_NAMES,
+            FORCE_TORQUE_BODY_NAME, TACTILE_BODY_NAMES,
         )
         from .events import SensorBatch
 
@@ -161,21 +161,19 @@ class SensorReader:
             name for name, path in zip(self.robot.body_names, self.robot.root_physx_view.link_paths[0])
             if name == FORCE_TORQUE_BODY_NAME or "/ROASRightHand/" in str(path)
         )
-        self.tactile = tuple(env.scene[f"contact_{name}"] for name in TACTILE_BODY_NAMES)
-        self.forbidden = tuple(env.scene[f"forbidden_{name}"] for name in FORBIDDEN_CONTACT_BODY_NAMES)
-        for name, sensor in zip(TACTILE_BODY_NAMES, self.tactile):
-            if (sensor.num_bodies != 1 or sensor.body_names != [name]
-                    or sensor.num_instances != env.num_envs):
-                raise RuntimeError(f"Tactile body {name!r} must resolve once per environment.")
-        for name, sensor in zip(FORBIDDEN_CONTACT_BODY_NAMES, self.forbidden):
-            if (sensor.num_bodies != 1 or sensor.num_instances != env.num_envs
-                    or sensor.cfg.history_length < env.cfg.decimation):
-                raise RuntimeError(f"Forbidden sensor {name!r} must cover every substep and replica.")
+        self.tactile = env.scene["tactile_contact"]
+        if (self.tactile.num_bodies != len(TACTILE_BODY_NAMES)
+                or set(self.tactile.body_names) != set(TACTILE_BODY_NAMES)
+                or self.tactile.num_instances != env.num_envs * len(TACTILE_BODY_NAMES)):
+            raise RuntimeError("Tactile sensor must resolve all 17 links exactly once per environment.")
+        indices, names = self.tactile.find_bodies(list(TACTILE_BODY_NAMES), preserve_order=True)
+        if tuple(names) != TACTILE_BODY_NAMES:
+            raise RuntimeError("Tactile links must map to the observation's fixed channel order.")
+        self.tactile_ids = torch.tensor(indices, device=env.device, dtype=torch.long)
         n, device = env.num_envs, env.device
         self.batch = SensorBatch(
             torch.zeros((n, 6), device=device), torch.zeros(n, dtype=torch.bool, device=device),
             torch.zeros((n, 17, 3), device=device), torch.zeros((n, 17), dtype=torch.bool, device=device),
-            torch.zeros(n, dtype=torch.bool, device=device),
         )
         self.last_time = env.sim.current_time
 
@@ -189,9 +187,7 @@ class SensorReader:
         b.wrench_valid[env_ids] = False
         b.tactile_force[env_ids] = 0
         b.tactile_valid[env_ids] = False
-        b.forbidden_contact[env_ids] = False
-        for sensor in (*self.tactile, *self.forbidden):
-            sensor.reset(env_ids)
+        self.tactile.reset(env_ids)
 
     @torch.no_grad()
     def __call__(self):
@@ -199,20 +195,13 @@ class SensorReader:
         if time <= self.last_time:
             return self.batch
         b = self.batch
-        reaction = self.robot.root_physx_view.get_link_incoming_joint_force()[:, self.body_index]
+        reaction = self.robot.data.body_incoming_joint_wrench_b[:, self.body_index]
         b.ideal_wrench.copy_(reaction)
         b.wrench_valid.copy_(torch.isfinite(reaction).all(-1))
-        # Fixed sensor loops (17 + 9), never loops over environment indices.
-        for channel, sensor in enumerate(self.tactile):
-            force = sensor.data.net_forces_w[:, 0]
-            b.tactile_force[:, channel].copy_(force)
-            b.tactile_valid[:, channel].copy_(torch.isfinite(force).all(-1))
-        b.forbidden_contact.zero_()
-        for sensor in self.forbidden:
-            forces = sensor.data.force_matrix_w_history
-            # Keep partners separate: opposing contacts must not cancel.
-            bad = (forces.square().sum(-1) > 1.0) | ~torch.isfinite(forces).all(-1)
-            b.forbidden_contact.logical_or_(bad.flatten(1).any(-1))
+        # One native view reads all 17 links; only the body axis is reordered.
+        force = self.tactile.data.net_forces_w.index_select(1, self.tactile_ids)
+        b.tactile_force.copy_(force)
+        b.tactile_valid.copy_(torch.isfinite(force).all(-1))
         self.last_time = time
         return b
 
@@ -220,17 +209,17 @@ class SensorReader:
 # Native classes are imported only by the scene configuration after AppLauncher.
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
-from isaaclab.utils import configclass
 from isaaclab.utils.warp import convert_to_warp_mesh
-from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics
+from pxr import Usd, UsdGeom, UsdPhysics
 
 
 class TaskContactSensor(ContactSensor):
     """Native contact buffers with a synchronous, whole-batch update fast path.
 
-    These sensors sample every physics tick. Discovering outdated CUDA rows
-    with nonzero() is redundant: after update every row is due. Keep native
-    force acquisition/history and fall back for other sensor configurations.
+    Every physics tick makes all rows due, so discovering outdated CUDA rows
+    with nonzero() is redundant. History sensors read immediately; sensors
+    without history read lazily. Keep native force acquisition/history and
+    fall back for other sensor configurations.
     """
 
     def _whole_batch_updates(self):
@@ -261,69 +250,12 @@ class TaskContactSensor(ContactSensor):
         super().reset(env_ids)
 
 
-class ForbiddenContactSensor(TaskContactSensor):
-    """Resolve one monitored body and exact partner bodies before physics starts."""
-
-    def __init__(self, cfg):
-        from ..config.ur5e.scene import OBJECT_SPECS
-        stage = sim_utils.get_current_stage()
-        expression = cfg.prim_path.split("/Robot/", 1)[0]
-        environments = sim_utils.find_matching_prims(expression)
-        template = min((str(prim.GetPath()) for prim in environments), key=lambda p: (len(p), p))
-        robot = stage.GetPrimAtPath(f"{template}/Robot")
-        bodies = [prim for prim in Usd.PrimRange(robot, Usd.TraverseInstanceProxies())
-                  if prim.GetName() == cfg.observed_body_name and prim.HasAPI(UsdPhysics.RigidBodyAPI)
-                  and "/ROASRightHand/" not in str(prim.GetPath())]
-        if len(bodies) != 1:
-            raise RuntimeError(f"Cannot resolve monitored arm/spacer body {cfg.observed_body_name}.")
-        cfg = cfg.copy()
-        cfg.prim_path = expression + str(bodies[0].GetPath())[len(template):]
-        for prim in sim_utils.find_matching_prims(cfg.prim_path):
-            PhysxSchema.PhysxContactReportAPI.Apply(prim).CreateThresholdAttr().Set(0.0)
-        filters = []
-        roots = [f"{template}/Shelf", *(f"{template}/{spec.name}" for spec in OBJECT_SPECS), "/World/Ground"]
-        for path in roots:
-            root = stage.GetPrimAtPath(path)
-            if not root.IsValid():
-                raise RuntimeError(f"Missing forbidden-contact partner: {path}")
-            prims = list(Usd.PrimRange(root, Usd.TraverseInstanceProxies()))
-            partners = [prim for prim in prims if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
-            if not partners:
-                partners = [prim for prim in prims if prim.HasAPI(UsdPhysics.CollisionAPI)
-                            and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False]
-            if not partners:
-                raise RuntimeError(f"No partner rigid body or collider under {path}")
-            for prim in partners:
-                partner = str(prim.GetPath())
-                filters.append(expression + partner[len(template):] if partner.startswith(template + "/") else partner)
-        cfg.filter_prim_paths_expr = sorted(set(filters))
-        super().__init__(cfg)
-
-    def _initialize_impl(self):
-        super()._initialize_impl()
-        if (self.num_bodies != 1
-                or self.contact_physx_view.filter_count != len(self.cfg.filter_prim_paths_expr)):
-            raise RuntimeError("Forbidden-contact filters must resolve one body to its exact partners.")
-
-
-@configclass
-class ForbiddenContactSensorCfg(ContactSensorCfg):
-    class_type: type = ForbiddenContactSensor
-    observed_body_name: str = ""
-
-
-def make_tactile_contact_cfg(body_name: str) -> ContactSensorCfg:
+def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:
+    """Group physical tactile links while retaining a separate force per body."""
+    expression = "(" + "|".join(body_names) + ")"
     return ContactSensorCfg(
-        class_type=TaskContactSensor, prim_path=f"{{ENV_REGEX_NS}}/Robot/ROASRightHand/{body_name}",
+        class_type=TaskContactSensor, prim_path=f"{{ENV_REGEX_NS}}/Robot/ROASRightHand/{expression}",
         update_period=0.0, history_length=0, track_pose=False, track_air_time=False, debug_vis=False,
-    )
-
-
-def make_forbidden_contact_cfg(body_name: str, history_length: int = 4) -> ContactSensorCfg:
-    return ForbiddenContactSensorCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{body_name}", observed_body_name=body_name,
-        update_period=0.0, history_length=history_length, track_pose=False, track_air_time=False,
-        max_contact_data_count_per_prim=128, debug_vis=False,
     )
 
 

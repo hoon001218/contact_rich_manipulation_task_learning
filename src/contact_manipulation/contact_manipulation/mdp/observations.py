@@ -12,12 +12,13 @@ import math
 
 import torch
 
-from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, quat_mul as _lab_quat_mul
+from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, quat_mul as _lab_quat_mul, quat_unique
 
 __all__ = [
     "prepare_initial_geometry", "geometry_in_eef_frame", "pack_policy_observation",
     "dynamic_sample", "self_motion_wrench", "calibrate_wrench", "compensate_wrench",
-    "policy_observation", "quat_apply", "quat_conjugate", "quat_mul",
+    "policy_observation", "initial_scene_geometry", "current_robot_sample", "previous_robot_sample",
+    "quat_apply", "quat_conjugate", "quat_mul",
 ]
 
 SI_200_8_RANGES = (200.0, 200.0, 360.0, 8.0, 8.0, 8.0)
@@ -42,7 +43,7 @@ def prepare_initial_geometry(
     target_indices: torch.Tensor,
     blocker_indices: torch.Tensor,
     *,
-    capacity: int = 30,
+    capacity: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reserve role slots and compact observed distractors **once on reset**.
 
@@ -113,8 +114,7 @@ def geometry_in_eef_frame(
     """Re-express initial OBBs in the current EEF frame; leave padding zero."""
     inverse_rotation = quat_conjugate(tcp_pose_b[:, None, 3:7])
     position = quat_apply(inverse_rotation, geometry[..., :3] - tcp_pose_b[:, None, :3])
-    orientation = quat_mul(inverse_rotation, geometry[..., 3:7])
-    orientation = torch.where(orientation[..., :1] < 0, -orientation, orientation)
+    orientation = quat_unique(quat_mul(inverse_rotation, geometry[..., 3:7]))
     transformed = torch.cat((position, orientation, geometry[..., 7:10]), dim=-1)
     return torch.where(valid[..., None], transformed, 0.0)
 
@@ -123,7 +123,7 @@ def pack_policy_observation(geometry_eef: torch.Tensor, history: torch.Tensor) -
     """Concatenate preordered/padded geometry and newest-first [N, 2, 72] history.
 
     The producer zeroes missing geometry/history before this operation. There
-    are no mask or role channels. With 30 geometry slots the result is 444D.
+    are no mask or role channels. With 10 geometry slots the result is 244D.
     """
     if geometry_eef.ndim != 3 or geometry_eef.shape[-1] != 10:
         raise ValueError("Geometry must have shape [N, M, 10].")
@@ -242,7 +242,7 @@ def compensate_wrench(
 
 
 def policy_observation(env) -> torch.Tensor:
-    """Isaac Lab ObservationTerm; state owns once-per-step history updates."""
+    """Shared packed snapshot for native observation terms and timeout bootstrap."""
     from .events import get_task_state
 
     state = get_task_state(env)
@@ -250,3 +250,18 @@ def policy_observation(env) -> torch.Tensor:
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)
         state.observation = pack_policy_observation(geometry, state.history)
     return state.observation
+
+
+def initial_scene_geometry(env) -> torch.Tensor:
+    """Initial visible geometry in the current EEF frame; target/blocker first."""
+    return policy_observation(env)[:, :100]
+
+
+def current_robot_sample(env) -> torch.Tensor:
+    """Current robot, compensated F/T, tactile and action measurements."""
+    return policy_observation(env)[:, 100:172]
+
+
+def previous_robot_sample(env) -> torch.Tensor:
+    """Previous completed sample, zeroed for rows beginning a new episode."""
+    return policy_observation(env)[:, 172:244]

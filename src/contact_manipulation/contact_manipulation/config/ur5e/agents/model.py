@@ -92,7 +92,7 @@ class ModelCfg:
     # Serialized checkpoint contract: target slot 0, blocker slot 1, no role-ID channels.
     observation_layout: str = "fixed_roles_v1"
     activation: str = "relu"  # Checkpoint metadata includes parameter-free activations.
-    max_objects: int = 30
+    max_objects: int = 10
     # Newest first: the current sample and the immediately preceding sample.
     history_steps: int = 2
     action_dim: int = 18
@@ -299,7 +299,8 @@ class ContactManipulationPolicy(nn.Module):
         return self.actor(latent), self.critic(latent).squeeze(-1)
 
     def value(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
-        return self.forward(observation, masks=masks)[1]
+        # Standalone final-state/bootstrap queries only need the critic head.
+        return self.critic(self.encode(observation, masks=masks)).squeeze(-1)
 
     def _distribution(self, mean: Tensor) -> torch.distributions.Normal:
         # Tensor validation in Normal performs GPU-to-host Boolean reads on

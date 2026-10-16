@@ -1,6 +1,6 @@
 """Native scene assets and once-only USD geometry/kinematics inspection.
 
-The simulator clones one authored robot, shelf and fixed 30-body object pool.
+The simulator clones one authored robot, shelf and fixed 10-body object pool.
 Episode roles and poses are selected by MDP reset events; no prim topology is
 changed during reset. This module has no dependency on the previous project.
 """
@@ -27,18 +27,27 @@ from isaaclab.sim.spawners.spawner_cfg import RigidObjectSpawnerCfg
 from isaaclab.sim.utils import clone, get_current_stage
 from isaaclab.utils import configclass
 
-FORBIDDEN_CONTACT_BODY_NAMES = (
-    "base_link", "shoulder_link", "upper_arm_link", "forearm_link",
-    "wrist_1_link", "wrist_2_link", "wrist_3_link",
-    "SensorMountProximal", "ToolForceTorqueLink",
-)
-FORBIDDEN_CONTACT_SENSOR_NAMES = tuple(f"forbidden_{name}" for name in FORBIDDEN_CONTACT_BODY_NAMES)
-
-
-
 NUCLEUS_ROOT = os.environ.get("CONTACT_MANIPULATION_NUCLEUS_ROOT", "omniverse://192.168.0.13").rstrip("/")
 DEFAULT_SHELF_USD_PATH = f"{NUCLEUS_ROOT}/Library/Shelf/Arena/Collected_speedrack_shape/speedrack_shape.usd"
 SHELF_POSITION = (-0.7, 0.0, 0.0)
+
+
+@clone
+def spawn_shelf(prim_path, cfg, translation=None, orientation=None, **kwargs):
+    """Use native USD spawning and explicitly define mass on the shelf body.
+
+    The source USD has RigidBodyAPI but no MassAPI; UsdFileCfg.mass_props only
+    modifies an existing MassAPI, so applying the schema is necessary here.
+    """
+    spawn_cfg = cfg.copy()
+    spawn_cfg.mass_props = None
+    prim = sim_utils.spawn_from_usd(prim_path, spawn_cfg, translation, orientation, **kwargs)
+    bodies = sim_utils.get_all_matching_child_prims(
+        prim_path, predicate=lambda p: p.HasAPI(UsdPhysics.RigidBodyAPI))
+    if len(bodies) != 1:
+        raise ValueError("Shelf must contain exactly one rigid body.")
+    sim_utils.define_mass_properties(str(bodies[0].GetPath()), cfg.mass_props)
+    return prim
 
 
 @dataclass(frozen=True)
@@ -77,8 +86,8 @@ ASSET_SPECS = (
 )
 # Load a reusable pool so non-Target assets can occupy every surrounding slot,
 # identities can change on reset without rebuilding USD or PhysX topology.
-MAX_ACTIVE_OBJECTS = 30
-OBJECT_COPIES_PER_ASSET = 3
+MAX_ACTIVE_OBJECTS = 10
+OBJECT_COPIES_PER_ASSET = 1
 OBJECT_SPECS = tuple(
     ObjectSpec(
         name=spec.name if copy_index == 0 else f"{spec.name}_copy_{copy_index + 1:02d}",
@@ -364,41 +373,118 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
             prim.SetInstanceable(False)
 
 
-def _preserve_tactile_parent_slots(stage: Usd.Stage, hand_path: str) -> None:
-    """Keep five parent CAD recesses from being filled by a single convex hull.
+def _tactile_parent_proxies(points: np.ndarray, pads: list[np.ndarray]):
+    """Two low-vertex convexes, with the pad-side piece recessed behind the pads.
 
-    Their original collision meshes contain the palm/pad-2 slots, but a single
-    convex hull encloses those tactile bodies and intercepts object contact.
-    Only these existing parent colliders are decomposed; all 17 tactile-link
-    colliders, rigid bodies, joints, inertias, and visuals remain unchanged.
+    This is template authoring, never an episode/physics-step operation. Each
+    pad's thin PCA axis defines its face; the sign points away from the parent.
+    Try the four tangent cuts around the first pad and retain the cut with the
+    smallest worst surface half-space error. Mass/inertia are not derived here.
     """
-    parent_names = ("right_plam_1", *(f"right_{finger}_2" for finger in ("index", "middle", "ring", "little")))
-    bodies = [prim for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.HasAPI(UsdPhysics.RigidBodyAPI)]
-    colliders = []
-    for name in parent_names:
-        matching = [body for body in bodies if body.GetName() == name]
-        if len(matching) != 1:
-            raise RuntimeError(f"Tactile parent {name!r} must resolve exactly one rigid body, got {len(matching)}.")
-        body_colliders = [
-            prim for prim in Usd.PrimRange(matching[0])
-            if prim.HasAPI(UsdPhysics.CollisionAPI)
-            and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False
-        ]
-        if not body_colliders:
-            raise RuntimeError(f"Tactile parent {name!r} has no enabled collision geometry.")
-        for collider in body_colliders:
-            meshes = [UsdGeom.Mesh(prim) for prim in Usd.PrimRange(collider) if prim.IsA(UsdGeom.Mesh)]
-            if not any(len(mesh.GetPointsAttr().Get() or []) >= 4 and mesh.GetFaceVertexCountsAttr().Get() for mesh in meshes):
-                raise RuntimeError(f"Tactile parent collider {collider.GetPath()} has no usable triangle mesh.")
-            colliders.append(collider)
-    # Tight surface projection and finer decomposition preserve millimetre
-    # slots; the SDK defaults (10% error, 32 hulls) can bridge those recesses.
-    cfg = sim_utils.ConvexDecompositionPropertiesCfg(
-        max_convex_hulls=128, hull_vertex_limit=64, voxel_resolution=1_000_000,
-        error_percentage=0.5, shrink_wrap=True, min_thickness=0.0001,
-    )
-    for collider in colliders:
-        sim_utils.define_mesh_collision_properties(str(collider.GetPath()), cfg, stage=stage)
+    from scipy.spatial import ConvexHull, HalfspaceIntersection
+
+    points = np.asarray(points, dtype=np.float64)
+    directions = np.array([d for d in product((-1., 0., 1.), repeat=3) if any(d)])
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    envelope = np.column_stack((directions, -(points @ directions.T).max(axis=0)))
+    faces, tangents = [], None
+    for pad in pads:
+        centered = pad - pad.mean(axis=0)
+        _, axes = np.linalg.eigh(centered.T @ centered / len(pad))
+        normal = axes[:, 0]
+        if normal @ (pad.mean(axis=0) - points.mean(axis=0)) < 0:
+            normal = -normal
+        # Keep the core behind the pad, including its rounded perimeter.
+        faces.append(np.r_[normal, -(pad @ normal).max() + .0012])
+        if tangents is None:
+            tangents = axes[:, 1:].T
+    faces = np.asarray(faces)
+
+    def polyhedron(planes):
+        inside = points[(points @ planes[:, :3].T + planes[:, 3] < -1.e-8).all(axis=1)]
+        if len(inside) < 4:
+            return None
+        vertices = HalfspaceIntersection(planes, inside.mean(axis=0)).intersections
+        hull = ConvexHull(vertices)
+        if len(vertices) > 64:
+            raise RuntimeError('Hand proxy exceeds the native convex vertex budget.')
+        # Consistent outward winding for the authored mesh.
+        triangles = hull.simplices.copy()
+        a, b, c = vertices[triangles[:, 0]], vertices[triangles[:, 1]], vertices[triangles[:, 2]]
+        reverse = (np.cross(b-a, c-a) * hull.equations[:, :3]).sum(axis=1) < 0
+        triangles[reverse] = triangles[reverse][:, [0, 2, 1]]
+        return vertices, triangles
+
+    candidates = []
+    for tangent in tangents:
+        for sign in (-1., 1.):
+            normal = sign * tangent
+            boundary = (pads[0] @ normal).min() - .001
+            cut = np.r_[normal, -boundary]
+            regions = (np.vstack((envelope, cut)), np.vstack((envelope, -cut, faces)))
+            pieces = [polyhedron(region) for region in regions]
+            if any(piece is None for piece in pieces):
+                continue
+            error = np.minimum.reduce([
+                (points @ region[:, :3].T + region[:, 3]).max(axis=1) for region in regions
+            ]).clip(min=0)
+            candidates.append((float(error.max()), pieces))
+    if not candidates:
+        raise RuntimeError('Cannot construct sensor-clear hand collision proxies.')
+    return min(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _preserve_tactile_parent_slots(stage: Usd.Stage, hand_path: str) -> None:
+    """Replace only five hand parent colliders with two convex pieces each.
+
+    Keep the 17 tactile bodies, all robot joints, and authored inertial properties.
+    Existing visual meshes are untouched. Native PhysX cooks the small convexes.
+    """
+    parents = ("right_plam_1", *(f"right_{finger}_2" for finger in ("index", "middle", "ring", "little")))
+    bodies = {p.GetName(): p for p in Usd.PrimRange(stage.GetPrimAtPath(hand_path))
+              if p.HasAPI(UsdPhysics.RigidBodyAPI)}
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+
+    def collision_points(body, reference):
+        colliders = [p for p in Usd.PrimRange(body) if p.HasAPI(UsdPhysics.CollisionAPI)
+                     and UsdPhysics.CollisionAPI(p).GetCollisionEnabledAttr().Get() is not False]
+        meshes = {str(p.GetPath()): p for collider in colliders for p in Usd.PrimRange(collider)
+                  if p.IsA(UsdGeom.Mesh)}
+        clouds = []
+        for mesh in meshes.values():
+            transform = np.asarray(cache.GetLocalToWorldTransform(mesh) * reference)
+            local = np.asarray(UsdGeom.Mesh(mesh).GetPointsAttr().Get(), dtype=np.float64)
+            clouds.append(local @ transform[:3, :3] + transform[3, :3])
+        if not clouds:
+            raise RuntimeError(f'No collision mesh for hand body {body.GetPath()}.')
+        return np.unique(np.concatenate(clouds), axis=0), colliders
+
+    for name in parents:
+        body = bodies[name]
+        reference = cache.GetLocalToWorldTransform(body).GetInverse()
+        points, originals = collision_points(body, reference)
+        pad_names = ('right_plam_force_sensor',) if name == 'right_plam_1' else (
+            name.removesuffix('_2') + '_force_sensor_2', name.removesuffix('_2') + '_force_sensor_3')
+        pads = [collision_points(bodies[pad], reference)[0] for pad in pad_names]
+        pieces = _tactile_parent_proxies(points, pads)
+        for collider in originals:
+            if '/collisions/' not in str(collider.GetPath()):
+                raise RuntimeError('Hand proxy replacement requires separate collision and visual subtrees.')
+            collider.SetActive(False)
+        for index, (vertices, triangles) in enumerate(pieces):
+            mesh = UsdGeom.Mesh.Define(stage, body.GetPath().AppendChild(f'TactileParentProxy_{index}'))
+            mesh.CreatePointsAttr([Gf.Vec3f(*p) for p in vertices])
+            mesh.CreateFaceVertexCountsAttr([3] * len(triangles))
+            mesh.CreateFaceVertexIndicesAttr(triangles.ravel().tolist())
+            mesh.CreateSubdivisionSchemeAttr('none')
+            mesh.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim()).CreateCollisionEnabledAttr(True)
+            sim_utils.define_mesh_collision_properties(str(mesh.GetPath()),
+                sim_utils.ConvexHullPropertiesCfg(hull_vertex_limit=64), stage=stage)
+            sim_utils.modify_collision_properties(str(mesh.GetPath()),
+                sim_utils.CollisionPropertiesCfg(contact_offset=.0005, rest_offset=0.), stage=stage)
+        # Ensure final hand-only collision overrides survive instance sharing.
+        body.CreateAttribute('contactManipulation:handProxy', Sdf.ValueTypeNames.Bool, custom=True).Set(True)
 
 
 @clone
@@ -422,7 +508,7 @@ def spawn_ur5e_hand(
         usd_path=cfg.ur5e_usd_path,
         rigid_props=cfg.rigid_props,
         articulation_props=cfg.articulation_props,
-        activate_contact_sensors=True,
+        activate_contact_sensors=False,  # Only the hand's tactile links need reporting.
     )
     ur_cfg.func(prim_path, ur_cfg, translation=translation, orientation=orientation)
 
@@ -543,6 +629,8 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             joint_vel={".*": 0.0},
         ),
         actuators={
+            # Match min: retain ImplicitActuator and its native simulator limits.
+            # OSC supplies feed-forward efforts; no separate torque clamp is added.
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=list(ARM_JOINT_NAMES),
                 effort_limit_sim={
@@ -715,11 +803,15 @@ def _arm_ik_kernel(targets: wp.array(dtype=wp.vec3), orientations: wp.array(dtyp
                    after: wp.array(dtype=wp.mat44), axes: wp.array(dtype=wp.vec3),
                    skew: wp.array(dtype=wp.mat33), skew2: wp.array(dtype=wp.mat33),
                    limits: wp.array(dtype=wp.vec2), root: wp.mat44, tcp_offset: wp.mat44,
-                   tcp_owner: int, iterations: int, result: wp.array(dtype=_ArmVector)):
+                   tcp_owner: int, iterations: int, active: wp.array(dtype=wp.bool),
+                   result: wp.array(dtype=_ArmVector)):
     row = wp.tid()
     arm = seeds[row]
     for j in range(6):
         arm[j] = wp.clamp(arm[j], limits[j][0] + 1.0e-6, limits[j][1] - 1.0e-6)
+    if not active[row]:
+        result[row] = arm
+        return
     for iteration in range(iterations):
         frame = root
         tcp = root * tcp_offset
@@ -1119,7 +1211,7 @@ class RobotPoseModel:
         return torch.where(((cosine < -.9999) & (sine < 1.e-4))[:, None], axis * angle[:, None], ordinary)
 
     @torch.no_grad()
-    def solve_batch(self, target_positions, target_rotations, arm_seeds, *, iterations=48):
+    def solve_batch(self, target_positions, target_rotations, arm_seeds, *, iterations=48, active_mask=None):
         """Fuse FP32 CUDA IK per candidate; retain tensor solvers as the oracle.
 
         The kernel uses the same damped Jacobian solve and joint limits, with
@@ -1127,9 +1219,13 @@ class RobotPoseModel:
         the fixed-iteration graph path. CPU follows the tensor equations.
         """
         if target_positions.is_cuda and target_positions.dtype == torch.float32:
-            return self._solve_batch_fused(target_positions, target_rotations, arm_seeds, iterations=iterations)
+            return self._solve_batch_fused(
+                target_positions, target_rotations, arm_seeds, iterations=iterations, active_mask=active_mask)
         if target_positions.device.type != "cuda":
-            return self._solve_batch_eager(target_positions, target_rotations, arm_seeds, iterations=iterations)
+            output = self._solve_batch_eager(target_positions, target_rotations, arm_seeds, iterations=iterations)
+            if active_mask is not None:
+                output[1].logical_and_(active_mask)
+            return output
         count = target_positions.shape[0]
         if count == 0:
             raise ValueError("An IK batch must contain at least one target.")
@@ -1159,9 +1255,12 @@ class RobotPoseModel:
         rotations[:count].copy_(target_rotations)
         seeds[:count].copy_(arm_seeds)
         graph.replay()
-        return tuple(output[:count] for output in outputs)
+        selected = tuple(output[:count] for output in outputs)
+        if active_mask is not None:
+            selected[1].logical_and_(active_mask)
+        return selected
 
-    def _solve_batch_fused(self, target_positions, target_rotations, arm_seeds, *, iterations):
+    def _solve_batch_fused(self, target_positions, target_rotations, arm_seeds, *, iterations, active_mask=None):
         wp.init()
         constants = self._tensor_constants(target_positions.device, target_positions.dtype)
         cache = constants.get("warp_ik")
@@ -1173,16 +1272,20 @@ class RobotPoseModel:
             cache += [wp.mat44(*constants[name].cpu().flatten().tolist()) for name in ("root", "tcp_offset")]
             constants["warp_ik"] = cache
         arm = torch.empty_like(arm_seeds, memory_format=torch.contiguous_format)
+        if active_mask is None:
+            active_mask = torch.ones(len(arm), device=arm.device, dtype=torch.bool)
         wp.launch(_arm_ik_kernel, dim=len(arm), inputs=[
             wp.from_torch(target_positions.contiguous(), dtype=wp.vec3),
             wp.from_torch(target_rotations.contiguous(), dtype=wp.mat33),
             wp.from_torch(arm_seeds.contiguous(), dtype=_ArmVector), *cache,
-            constants["tcp_owner"], iterations, wp.from_torch(arm, dtype=_ArmVector)],
+            constants["tcp_owner"], iterations, wp.from_torch(active_mask.contiguous()),
+            wp.from_torch(arm, dtype=_ArmVector)],
             stream=wp.stream_from_torch(torch.cuda.current_stream(arm.device)))
         frames, joints, tcp = self.arm_forward_batch(arm)
         valid = ((target_positions - tcp[:, :3, 3]).norm(dim=-1) <= 5.e-4)
         valid &= self._rotation_error_batch(target_rotations, tcp[:, :3, :3]).norm(dim=-1) <= .01
         valid &= torch.isfinite(arm).all(-1)
+        valid &= active_mask
         positions = constants["default"].expand(len(arm), -1).clone()
         positions[:, constants["arm_ids"]] = arm
         return positions, valid, frames, joints, tcp
@@ -1369,11 +1472,16 @@ class TaskObjectPool(RigidObjectCollection):
     def refresh_parking(self):
         if self.parked_mask is None:
             return
+        composer = self.permanent_wrench_composer
+        # A zero wrench still activates native per-step force submission. Check
+        # only at reset, and leave the native composer inactive when all objects
+        # are on the shelf.
+        composer.reset()
+        if not self.parked_mask.any():
+            return
         if self._countergravity is None:
             self._countergravity = -self.data.default_mass.to(self.device) * self.gravity
-        composer = self.permanent_wrench_composer
         # Refresh conversion frames after repeated pose writes at one timestamp.
-        composer.reset()
         composer.set_forces_and_torques(
             forces=self._countergravity * self.parked_mask[..., None], is_global=True,
         )
@@ -1390,6 +1498,10 @@ def make_object_collection_cfg() -> RigidObjectCollectionCfg:
                 prim_path=f"{{ENV_REGEX_NS}}/{spec.name}",
                 spawn=(FlatBoxUsdCfg if spec.asset_name in YCB_BOX_ASSETS else sim_utils.UsdFileCfg)(
                     usd_path=spec.usd_path,
+                    collision_props=(
+                        sim_utils.CollisionPropertiesCfg(contact_offset=0.005)
+                        if spec.asset_name.startswith("ycb_") else None
+                    ),
                     rigid_props=sim_utils.RigidBodyPropertiesCfg(
                         disable_gravity=False,
                         kinematic_enabled=False,
@@ -1668,7 +1780,10 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
             relationship.SetTargets(remapped)
         # Root bindings/poses remain editable; only descendants form prototypes.
         live = stage.GetPrimAtPath(path)
-        live.GetReferences().AddReference(output_path, destination)
+        # The baked subtree contains the resolved asset and our collision edits.
+        # An older, stronger reference can restore its original offsets or
+        # colliders once local descendant edits become instance proxies.
+        live.GetReferences().SetReferences([Sdf.Reference(output_path, destination)])
         live.SetInstanceable(True)
         if not live.IsInstance():
             raise RuntimeError(f'Failed to share geometry below {path}.')

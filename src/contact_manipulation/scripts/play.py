@@ -1,4 +1,9 @@
-"""Play a research checkpoint using Isaac Lab's native RSL-RL inference flow."""
+"""Follow Sweeping-Policy/min's native RSL-RL inference flow for the graph policy.
+
+Use the example's checkpoint/runner/inference sequence. Keep this entry point
+because stock play unconditionally exports JIT/ONNX, which the shared GNN
+adapter does not implement. Playback itself uses the native inference policy.
+"""
 
 import argparse
 from importlib.metadata import version

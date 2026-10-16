@@ -5,7 +5,7 @@ One batched update per common_step_counter keeps history and path integrals
 independent of manager call order. Only selected rows change on partial reset.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from collections.abc import Mapping
 from functools import lru_cache
 import math
@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from numba import njit
 import warp as wp
+from isaaclab.utils.math import convert_quat, matrix_from_quat
 
 from .observations import (
     SI_200_8_RANGES, SI_200_8_RESOLUTION, calibrate_wrench, compensate_wrench,
@@ -31,15 +32,15 @@ from .terminations import task_conditions, terminal_transition
 
 @dataclass
 class MdpCfg:
-    max_objects: int = 30
+    max_objects: int = 10
     clearance_decay: float = 1.0
     rearrangement_decay: float = 2.0
     motion_acceleration_decay: float = 1.0
     motion_wrench_increase_decay: float = 1.0
-    time_penalty_scale: float = 0.02
-    time_penalty_growth_rate: float = 0.7
     arm_joint_acceleration_ref: float = 5.0
     hand_joint_acceleration_ref: float = 10.0
+    time_penalty_scale: float = 0.02
+    time_penalty_growth_rate: float = 0.7
     force_rate_ref: float = 200.0
     torque_rate_ref: float = 10.0
     success_reward: float = 500.0
@@ -59,10 +60,12 @@ class MdpCfg:
     joint_position_scale: float = math.pi
     joint_velocity_scale: float = 2.0
     tactile_threshold: float = 0.01
+    shelf_translation_tolerance: float = 0.01
+    shelf_rotation_tolerance: float = math.radians(2.0)
 
     def __post_init__(self):
-        if self.max_objects != 30:
-            raise ValueError("The agreed observation contract reserves 30 object slots.")
+        if self.max_objects != 10:
+            raise ValueError("The agreed observation contract reserves 10 object slots.")
         if not isinstance(self.stable_steps, int) or self.stable_steps < 1:
             raise ValueError("stable_steps must be a positive integer.")
         for name, value in vars(self).items():
@@ -81,12 +84,11 @@ class TransitionBatch:
     corners: torch.Tensor              # N,O,8,3; fixed corner correspondence
     rotation: torch.Tensor             # N,O,4; relative to canonical upright
     velocity: torch.Tensor             # N,O,6; linear velocity at the OBB center
-    joint_velocity: torch.Tensor       # N,12; six arm then six independent hand joints
     sensor_wrench: torch.Tensor        # N,6; SI-200-8 measured, self-load compensated
     sensor_position: torch.Tensor      # N,3; world
     sensor_rotation: torch.Tensor      # N,4; world, wxyz
     sensor_range_exceeded: torch.Tensor  # N,6; before clipping/compensation
-    forbidden_contact: torch.Tensor    # N; partner-resolved sensor result
+    shelf_pose: torch.Tensor           # N,7; world link pose, wxyz
     state_valid: torch.Tensor          # N; robot and sensor finite/ready
     sample: torch.Tensor               # N,72; current robot/sensor/action observation
     tcp_pose_b: torch.Tensor            # N,7; measured EEF in robot base
@@ -254,7 +256,9 @@ def projected_areas(corners, active, region):
                   stream=wp.stream_from_torch(torch.cuda.current_stream(corners.device)))
         return areas, overlaps
     polygon, count = convex_hull_xy(corners[..., :2])
-    return polygon_area(polygon, count), rectangle_overlap_area(polygon, count, region[:, None, :])
+    areas = polygon_area(polygon, count)
+    overlaps = rectangle_overlap_area(polygon, count, region[:, None, :])
+    return torch.where(active, areas, 0.0), torch.where(active, overlaps, 0.0)
 
 
 def object_geometry(pose, local_center, local_corners, upright):
@@ -293,10 +297,10 @@ class TaskState:
         self.workspace_bounds = zeros(n, 4)
         self.shelf_top = zeros(n)
         self.ceiling = zeros(n)
+        self.initial_shelf_pose = zeros(n, 7)
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
         self.previous_corners = zeros(n, o, 8, 3)
-        self.previous_joint_velocity = zeros(n, 12)
         self.previous_wrench = zeros(n, 6)
         self.wrench_bias = zeros(n, 6)
         self.initial_sensor_position = zeros(n, 3)
@@ -308,9 +312,9 @@ class TaskState:
         self.terminal_paid = zeros(n, kind=torch.bool)
         self.failure_reasons = zeros(n, 7, kind=torch.bool)
         self.components = zeros(n, 5)
-        self.motion_costs = zeros(n, 2)
+        self.wrench_rate_cost = zeros(n)
         self.rearrangement_increment = zeros(n)
-        self.total_overlap = zeros(n)
+        self.blocker_overlap = zeros(n)
 
     @torch.no_grad()
     def reset(self, ids, batch, *, geometry_b, geometry_valid, active, target, blocker,
@@ -333,10 +337,10 @@ class TaskState:
                             ("access_region", access_region), ("workspace_bounds", workspace_bounds),
                             ("shelf_top", shelf_top), ("ceiling", ceiling)):
             getattr(self, name)[ids] = value[rows]
+        self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
         self.initial_center[ids] = batch.center[rows]
         self.initial_rotation[ids] = batch.rotation[rows]
         self.previous_corners[ids] = batch.corners[rows]
-        self.previous_joint_velocity[ids] = batch.joint_velocity[rows]
         self.initial_sensor_position[ids] = batch.sensor_position[rows]
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
         self.history[ids] = 0
@@ -347,7 +351,7 @@ class TaskState:
         self.history[ids, 0, 54:72] = 0
         for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count",
                      "success", "failure", "terminal_paid", "failure_reasons", "components",
-                     "motion_costs", "rearrangement_increment", "total_overlap"):
+                     "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
             getattr(self, name)[ids] = 0
         self.ready = True
         # Build a new tensor: extras may still reference the previous episode's
@@ -371,10 +375,12 @@ class TaskState:
         if step != self.last_step + 1:
             raise RuntimeError("MDP must be evaluated once every completed control transition.")
         safe_corners = torch.nan_to_num(batch.corners, nan=0.0, posinf=0.0, neginf=0.0)
-        areas, overlap = projected_areas(safe_corners, self.active, self.access_region)
-        blocked = torch.where(self.blocker & self.active, overlap, 0.0).sum(-1)
-        blocker_area = torch.where(self.blocker & self.active, areas, 0.0).sum(-1)
-        self.total_overlap.copy_(torch.where(self.active & ~self.target, overlap, 0.0).sum(-1))
+        # Clearance and its success gate concern only the designated Blocker.
+        # Skip polygon clipping for other objects; their path/safety checks remain.
+        areas, overlap = projected_areas(safe_corners, self.blocker & self.active, self.access_region)
+        blocked = overlap.sum(-1)
+        blocker_area = areas.sum(-1)
+        self.blocker_overlap.copy_(blocked)
         increment = corner_path_increment(self.previous_corners, batch.corners, self.active)
         self.rearrangement_increment.copy_(torch.nan_to_num(increment, nan=0.0, posinf=0.0, neginf=0.0))
         self.path_length.add_(self.rearrangement_increment)
@@ -383,24 +389,25 @@ class TaskState:
                   + torch.cross(batch.sensor_position - self.initial_sensor_position, force, dim=-1))
         fixed_wrench = torch.cat((force, moment), -1)
         components, costs = reward_components(
-            self.cfg, blocked, blocker_area, self.path_length, batch.joint_velocity,
-            self.previous_joint_velocity, fixed_wrench, self.previous_wrench, self.dt,
+            self.cfg, blocked, blocker_area, self.rearrangement_increment,
+            fixed_wrench, self.previous_wrench, self.dt,
             elapsed_time=self.elapsed_time,
         )
         candidate, stable, reasons, failed = task_conditions(
             self.cfg, center=batch.center, corners=batch.corners, rotation=batch.rotation,
             velocity=batch.velocity, active=self.active, target=self.target,
             initial_center=self.initial_center, initial_rotation=self.initial_rotation,
-            total_overlap=self.total_overlap, sensor_wrench=batch.sensor_wrench,
+            blocker_overlap=self.blocker_overlap, sensor_wrench=batch.sensor_wrench,
             stable_count=self.stable_count, workspace_bounds=self.workspace_bounds,
             shelf_top=self.shelf_top, ceiling=self.ceiling,
-            sensor_range_exceeded=batch.sensor_range_exceeded, forbidden_contact=batch.forbidden_contact,
+            sensor_range_exceeded=batch.sensor_range_exceeded,
+            shelf_pose=batch.shelf_pose, initial_shelf_pose=self.initial_shelf_pose,
             state_valid=batch.state_valid,
         )
         successful, payment, paid = terminal_transition(candidate, failed, stable, self.terminal_paid, self.cfg)
         self.components[:, :4] = components
         self.components[:, 4] = payment
-        self.motion_costs.copy_(costs)
+        self.wrench_rate_cost.copy_(costs)
         self.stable_count.copy_(stable)
         self.success.copy_(successful)
         self.failure.copy_(failed)
@@ -410,7 +417,6 @@ class TaskState:
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
         self.tcp_pose_b.copy_(torch.nan_to_num(batch.tcp_pose_b, nan=0.0, posinf=0.0, neginf=0.0))
         self.previous_corners.copy_(batch.corners)
-        self.previous_joint_velocity.copy_(batch.joint_velocity)
         self.previous_wrench.copy_(fixed_wrench)
         self.elapsed_time.add_(self.dt)
         self.observation = None
@@ -427,12 +433,12 @@ class SceneBatch:
     Per-episode values must stay valid until reset_task commits the selected rows.
     """
 
-    object_ids: torch.Tensor             # N,30
+    object_ids: torch.Tensor             # N,10
     target_id: torch.Tensor              # N
     blocker_id: torch.Tensor             # N
-    geometry_b: torch.Tensor             # N,30,10; accepted initial vision ONLY
-    geometry_valid: torch.Tensor         # N,30
-    observed_ids: torch.Tensor           # N,30; association to collection IDs
+    geometry_b: torch.Tensor             # N,10,10; accepted initial vision ONLY
+    geometry_valid: torch.Tensor         # N,10
+    observed_ids: torch.Tensor           # N,10; association to collection IDs
     lower: torch.Tensor                  # collection_size,3
     upper: torch.Tensor                  # collection_size,3
     upright: torch.Tensor                # collection_size,4 (wxyz)
@@ -450,23 +456,12 @@ class SensorBatch:
 
     The reader binds the native articulation and contact sensors. Ideal
     wrench is parent-on-child joint reaction at the sensor center, sensor axes.
-    Forbidden contact must be aggregated per partner, never vector-summed across
-    different contact partners; see forbidden_contact_from_history below.
     """
 
     ideal_wrench: torch.Tensor           # N,6; before SI-200-8 measurement model
     wrench_valid: torch.Tensor           # N
     tactile_force: torch.Tensor          # N,17,3; latest net normal forces
     tactile_valid: torch.Tensor          # N,17
-    forbidden_contact: torch.Tensor      # N; arm/spacer only, hand excluded
-
-
-def forbidden_contact_from_history(forces, threshold=1.0):
-    """Any body/partner in the recent substeps exceeds 1 N; opposing contacts cannot cancel."""
-    if forces.ndim != 5 or forces.shape[-1] != 3:
-        raise ValueError("Expected contact force history [N, substeps, bodies, partners, 3].")
-    return ((torch.linalg.vector_norm(forces, dim=-1) > threshold).any(dim=(1, 2, 3))
-            | ~torch.isfinite(forces).all(dim=(1, 2, 3, 4)))
 
 
 def _ensure_state(env):
@@ -483,25 +478,35 @@ def _bind_scene(env, state, scene):
     from types import SimpleNamespace
 
     robot = env.scene["robot"]
-    arm = env.action_manager.get_term("arm_action")
-    hand = env.action_manager.get_term("hand_action")
+    # Resolve asset IDs through the public API; stock action terms do not expose
+    # the task-specific attributes previously supplied by our subclasses.
+    arm_ids, _ = robot.find_joints(env.cfg.actions.arm_action.joint_names, preserve_order=True)
+    hand_ids, _ = robot.find_joints(env.cfg.actions.hand_action.joint_names, preserve_order=True)
+    tcp_ids, _ = robot.find_bodies(env.cfg.actions.arm_action.body_name)
+    if len(arm_ids) != 6 or len(hand_ids) != 6 or len(tcp_ids) != 1:
+        raise ValueError("Resolve six arm joints, six hand joints, and one TCP body.")
     names = robot.body_names
     if not scene.distal_body_names or scene.sensor_body_name not in scene.distal_body_names:
         raise ValueError("Supply the complete distal hand/spacer body list, including the F/T body.")
     distal = [names.index(name) for name in scene.distal_body_names]
     if len(set(distal)) != len(distal):
         raise ValueError("F/T compensation bodies must not be duplicated.")
-    joint_ids = torch.tensor(arm.joint_ids + hand.joint_ids, device=env.device)
+    joint_ids = torch.tensor(arm_ids + hand_ids, device=env.device)
     distal_ids = torch.tensor(distal, device=env.device)
     masses = robot.root_physx_view.get_masses().to(env.device).index_select(1, distal_ids)
     inertias = robot.root_physx_view.get_inertias().to(env.device).index_select(1, distal_ids)
     # PhysX exposes COM inertia in link axes and column-major flattened order.
     inertias = inertias.reshape(env.num_envs, len(distal), 3, 3).transpose(-1, -2).contiguous()
     n, o = env.num_envs, state.cfg.max_objects
+    # These asset properties are fixed in this task. Native COM properties
+    # otherwise fetch CPU buffers again at every physics timestamp/reset.
+    body_com_local = robot.data.body_com_pos_b.index_select(1, distal_ids).clone()
+    object_com_local = env.scene["object_collection"].data.object_com_pos_b.clone()
     state.bindings = SimpleNamespace(
-        robot=robot, objects=env.scene["object_collection"], arm=arm, hand=hand,
-        joint_ids=joint_ids, distal_ids=distal_ids, tcp_id=arm.tcp_body_id,
+        robot=robot, objects=env.scene["object_collection"], shelf=env.scene["shelf"],
+        joint_ids=joint_ids, distal_ids=distal_ids, tcp_id=tcp_ids[0],
         sensor_id=names.index(scene.sensor_body_name), masses=masses, inertias=inertias,
+        body_com_local=body_com_local, object_com_local=object_com_local,
         gravity=torch.tensor(env.sim.cfg.gravity, device=env.device),
         ranges=torch.tensor(SI_200_8_RANGES, device=env.device),
         resolution=torch.tensor(SI_200_8_RESOLUTION, device=env.device),
@@ -556,8 +561,7 @@ def _validate_reset_data(env, scene, ids):
     if not isinstance(sensors, SensorBatch):
         raise ValueError("task_sensor_reader must return SensorBatch.")
     for name, shape, dtype in (("ideal_wrench", (n, 6), None), ("wrench_valid", (n,), torch.bool),
-                               ("tactile_force", (n, 17, 3), None), ("tactile_valid", (n, 17), torch.bool),
-                               ("forbidden_contact", (n,), torch.bool)):
+                               ("tactile_force", (n, 17, 3), None), ("tactile_valid", (n, 17), torch.bool)):
         value = getattr(sensors, name)
         if value.shape != shape or value.device != device or (dtype is not None and value.dtype != dtype):
             raise ValueError(f"SensorBatch.{name} requires shape {shape}, dtype {dtype}, device {device}.")
@@ -567,16 +571,17 @@ def _validate_reset_data(env, scene, ids):
 def _transition_tensors(env, state, rows, values):
     """Pure tensor transform after native physics/sensor acquisition."""
     b = state.bindings
-    (object_pose, object_com, object_velocity, body_position, body_rotation, body_com,
+    (object_pose, object_velocity, body_position, body_rotation,
      body_acceleration, body_angular_velocity, root_position, root_rotation, joint_position,
      joint_velocity, ideal_wrench, wrench_valid_all, tactile_force_all, tactile_valid_all,
-     forbidden_contact) = values
+     shelf_pose, actions, joint_effort) = values
     ids = b.object_ids[rows]
     origins = env.scene.env_origins[rows, None, :]
     pose = object_pose[rows].gather(1, ids[..., None].expand(-1, -1, 7))
     pose[..., :3] -= origins
     center, corners, rotation = object_geometry(pose, b.local_center[rows], b.local_corners[rows], b.upright[rows])
-    com = object_com[rows].gather(1, ids[..., None].expand(-1, -1, 3)) - origins
+    local_com = b.object_com_local[rows].gather(1, ids[..., None].expand(-1, -1, 3))
+    com = pose[..., :3] + quat_apply(pose[..., 3:7], local_com)
     velocity = object_velocity[rows].gather(1, ids[..., None].expand(-1, -1, 6))
     velocity[..., :3] += torch.cross(velocity[..., 3:], center - com, dim=-1)
 
@@ -586,9 +591,12 @@ def _transition_tensors(env, state, rows, values):
     raw_wrench, wrench_valid = ideal_wrench[rows], wrench_valid_all[rows]
     tactile_force = tactile_force_all[rows]
     measured, overrange = calibrate_wrench(raw_wrench, b.ranges, b.resolution)
+    distal_rotation = body_rotation.index_select(1, b.distal_ids)
+    distal_com = (body_position.index_select(1, b.distal_ids)
+                  + quat_apply(distal_rotation, b.body_com_local[rows]))
     self_load = self_motion_wrench(
-        b.masses[rows], b.inertias[rows], body_com[rows].index_select(1, b.distal_ids),
-        body_rotation.index_select(1, b.distal_ids), body_acceleration[rows].index_select(1, b.distal_ids),
+        b.masses[rows], b.inertias[rows], distal_com,
+        distal_rotation, body_acceleration[rows].index_select(1, b.distal_ids),
         body_angular_velocity[rows].index_select(1, b.distal_ids), sensor_position, sensor_rotation, b.gravity,
     )
     wrench = compensate_wrench(measured, self_load, state.wrench_bias[rows], wrench_valid)
@@ -603,14 +611,15 @@ def _transition_tensors(env, state, rows, values):
     sample = dynamic_sample(
         joint_pos, joint_vel, tcp_pose, wrench,
         torch.linalg.vector_norm(tactile_force, dim=-1) > state.cfg.tactile_threshold,
-        tactile_valid, torch.nan_to_num(env.action_manager.action[rows], nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1, 1), joint_position_scale=state.cfg.joint_position_scale,
+        tactile_valid, torch.nan_to_num(actions[rows], nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1, 1), joint_position_scale=state.cfg.joint_position_scale,
         joint_velocity_scale=state.cfg.joint_velocity_scale, wrench_ranges=b.ranges,
     )
     valid = (torch.isfinite(sample).all(-1) & torch.isfinite(raw_wrench).all(-1)
-             & wrench_valid & ~b.arm.invalid_control[rows] & ~b.hand.invalid_control[rows])
-    return TransitionBatch(center, corners, rotation, velocity, joint_vel, wrench, sensor_position,
+             & wrench_valid & torch.isfinite(actions[rows]).all(-1)
+             & torch.isfinite(joint_effort[rows]).all(-1))
+    return TransitionBatch(center, corners, rotation, velocity, wrench, sensor_position,
                            sensor_rotation, overrange & wrench_valid[:, None],
-                           forbidden_contact[rows], valid, sample, tcp_pose)
+                           shelf_pose[rows], valid, sample, tcp_pose)
 
 
 @torch.no_grad()
@@ -618,19 +627,21 @@ def _read_transition(env, state, env_ids=None):
     """Acquire native data once, then replay the complete rollout tensor transform."""
     b = state.bindings
     data, objects, sensors = b.robot.data, b.objects.data, env.task_sensor_reader()
-    values = (objects.object_link_pose_w, objects.object_com_pos_w, objects.object_com_vel_w,
-              data.body_link_pos_w, data.body_link_quat_w, data.body_com_pos_w, data.body_com_acc_w,
+    values = (objects.object_link_pose_w, objects.object_com_vel_w,
+              data.body_link_pos_w, data.body_link_quat_w, data.body_com_acc_w,
               data.body_com_ang_vel_w, data.root_pos_w, data.root_quat_w, data.joint_pos, data.joint_vel,
               sensors.ideal_wrench, sensors.wrench_valid, sensors.tactile_force, sensors.tactile_valid,
-              sensors.forbidden_contact)
+              b.shelf.data.root_link_pose_w, env.action_manager.action, data.applied_torque)
     rows = slice(None) if env_ids is None else env_ids
     if env_ids is not None or not values[0].is_cuda:
         return _transition_tensors(env, state, rows, values)
     key = (torch.is_inference_mode_enabled(), torch.backends.cuda.matmul.allow_tf32)
     cache = getattr(state, "_transition_graphs", {})
     if key not in cache:
-        static = tuple(t.clone() for t in values)
-        with torch.cuda.device(values[0].device):
+        # Graph-owned buffers and Philox bookkeeping must be normal tensors:
+        # native training alternates inference rollouts and non-inference work.
+        with torch.inference_mode(False), torch.cuda.device(values[0].device):
+            static = tuple(t.clone() for t in values)
             stream = torch.cuda.Stream(device=values[0].device)
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
@@ -647,6 +658,59 @@ def _read_transition(env, state, env_ids=None):
         destination.copy_(source)
     graph.replay()
     return TransitionBatch(**{name: value.clone() for name, value in vars(output).items()})
+
+
+def _read_reset_snapshot(env, state, ids):
+    """Read only measurements consumed at reset; no force/COM/dynamics fetch."""
+    b = state.bindings
+    data = b.robot.data
+    selected = b.object_ids[ids]
+    pose = b.objects.data.object_link_pose_w[ids].gather(1, selected[..., None].expand(-1, -1, 7))
+    pose[..., :3] -= env.scene.env_origins[ids, None]
+    center, corners, rotation = object_geometry(
+        pose, b.local_center[ids], b.local_corners[ids], b.upright[ids])
+    position, orientation = data.body_link_pos_w[ids], data.body_link_quat_w[ids]
+    inverse_root = quat_conjugate(data.root_quat_w[ids])
+    tcp_position = quat_apply(inverse_root, position[:, b.tcp_id] - data.root_pos_w[ids])
+    tcp_rotation = quat_mul(inverse_root, orientation[:, b.tcp_id])
+    tcp_rotation = torch.where(tcp_rotation[:, :1] < 0, -tcp_rotation, tcp_rotation)
+    tcp_pose = torch.cat((tcp_position, tcp_rotation), -1)
+    joints = data.joint_pos[ids].index_select(1, b.joint_ids) / state.cfg.joint_position_scale
+    velocity = data.joint_vel[ids].index_select(1, b.joint_ids) / state.cfg.joint_velocity_scale
+    sample = torch.cat((joints, velocity, tcp_pose, joints.new_zeros((ids.numel(), 41))), -1)
+    return SimpleNamespace(center=center, corners=corners, rotation=rotation,
+                           shelf_pose=b.shelf.data.root_link_pose_w[ids], sensor_position=position[:, b.sensor_id],
+                           tcp_pose_b=tcp_pose, sample=sample)
+
+
+def _prepare_reset_geometry(scene, ids):
+    """Validate and prepare immutable scene fields, separately from robot state."""
+    object_ids = scene.object_ids[ids]
+    active = object_ids >= 0
+    target = active & (object_ids == scene.target_id[ids, None])
+    blocker = active & (object_ids == scene.blocker_id[ids, None])
+    if bool(((target.sum(-1) != 1) | (blocker.sum(-1) != 1) | (target & blocker).any(-1)).any()):
+        raise ValueError("Each episode requires one distinct active target and blocker.")
+    sorted_ids = object_ids.sort(dim=-1).values
+    if bool(((sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (sorted_ids[:, 1:] >= 0)).any()):
+        raise ValueError("Active collection IDs must be unique; repeated object TYPES use different bodies.")
+    if bool((object_ids >= scene.lower.shape[0]).any()):
+        raise ValueError("Object IDs exceed catalog bounds.")
+    selected = object_ids.clamp_min(0)
+    lower, upper = scene.lower[selected], scene.upper[selected]
+    center = .5 * (lower + upper)
+    signs = lower.new_tensor(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+                             (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
+    corners = center[..., None, :] + .5 * (upper - lower)[..., None, :] * signs
+    observed_ids, valid = scene.observed_ids[ids], scene.geometry_valid[ids]
+    observed_target = (observed_ids == scene.target_id[ids, None]) & valid
+    observed_blocker = (observed_ids == scene.blocker_id[ids, None]) & valid
+    roles = torch.stack((observed_target.long().argmax(-1), observed_blocker.long().argmax(-1)), -1)
+    roles = torch.where(torch.stack((observed_target.any(-1), observed_blocker.any(-1)), -1), roles, -1)
+    geometry, valid = prepare_initial_geometry(scene.geometry_b[ids], valid, roles[:, 0], roles[:, 1])
+    return SimpleNamespace(object_ids=selected, local_center=center, local_corners=corners,
+                           upright=scene.upright[selected], active=active, target=target, blocker=blocker,
+                           geometry=geometry, valid=valid)
 
 
 @torch.no_grad()
@@ -667,46 +731,41 @@ def reset_task(env, env_ids=None):
         return
     if ids.ndim != 1 or bool(((ids < 0) | (ids >= env.num_envs)).any()) or ids.unique().numel() != ids.numel():
         raise ValueError("Reset IDs must be distinct environment indices.")
-    _validate_reset_data(env, scene, ids)
+    runtime = getattr(env, "_episode_reset", None)
+    # Only the native producer can authorize reuse, after a successful commit.
+    # Consume this marker: direct/external SceneBatch resets keep full validation.
+    shared = (runtime is not None and getattr(runtime, "mdp_reset_scene", None) is scene
+              and getattr(runtime, "mdp_reset_ids", None) is env_ids)
+    if runtime is not None:
+        runtime.mdp_reset_scene = None
+    key = ((id(scene), id(runtime.shared_template), id(scene.lower), id(scene.upper), id(scene.upright))
+           if shared else None)
+    cached = getattr(runtime, "mdp_geometry", None) if shared else None
+    if cached is None or cached[0] != key:
+        # Native shared metadata is an immutable singleton broadcast by reset_scene.
+        rows = ids[:1] if shared else ids
+        _validate_reset_data(env, scene, rows)
+        prepared = _prepare_reset_geometry(scene, rows)
+        if shared:
+            runtime.mdp_geometry = (key, prepared)
+    else:
+        prepared = cached[1]
     if state.bindings is None:
         _bind_scene(env, state, scene)
     b = state.bindings
-    if scene.object_ids.shape != (env.num_envs, state.cfg.max_objects) or scene.object_ids.dtype != torch.long:
-        raise ValueError("Scene object_ids must be int64 [num_envs,30].")
-    object_ids = scene.object_ids[ids]
-    active = object_ids >= 0
-    target = active & (object_ids == scene.target_id[ids, None])
-    blocker = active & (object_ids == scene.blocker_id[ids, None])
-    if bool(((target.sum(-1) != 1) | (blocker.sum(-1) != 1) | (target & blocker).any(-1)).any()):
-        raise ValueError("Each episode requires one distinct active target and blocker.")
-    sorted_ids = object_ids.sort(dim=-1).values
-    if bool(((sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (sorted_ids[:, 1:] >= 0)).any()):
-        raise ValueError("Active collection IDs must be unique; repeated object TYPES use different bodies.")
-    if bool((object_ids >= scene.lower.shape[0]).any()):
-        raise ValueError("Object IDs exceed catalog bounds.")
-    selected = object_ids.clamp_min(0)
-    b.object_ids[ids] = selected
-    lower, upper = scene.lower[selected], scene.upper[selected]
-    center_local = 0.5 * (lower + upper)
-    signs = lower.new_tensor(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
-                              (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
-    b.local_center[ids] = center_local
-    b.local_corners[ids] = center_local[..., None, :] + 0.5 * (upper - lower)[..., None, :] * signs
-    b.upright[ids] = scene.upright[selected]
-    observed_ids, geometry_valid = scene.observed_ids[ids], scene.geometry_valid[ids]
-    observed_target = (observed_ids == scene.target_id[ids, None]) & geometry_valid
-    observed_blocker = (observed_ids == scene.blocker_id[ids, None]) & geometry_valid
-    role_indices = torch.stack((observed_target.long().argmax(-1), observed_blocker.long().argmax(-1)), -1)
-    role_indices = torch.where(torch.stack((observed_target.any(-1), observed_blocker.any(-1)), -1), role_indices, -1)
-    geometry, valid = prepare_initial_geometry(scene.geometry_b[ids], geometry_valid,
-                                               role_indices[:, 0], role_indices[:, 1])
-    # Only this reset batch is sorted/validated. Unreset initial vision remains frozen.
-    initial = _read_transition(env, state, ids)
+    for name in ("object_ids", "local_center", "local_corners", "upright"):
+        getattr(b, name)[ids] = getattr(prepared, name)
+    initial = _read_reset_snapshot(env, state, ids)
+    if not bool(torch.isfinite(initial.shelf_pose).all()
+                & (initial.shelf_pose[:, 3:].norm(dim=-1) > 1.e-8).all()):
+        raise ValueError("Reset shelf pose must be finite with a valid quaternion.")
     if not bool(torch.isfinite(initial.sample[:, :31]).all()
                 & (initial.tcp_pose_b[:, 3:7].norm(dim=-1) > 1.e-8).all()):
         raise ValueError("Reset robot joint/EEF measurements must be finite with a valid quaternion.")
-    state.reset(ids, initial, geometry_b=geometry, geometry_valid=valid,
-                active=active, target=target, blocker=blocker, access_region=scene.access_region[ids],
+    expand = lambda value: value.expand(ids.numel(), *value.shape[1:])
+    state.reset(ids, initial, geometry_b=expand(prepared.geometry), geometry_valid=expand(prepared.valid),
+                active=expand(prepared.active), target=expand(prepared.target), blocker=expand(prepared.blocker),
+                access_region=scene.access_region[ids],
                 workspace_bounds=scene.workspace_bounds[ids], shelf_top=scene.shelf_top[ids],
                 ceiling=scene.ceiling[ids], step=env.common_step_counter, batch_is_selected=True)
     if "terminal_observation" in env.extras:
@@ -765,11 +824,11 @@ class SpawnRules:
     y_range: tuple[float, float] = (-0.455, 0.455)
     shelf_top: float = 1.05
     ceiling: float = 1.35
-    min_objects: int = 4
-    max_objects: int = 30
+    min_objects: int = 10
+    max_objects: int = 10
     min_asset_types: int = 4
     max_asset_types: int = 10
-    all_asset_types: bool = False
+    all_asset_types: bool = True
     edge_margin: float = 0.015
     gap: float = 0.003
     hand_width: float = 0.10
@@ -779,7 +838,7 @@ class SpawnRules:
     min_y_coverage: float = 0.65
     neighbor_distance: float = 0.04
     min_neighbor_fraction: float = 0.75
-    min_shelf_occupancy: float = 0.35
+    min_shelf_occupancy: float = 0.20
     region_grid: tuple[int, int] = (2, 3)
     min_region_occupancy: float = 0.10
     reserve_blocker_front: bool = True
@@ -2754,12 +2813,209 @@ def oriented_boxes_separated_batch(center_a, rotation_a, half_a, center_b, rotat
     axes_a = rotation_a.transpose(-1, -2)
     axes_b = rotation_b.transpose(-1, -2)
     length = torch.linalg.cross(axes_a[..., :, None, :], axes_b[..., None, :, :]).norm(dim=-1)
-    separated |= ((length > 1.e-9) & (distance + _EPS * length >= radius + clearance * length)).any((-2, -1))
+    cross_separated = (length > 1.e-9) & (distance + _EPS * length >= radius + clearance * length)
+    # Relative projections lose significance for almost parallel axes. The
+    # eager CPU/dtype oracle uses direct FP64 projections on those axes only.
+    near = torch.where(length < 1.e-4)
+    if near[0].numel():
+        leading = length.shape[:-2]
+        rows = near[:-2]
+        aa = axes_a.expand(*leading, 3, 3)
+        bb = axes_b.expand(*leading, 3, 3)
+        cross = torch.linalg.cross(aa[(*rows, near[-2])].double(), bb[(*rows, near[-1])].double())
+        norm = cross.norm(dim=-1)
+        delta64 = center_b.expand(*leading, 3)[rows].double() - center_a.expand(*leading, 3)[rows].double()
+        ha = half_a.expand(*leading, 3)[rows].double()
+        hb = half_b.expand(*leading, 3)[rows].double()
+        radius64 = (ha * (aa[rows].double() * cross[..., None, :]).sum(-1).abs()).sum(-1)
+        radius64 += (hb * (bb[rows].double() * cross[..., None, :]).sum(-1).abs()).sum(-1)
+        cross_separated[near] = (norm > 1.e-9) & (
+            (delta64 * cross).sum(-1).abs() + _EPS * norm >= radius64 + clearance * norm)
+    separated |= cross_separated.any((-2, -1))
     return separated
 
 
+@wp.func
+def _collider_transform(frames: wp.array4d(dtype=wp.float32), owners: wp.array(dtype=wp.int64),
+                        offsets: wp.array3d(dtype=wp.float32), row: int, collider: int):
+    frame, offset = wp.mat44(0.0), wp.mat44(0.0)
+    owner = int(owners[collider])
+    for i in range(4):
+        for j in range(4):
+            frame[i, j] = frames[row, owner, i, j]
+            offset[i, j] = offsets[collider, i, j]
+    return frame * offset
+
+
+@wp.func
+def _parallel_cross_separated(ca: wp.vec3, ra: wp.mat33, ha: wp.vec3,
+                              cb: wp.vec3, rb: wp.mat33, hb: wp.vec3,
+                              i: int, j: int, gap: float):
+    # The relative-rotation shortcut divides cancellation error by a tiny axis
+    # length. Recompute only these axes from the original FP32 geometry in FP64.
+    a = wp.vec3d(wp.float64(ra[0, i]), wp.float64(ra[1, i]), wp.float64(ra[2, i]))
+    b = wp.vec3d(wp.float64(rb[0, j]), wp.float64(rb[1, j]), wp.float64(rb[2, j]))
+    axis = wp.cross(a, b)
+    length = wp.length(axis)
+    if length <= wp.float64(1.e-9):
+        return False
+    delta = wp.vec3d(wp.float64(cb[0]) - wp.float64(ca[0]),
+                     wp.float64(cb[1]) - wp.float64(ca[1]),
+                     wp.float64(cb[2]) - wp.float64(ca[2]))
+    radius = wp.float64(0.0)
+    for k in range(3):
+        aa = wp.vec3d(wp.float64(ra[0, k]), wp.float64(ra[1, k]), wp.float64(ra[2, k]))
+        bb = wp.vec3d(wp.float64(rb[0, k]), wp.float64(rb[1, k]), wp.float64(rb[2, k]))
+        radius += wp.float64(ha[k]) * wp.abs(wp.dot(aa, axis)) + wp.float64(hb[k]) * wp.abs(wp.dot(bb, axis))
+    return wp.abs(wp.dot(delta, axis)) + wp.float64(1.e-9) * length >= radius + wp.float64(gap) * length
+
+
+@wp.func
+def _sat_separated(ca: wp.vec3, ra: wp.mat33, ha: wp.vec3,
+                   cb: wp.vec3, rb: wp.mat33, hb: wp.vec3, gap: float):
+    # Keep the eager oracle's EPS, world-axis shortcut and cross-axis length.
+    delta = cb - ca
+    for axis in range(3):
+        a, b = float(0.0), float(0.0)
+        for k in range(3):
+            a += wp.abs(ra[axis, k]) * ha[k]
+            b += wp.abs(rb[axis, k]) * hb[k]
+        if wp.abs(delta[axis]) + 1.e-9 >= a + b + gap:
+            return True
+    relative = wp.transpose(ra) * rb
+    translation = wp.transpose(ra) * delta
+    for axis in range(3):
+        a, b = float(0.0), float(0.0)
+        for k in range(3):
+            a += wp.abs(relative[axis, k]) * hb[k]
+            b += wp.abs(relative[k, axis]) * ha[k]
+        if wp.abs(translation[axis]) + 1.e-9 >= ha[axis] + a + gap:
+            return True
+        projection = float(0.0)
+        for k in range(3):
+            projection += relative[k, axis] * translation[k]
+        if wp.abs(projection) + 1.e-9 >= hb[axis] + b + gap:
+            return True
+    for i in range(3):
+        i1, i2 = (i + 1) % 3, (i + 2) % 3
+        aa = wp.vec3(ra[0, i], ra[1, i], ra[2, i])
+        for j in range(3):
+            j1, j2 = (j + 1) % 3, (j + 2) % 3
+            bb = wp.vec3(rb[0, j], rb[1, j], rb[2, j])
+            length = wp.length(wp.cross(aa, bb))
+            if length < 1.e-4:
+                if _parallel_cross_separated(ca, ra, ha, cb, rb, hb, i, j, gap):
+                    return True
+            else:
+                distance = wp.abs(translation[i2] * relative[i1, j] - translation[i1] * relative[i2, j])
+                radius = (ha[i1] * wp.abs(relative[i2, j]) + ha[i2] * wp.abs(relative[i1, j])
+                          + hb[j1] * wp.abs(relative[i, j2]) + hb[j2] * wp.abs(relative[i, j1]))
+                if distance + 1.e-9 * length >= radius + gap * length:
+                    return True
+    return False
+
+
+@wp.kernel(enable_backward=False)
+def _robot_clearance_kernel(
+    frames: wp.array4d(dtype=wp.float32), joints: wp.array4d(dtype=wp.float32),
+    owners: wp.array(dtype=wp.int64), offsets: wp.array3d(dtype=wp.float32),
+    half: wp.array2d(dtype=wp.float32), pairs: wp.array2d(dtype=wp.int32),
+    pair_counts: wp.array(dtype=wp.int32), centers: wp.array3d(dtype=wp.float32),
+    rotations: wp.array4d(dtype=wp.float32), obstacle_half: wp.array3d(dtype=wp.float32),
+    obstacle_valid: wp.array2d(dtype=wp.bool), candidate_valid: wp.array(dtype=wp.bool),
+    clearance: float, min_height: float, min_forward: float,
+    valid: wp.array2d(dtype=wp.bool), heights: wp.array(dtype=wp.float32),
+):
+    row, collider = wp.tid()
+    shoulder = wp.vec3(joints[row, 1, 0, 3], joints[row, 1, 1, 3], joints[row, 1, 2, 3])
+    elbow = wp.vec3(joints[row, 2, 0, 3], joints[row, 2, 1, 3], joints[row, 2, 2, 3])
+    wrist = wp.vec3(joints[row, 3, 0, 3], joints[row, 3, 1, 3], joints[row, 3, 2, 3])
+    chord = wrist - shoulder
+    fraction = wp.dot(elbow - shoulder, chord) / wp.max(wp.dot(chord, chord), 1.e-18)
+    height = elbow[2] - shoulder[2] - wp.clamp(fraction, 0.0, 1.0) * chord[2]
+    if collider == 0:
+        heights[row] = height
+    valid[row, collider] = False
+    if not candidate_valid[row] or not (height >= min_height and elbow[0] - wrist[0] >= min_forward):
+        return
+    transform = _collider_transform(frames, owners, offsets, row, collider)
+    for i in range(4):
+        for j in range(4):
+            if not wp.isfinite(transform[i, j]):
+                return
+    center = wp.vec3(transform[0, 3], transform[1, 3], transform[2, 3])
+    rotation = wp.mat33(transform[0, 0], transform[0, 1], transform[0, 2],
+                        transform[1, 0], transform[1, 1], transform[1, 2],
+                        transform[2, 0], transform[2, 1], transform[2, 2])
+    extent = wp.vec3(half[collider, 0], half[collider, 1], half[collider, 2])
+    vertical_radius = float(0.0)
+    for axis in range(3):
+        vertical_radius += wp.abs(rotation[2, axis]) * extent[axis]
+    bottom = center[2] - vertical_radius
+    if not (bottom >= clearance):
+        return
+    for obstacle in range(centers.shape[1]):
+        if obstacle_valid[row, obstacle]:
+            other_center = wp.vec3(centers[row, obstacle, 0], centers[row, obstacle, 1], centers[row, obstacle, 2])
+            other_rotation = wp.mat33(0.0)
+            for i in range(3):
+                for j in range(3):
+                    other_rotation[i, j] = rotations[row, obstacle, i, j]
+            other_half = wp.vec3(obstacle_half[row, obstacle, 0], obstacle_half[row, obstacle, 1],
+                                 obstacle_half[row, obstacle, 2])
+            if not _sat_separated(center, rotation, extent, other_center, other_rotation, other_half, clearance):
+                return
+    # Each self-pair belongs to its first collider, without a global pair scan.
+    for pair in range(pair_counts[collider]):
+        other = pairs[collider, pair]
+        other_transform = _collider_transform(frames, owners, offsets, row, other)
+        other_center = wp.vec3(other_transform[0, 3], other_transform[1, 3], other_transform[2, 3])
+        other_rotation = wp.mat33(other_transform[0, 0], other_transform[0, 1], other_transform[0, 2],
+                                  other_transform[1, 0], other_transform[1, 1], other_transform[1, 2],
+                                  other_transform[2, 0], other_transform[2, 1], other_transform[2, 2])
+        other_half = wp.vec3(half[other, 0], half[other, 1], half[other, 2])
+        if not _sat_separated(center, rotation, extent, other_center, other_rotation, other_half, 0.002):
+            return
+    valid[row, collider] = True
+
+
 def _robot_candidate_clearance(env, frames, joints, tcp, obstacle_centers, obstacle_rotations, obstacle_half,
-                               obstacle_valid):
+                               obstacle_valid, candidate_valid=None):
+    """Fused FP32 CUDA clearance; eager tensors remain the CPU/dtype oracle."""
+    if frames.is_cuda and frames.dtype == torch.float32:
+        model, rules = env.robot_pose_model, env.cfg.robot_start
+        constants = model._tensor_constants(frames.device, frames.dtype)
+        if "clearance_pairs" not in constants:
+            owned = [[] for _ in model.colliders]
+            for first, second in model.self_collision_pairs():
+                owned[first].append(second)
+            width = max((len(row) for row in owned), default=0)
+            pairs = np.full((len(owned), max(1, width)), -1, dtype=np.int32)
+            for index, row in enumerate(owned):
+                pairs[index, :len(row)] = row
+            constants["clearance_pairs"] = torch.as_tensor(pairs, device=frames.device)
+            constants["clearance_pair_counts"] = torch.tensor([len(row) for row in owned],
+                                                              device=frames.device, dtype=torch.int32)
+        if candidate_valid is None:
+            candidate_valid = torch.ones(frames.shape[0], device=frames.device, dtype=torch.bool)
+        output = torch.empty((frames.shape[0], len(model.colliders)), device=frames.device, dtype=torch.bool)
+        height = frames.new_empty(frames.shape[0])
+        wp.launch(_robot_clearance_kernel, dim=output.shape, inputs=[
+            wp.from_torch(frames), wp.from_torch(joints), wp.from_torch(constants["collider_owners"]),
+            wp.from_torch(constants["collider_offsets"]), wp.from_torch(constants["collider_half"]),
+            wp.from_torch(constants["clearance_pairs"]), wp.from_torch(constants["clearance_pair_counts"]),
+            wp.from_torch(obstacle_centers), wp.from_torch(obstacle_rotations), wp.from_torch(obstacle_half),
+            wp.from_torch(obstacle_valid), wp.from_torch(candidate_valid), rules.collision_clearance,
+            rules.min_elbow_height, rules.min_forearm_forward, wp.from_torch(output), wp.from_torch(height)],
+            stream=wp.stream_from_torch(torch.cuda.current_stream(frames.device)))
+        return output.all(-1), height
+    valid, height = _robot_candidate_clearance_eager(
+        env, frames, joints, tcp, obstacle_centers, obstacle_rotations, obstacle_half, obstacle_valid)
+    return (valid if candidate_valid is None else valid & candidate_valid), height
+
+
+def _robot_candidate_clearance_eager(env, frames, joints, tcp, obstacle_centers, obstacle_rotations, obstacle_half,
+                                     obstacle_valid):
     """Evaluate all authored colliders and high-elbow geometry on the device."""
     model, rules = env.robot_pose_model, env.cfg.robot_start
     constants = model._tensor_constants(frames.device, frames.dtype)
@@ -2834,13 +3090,14 @@ def _robot_start_noise(seeds: wp.array(dtype=wp.int64), noise: wp.array3d(dtype=
 
 
 @torch.no_grad()
-def _sample_robot_starts(env, samples, seeds, *, proposals=None):
+def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=None, return_tensors=False):
     """Sample continuous starts with bounded batched GPU IK and OBB acceptance.
 
     Returns one device-tensor start tuple or ``None`` per requested scene. Failed
     rows can be resampled without discarding valid neighbors. Episode RNG and
-    metadata preparation plus bounded acceptance indices use host arrays; no
-    per-environment nonlinear solver or live physics trial is used.
+    metadata preparation use host arrays. CUDA keeps acceptance and pending
+    masks on device across candidate chunks; its native caller can consume the
+    batched result directly. No live physics trial is used.
     """
     if len(samples) != len(seeds):
         raise ValueError("Every scene requires one reproducible robot-start seed.")
@@ -2851,19 +3108,34 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None):
     count = len(samples)
     if not isinstance(rules.ik_batch_size, int) or isinstance(rules.ik_batch_size, bool) or rules.ik_batch_size <= 0:
         raise ValueError("Robot start ik_batch_size must be a positive integer.")
-    _validate_robot_start_rules(env.spawn_rules, rules)
-    if proposals is None:
-        proposals = _episode_proposals(samples,len(env.spawn_geometries),device,dtype)
-    centers,rotations,half,obstacle_valid = _scene_boxes_tensor(env,samples,proposals)
+    # The shared producer owns immutable singleton proposals. Cache only scene
+    # inputs, never candidates or acceptance results for the new robot pose.
+    key = (id(model), tuple(vars(rules).items()), tuple(vars(env.spawn_rules).items()))
+    cached = getattr(scene_cache, "robot", None)
+    if cached is None or cached[0] != key:
+        _validate_robot_start_rules(env.spawn_rules, rules)
+        source_samples = [scene_cache.sample] if scene_cache is not None else samples
+        source = scene_cache.proposals if scene_cache is not None else proposals
+        if source is None:
+            source = _episode_proposals(source_samples,len(env.spawn_geometries),device,dtype)
+        boxes = _scene_boxes_tensor(env,source_samples,source)
+        constants = model._tensor_constants(device, dtype)
+        blockers = torch.tensor([sample.blocker_id for sample in source_samples], device=device)
+        blocker_pose = source[0][torch.arange(len(source_samples), device=device), blockers]
+        regions = _robot_start_regions(blocker_pose, constants['scene_half'][blockers], env.spawn_rules, rules)
+        if not bool(torch.isfinite(regions).all() & (regions[:, 0] < regions[:, 1]).all()):
+            raise ValueError("Robot start front region is empty or non-finite after shelf clearance.")
+        cached = (key, (*boxes, regions))
+        if scene_cache is not None:
+            scene_cache.robot = cached
+    centers, rotations, half, obstacle_valid, regions = (
+        value.expand(count, *value.shape[1:]) for value in cached[1])
     constants = model._tensor_constants(device, dtype)
-    blockers = torch.tensor([sample.blocker_id for sample in samples], device=device)
-    blocker_pose = proposals[0][torch.arange(count, device=device), blockers]
-    regions = _robot_start_regions(blocker_pose, constants['scene_half'][blockers], env.spawn_rules, rules)
-    if not bool(torch.isfinite(regions).all() & (regions[:, 0] < regions[:, 1]).all()):
-        raise ValueError("Robot start front region is empty or non-finite after shelf clearance.")
-    lower, upper = regions[:, (0, 2, 4)], regions[:, (1, 3, 5)]
-    origin = torch.as_tensor(model.base_origin, device=device, dtype=dtype)
-    rotation = torch.tensor(ROBOT_START_TCP_ROTATION, device=device, dtype=dtype)
+    lower, upper = regions[:, ::2], regions[:, 1::2]
+    if "start_origin" not in constants:
+        constants["start_origin"] = torch.as_tensor(model.base_origin, device=device, dtype=dtype)
+        constants["start_rotation"] = torch.tensor(ROBOT_START_TCP_ROTATION, device=device, dtype=dtype)
+    origin, rotation = constants["start_origin"], constants["start_rotation"]
     # Local generators keep each episode independent of reset subset/order.
     if torch.device(device).type == "cuda":
         noise = torch.empty((count, rules.max_attempts, 9), device=device, dtype=dtype)
@@ -2874,11 +3146,112 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None):
         noise = torch.as_tensor(np.stack([np.random.default_rng(int(seed) ^ 0x5D2EA91C).random(
             (rules.max_attempts, 9), dtype=np.float32) for seed in seeds]), device=device)
     result = torch.zeros((count, len(model.joint_names) + 5), device=device, dtype=dtype)
+    if torch.device(device).type == "cuda":
+        # Keep capture buffers and PyTorch generator bookkeeping ordinary
+        # tensors even when an RSL-RL rollout calls reset in InferenceMode.
+        # They can then be replayed safely from either execution mode.
+        with torch.inference_mode(False):
+            result = result.clone()
+            if "start_lifts" not in constants:
+                constants["start_lifts"] = result.new_tensor((-2.0, -1.6, -.6, -1.0))
+                constants["start_elbows"] = result.new_tensor((1.8, 1.2, -1.8, -1.2))
+            # A small first chunk handles easy scenes without running unnecessary
+            # nonlinear solves. Later chunks retain fixed rows and skip accepted
+            # rows inside the IK/clearance kernels; there is no host readback or
+            # variable-size GPU nonzero between chunks. Capture the tensor dispatch
+            # as one graph so inactive tail chunks have little Python overhead.
+            maximum = min(32 if count <= 32 else 8, rules.max_attempts, rules.ik_batch_size)
+            group_size = 1 << max(0, (rules.ik_batch_size // maximum).bit_length() - 1)
+            cache = getattr(model, "_robot_start_graphs", {})
+            model._robot_start_graphs = cache
+            for begin in range(0, count, group_size):
+                rows = min(group_size, count - begin)
+                bucket = 1 << (rows - 1).bit_length()
+                key = (str(noise.device), dtype, bucket, centers.shape[1], maximum,
+                       tuple(vars(rules).items()), torch.backends.cuda.matmul.allow_tf32)
+                if key not in cache:
+                    # These are independent input buffers. Scene changes update
+                    # them on replay instead of retaining stale obstacle geometry.
+                    inputs = [value[begin:begin + 1].expand(bucket, *value.shape[1:]).clone()
+                              for value in (noise, centers, rotations, half, obstacle_valid, regions)]
+                    enabled = torch.zeros(bucket, device=device, dtype=torch.bool)
+                    inputs.append(enabled)
+
+                    def candidates(values):
+                        random, scene_centers, scene_rotations, scene_half, scene_valid, bounds, enabled_rows = values
+                        low, high = bounds[:, ::2], bounds[:, 1::2]
+                        accepted_rows = ~enabled_rows
+                        output = torch.zeros((bucket, result.shape[1]), device=device, dtype=dtype)
+                        offset = 0
+                        while offset < rules.max_attempts:
+                            width = min(8 if offset == 0 else maximum, maximum, rules.max_attempts - offset)
+                            selected_noise = random[:, offset:offset + width]
+                            target = low[:, None] + selected_noise[..., :3] * (high - low)[:, None] + origin
+                            arm = constants["default"][constants["arm_ids"]].expand(bucket, width, -1).clone()
+                            absolute = torch.arange(offset, offset + width, device=device)
+                            branch = absolute % 4
+                            lifts = constants["start_lifts"][branch]
+                            elbows = constants["start_elbows"][branch]
+                            arm[..., 1], arm[..., 2], arm[..., 3] = lifts, elbows, -lifts - elbows
+                            strength = (absolute // 8).clamp_max(2).to(dtype)
+                            arm += (selected_noise[..., 3:] - .5) * strength[None, :, None]
+                            active_candidates = (~accepted_rows[:, None]).expand(-1, width).reshape(-1).contiguous()
+                            q, valid, frames, joints, tcp = model.solve_batch(
+                                target.reshape(-1, 3), rotation.expand(bucket * width, -1, -1),
+                                arm.reshape(-1, 6), active_mask=active_candidates)
+                            clear, heights = _robot_candidate_clearance(
+                                env, frames, joints, tcp,
+                                scene_centers[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_centers.shape[1:]),
+                                scene_rotations[:, None].expand(-1, width, -1, -1, -1).reshape(-1, *scene_rotations.shape[1:]),
+                                scene_half[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_half.shape[1:]),
+                                scene_valid[:, None].expand(-1, width, -1).reshape(-1, scene_valid.shape[1]),
+                                candidate_valid=valid & active_candidates)
+                            actual = tcp[:, :3, 3].reshape(bucket, width, 3) - origin
+                            valid = valid.reshape(bucket, width) & clear.reshape(bucket, width)
+                            valid &= (actual >= low[:, None]).all(-1) & (actual <= high[:, None]).all(-1)
+                            first = torch.where(valid, torch.arange(width, device=device), width).amin(-1)
+                            found = first < width
+                            chosen = torch.arange(bucket, device=device) * width + first.clamp_max(width - 1)
+                            selected = torch.cat((q[chosen], actual.reshape(-1, 3)[chosen],
+                                                  heights[chosen, None], (first + offset + 1).to(dtype)[:, None]), -1)
+                            output = torch.where(found[:, None], selected, output)
+                            accepted_rows |= found
+                            offset += width
+                        return output
+
+                    with torch.cuda.device(device):
+                        stream = torch.cuda.Stream(device=device)
+                        stream.wait_stream(torch.cuda.current_stream(device))
+                        with torch.cuda.stream(stream):
+                            candidates(inputs)
+                        torch.cuda.current_stream(device).wait_stream(stream)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            output = candidates(inputs)
+                    # At most a small set of count buckets is needed. Bound graph
+                    # memory if object counts or runtime rules change repeatedly.
+                    if len(cache) >= 8:
+                        cache.pop(next(iter(cache)))
+                    # CUDA graph capture owns intermediate buffers, but these two
+                    # tensors were created outside capture and must stay alive.
+                    cache[key] = (inputs, graph, output, origin, rotation)
+                inputs, graph, output, _, _ = cache[key]
+                for buffer, value in zip(inputs[:-1], (noise, centers, rotations, half, obstacle_valid, regions)):
+                    buffer[:rows].copy_(value[begin:begin + rows])
+                inputs[-1].zero_()
+                inputs[-1][:rows] = True
+                graph.replay()
+                result[begin:begin + rows].copy_(output[:rows])
+            if return_tensors:
+                return result, regions
+            attempts = result[:, -1].to(torch.long).cpu().tolist()
+            return [(result[row, :-5], regions[row], result[row, -5:-2], result[row, -2], result[row, -1])
+                    if attempt else None for row, attempt in enumerate(attempts)]
     accepted = [False] * count
-    # Bound pairwise collision scratch independently of the selected count.
-    # Larger batches amortize GPU launches; lowering the cap trades throughput
-    # for scratch memory without changing episode candidate random streams.
-    proposals = min(8, rules.max_attempts, rules.ik_batch_size)
+    # Small asynchronous resets benefit from processing more candidates per
+    # launch; full resets already have enough rows to fill the GPU. Keep the
+    # same total scratch cap and the absolute candidate random streams.
+    proposals = min(32 if count <= 32 else 8, rules.max_attempts, rules.ik_batch_size)
     group_size = max(1, rules.ik_batch_size // proposals)
     for begin in range(0, count, group_size):
         pending = list(range(begin, min(count, begin + group_size)))
@@ -2944,10 +3317,7 @@ def _check_physical_robot_starts(env, samples, starts, poses, origins):
         expected = model.forward_batch(q)
         actual = poses[begin:begin + len(selected)]
         positions = actual[..., :3] - origins[begin:begin + len(selected), None] + poses.new_tensor(model.base_origin)
-        x, y, z, w = actual[..., 3:].unbind(-1)
-        rotations = torch.stack((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w),
-                                 2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w),
-                                 2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)), -1).reshape(*x.shape, 3, 3)
+        rotations = matrix_from_quat(convert_quat(actual[..., 3:], to="wxyz"))
         match = ((positions - expected[..., :3, 3]).norm(dim=-1) <= 2.e-4).all(-1)
         match &= ((rotations - expected[..., :3, :3]).norm(dim=(-2, -1)) <= 3.e-4).all(-1)
         output.append(match & torch.isfinite(actual).all((-2, -1)))
@@ -2991,25 +3361,25 @@ def _sample_robot_start(env, sample, seed: int) -> tuple:
 
 
 
-# Native reset event. Each selected row gets a newly sampled episode. USD
-# inspection is shared; initial perception queries shared surface meshes.
+# Native reset event. A scene round shares one layout/vision; robot starts
+# are continuously sampled and collision-checked on every selected-row reset.
 
 @dataclass
 class EpisodeBatch:
     object_state: torch.Tensor       # M,P,13; environment-local link pose / zero COM velocity
-    object_ids: torch.Tensor         # M,30; active pool IDs, -1 padding
+    object_ids: torch.Tensor         # M,10; active pool IDs, -1 padding
     active: torch.Tensor             # M,P
     target_id: torch.Tensor          # M
     blocker_id: torch.Tensor         # M
     access_region: torch.Tensor      # M,4
     joint_positions: torch.Tensor    # M,J; checked complete articulation configurations
-    geometry_b: torch.Tensor         # M,30,10; independently rendered initial geometry
-    geometry_valid: torch.Tensor     # M,30
-    observed_ids: torch.Tensor       # M,30
+    geometry_b: torch.Tensor         # M,10,10; initial geometry in robot base frame
+    geometry_valid: torch.Tensor     # M,10
+    observed_ids: torch.Tensor       # M,10
     robot_regions: torch.Tensor      # M,6
     robot_tcp: torch.Tensor          # M,3; environment coordinates
     visibility: torch.Tensor         # M,2; target, blocker
-    camera_pose: torch.Tensor        # M,7; world frame, wxyz
+    camera_pose: torch.Tensor        # M,7; world frame (shared template: env-local), wxyz
     camera_intrinsics: torch.Tensor  # M,3,3
     seeds: torch.Tensor              # M; reproducible per-environment episode seed
 
@@ -3023,7 +3393,7 @@ def _episode_proposals(samples, p, device, dtype, *, support_heights=None):
     """Keep XY/yaw on device; only IDs and static support heights come from metadata."""
     m = len(samples)
     active = np.zeros((m, p), dtype=bool)
-    slots = np.full((m, 30), -1, dtype=np.int64)
+    slots = np.full((m, 10), -1, dtype=np.int64)
     lengths = np.fromiter((len(s.active_ids) for s in samples), dtype=np.int64, count=m)
     rows = np.repeat(np.arange(m), lengths)
     columns = np.arange(len(rows)) - np.repeat(np.cumsum(lengths) - lengths, lengths)
@@ -3101,12 +3471,12 @@ def _initialize_episode_reset(env):
         raise RuntimeError("Cannot determine the physical hand-side F/T compensation subtree.")
     n = env.num_envs
     env.task_scene_data = SceneBatch(
-        object_ids=torch.full((n, 30), -1, device=env.device, dtype=torch.long),
+        object_ids=torch.full((n, 10), -1, device=env.device, dtype=torch.long),
         target_id=torch.zeros(n, device=env.device, dtype=torch.long),
         blocker_id=torch.ones(n, device=env.device, dtype=torch.long),
-        geometry_b=torch.zeros((n, 30, 10), device=env.device),
-        geometry_valid=torch.zeros((n, 30), device=env.device, dtype=torch.bool),
-        observed_ids=torch.full((n, 30), -1, device=env.device, dtype=torch.long),
+        geometry_b=torch.zeros((n, 10, 10), device=env.device),
+        geometry_valid=torch.zeros((n, 10), device=env.device, dtype=torch.bool),
+        observed_ids=torch.full((n, 10), -1, device=env.device, dtype=torch.long),
         lower=lower, upper=upper, upright=upright,
         access_region=torch.zeros((n, 4), device=env.device),
         workspace_bounds=lower.new_tensor((*env.spawn_rules.x_range, *env.spawn_rules.y_range)).expand(n, -1),
@@ -3143,10 +3513,11 @@ def _write_physical_reset(env, ids, object_state, joint_positions, active):
     root[:, :3] += env.scene.env_origins[ids]
     root[:, 7:] = 0
     robot.write_root_state_to_sim(root, env_ids=ids)
-    robot.write_joint_state_to_sim(joint_positions, torch.zeros_like(joint_positions), env_ids=ids)
+    zero_joints = torch.zeros_like(joint_positions)
+    robot.write_joint_state_to_sim(joint_positions, zero_joints, env_ids=ids)
     robot.set_joint_position_target(joint_positions, env_ids=ids)
-    robot.set_joint_velocity_target(torch.zeros_like(joint_positions), env_ids=ids)
-    robot.set_joint_effort_target(torch.zeros_like(joint_positions), env_ids=ids)
+    robot.set_joint_velocity_target(zero_joints, env_ids=ids)
+    robot.set_joint_effort_target(zero_joints, env_ids=ids)
 
 
 def _check_physical_robot_start(env, sample, expected, poses, origin):
@@ -3172,8 +3543,8 @@ def _check_physical_robot_start(env, sample, expected, poses, origin):
         raise RuntimeError(f"Physical robot reset failed collision clearance: {reason}")
 
 
-def _build_episode_batch(env, runtime, ids):
-    """Prepare distinct episodes for selected rows without rendering.
+def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
+    """Prepare checked episodes, or a singleton template for a shared scene round.
 
     Layouts retain independent role/path seeds and device-resident clutter
     packing/repair. IK, pose conversion and PhysX writes are batched.
@@ -3184,6 +3555,10 @@ def _build_episode_batch(env, runtime, ids):
     scene, specs, m = env.task_scene_data, runtime.specs, ids.numel()
     selected = ids.tolist()
     counts = runtime.reset_counts[ids].tolist()
+    if scene_generation is not None:
+        if m != 1:
+            raise ValueError("A shared scene template must be prepared in one environment.")
+        counts = [scene_generation]
     seeds = [_episode_seed(int(env.cfg.seed), index, count) for index, count in zip(selected, counts)]
     streams = [random.Random(seed) for seed in seeds]
     targets = [index for index, spec in enumerate(specs)
@@ -3210,14 +3585,14 @@ def _build_episode_batch(env, runtime, ids):
                                                      for g in env.spawn_geometries])
     batch = EpisodeBatch(
         object_state=default.new_zeros((m, len(specs), 13)),
-        object_ids=torch.full((m, 30), -1, device=env.device, dtype=torch.long),
+        object_ids=torch.full((m, 10), -1, device=env.device, dtype=torch.long),
         active=torch.zeros((m, len(specs)), device=env.device, dtype=torch.bool),
         target_id=torch.tensor([role[0] for role in roles], device=env.device),
         blocker_id=torch.tensor([role[1] for role in roles], device=env.device),
         access_region=default.new_zeros((m, 4)), joint_positions=torch.zeros_like(saved[2]),
-        geometry_b=default.new_zeros((m, 30, 10)),
-        geometry_valid=torch.zeros((m, 30), device=env.device, dtype=torch.bool),
-        observed_ids=torch.full((m, 30), -1, device=env.device, dtype=torch.long),
+        geometry_b=default.new_zeros((m, 10, 10)),
+        geometry_valid=torch.zeros((m, 10), device=env.device, dtype=torch.bool),
+        observed_ids=torch.full((m, 10), -1, device=env.device, dtype=torch.long),
         robot_regions=default.new_zeros((m, 6)), robot_tcp=default.new_zeros((m, 3)),
         visibility=default.new_zeros((m, 2)), camera_pose=default.new_zeros((m, 7)),
         camera_intrinsics=default.new_zeros((m, 3, 3)),
@@ -3317,6 +3692,11 @@ def _build_episode_batch(env, runtime, ids):
                     batch.visibility[accepted_ids] = default.new_tensor([s.visible_fractions for s in accepted_snapshots])
                 pending = [row for row in pending if row not in accepted]
                 if not pending:
+                    if scene_generation is not None:
+                        # Cached camera pose is local; metadata/OBBs already use
+                        # robot-base coordinates and never depend on reset EEF.
+                        batch.camera_pose[:, :3] -= origins[0]
+                        return batch, samples[0]
                     return batch
             failures = [(selected[row], errors[row]) for row in pending[:3]]
             raise RuntimeError(f"Independent episode preparation exhausted retries: {failures}")
@@ -3336,8 +3716,14 @@ def _build_episode_batch(env, runtime, ids):
 
 
 def apply_episode_batch(env, ids, batch):
-    """Commit independent episodes by selected row, without host reads or env loops."""
+    """Commit episodes by selected row, without host reads or env loops."""
     runtime, scene = env._episode_reset, env.task_scene_data
+    runtime.mdp_reset_scene = None
+    shelf = env.scene["shelf"]
+    shelf_state = shelf.data.default_root_state[ids].clone()
+    shelf_state[:, :3] += env.scene.env_origins[ids]
+    shelf_state[:, 7:] = 0
+    shelf.write_root_state_to_sim(shelf_state, env_ids=ids)
     _write_physical_reset(env, ids, batch.object_state, batch.joint_positions, batch.active)
     for name in ("object_ids", "target_id", "blocker_id", "access_region", "geometry_b", "geometry_valid", "observed_ids"):
         getattr(scene, name)[ids] = getattr(batch, name)
@@ -3350,14 +3736,90 @@ def apply_episode_batch(env, ids, batch):
     env.sim.forward()
 
 
+def _shared_reset_batch(env, runtime, ids, template, sample):
+    """Broadcast frozen vision/layout and sample fresh continuous EEF starts.
+
+    Only IK failures are retried. No layout generation or visibility query is
+    performed here; accepted starts are retained while failed rows resample.
+    """
+    count = ids.numel()
+    # Layout/vision are read-only inputs to the native writers. Materialize only
+    # fields changed below; those writers copy the remaining broadcast views.
+    batch = EpisodeBatch(**{f.name: getattr(template, f.name).expand(
+        count, *getattr(template, f.name).shape[1:]) for f in fields(EpisodeBatch)})
+    for name in ("camera_pose", "joint_positions", "robot_regions", "robot_tcp"):
+        setattr(batch, name, getattr(batch, name).clone())
+    batch.camera_pose[:, :3] += env.scene.env_origins[ids]
+    reset_keys = torch.stack((ids, runtime.reset_counts[ids]), -1).cpu().tolist()
+    seeds = [_episode_seed(int(env.cfg.seed), index, reset_count)
+             for index, reset_count in reset_keys]
+    batch.seeds = torch.tensor(seeds, device=env.device, dtype=torch.long)
+    cache = getattr(runtime, "shared_inputs", None)
+    if cache is None or cache.template is not template or cache.sample is not sample:
+        cache = SimpleNamespace(template=template, sample=sample, proposals=_episode_proposals(
+            [sample], len(runtime.specs), env.device, batch.object_state.dtype,
+            support_heights=runtime.support_heights), robot=None)
+    pending = list(range(count))
+    for attempt in range(env.cfg.initial_vision.max_layout_attempts):
+        tensor_starts = torch.device(env.device).type == "cuda"
+        starts = _sample_robot_starts(
+            env, [sample] * len(pending), [seeds[row] + 7_919 * (attempt + 1) for row in pending],
+            scene_cache=cache, return_tensors=tensor_starts)
+        if tensor_starts:
+            result, regions = starts
+            rows = torch.tensor(pending, device=env.device)
+            accepted = result[:, -1] > 0
+            for name, value in (("joint_positions", result[:, :-5]), ("robot_regions", regions),
+                                ("robot_tcp", result[:, -5:-2])):
+                destination = getattr(batch, name)
+                destination[rows] = torch.where(accepted[:, None], value, destination[rows])
+            # One final transfer per bounded search, after all proposal chunks;
+            # only rare failures enter the host retry list. Accepted tensor
+            # rows never travel through per-environment Python tuples/stacks.
+            attempts = result[:, -1].to(torch.long).cpu().tolist()
+            pending = [row for row, chosen in zip(pending, attempts) if chosen == 0]
+        else:
+            accepted = [index for index, start in enumerate(starts) if start is not None]
+            if accepted:
+                rows = torch.tensor([pending[index] for index in accepted], device=env.device)
+                for name, column in (("joint_positions", 0), ("robot_regions", 1), ("robot_tcp", 2)):
+                    getattr(batch, name)[rows] = torch.stack([
+                        torch.as_tensor(starts[index][column], device=env.device, dtype=batch.object_state.dtype)
+                        for index in accepted])
+            pending = [row for row, start in zip(pending, starts) if start is None]
+        if not pending:
+            runtime.shared_inputs = cache
+            return batch
+    raise RuntimeError(f"Shared scene robot-start search exhausted retries for {len(pending)} environments.")
+
+
 @torch.no_grad()
 def reset_scene(env, env_ids=None):
-    """One native reset path: new scene, robot and initial image for each selected env."""
+    """Restore a shared scene, with freshly randomized robot starts on every reset."""
     ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
     if ids.numel() == 0:
         return
     if ids.ndim != 1 or ids.dtype != torch.long:
         raise ValueError("Native reset IDs must be a one-dimensional int64 tensor.")
     runtime = _initialize_episode_reset(env)
-    batch = _build_episode_batch(env, runtime, ids)
+    refresh = (not hasattr(runtime, "shared_template")
+               or env.common_step_counter >= runtime.next_scene_step)
+    if refresh:
+        if ids.numel() != env.num_envs:
+            raise RuntimeError("A shared scene can only change when all environments reset together.")
+        generation = getattr(runtime, "scene_generation", -1) + 1
+        # Only env_0 stages the new layout/vision. All environments are resetting
+        # at this boundary. A singleton physical check validates model/PhysX FK.
+        template, sample = _build_episode_batch(
+            env, runtime, torch.zeros(1, device=env.device, dtype=torch.long), scene_generation=generation)
+    else:
+        template, sample = runtime.shared_template, runtime.shared_sample
+    batch = _shared_reset_batch(env, runtime, ids, template, sample)
     apply_episode_batch(env, ids, batch)
+    if refresh:
+        runtime.shared_template, runtime.shared_sample = template, sample
+        runtime.scene_generation = generation
+        runtime.scene_start_step = env.common_step_counter
+        runtime.next_scene_step = env.common_step_counter + env.max_episode_length
+    runtime.mdp_reset_scene = env.task_scene_data
+    runtime.mdp_reset_ids = env_ids

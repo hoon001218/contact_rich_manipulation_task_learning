@@ -23,6 +23,9 @@ from ....mdp.observations import SI_200_8_RANGES, SI_200_8_RESOLUTION
 from .model import ContactManipulationPolicy, ModelCfg, build_policy_masks
 
 
+ACTION_CONTRACT = "isaaclab_min_osc_variable_kp_joint_position_to_limits_v1"
+
+
 class NativeContactActor(nn.Module):
     """Expose the research policy through the RSL-RL model interface.
 
@@ -42,6 +45,7 @@ class NativeContactActor(nn.Module):
         output_dim: int,
         model_cfg: dict | ModelCfg | None = None,
         max_forward_batch_size: int = 512,
+        compile_model: bool = False,
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         stochastic: bool = False,
@@ -64,7 +68,16 @@ class NativeContactActor(nn.Module):
         self.obs_dim = self.cfg.observation_dim
         self.output_dim = output_dim
         self.max_forward_batch_size = max_forward_batch_size
+        if type(compile_model) is not bool:
+            raise ValueError("compile_model must be a Boolean.")
+        self.compile_model = compile_model
         self.policy = ContactManipulationPolicy(self.cfg)
+        # Keep the registered research model/checkpoint keys unchanged. Only
+        # the pure tensor chunk call is compiled, lazily on its first CUDA use.
+        # CUDA graphs are disabled: native rollout uses inference_mode whereas
+        # PPO updates require gradients, and shared graph replay cannot safely
+        # cross those contexts in the pinned PyTorch version.
+        self._compiled_forward = None
         self._normal: torch.distributions.Normal | None = None
         self._entropy: Tensor | None = None
         self._entropy_noise: Tensor | None = None
@@ -78,13 +91,29 @@ class NativeContactActor(nn.Module):
             raise ValueError(f"Expected a batched policy observation with width {self.obs_dim}.")
         return observation
 
+    def _forward_chunk(self, observation: Tensor) -> tuple[Tensor, Tensor]:
+        return self.policy(observation, masks=build_policy_masks(observation, self.cfg))
+
     def _forward_policy(self, observation: Tensor) -> tuple[Tensor, Tensor]:
         leading = observation.shape[:-1]
         flattened = observation.reshape(-1, self.obs_dim)
         if not flattened.shape[0]:
             raise ValueError("The research model requires a nonempty observation batch.")
+        forward = self._forward_chunk
+        if self.compile_model and flattened.is_cuda:
+            if self._compiled_forward is None:
+                self._compiled_forward = torch.compile(
+                    self._forward_chunk, fullgraph=True, dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+            forward = self._compiled_forward
+        if flattened.shape[0] <= self.max_forward_batch_size:
+            # The standard 1024-environment rollout already fits one forward.
+            # Do not copy its actor/value outputs through singleton cat calls.
+            means, values = forward(flattened)
+            return means.reshape(*leading, self.output_dim), values.reshape(*leading, 1)
         results = [
-            self.policy(chunk, masks=build_policy_masks(chunk, self.cfg))
+            forward(chunk)
             for chunk in flattened.split(self.max_forward_batch_size)
         ]
         return (
@@ -250,6 +279,9 @@ class NativeContactCritic(nn.Module):
         flattened = observation.reshape(-1, self.obs_dim)
         if not flattened.shape[0]:
             raise ValueError("The research model requires a nonempty observation batch.")
+        if flattened.shape[0] <= self.max_forward_batch_size:
+            values = self.policy.value(flattened, masks=build_policy_masks(flattened, self.cfg))
+            return values.reshape(*observation.shape[:-1], 1)
         values = [
             self.policy.value(chunk, masks=build_policy_masks(chunk, self.cfg))
             for chunk in flattened.split(self.max_forward_batch_size)
@@ -323,6 +355,7 @@ class ContactManipulationPPO(PPO):
             "model_cfg": asdict(actor.policy.cfg),
             "force_torque": {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES,
                              "resolution": SI_200_8_RESOLUTION},
+            "action_contract": ACTION_CONTRACT,
         }
         return algorithm_class(
             actor, critic, storage, device=device, checkpoint_metadata=metadata,
@@ -333,6 +366,14 @@ class ContactManipulationPPO(PPO):
         """Bootstrap time limits from the preserved final observation before reset."""
         native_extras = dict(extras)
         time_outs = native_extras.pop("time_outs", None)
+        time_outs_possible = native_extras.pop("time_outs_possible", None)
+        if time_outs_possible is False:
+            # The native shared-round termination term certifies this from
+            # host counters before reset can move its deadline. Even physical
+            # failures need no critic evaluation when no timeout is possible.
+            # Missing metadata retains generic final-state bootstrapping.
+            super().process_env_step(obs, rewards, dones, native_extras)
+            return
         if time_outs is not None:
             time_outs = time_outs.to(device=self.device, dtype=torch.bool)
             terminated = extras.get("terminated")
@@ -455,15 +496,21 @@ class ContactManipulationPPO(PPO):
         return dict(zip(names, (totals / max(updates, 1)).tolist()))
 
     def save(self):
-        """Add observation and physical sensor semantics to native checkpoint fields."""
+        """Add observation, physical sensor, and action semantics to native fields."""
         saved = super().save()
         saved["research_metadata"] = deepcopy(self.checkpoint_metadata)
         return saved
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
-        """Reject incompatible observation/F/T profiles before changing any weights."""
+        """Reject incompatible actions and observation/F/T profiles before loading."""
         metadata = loaded_dict.get("research_metadata")
-        if metadata is None or metadata != self.checkpoint_metadata:
+        if not isinstance(metadata, Mapping) or metadata.get("action_contract") != ACTION_CONTRACT:
+            raise ValueError(
+                "Checkpoint action contract is missing or differs from the native Isaac Lab OSC "
+                "and joint-position-to-limits actions. Previous custom-action checkpoints have "
+                "different 18D action semantics; start a new training run."
+            )
+        if metadata != self.checkpoint_metadata:
             raise ValueError(
                 "Checkpoint observation layout/model configuration or F/T sensor profile is missing or differs "
                 "from this model."

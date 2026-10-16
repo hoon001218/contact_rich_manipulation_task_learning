@@ -12,7 +12,9 @@ from .model import ModelCfg
 class ContactActorCfg:
     class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactActor"
     model_cfg: dict = asdict(ModelCfg())
-    max_forward_batch_size: int = 1024
+    max_forward_batch_size: int = 8192
+    # Inductor fuses the unchanged FP32 model/mask math; no CUDA graph replay.
+    compile_model: bool = True
     obs_normalization: bool = False
     distribution_cfg: dict = {"class_name": "tanh_gaussian", "init_std": ModelCfg().initial_std}
     # Compatibility with Isaac Lab's native RSL-RL configuration migration.
@@ -22,7 +24,7 @@ class ContactActorCfg:
 @configclass
 class ContactCriticCfg:
     class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactCritic"
-    max_forward_batch_size: int = 1024
+    max_forward_batch_size: int = 8192
     obs_normalization: bool = False
     distribution_cfg: dict | None = None
     stochastic: bool = False

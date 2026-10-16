@@ -4,10 +4,3 @@ from .events import MdpCfg, SceneBatch, SensorBatch, SpawnRules, RobotStartRules
 from .observations import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403
-
-
-def __getattr__(name):
-    if name in ("ArmOscActionCfg", "HandPositionActionCfg"):
-        from . import actions
-        return getattr(actions, name)
-    raise AttributeError(name)

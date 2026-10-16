@@ -38,7 +38,7 @@ from contact_manipulation.config.ur5e.agents.model import (
     ContactManipulationPolicy, build_policy_masks,
 )
 from contact_manipulation.config.ur5e.agents.model import ModelCfg, _masked_softmax
-from contact_manipulation.config.ur5e.agents.ppo import ContactManipulationPPO
+from contact_manipulation.config.ur5e.agents.ppo import ACTION_CONTRACT, ContactManipulationPPO
 from contact_manipulation.mdp.observations import SI_200_8_RANGES, SI_200_8_RESOLUTION
 
 
@@ -101,7 +101,7 @@ class ModelTests(unittest.TestCase):
         return self.model(values, masks=self.masks(values))
 
     def test_default_observation_layout_excludes_mask_channels(self):
-        self.assertEqual(ModelCfg().observation_dim, 444)
+        self.assertEqual(ModelCfg().observation_dim, 244)
         self.assertEqual(asdict(ModelCfg())["history_steps"], 2)
         self.assertEqual(asdict(ModelCfg())["activation"], "relu")
         self.assertFalse(any(isinstance(module, torch.nn.SiLU) for module in self.model.modules()))
@@ -614,6 +614,7 @@ class NativeLearningTests(unittest.TestCase):
         self.assertEqual(len(actual), len({id(value) for value in actual}))
         saved = algorithm.save()
         self.assertEqual(saved["research_metadata"]["force_torque"], {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES, "resolution": SI_200_8_RESOLUTION})
+        self.assertEqual(saved["research_metadata"]["action_contract"], ACTION_CONTRACT)
         self.assertIn("policy.critic.weight", saved["actor_state_dict"])
         self.assertEqual(saved["critic_state_dict"], {})
 
@@ -754,9 +755,6 @@ class NativeLearningTests(unittest.TestCase):
     def test_checkpoint_semantics_are_checked_before_loading_weights(self):
         algorithm, _ = make_algorithm()
         variants = []
-        legacy = algorithm.save()
-        del legacy["research_metadata"]
-        variants.append(legacy)
         layout = algorithm.save()
         layout["research_metadata"]["model_cfg"]["observation_layout"] = "legacy_roles"
         variants.append(layout)
@@ -768,6 +766,32 @@ class NativeLearningTests(unittest.TestCase):
                 with self.subTest(metadata=checkpoint.get("research_metadata")), self.assertRaisesRegex(ValueError, "F/T"):
                     algorithm.load(checkpoint)
             load.assert_not_called()
+
+    def test_previous_action_checkpoints_are_rejected_before_loading_weights(self):
+        algorithm, _ = make_algorithm()
+        variants = []
+        unversioned = algorithm.save()
+        del unversioned["research_metadata"]
+        variants.append(unversioned)
+        legacy = algorithm.save()
+        del legacy["research_metadata"]["action_contract"]
+        variants.append(legacy)
+        custom = algorithm.save()
+        custom["research_metadata"]["action_contract"] = "custom_osc_and_bounded_hand_v1"
+        variants.append(custom)
+        before = {name: value.clone() for name, value in algorithm.actor.state_dict().items()}
+        with patch.object(algorithm.actor, "load_state_dict") as actor_load, \
+             patch.object(algorithm.critic, "load_state_dict") as critic_load, \
+             patch.object(algorithm.optimizer, "load_state_dict") as optimizer_load:
+            for checkpoint in variants:
+                with self.subTest(metadata=checkpoint.get("research_metadata")), \
+                     self.assertRaisesRegex(ValueError, "action contract.*native Isaac Lab OSC"):
+                    algorithm.load(checkpoint)
+            actor_load.assert_not_called()
+            critic_load.assert_not_called()
+            optimizer_load.assert_not_called()
+        for name, value in algorithm.actor.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
     def test_inference_policy_uses_same_observable_input(self):
         cfg = runner_config()
@@ -796,6 +820,53 @@ class NativeLearningTests(unittest.TestCase):
             with patch.object(algorithm.actor.policy, "value", wraps=algorithm.actor.policy.value) as value:
                 algorithm.critic(obs)
             self.assertEqual(value.call_count, 1)
+
+    def test_compilation_is_optional_on_cpu_and_does_not_register_checkpoint_wrappers(self):
+        cfg = runner_config()
+        cfg["actor"]["compile_model"] = True
+        algorithm, env = make_algorithm(cfg)
+        with patch.object(torch, "compile", side_effect=AssertionError("CPU must remain eager")):
+            algorithm.act(env.get_observations())
+        self.assertIsNone(algorithm.actor._compiled_forward)
+        self.assertTrue(all(name.startswith("policy.") for name in algorithm.actor.state_dict()))
+        cfg["actor"]["compile_model"] = "yes"
+        with self.assertRaisesRegex(ValueError, "compile_model"):
+            make_algorithm(cfg)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA Inductor model integration")
+    def test_cuda_compilation_preserves_inference_training_gradients_and_checkpoint_keys(self):
+        algorithm, env = make_algorithm(num_envs=4)
+        actor = algorithm.actor.cuda()
+        reference = deepcopy(actor)
+        actor.compile_model = True
+        obs = env.get_observations().to("cuda")
+        keys = list(actor.state_dict())
+        with torch.inference_mode():
+            expected_actions = reference(obs).clone()
+            actions = actor(obs).clone()
+            values = algorithm.critic(obs).clone()
+            torch.testing.assert_close(actions, expected_actions, rtol=1e-4, atol=2e-6)
+            torch.testing.assert_close(values, reference.policy.value(
+                obs["policy"], masks=build_policy_masks(obs["policy"], actor.cfg)).unsqueeze(-1),
+                rtol=1e-4, atol=2e-6)
+        # Native runner alternates inference rollout with gradient-enabled PPO.
+        for candidate in (reference, actor):
+            candidate.zero_grad(set_to_none=True)
+            output = candidate(obs)
+            value = candidate.consume_cached_value(obs)
+            (output.square().mean() + value.square().mean()).backward()
+        for actual, expected in zip(actor.parameters(), reference.parameters()):
+            if expected.grad is not None:
+                torch.testing.assert_close(actual.grad, expected.grad, rtol=3e-3, atol=3e-6)
+        with torch.no_grad():
+            actor.policy.actor.bias.add_(.01)
+            reference.policy.actor.bias.add_(.01)
+        # Repeated inference must see parameter changes and retain prior outputs.
+        with torch.inference_mode():
+            torch.testing.assert_close(actor(obs), reference(obs), rtol=1e-4, atol=2e-6)
+            torch.testing.assert_close(actions, expected_actions, rtol=1e-4, atol=2e-6)
+        self.assertEqual(list(actor.state_dict()), keys)
+        self.assertTrue(all(name.startswith("policy.") for name in keys))
 
     def test_rollout_and_timeout_have_no_tensor_scalar_reads(self):
         algorithm, env = make_algorithm()
@@ -826,6 +897,65 @@ class NativeLearningTests(unittest.TestCase):
         with patch.object(algorithm.critic, "forward") as critic:
             algorithm.process_env_step(obs, torch.ones(4), torch.zeros(4, dtype=torch.long), extras)
         critic.assert_not_called()
+
+    def test_native_round_without_possible_timeouts_skips_terminal_critic_without_scalar_reads(self):
+        algorithm, env = make_algorithm(num_envs=4)
+        obs = env.get_observations()
+        self.transition(algorithm, obs, [2., 7., 1., 3.])
+        rewards = torch.tensor([1., 2., 3., 4.])
+        extras = dict(time_outs=torch.zeros(4, dtype=torch.bool),
+                      time_outs_possible=False, terminated=torch.tensor([False, True, False, True]),
+                      terminal_observation=obs["policy"].clone(), terminal_env_ids=torch.tensor([1, 3]))
+        with patch.object(algorithm.critic, "forward") as critic, \
+             patch.object(torch.Tensor, "__bool__", side_effect=AssertionError("tensor bool")), \
+             patch.object(torch.Tensor, "item", side_effect=AssertionError("tensor item")):
+            algorithm.process_env_step(obs, rewards, torch.tensor([0, 1, 0, 1]), extras)
+        critic.assert_not_called()
+        torch.testing.assert_close(algorithm.storage.rewards[0, :, 0], rewards)
+        self.assertIs(extras["time_outs_possible"], False)
+        self.assertIn("time_outs", extras)
+
+    def test_native_round_boundary_keeps_timeout_final_state_bootstrap(self):
+        algorithm, env = make_algorithm()
+        obs = env.get_observations()
+        self.transition(algorithm, obs, [2., 7.])
+        extras = dict(time_outs=torch.tensor([True, True]), time_outs_possible=True,
+                      terminated=torch.tensor([False, True]), terminal_observation=obs["policy"].clone(),
+                      terminal_env_ids=torch.tensor([0, 1]))
+        with patch.object(algorithm.critic, "forward", return_value=torch.tensor([[4.], [400.]])) as critic:
+            algorithm.process_env_step(obs, torch.ones(2), torch.ones(2, dtype=torch.long), extras)
+        critic.assert_called_once()
+        torch.testing.assert_close(algorithm.storage.rewards[0, :, 0], torch.tensor([4.96, 1.]))
+
+    def test_timeout_host_hint_tracks_scene_boundary_and_external_fallback(self):
+        from contact_manipulation.mdp.terminations import scene_time_out
+
+        env = SimpleNamespace(episode_length_buf=torch.tensor([15, 399]), max_episode_length=400,
+                              common_step_counter=399, extras={}, _episode_reset=SimpleNamespace(
+                                  scene_start_step=0, next_scene_step=400, shared_template=object()))
+        with patch.object(torch.Tensor, "__bool__", side_effect=AssertionError("tensor bool")), \
+             patch.object(torch.Tensor, "item", side_effect=AssertionError("tensor item")):
+            before = scene_time_out(env)
+            self.assertIs(env.extras["time_outs_possible"], False)
+            env.common_step_counter = 400
+            boundary = scene_time_out(env)
+            self.assertIs(env.extras["time_outs_possible"], True)
+            # Reset replaces the deadline but must not change this step's hint.
+            env._episode_reset.scene_start_step = 400
+            env._episode_reset.next_scene_step = 800
+            self.assertIs(env.extras["time_outs_possible"], True)
+            env.common_step_counter = 401
+            env.episode_length_buf.zero_()
+            after = scene_time_out(env)
+            self.assertIs(env.extras["time_outs_possible"], False)
+            del env._episode_reset.scene_start_step
+            env.episode_length_buf[1] = 400
+            fallback = scene_time_out(env)
+            self.assertIs(env.extras["time_outs_possible"], True)
+        torch.testing.assert_close(before, torch.tensor([False, False]))
+        torch.testing.assert_close(boundary, torch.tensor([True, True]))
+        torch.testing.assert_close(after, torch.tensor([False, False]))
+        torch.testing.assert_close(fallback, torch.tensor([False, True]))
 
     def test_actor_rollout_chunks_do_not_change_distribution_or_random_samples(self):
         algorithm, env = make_algorithm(num_envs=7)

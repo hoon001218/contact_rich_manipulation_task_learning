@@ -1,4 +1,9 @@
-"""Train with Isaac Lab's native RSL-RL flow and the research episode clock."""
+"""Follow Sweeping-Policy/min's native RSL-RL flow with the research episode clock.
+
+Keep the example's AppLauncher/Hydra/env/wrapper/runner order. A direct runpy
+launcher would use the stock randomized initial episode counters; this task's
+initial vision, history and elapsed-time reward must all begin at actual reset.
+"""
 
 import argparse
 from datetime import datetime

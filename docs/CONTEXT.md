@@ -3308,3 +3308,1981 @@ seed 0–15의 배치 생성 및 validate_sample을 확인했다. 16/16개 배�
 active 수는 15–18개, 최소 전체 점유율은 35.07%였다. 작성된 catalog도 10종×3개임을 확인했다.
 실제 Isaac Sim의 새 pool 생성·학습 처리량은 아직 측정하지 않았다.
 CPU 결과는 `/tmp/contact_30_objects_cpu.log`에 기록했다.
+
+### 2026-10-14 물체 10개 실험
+
+사용자가 10개로 줄여 실험하도록 요청했다. 물리 pool을 10종×1개로 만들고,
+`SpawnRules`의 min/max_objects=10, all_asset_types=True로 매 episode 정확히 10개를
+배치한다. Target 1개·Blocker 1개·주변 물체 8개이며 종류 중복은 없다.
+1024환경의 물체 rigid body는 10,240개다. 물리 100 Hz·정책 50 Hz는 유지한다.
+
+저장된 실제 USD 형상에서 10종 footprint 합은 0.0711358692 m², 유효 선반 면적은
+0.3256 m²로 전체 점유율은 21.8476%다. 35% 조건을 유지하면 모든 reset이 실패하므로
+이번 10개 실험의 전체 최소 점유율은 20%로 조정했다. 선반 영역, 지역별 10% 점유율,
+Target/Blocker 조건, 재배치 공간, 가시율 기준은 유지했다. 이 변경은 물체 수와 함께
+장면 밀집도를 낮추므로 단순한 동일 작업량 최적화로 해석하지 않는다.
+
+MDP/reset/vision/GNN 슬롯은 10개로 통일했고 observation은 10×10+2×72=244D다.
+이전 30/40-slot checkpoint는 기본 resume/play와 호환되지 않는다.
+README와 기존 검사 fixture를 갱신했으며 파일은 추가하지 않았다.
+
+검증: CPU 검사 180개 중 172개 통과, Isaac Sim/CUDA 검사 8개 skip
+(`/tmp/contact_10_objects_cpu.log`). 실제 USD에서 추출해 저장한 catalog로 seed 0–31의
+배치 생성 및 validate_sample을 실행해 32/32 통과했다. 모두 10종·10개이며 전체 점유율
+21.85%, 지역별 점유율 최솟값 10.55%였다. 작성된 scene catalog도 10종×1개임을 확인했다.
+이번 검증은 배치 생성과 CPU 모델/MDP에 대한 것이며 실제 Isaac Sim 실행, IK/vision을
+포함한 전체 reset 및 학습 처리량은 아직 재측정하지 않았다.
+
+### 2026-10-14 물체 축소 후 병목 재계측: 로봇 물리와 반복 COM 조회
+
+사용자는 물체 30→10개 변경의 효과가 작다며 현재 느린 원인 분석을 요청했다.
+Production 동작은 변경하지 않고 `/tmp`의 native train 복사본에 함수별 inclusive/exclusive
+wall timer, cProfile, PyTorch CPU/CUDA trace 및 일시적인 COM-cache 비교를 추가했다.
+
+최근 사용자 로그에서 첫 iteration을 제외한 30개 실행(19-18-24, 5회)은 평균 4.004초,
+10개 실행(19-32-12, 6회)은 3.772초였다. 둘 다 1024환경·100 Hz physics·50 Hz policy다.
+약 5.8% 차이지만 배치·밀집도·학습 궤적이 다르고 timeout 전 짧은 구간이므로 엄밀한
+동일 작업량 비교나 장기 평균으로 해석하지 않는다.
+
+RTX 3090에서 현재 10개 설정으로 16 iteration을 계측했다. 첫 warm-up iteration과
+cProfile을 켠 index 2를 제외한 14회 평균은 3.995초(collection 3.116, PPO 0.879)였다.
+대량 timeout이 발생한 index 12를 추가로 제외한 13회 평균은 3.748초다.
+그 구간의 주요 inclusive 시간/iteration은 다음과 같다. 일부 중첩되므로 합산하지 않는다.
+
+| 구간 | 시간 |
+|---|---:|
+| Physics step (64회) | 1.299 s |
+| PhysX fetch_results (physics 내부) | 1.280 s |
+| PPO update | 0.880 s |
+| Arm apply / action process | 0.391 / 0.107 s |
+| OSC Jacobian 준비 (arm apply 내부) | 0.236 s |
+| OSC.compute (arm apply 내부) | 0.055 s |
+| MDP 기하·상태·센서 읽기 | 0.422 s |
+| Scene update | 0.190 s |
+| Contact buffer 읽기/갱신 (위 센서/scene 구간에 포함) | 0.179 s |
+| MDP.advance | 0.100 s |
+| 소규모 reset 전체 | 0.102 s |
+
+Index 12의 iteration은 7.209초, reset 3.579초였다. Reset 내부는 vision 1.937초,
+배치 생성 0.567초, IK 0.864초다. 다른 iteration의 vision 비용은 평균 0.013초였다.
+따라서 ray casting은 대량 reset spike의 주요 요소지만 평상시 step 병목 전체를 설명하지 않는다.
+
+Native 자원 수: 로봇당 41 rigid bodies·18 joints, 환경당 27 sensors(17 tactile,
+9 forbidden-contact, 1 frame transformer). 물체 10개로 줄여도 로봇 링크만 41,984개다.
+Contact 실제 읽기/갱신은 정상 iteration당 1120회(17×32 + 9×64)이며 각 호출은
+1024환경을 tensor로 처리한다. 환경별 Python loop가 아니라 센서별 SDK 호출·buffer 연산이다.
+
+별도 GPU trace는 실제 env.step 4회(physics 8회)를 측정했다. kernel duration 합에서
+가장 큰 단일 항목은 `artiSolveInternalConstraintsTGS1T` 39.818 ms/144회였다.
+144=8×(position 16 + velocity 2)로 현재 solver 설정의 반복이 trace에 나타난다.
+그 외 `convexPlaneNphase_Kernel` 21.835 ms, `solveBlockUnified` 11.339 ms,
+`artiPropagateImpulses2TGS` 10.295 ms, `stepArticulation1TTGS` 9.469 ms였다.
+Kernel 누적 시간은 overlap·계측 overhead가 있어 전체 wall-time 분해와 같지 않다.
+Physics 직전 CUDA synchronize를 넣은 16 policy step 진단에서 선행 CUDA 대기는
+합계 1.63 ms, physics.step은 669.15 ms였다. Fetch 비용의 대부분을 앞선 정책/제어의
+미완료 GPU 작업 탓으로 돌릴 근거는 없었다.
+
+구체적인 불필요 조회 후보도 확인했다. 현재 SDK의 `ArticulationData.body_com_pose_b`는
+simulation timestamp마다 `root_physx_view.get_coms().to(device)`를 호출한다.
+Runtime에서 get_coms 반환은 CPU, shape [1024,41,7]이었다. 우리 OSC의 TCP Jacobian
+COM→link 보정과 MDP의 world COM 계산이 이 경로를 사용한다. 움직이는 world COM은
+매번 갱신해야 하지만 link-local COM은 mass/COM randomization이 없는 현재 구성에서는
+고정이다. 모든 링크의 고정 COM 정보를 CPU에서 읽고 GPU로 복사하는 비용이 반복된다.
+
+임시 프로세스 안에서 native/cached/native/cached를 16 step씩 교대로 실행했다.
+Reset은 모두 0회였고 local COM 값이 끝까지 동일함을 확인했다.
+Native 1.423/1.468초, cached 1.248/1.305초로 평균 env.step 시간은 1.446→1.276초,
+약 11.7% 감소했다. 32 step 환산 약 0.339초의 후보 절감이며 PPO·전체 학습 개선율이 아니다.
+연속된 서로 다른 물리 구간의 짧은 비교이므로 같은 초기 상태 replay 및 관측/토크 동등성,
+mass/COM 변경 시 invalidation 검증이 정식 적용 전에 필요하다. SDK/production에는
+캐시 패치를 적용하지 않았다.
+
+다음 우선순위는 고정 local COM 재조회 제거, articulation solver 16/2 비용과 접촉 정확도의
+비교, sensor별 반복 SDK 호출/작은 kernel 집계, 대량 reset vision/IK 순이다.
+PPO 자체도 약 0.88초이므로 물체 수 또는 ray casting만 줄여 1–2초를 보장할 수 없다.
+
+자료: `/tmp/contact_detailed_profile.py`, `/tmp/contact_detailed_10_1024.{json,log}`,
+`/tmp/contact_detailed_10_1024_cpu.txt`, `/tmp/contact_trace_profile.py`,
+`/tmp/contact_trace10_1024_trace.json`, `/tmp/contact_trace10_1024_torch.txt`,
+`/tmp/contact_trace10_1024_com_ab.json`, `/tmp/contact_trace10_1024_fenced.json`.
+첫 실행은 16 iteration 수집 후 추가 trace를 inference_mode 없이 호출한 임시 계측 오류로
+종료코드 1이었다. Trace/비교 함수를 inference_mode로 수정한 두 번째 실행은
+3 iteration 및 trace·대기 분리·COM 비교까지 완료하고 종료코드 0이었다.
+
+### 2026-10-14 — Tactile 17개 링크의 ContactSensor 통합
+
+사용자 요청: 링크별 17D 접촉 observation을 유지하며 native ContactSensor를 묶고,
+자세/금지 접촉용 센서도 통합 가능한지 확인한다.
+
+`UR5eContactSceneCfg.tactile_contact` 하나가 정확한 17개 링크 이름의 regex로 body view를
+생성한다. `SensorReader`는 초기화 때 `find_bodies(..., preserve_order=True)`로
+`TACTILE_BODY_NAMES` 순서의 GPU index를 저장한다. 매 측정은 native `[N,17,3]`를 한 번
+읽고 `index_select`로 정렬한다. 기존 0.01 N binary 판정, 유효성 처리, 17D observation,
+부분 reset 규칙은 유지한다. Native body 순서가 observation 순서와 실제로 달랐으므로
+이 명시적인 정렬이 필요하다. 새 production 파일은 추가하지 않았다.
+
+금지 접촉 9개는 유지한다. 현재 checkout의 공식 ContactSensor 문서는 상대별 force
+filter를 one-to-many로 제한한다. 각 arm/spacer body가 선반·물체·바닥과 접촉한 힘을
+상대별/physics substep별로 검사하는 현재 의미를 보존하려면 개별 sensor가 필요하다.
+Unfiltered `[N,9,3]`로 묶는 것은 가능하지만 상대별 힘의 상쇄와 접촉 상대 구분 때문에
+현재 failure 판정과 같지 않다. 초기 IK의 기하 충돌 검사는 이 물리 contact history와 별개다.
+근거: `IsaacLab/source/isaaclab/isaaclab/sensors/contact_sensor/contact_sensor.py`의
+class docstring, `IsaacLab/scripts/tutorials/04_sensors/contact_sensor.py`의 grouped hind feet.
+
+검증:
+- CPU suite: 181 tests, 173 통과·8 skip. 링크 순서를 뒤집은 native buffer fixture에서
+  canonical 17채널 복원, 일부 환경 reset, nonfinite 측정, 반대 방향 partner force 검사 통과.
+- Native GPU 4환경: 통합 sensor와 기존 방식의 17개 reference sensor를 동일 scene에
+  붙여 실제 물체 접촉을 비교했다. 17채널 모두 nonzero 접촉을 경험했고 34 physics samples의
+  힘 차이 최댓값 0.0, binary 판정 동일. 환경 1·3 reset 후 0·2 측정값 유지 확인.
+- 임시 검증 자료: `/tmp/contact_grouped_validation.py`,
+  `/tmp/contact_grouped_validation.json`, `/tmp/contact_grouped_validation.log`.
+
+1024환경·물체10개·100Hz physics/50Hz policy에서 16 iteration 학습도 종료코드 0으로
+완료했다. 초기화/의도적 cProfile iteration(0·2)을 제외한 14회 평균은 3.965초였고,
+이전 17개 센서 실행의 3.995초와 큰 차이는 없었다. 대량 reset(index12)은 7.167초였다.
+대량 reset도 제외한 13회 평균은 3.719초(이전 3.748초)다. 짧은 별도 실행의 비교이므로
+전체 iteration 개선율을 안정적인 수치로 단정하지 않는다.
+
+변경의 직접적인 효과는 정상 iteration당 native contact buffer update가 1120→608회,
+접촉 buffer 구간 평균 0.179→0.143초, 전체 SensorReader 구간 0.126→0.044초였다.
+두 구간은 일부 중첩되므로 절감 시간을 합산하면 안 된다. Scene sensor 인스턴스는
+27→11개(1 tactile, 9 forbidden, 1 frame transformer)이고 실제 물리 링크 수는 그대로다.
+전체 학습 속도의 주요 병목인 물리·PPO·대량 reset은 이 변경으로 해결되지 않는다.
+자료: `/tmp/contact_grouped_profile.py`, `/tmp/contact_grouped_1024.json`,
+`/tmp/contact_grouped_1024.log`, `/tmp/contact_grouped_1024_meta.json`.
+
+### 2026-10-14 — 금지 접촉 센서 제거 및 선반 pose 기반 실패 판정
+
+사용자는 arm/spacer 접촉 자체를 실패로 볼 필요가 없으며, 선반이 움직인 결과로 종료하기로
+결정했다. 기준은 초기 위치 대비 1 cm 또는 초기 회전 대비 2° **초과**다.
+
+- `ForbiddenContactSensor`와 관련 9개 scene sensor, 상대 필터 생성, history 읽기/집계,
+  SensorBatch의 forbidden flag, 상수 및 사용하지 않는 helper를 제거했다.
+- 선반은 native `RigidObjectCfg`로 변경하고 kinematic을 해제했다. 중력과 원본 collision을
+  사용한다. 질량은 `examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/shelf_sweep_env_cfg.py`
+  의 설정과 같은 100 kg이며, 실측 질량은 아니다. 관성은 PhysX의 collider 기반 계산을 쓴다.
+- 실제 USD는 `/Rack/rack`에 RigidBodyAPI 하나가 있고 MassAPI는 없었다. 현재 SDK의
+  UsdFileCfg.mass_props는 기존 MassAPI만 수정하므로 단순 설정 시 경고와 함께 미적용되어
+  PhysX 질량이 35.8 kg이었다. 기존 scene.py에 작은 spawn_shelf adapter를 두고 native
+  spawn_from_usd + define_mass_properties를 호출해 명시적으로 적용했다. 원본 USD는 수정하지
+  않으며, 최종 PhysX에서 100 kg을 확인했다.
+- `TransitionBatch.shelf_pose` [N,7]와 `TaskState.initial_shelf_pose`를 사용한다.
+  초기 pose는 reset에서 해당 환경 행만 저장한다. GPU에서 위치 차이 제곱합과 normalized
+  quaternion 내적의 절댓값을 비교한다. 각도 계산의 acos 없이 2° 기준을 검사하고 q/-q를
+  동일 회전으로 취급한다. Nonfinite/zero quaternion은 invalid-state 실패다.
+- 기존 failure reason slot 5를 shelf displacement로 교체했다. 실패 보상 -100과 실패 우선
+  terminal 처리는 그대로다. Shelf pose는 privileged 종료 판정에만 쓰며 observation에
+  추가하지 않는다. OSC pose 제어와 F/T·17채널 tactile 입력도 그대로다.
+- apply_episode_batch에서 선반 pose를 default_root_state + env_origin으로 복원하고 속도를
+  0으로 만든다. 빌드 중에는 선반을 쓰지 않으므로 후보 생성 실패 시에도 원래 상태가 유지된다.
+  초기 pose reference와 다른 환경의 상태는 부분 reset으로 변경되지 않는다.
+- Scene sensor는 2개(tactile 통합 + EEF frame)이며, UR5e contact-report 활성화도 제거했다.
+  Self-collision 설정/초기 IK의 기하 검사는 이 변경의 대상이 아니다.
+
+검증:
+- CPU suite 182 tests: 174 통과, 8 skip. 위치·회전 임계값 양쪽, q/-q 및 normalization,
+  nonfinite pose, env별 실패/보상, 초기 pose 부분 갱신, 물리 reset의 선택 행/속도 복원 검증.
+- CUDA transition graph와 eager 결과 및 부분 reset 일치 테스트 1개 통과.
+- Native 4환경에서 8초간 초기 선반의 최대 이동 약 0.0132 mm로 1 cm 미만.
+  위치 2 cm/회전 3° 주입 시 해당 두 환경만 shelf failure flag가 켜지고 -100 적용 확인.
+  Native manager 부분 reset에서 다른 환경 pose/reference 유지와 선택 행 속도 0 확인.
+- 동적 응답 추가 검사: 한 환경에 2 m/s 초기 속도를 주고 0.2초 후 약 6.11 cm 이동 확인.
+  최초 짧은 1 m/s·0.05초 검사에서는 1 cm 이동을 넘는다는 임시 테스트 가정이 실패했으며,
+  더 긴 검사에서 실제 pose와 velocity를 함께 확인했다. 초기 설정을 kinematic으로 남긴
+  상태는 아니다. 마지막 native 검증은 종료코드 0.
+- 자료: `/tmp/contact_shelf_inspect.log`, `/tmp/contact_shelf_validation.py`,
+  `/tmp/contact_shelf_validation.json`, `/tmp/contact_shelf_validation.log`,
+  `/tmp/shelf_cpu_tests.log`, `/tmp/shelf_cuda_tests.log`.
+
+최종 1024환경·물체10개·100/50 Hz에서 16 iteration 학습이 종료코드 0으로 완료됐다.
+Scene sensor 수는 2개다. 일반 iteration당 contact buffer 조회는 608→32회,
+해당 구간 평균 0.143→0.0167초로 줄었다. Warmup과 cProfile 구간(0·2)을 제외한
+14회 평균은 3.735초(직전 통합 tactile+9 forbidden 실행 3.965초)였고,
+대량 reset(index12)도 제외한 13회 평균은 3.479초(이전 3.719초)였다.
+대량 reset iteration은 7.056초, reset 자체 3.620초다. 서로 다른 짧은 실행의 비교이며
+센서 제거뿐 아니라 선반 동역학/종료 조건이 달라졌으므로 엄밀한 동일 trajectory A/B는 아니다.
+일반 collection 2.603초, PPO 0.876초, physics.step 누적 1.289초로 전체 1–2초 목표에는
+추가 병목 개선이 필요하다. 자료: `/tmp/contact_shelf_profile.py`,
+`/tmp/contact_shelf_1024.json`, `/tmp/contact_shelf_1024.log`.
+
+### 2026-10-14 — 센서 제거 후 1024환경 단계별 상세 프로파일
+
+사용자 요청에 따라 학습 로직 변경 없이 실행 단계별 inclusive/self wall time과 호출 수를 계측했다.
+
+조건: RTX 3090, PyTorch 2.7.0+cu128, CPU torch threads=8, 1024환경, 환경당 물체10개,
+로봇41 bodies, 센서2개, dynamic 선반100 kg, physics100 Hz/policy50 Hz,
+rollout32 step, PPO4 epochs×4 minibatches. 한 iteration은 32,768 transitions와
+64회의 병렬 physics step이다. 아래 초 단위 수치는 한 환경/step이 아니라 iteration 합계다.
+
+첫 32회 실행에서는 iteration3에 cProfile, iteration5에 torch CPU/CUDA profiler를 사용했다.
+프로파일 후 PPO 시간이 약1.1초로 달라져, 프로파일러를 전혀 켜지 않는 새 프로세스로
+동일한 32회 실행을 별도로 수행했다. 최종 시간 표는 두 번째 실행의 perf_counter 계측만 사용한다.
+두 실행 모두 정상 종료했다. CUDA 이벤트/커널 분석은 첫 실행의 진단 자료로만 사용한다.
+
+두 번째 실행: warmup(0)을 제외한 31회 평균 **3.877초**. 대량 reset iteration
+12·24(각 iteration 합계1006·993환경 reset)를 분리한 일반29회 평균 **3.646초**,
+중앙값3.613초, 범위3.361–4.160초다. 일반 iteration도 평균2.9회의 소규모 reset 호출을 포함한다.
+대량 reset 2회 평균7.218초(7.124–7.311초)다. Native collect_time+learn_time 기준으로
+logger/checkpoint는 포함하지 않으며, logger 자체는 평균0.0079초였다.
+
+아래 행은 서로 겹치지 않는다. 하위 단계 표는 상위 행에 포함되므로 다시 더하지 않는다.
+
+| 일반 iteration 단계 | 평균 초 | 비중 |
+|---|---:|---:|
+| 물리 simulation / PhysX | 1.2882 | 35.3% |
+| PPO update + GAE | 0.9090 | 24.9% |
+| Action 처리 + OSC/hand 제어 | 0.5356 | 14.7% |
+| MDP 상태 읽기·공통 보상/종료 계산 | 0.4590 | 12.6% |
+| 소규모 reset | 0.1753 | 4.8% |
+| Rollout 정책 추론 | 0.1193 | 3.3% |
+| Scene write/update | 0.1008 | 2.8% |
+| Reward/observation manager 반환 | 0.0171 | 0.5% |
+| Wrapper·storage·NaN 검사·runner bookkeeping 등 | 0.0418 | 1.1% |
+
+제어 상세(0.5356초에 포함):
+
+| 단계 | 평균 초 | 호출/iteration |
+|---|---:|---:|
+| action.process | 0.1215 | 32 |
+| action.apply/arm.apply/osc.ee_jacobian | 0.2381 | 64 |
+| action.apply/arm.apply/osc.ee_jacobian/data.local_com | 0.1826 | 64 |
+| action.apply/arm.apply/osc.compute | 0.0566 | 64 |
+| action.apply/arm.apply/osc.dynamic_quantities | 0.0277 | 64 |
+| action.apply/hand.apply | 0.0118 | 64 |
+
+MDP 상세(0.4590초에 포함):
+
+| 단계 | 평균 초 |
+|---|---:|
+| mdp.read_transition | 0.3137 |
+| mdp.read_transition/data.world_com | 0.1919 |
+| mdp.read_transition/data.world_com/data.local_com | 0.1821 |
+| mdp.read_transition/data.object_com | 0.0593 |
+| mdp.read_transition/sensors.read | 0.0277 |
+| mdp.read_transition/sensors.read/tactile.read | 0.0165 |
+| mdp.advance | 0.1197 |
+| mdp.advance/mdp.conditions | 0.0605 |
+| mdp.advance/mdp.reward_components | 0.0172 |
+| mdp.advance/mdp.projected_areas | 0.0097 |
+| mdp.eef_geometry | 0.0121 |
+
+Native termination manager 호출이 공통 MDP 갱신을 처음 수행하므로, 이 구간에는
+센서·물체·로봇 데이터 읽기와 reward/termination 공통 계산이 함께 들어 있다.
+Reward manager에서 위 계산을 다시 수행하지 않는다.
+
+PPO 상세(update0.9023초에 포함):
+
+| 단계 | 평균 초 |
+|---|---:|
+| model.actor | 0.3787 |
+| model.actor/model.scene | 0.2598 |
+| model.actor/model.masks | 0.0591 |
+| model.actor/model.fusion_head | 0.0149 |
+| model.critic | 0.0027 |
+| ppo.backward | 0.4560 |
+| ppo.clip_grad | 0.0154 |
+| ppo.optimizer | 0.0122 |
+
+각 minibatch8192개를 max_forward_batch_size1024로 8분할하여 GNN/attention forward는
+update당128회다. Rollout에서는32회, GAE/timeout value는 별도다. Actor와 critic은 shared
+encoder 결과를 재사용하며, 위 model.actor 시간에는 shared value head도 포함된다.
+
+대량 reset 2회의 reset 구간만 평균3.7022초. 같은 iteration 전체7.2176초와 구분한다.
+
+| Reset 단계 | 평균 초 |
+|---|---:|
+| 배치 생성 | 0.7166 |
+| 초기 vision 전체 | 1.9575 |
+| IK·후보 자세 검사 전체 | 0.8758 |
+| 나머지 실제 FK 확인·쓰기·commit·MDP reset·manager 등 | 0.1522 |
+
+IK 내부: solve_batch 0.1654초, 후보 충돌 검사0.5889초. 각각의 상위 전체0.8758초에 포함된다.
+Vision 내부 _trace 함수의 host-return 시간은 약0.10초지만 GPU ray kernel 완료를 기다리는
+후속 tolist()/동기화는 바깥 capture_batch에 잡힌다. 따라서 나머지를 Python 순수 계산 시간으로
+해석하거나 ray casting이0.10초뿐이라고 결론 내리면 안 된다.
+
+확인된 비용과 다음 후보:
+
+
+- Tactile native buffer는32회, 0.0165초로 전체 일반 iteration의 약0.45%.
+  직전9개 forbidden 포함 실행의0.143초에서 크게 줄었지만 전체 시간 중 비중은 작다.
+
+- PhysX step1.2882초 중 fetch_results 경로1.2682초. 이는 물리 완료 대기/동기화 포함 wall time이며
+  순수 GPU kernel 시간과 같지 않다. 별도 CUDA trace의 실제 kernel 누적은 convexPlaneNphase
+  185.2ms, articulation internal constraints177.2ms, solveBlockUnified106.2ms,
+  articulation impulse propagation98.2ms, stepArticulation83.5ms였다.
+  Internal constraints1152호출=64physics×(position16+velocity2). 센서 개수와 별도로 남는 비용이다.
+
+- Robot link-local COM 경로는 OSC0.1826초 + MDP0.1821초, 약0.365초.
+  SDK ArticulationData.body_com_pose_b가 timestamp마다 get_coms().to(device)를 실행한다.
+  PhysX SDK get_coms는 CPU tensor(device -1)를 만들며, CPU profile에서 articulation
+  get_coms65회(64 substep+reset) 누적0.339초였다. Object COM도 별도0.0593초다.
+  고정 local COM 재조회 제거는 우선 후보지만, 이 wall time 전체가 절감된다고 보장하지 않는다.
+
+- PPO는 forward0.3787초와 backward0.4560초가 대부분이다. Forward 조각 수를 줄이는 후보는
+  활성화 메모리와 처리량을 함께 측정해야 한다. 학습 epoch/rollout을 줄이는 방식과 구분한다.
+
+- 대량 reset은 vision 약1.96초 및 IK 충돌 검사약0.59초가 우선순위다.
+
+
+주의: perf_counter 수치는 CPU 호출 시작→반환 경과시간이다. GPU 연산은 비동기이므로
+완료 대기가 후속 호출에 귀속될 수 있다. GPU trace의 CUDA user-range(stage::...)는
+실제 kernel과 중첩되어 합산하면 부풀려진다. gpu_kernels_filtered.json은 이 annotation
+범위를 제외했으며, 커널 누적 시간 역시 iteration wall time에 더하면 안 된다.
+
+원자료/재현 스크립트: `outputs/contact_manipulation/stage_profile_20261014/`.
+최종 `timing_only/iterations.json`, `timing_only/summary.json`, `timing_only/summary.txt`,
+`metadata.json`, `cpu.pstats`, `gpu_ops.json`, `gpu_kernels_filtered.json`,
+`profile_timing.py`, `profile_with_trace.py`, `commands.json`, 각 run log를 보관했다.
+프로파일 스크립트는 고정 output 경로를 사용하므로 재실행하면 해당 계측 자료를 덮어쓴다.
+
+### 2026-10-14 — Sweeping-Policy `min` 브랜치 물리·제어 비교
+
+- 검토 기준: 로컬 examples/Sweeping-Policy-DRL-Sim-Train의 origin/min,
+  `57caa46bd3fe9f8fb00fc0160d1c31beb23b4c78` (2026-08-12).
+  원격 ls-remote는 GitHub 인증 실패로 최신 여부를 확인하지 못했다.
+  기존 main checkout을 변경하지 않고 git archive를 /tmp/sweeping_min_review에 추출했다.
+- 가장 가까운 예제는 Isaac-Sweep-Object-UR5e-Random-v2:
+  sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py.
+  공통 UR5eSweepEnvCfg를 상속하고 arm implicit stiffness/damping=0 및 공식
+  OperationalSpaceControllerActionCfg만 교체한다. 별도 physics step override가 없다.
+- 예제는 pose_abs 7D + binary gripper 1D, fixed impedance 6축 stiffness=100,
+  full inertial decoupling 및 gravity compensation, nullspace 없음이다.
+  우리의 pose_rel + variable_kp + 독립 hand joint position 18D는 연구 요구 차이이며
+  예제의 action 공간으로 바꿀 이유는 아니다. 두 환경 모두 pose 제어에 contact sensor가 필요 없다.
+- 물리 dt=.01/decimation=2는 동일하다. 예제 물체 solver는 position16/velocity1,
+  현재 물체와 articulation은 16/2다. 예제 robot의 articulation solver 및 self collision은
+  Python config에서 override하지 않는다. 외부 UR5e_v4.usd가 로컬에 없어 해당 실제 값은 미확인이다.
+  물체의 16/1을 robot 설정이라고 해석하면 안 된다.
+- 예제 bounce threshold=.2, friction correlation=.00625, rigid patch capacity=5*2**17,
+  found/lost aggregate pairs=2**28, total aggregate pairs=2**18이다.
+  현재는 bounce=.05, 나머지는 로컬 Isaac Lab 기본값(.025, 5*2**15, 2**25, 2**21)이다.
+  버퍼 capacity는 반복 횟수 설정이 아니므로 그대로 복사해서 속도 향상을 기대하지 않는다.
+- 예제의 native OSC 역시 매 physics step Jacobian/mass/gravity/state를 조회한다.
+  우리의 추가 COM→TCP Jacobian/속도 보정은 좌표계 일관성을 위해 존재한다.
+  앞선 계측에서 비싼 body_com_pos_b 조회를 줄이려면 보정 제거 대신 고정 local COM
+  캐시 및 질량/COM 변경 시 무효화를 검토한다. 이번 검토에서는 구현을 변경하지 않았다.
+- 예제 reset은 2×3 slot 순열/XY jitter/yaw와 pose write이며, target·순열·XY jitter·방향은
+  reset batch에서 공유된다. Python object loop도 있다. 독립 clutter 생성·IK·가시성 검증이
+  필요한 현재 reset의 대체 구현이나 GPU 최적화 기준으로 그대로 사용하지 않는다.
+- 예제 PPO는 일반 MLP [256,128,64], rollout36, epochs8/minibatches4다.
+  현재 rollout32 및 GNN/attention 정책과 iteration 수치만으로 성능을 비교할 수 없다.
+- 정적 검증: python -m unittest discover -s /tmp/sweeping_min_review/tests
+  -p test_v2_osc_contract.py → 3개 중 2 pass/1 fail. 실제 stiffness는 전축100,
+  테스트 기대값은 translation80/rotation40인 불일치다. 예제 문서에도 이 차이가 설명되어 있다.
+  min 환경의 실제 simulation/성능 측정은 이번에 수행하지 않았다.
+
+
+### 2026-10-14 — 공통 scene round·초기 vision 공유, 매 reset 연속 EEF randomization
+
+사용자 승인: 전체 환경이 한 초기 물체 배치/가상 시점을 공유하고, 중간 종료는 그 배치로
+복원한다. 이후 명시한 보정에 따라 로봇 자세 bank는 도입하지 않는다. 매 episode마다
+Blocker 앞 허용 영역에서 EEF 위치를 새로 뽑고 GPU IK·elbow-up·전완 방향·충돌 검사를 유지한다.
+
+구현:
+- 기존 events.py/shelf_manipulation_env_cfg.py/terminations.py 안에서 수정했다. 생산 코드 파일 추가 없음.
+- 공통 round는 episode_length_s와 같은 8초=400 policy step. scene_time_out은 native episode
+  timeout OR 공통 round 경계다. 최근 재시작한 환경도 round 경계에서 truncate한다.
+  물리 성공/실패가 동시에 발생하면 기존 PPO의 termination 우선순위로 bootstrap하지 않는다.
+  나머지 timeout은 reset 전 terminal_observation으로 bootstrap한다. 환경 step/reset override 없음.
+- 전체 reset 경계에서 env_0 한 개로 새 배치·기하 vision·물리 FK 검증을 수행한다.
+  _build_episode_batch(scene_generation=...)가 singleton template과 SceneSample을 반환한다.
+  가시성/IK 검사에 실패한 제안의 bounded retry는 유지하므로 모든 round에 capture 호출이
+  반드시 정확히 한 번이라는 보장은 없다. 승인된 장면을 환경 수만큼 다시 관측하지 않는 구조다.
+- _shared_reset_batch는 template의 물체 상태/역할/관측을 tensor broadcast하고, 선택 환경마다
+  독립 seed로 연속 EEF 위치와 새 관절 자세를 계산한다. 실패한 IK 행만 재시도하고 승인 행은 유지한다.
+  CPU metadata/seed 처리와 bounded IK batch loop는 남아 있다. 환경별 SciPy IK를 도입하지 않았다.
+- Initial geometry는 robot-base frame으로 저장하고 기존 geometry_in_eef_frame으로 변환한다.
+  Robot은 ray casting에서 제외되므로 로봇 자세 변경으로 물체 가시성 결과를 다시 계산하지 않는다.
+  Camera pose cache는 env-local이며 reset 대상 origin을 더해 world pose로 기록한다.
+- 중간 reset은 레이/배치 생성 없이 캐시를 복원한다. 선반 pose·속도, 물체/로봇 속도·target,
+  F/T 처리 상태, previous history와 MDP 누적값도 기존 selected-row reset 경로로 초기화한다.
+  배치 생성 seed는 round 번호, 로봇 seed는 환경 ID/reset 횟수에 따른다.
+- 기존 independent batch helper는 단위 검증 경로를 유지하지만 학습 reset은 singleton template만 생성한다.
+
+검증:
+- CPU 전체 184개: 176 pass, CUDA/Isaac 런타임 관련 8 skip. 공유 cache 보존, 부분 reset의 새 IK,
+  미선택 행 보존, round 경계의 전체 timeout/교체, IK 재시도/실패 시 미commit을 포함한다.
+- 실제 CUDA/Isaac 4환경: 초기/다음 round의 capture request 크기는 [1,1]. 부분 reset에서
+  capture 호출 추가 없음; 로봇 관절 자세는 서로 다르고 재reset 시 바뀜. 새 자세의 실제 PhysX FK,
+  서로 다른 EEF 기준 관측, 카메라 원점 이동, 미선택 물리/이력 보존과 전체 truncation 확인. exit0.
+- 별도 검증 스크립트에서 경계를 빨리 시험하기 위해 common counter를 옮길 때 MDP counter도
+  같이 옮겨야 했다. 두 초기 검증 실패는 스크립트의 불일치였으며 생산 코드의 step guard는 유지했다.
+- 실제 RTX 3090/1024환경/10물체/32 rollout/32 iteration 학습 exit0. 기존 계측과 같은
+  host perf_counter 계측을 사용했고 초기 iteration0을 제외한 31개를 비교했다.
+
+| 항목 | 직전 독립 장면 방식 | 공통 장면 방식 |
+|---|---:|---:|
+| 일반 iteration 평균 (29개) | 3.646 s | 3.320 s |
+| 대규모 reset 포함 iteration 평균 (2개) | 7.218 s | 3.878 s |
+| 전체 iteration 평균 (warmup 제외 31개) | 3.877 s | 3.356 s |
+| 대규모 reset 내부 합계/iteration | 3.702 s | 0.510 s |
+| 해당 구간 layout 생성 | 0.717 s | 0.0085 s |
+| 해당 구간 vision 호출 | 1.958 s | 0.0064 s |
+| 해당 구간 IK/후보 검사 | 0.876 s | 0.427 s |
+| 일반 iteration의 부분 reset 합계 | 0.175 s | 0.0216 s |
+
+대규모 reset 내부 약86% 감소, 전체 iteration 평균 약13% 감소다. IK는 제거/캐시하지 않았다.
+공유 layout에 따라 IK 난이도/실패 빈도 및 물리 부하도 달라져 이전/이후가 동일 trajectory는 아니다.
+새 실행에서 round 교체 iteration은12/24이며 각각1024환경을 reset했고, vision request는
+각각[1]이었다. 다른 iteration에는 vision 호출이 없었다. 정상 구간 physics.step 평균1.197초,
+PPO/GAE 평균0.883초는 남아 있어 목표1–2초/iteration 달성으로 해석하면 안 된다.
+호출 시간은 GPU 비동기 대기가 후속 호출에 귀속될 수 있으며 순수 kernel 시간은 아니다.
+두 round 교체만 포함한 짧은 실험으로 장기 성능/학습 품질까지 검증한 결과는 아니다.
+
+자료: outputs/contact_manipulation/shared_scene_20261014/ 아래 validation.json/log, tests.log,
+profile_timing.py, timing_run.log, timing_only/iterations.json 및 metadata.json, compare.py,
+comparison.json, commands.json. 비교 기준은 stage_profile_20261014/timing_only의 기존 측정이다.
+
+
+### 2026-10-14 — YCB 대 기존 물체 USD/collision 비교 및 1024환경 물리 비교
+
+사용자 요청: 같은 scene으로 2048환경을 사용하는 사례가 있으므로 hand 링크 수만으로
+병목을 단정하지 않고, YCB 메시가 기존 물체보다 복잡한지 실제 asset과 물리 비용을 비교한다.
+생산 코드/원본 USD를 수정하지 않았다. 진단용 임시 공유 USD에서만 collider를 변경했다.
+
+실제 source USD 및 env_0의 최종 runtime prim을 조사하고, PhysX cooking interface의
+request_convex_collision_representation(run_asynchronously=False)로 생성된 hull을 직접 조회했다.
+Mesh 삼각형 합은 source USD의 모든 Mesh 합계이며, collider/보조 mesh도 포함한다.
+설정의 maxConvexHulls가 아니라 실제 cooking 결과 hull 수를 아래에 기록했다.
+
+| 물체 | USD Mesh 삼각형 합 | 활성 runtime collision | cooked hull 정점 합 |
+|---|---:|---|---:|
+| bottle_1 | 727,598 | convex hull 2 | 96 |
+| cup_1 | 140 | convex hull 1 | 48 |
+| cup_2 | 125,340 | convex hull 2 | 96 |
+| mug_1 | 5,466 | convex hull 2 | 97 |
+| mug_2 | 284 | convex hull 1 | 45 |
+| can_1 | 501,628 | convex hull 2 | 96 |
+| YCB003 cracker box | 16,384 | convex hull 1 + Cube 1 | 34 (Cube 별도) |
+| YCB004 sugar box | 16,384 | convex hull 1 + Cube 1 | 34 (Cube 별도) |
+| YCB005 soup can | 16,382 | convex hull 1 | 34 |
+| YCB006 mustard bottle | 16,382 | convex decomposition 32 hulls | 640 |
+
+기존6종은 총10 collision shapes, YCB4종은 총37개(35 hulls+2 cubes)다.
+Mustard 하나가32개를 차지한다. Source 메시 삼각형 수는 기존 병/유리컵/캔이 더 크다.
+따라서 높은 render/source triangle count와 매 step PhysX 형상 복잡도를 구분해야 한다.
+
+발견된 미수정 결함 — YCB box collider 비활성화 override 소실:
+- spawn_flat_box_from_usd는 원본 Mesh collisionEnabled=False, FlatBoxCollision=True로 작성한다.
+- share_rigid_body_geometry 전/후를 직접 기록하니 두 박스 모두 False/True → True/True가 된다.
+- 현재 공유 함수는 기존 reference 뒤에 baked reference를 추가하고 body를 instanceable로 만든다.
+  원본 reference의 collider 의견이 baked override보다 강하게 적용되어 비활성화가 소실된다.
+- 실험에서 해당 body의 baked reference를 원본보다 우선하도록 정렬하면 원본 Mesh=False,
+  Cube=True가 유지된다. 이전 문서의 “박스는 단일 평면 proxy만 사용한다”는 설명은 의도한
+  동작이며 현재 런타임 상태와 달랐다. 이 문제는 별도 생산 수정/회귀 검증 대상이다.
+  현재 synthetic geometry 공유 테스트는 외부 reference와 상충하는 disabled collider override를
+  포함하지 않아 이 사례를 검출하지 못했다.
+
+성능 비교: RTX3090/1024환경/10물체/동일41-link 로봇, dt=.01, solver16/2 유지.
+기준 상태를 fixed_states.pt에 저장해 초기 물체/관절/선반 상태와 물체 질량·관성·COM을
+비교 실행에 재사용했다. 각 조건을 별도 프로세스로 실행해5블록 측정했으며, 블록마다
+64 physics steps warmup 후64 steps를 측정했다. OSC는 zero action으로 초기 pose를 유지한다.
+매 측정 전후 CUDA synchronize로 앞서 제출된 제어 tensor 작업의 대기시간을 분리했다.
+따라서 아래는 PPO iteration 시간이 아니라 PhysX 64회 호출의 누적 wall time이다.
+
+| 조건 | 64 physics steps 평균 | 블록 범위 | 기준 대비 |
+|---|---:|---:|---:|
+| 현재 설정 | 1.188709 s | 1.178267–1.194988 s | 기준 |
+| Mustard만 32 hull→1 convexHull | 1.169826 s | 1.160980–1.187903 s | 약1.6% 감소 |
+| 위 변경 + YCB 박스2종 중복 collider 제거 | 1.147127 s | 1.135426–1.159629 s | 약3.5% 감소 |
+
+모든 실행 exit0, 비교 조건의 runtime collider enable/approximation을 JSON에 저장했다.
+형상 수상 mustard는 유난히 복잡하지만 이 정지 자세 유지 실험에서 단순화 효과는 작았다.
+현재 약1.2초의 물리 시간을 YCB collision 복잡도만으로 설명할 근거는 부족하다.
+접촉 조작 중의 효과와 정책 학습 품질은 이 실험에서 검증하지 않았다. 단일 hull은 오목한
+부분을 채우므로 학습용 형상을 바꿀 때에는 기하 정확성 검토가 필요하다.
+Hand 링크 수가 주원인이라고도 아직 단정할 수 없다. 동일 robot/solver/collider 조건의
+실제 단계별 비교가 필요하다. 이번 요청 범위는 비교/진단이며 위 변경은 학습에 적용하지 않았다.
+
+자료: outputs/contact_manipulation/object_collision_audit_20261014/ 아래 assets.json,
+summary.json, baseline.json, mustard_hull.json, ycb_fixed.json, 각 log, fixed_states.pt,
+audit_assets.py, benchmark.py, commands.json. 스크립트 재실행은 해당 결과를 덮어쓴다.
+
+
+### 2026-10-14 — 물리 step 재검토: 손의 충돌 shape 676개와 TGS 반복 비용
+
+사용자 요청: 링크 수만으로 병목을 단정하지 말고 물리 simulation step이 긴 이유를 다시 검토.
+학습 코드/원본 USD는 변경하지 않았다. 진단 시에만 임시 geometry library 또는 native PhysxCfg를 변경했다.
+
+측정 조건:
+- RTX 3090, 1024환경, 10물체, 로봇 41링크/18DOF, physics dt=0.01.
+- 이전 object_collision_audit_20261014/fixed_states.pt의 동일 초기 물체/로봇/선반 상태 사용.
+- 물체 및 로봇 mass/COM/inertia도 기준값으로 복원해 collision 변경에 따른 자동 질량 변화를 배제.
+- zero18D action: arm delta pose=0으로 OSC 목표 유지, hand는 정규화 action0에 해당하는 중간 목표로 움직임.
+  완전히 정지한 장면 또는 학습 정책의 contact-rich rollout으로 해석하면 안 된다.
+- 각 설정 5블록, 블록마다 상태 복원 후 64step warmup + 64step 측정.
+  apply_action/scene.write 이후 CUDA synchronize, sim.step(False) 전후 wall time+CUDA synchronize.
+  reset/IK/raycast/PPO 및 OSC 계산은 측정 구간 밖. 별도의 64step GPU trace도 기준/손 단순화에서 수집.
+- 따라서 결과는 iteration 전체 시간이 아니라 rollout당 물리 64회에 해당하는 누적 시간이다.
+
+핵심 발견:
+- PhysX ArticulationView.max_shapes와 env_0의 링크별 RigidBodyView.max_shapes로 실제 shape 수 확인.
+  robot=676 shapes, links=41. 단순히 max_convex_hulls 설정값만 보고 추정한 수치가 아니다.
+- right_plam_1, right_index_2, right_middle_2, right_ring_2, right_little_2가 각각128 shapes.
+  나머지36개 링크는 각각1 shape: 5*128+36=676.
+  1024환경에서 위5개 링크만655,360 shapes, 전체 로봇692,224 shapes.
+- 원인 설정은 config/ur5e/scene.py::_preserve_tactile_parent_slots.
+  tactile pad 주변 홈을 convex hull이 메우지 않도록 max_convex_hulls=128, error_percentage=.5,
+  voxel_resolution=1_000_000, shrink_wrap=True를 적용했던 부분이다.
+- 손의 위5개 링크만 convexHull로 바꾼 진단에서는 robot=41 shapes로 감소.
+  41링크/18DOF와17개 tactile 링크, 제어 방식은 유지되지만 collider가 홈을 메우므로
+  tactile 접촉 의미까지 동등하게 유지되었다고 해석하면 안 된다.
+
+| 단독 변경 | 물리64step 평균 | 5블록 범위 | 기준 대비 감소 |
+|---|---:|---:|---:|
+| 기준: 기존 형상, solver16/2 | 1.189156s | 1.174827–1.201106s | — |
+| 손의5개 parent collider만 convexHull | 0.760691s | 0.753221–0.772928s | 36.03% |
+| 모든 robot mesh collider를 convexHull | 0.756063s | 0.750266–0.763840s | 36.42% |
+| 형상 유지, scene solver8/1 | 0.881642s | 0.878452–0.889159s | 25.86% |
+| 형상 유지, scene solver4/1 | 0.729232s | 0.721431–0.737664s | 38.68% |
+| 형상/solver 유지, ground plane→100×100×1m static box | 1.380843s | 1.368049–1.399931s | -16.12% (느려짐) |
+
+solver 실험은 native scene min/max position/velocity iteration cap을 모두8/1 또는4/1로 설정했다.
+로봇만의 반복 횟수를 낮춘 실험은 아니며 물리100Hz/정책50Hz 주기는 동일하다.
+solver와 collision 단순화의 개선율은 별도 실험이므로 더하면 안 된다.
+기준은 첫 실행1.182523s, 마지막 재실행1.189156s로 유사하게 재현됐다. 표는 마지막 기준을 사용.
+
+별도 GPU trace(64physics steps, kernel duration 합; wall time의 배타적 분해가 아님):
+
+| GPU kernel | 기준 | 손5개 collider 단순화 |
+|---|---:|---:|
+| convexPlaneNphase_Kernel | 189.120ms | 20.420ms |
+| doAggPairCollisions | 75.519ms | 5.413ms |
+| sortAndUpdateAggregateProjections | 48.644ms | 2.941ms |
+| artiSolveInternalConstraintsTGS1T | 167.502ms | 177.318ms |
+| stepArticulation1TTGS | 83.836ms | 79.613ms |
+
+충돌 형상 단순화로 충돌 후보 처리/convex-plane 비용이 줄었고, articulation 내부 제약 비용은
+그대로 남았다. artiSolveInternalConstraints는 두 trace 모두1152회=(16+2)*64,
+stepArticulation은1024회=16*64. 링크 수를 제거하지 않아도36%가 감소했으므로
+기존의 '링크가 많아서 느림' 설명보다 '우리 손 collider 세분화 + TGS 반복'이 구체적인 근거다.
+YCB 단순화의 이전 측정1.6–3.5%보다 영향이 컸다.
+
+제외한 실험/제약:
+- no_robot_collision은 프로세스 exit0이지만 PhysX foundLostPairsCapacity 부족(요구67,699,200)
+  및 miss interactions 오류가 있었고 선반이 약8m 자유 낙하했다. 속도 비교에서 제외했다.
+- 최초 진단에서는 Xform collider에 Mesh 전용 cooking query를 호출해 query error가 났다.
+  Xform에 대해 이 query를 하지 않도록 진단 스크립트를 수정하고 baseline을 재실행했다.
+  손의 실제 shape 수는 SDK rigid-body view로 측정했으며 failed cooking query의0을 사용하지 않는다.
+- 축소한 solver 및 단일 hull의 장기 접촉 안정성, F/T 정확도, tactile 가시 접촉, 학습 품질은 미검증.
+  속도만으로 production 설정을 바꾸지 않았다. 기존 센서 홈을 보존하는 소수 compound collider를
+  위5개 링크에 구성하는 것이 우선 후보이며, solver8/1은 접촉/제어 오차를 비교한 뒤 판단해야 한다.
+- 남은 articulation 비용을 링크 수 자체의 불가피한 한계로 단정하지 않는다. fixed joint 유지 이유,
+  solver/constraint 설정 및 필요한 정밀도를 분리해 추가 검토할 수 있다.
+
+관련 공식 근거: IsaacLab/source/isaaclab/isaaclab/sim/simulation_cfg.py의 native solver bounds;
+https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/rigid_bodies_articulations/articulations.html
+(TGS position iteration 증가의 성능 비용),
+https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/docs/Simulation.html
+(simulate/fetch synchronization 및 solver iteration의 의미).
+
+재현 자료: outputs/contact_manipulation/physics_reaudit_20261014/
+benchmark.py, run_suite.py, confirm.py, commands.json, confirm_commands.json,
+summary.json, 각 variant의 json/log, baseline/hand_parents_hull의 trace/kernel 집계.
+production 코드 변경이나 추가 테스트 파일은 없다.
+
+### 2026-10-14 — 원격 min 브랜치의 Inspire Hand 처리 재확인
+
+이전 로컬 origin/min=57caa46 사본보다 원격 min이 새 버전임을 GitHub connector로 확인했다.
+원격에는 Robotiq뿐 아니라 Inspire Open v0/v1/v2 및 mass 파생 환경이 추가되어 있다.
+따라서 이전 로컬 OSC/Robotiq 분석을 원격 min 전체에 일반화하면 안 된다.
+- src/ur5e_inspire_open.py: 외부 ur5e_inspire.usd 로드, inspire_left_* 손 관절12개;
+  v0는 revolute를 fixed로 바꾸고 hand actuator/action 제거. self-collision=False.
+- src/ur5e_inspire_hand.py: v1은 일반 UsdFileCfg로 원래12가동 관절 유지.
+  hand action2D(공통 굽힘/엄지 opposition)를 tensor로12joint position targets에 전개.
+  native ImplicitActuatorCfg K=1.2,D=.06,effort=.20Nm,velocity=1rad/s,armature=.0001.
+  v1이 v0를 상속해도 fixed-open spawner는 교체되므로 손 관절이 고정된 것은 아니다.
+- v2 sensor cfg:17pad를 하나의 ContactSensorCfg regex로 묶어 threshold=.05N,history1.
+  v2-mass 및 그 파생에서는 palm1채널만 관측. v2와 v2-mass를 혼동하지 않는다.
+- src/ur5e_inspire_sensors.py는 외부 src/trash/hand_manipulation_rl의
+  assets.robot.Ur5eAxia80InspireSpawnerCfg 및 sensors.py를 import한다.
+  기본 USD도 동일 외부 패키지의 assets/data/ur5e_inspire_usd/ur5e_inspire.usd.
+  이 repo 자체에는 실제 USD/외부 spawner가 없고 이 로컬 workspace에도 찾지 못했다.
+- 확인한 repo hand 설정에는 우리 _preserve_tactile_parent_slots의128hull 설정이나
+  로봇 solver16/2 override가 없다. 하지만 외부 USD/spawner 내부 설정은 미확인이라
+  min의 실제 collision shape 수, hull 방식, 최종 solver 값을 단정할 수 없다.
+- 정책 hand action2D는 물리 손 관절2개를 의미하지 않는다. 가동형은12개를 유지한다.
+근거: https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/src/ur5e_inspire_hand.py
+https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/src/ur5e_inspire_open.py
+https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/src/ur5e_inspire_sensors.py
+https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/docs/11_inspire_hand_variants.md
+
+### 2026-10-14 — 최소 collider 설계안 검토 (미구현)
+
+사용자가5개 parent 링크의 collider 수를 정말 최소화할 방안을 요청했다.
+ROAS right-hand URDF와 STL을 CPU로 읽어 고정 센서의 parent-relative pose를 확인했다.
+right_plam_1에는 palm pad, 네 finger_2에는 force_sensor_2/3가 서로 다른 방향으로 붙는다.
+따라서 단순 uniform shrink 또는128→임의 작은 decomposition budget으로 끝내기보다,
+센서 접촉면을 침범하지 않는 소수 convex proxy를 명시적으로 구성하는 방향을 제안한다.
+- 각 parent를1개 primitive/저정점 convex core에서 시작하고 센서면 쪽을 half-space로 절단.
+- 센서 뒤쪽과 옆면/관절부를 얼마나 보존하는지 검사하고, 중요한 비센서 표면 누락에만
+  별도 side/support shape 추가. 전체 링크를 센서면 한 평면으로 잘라 버리는 것은
+  멀리 떨어진 외형까지 깎을 수 있으므로 최소안의 검증이 필요하다.
+- 손가락 parent1–2개/개, 손바닥1–4개를 초기 탐색 budget으로 제안:
+  해당5개 합5–12 shapes, 로봇 전체41–48 shapes가 목표이며 달성/최적성 보장은 아니다.
+- 17개 센서 collider/링크 및 F/T 전달 경로 유지. 원래 질량/COM/관성 명시 유지.
+- one-time authoring/cooking만 수행, episode/step별 재생성·분할 없음.
+- 실제 cooked geometry, GPU 지원, contact/rest offset을 포함해 pad 중앙/가장자리/비스듬한
+  접근 시 채널 반응, 인접 parent-only 접촉 시 오검출, 비센서 표면 관통을 검증해야 함.
+- 단순한 parent clipping의 후보 계산은 pad local+Z와0.5mm retreat를 가정한 탐색용이었다.
+  외부 접촉면 normal/최소여유를 확정한 값이 아니고, 실제 CAD 표면 보존이나 센서 접촉을
+  검증한 결과가 아니므로 production 치수/최소 shape 수의 근거로 사용하지 않는다.
+- 속도는 shape 수에 정비례하지 않음. solver 비용이 남고 기존 단일hull 실험의36%는
+  이상화된 진단 비교이며 새 proxy의 학습 속도/정확도를 보장하지 않는다.
+
+### 2026-10-14 — Hand만 최소 convex proxy 적용
+
+사용자 요청: UR5e는 수정하지 않고 Hand에만 적용한다.
+`config/ur5e/scene.py`의 기존 `_preserve_tactile_parent_slots`를 교체했다.
+새 production 파일 없이 같은 파일에 순수 geometry helper를 추가했다.
+
+- 변경 대상은 `right_plam_1`, `right_{index,middle,ring,little}_2`의 5개 parent collider뿐이다.
+  각 128 convex decomposition → 각 2개의 저정점 convex mesh. 실제 PhysX shape count는
+  해당 5개 합 640→10, 로봇 전체 676→46이다. 41 bodies/18 joints는 유지한다.
+- 26개 방향의 support plane으로 단순 envelope를 만들고, 첫 pad의 tangent 방향으로
+  관절부와 센서부를 분리한다. 센서부는 pad의 outward PCA normal 기준 표면에서
+  1.2 mm 뒤로 자른다. 4개 분할 후보 중 원본 parent 점의 최대 half-space 오차가
+  가장 작은 후보를 선택한다. 이 오차는 정확한 Euclidean 거리/Hausdorff 거리가 아니다.
+- 2개로 나누는 이유: 센서면으로 parent 전체를 자르면 손바닥/관절 돌출부가 크게 사라진다.
+  돌출부와 센서부를 분리해 유지한다. 2개가 수학적 최소임을 입증한 것은 아니다.
+  세밀한 CAD 홈은 근사하며 정확한 원본 collision 표면을 유지한다는 의미는 아니다.
+- Native ConvexHullPropertiesCfg(hull_vertex_limit=64), contact_offset=0.5 mm,
+  rest_offset=0. 생성은 최초 template authoring에서만 수행하고 native PhysX가 cooking한다.
+  reset/physics step에는 추가 geometry 계산이 없다.
+- 원본 collision 전용 subtree를 inactive로 처리한다. collisionEnabled=false만으로는
+  PhysX shape 배열에 잔류하여 51개였으므로 최종 구성은 subtree 비활성화로 46개다.
+  원본 visual mesh는 유지한다. 표시된 5개 Hand body의 reference는 완전히 펼친 baked
+  subtree 하나로 교체한다. Flatten은 inactive prim을 생략하므로 옛 body reference를
+  함께 남겨 두면 제거한 collider가 instance 안에서 다시 나타날 수 있어 이를 제거했다.
+- UR5e collider/제어, 17개 tactile body/collider, F/T 연결, joints, solver 설정은 변경하지 않았다.
+  Native PhysX에서 mass/COM/inertia를 변경 전 snapshot과 비교해 일치 확인했다.
+
+검증과 한계:
+- 실제 ROAS STL/URDF 기반 회귀 테스트: 5개 parent 각각 2개, piece당 64개 이하 정점,
+  pad local+Z 기준 중앙/주변 접근 시 parent가 센서 표면 뒤에 있음 확인.
+- Native GPU 접촉 시험: 반지름 1.5 mm kinematic sphere로 17개 pad의 중앙/주변 5지점씩
+  접근, 0.01 N 기준. 변경한 parent에 붙은 9개 pad의 45지점은 모두 감지된다.
+  전체 85지점 중 84개 감지, 17개 채널 모두 감지 이력이 있다.
+  `right_middle_force_sensor_1`의 한 주변 지점은 기존128-hull Hand에서도 같은 시험으로
+  미감지됐다. 변경 대상 parent의 pad가 아니며 이번 변경의 새로운 누락은 아니다.
+  변경하지 않은 thumb pad1의 한 지점은 기존과 새 구성 모두 parent가 먼저 접촉한다.
+  이 시험은 모든 방향/가장자리/실제 물체 조작에 대한 완전한 검증은 아니다.
+- CPU test_mdp 135 tests 완료(7 skipped). Native USD sharing 3개 회귀 테스트도 통과했다.
+  접촉 비교는 변경 전후 joint pose가 동일한지 별도로 검사했으며 새로운 누락 없이 완료했다.
+- RTX3090,1024환경,10물체,동일 저장 초기상태/질량,100 Hz physics/50 Hz policy,
+  64 warmup+64 timed steps를 5회: 물리64step 평균 기존1.189156 s → 새0.750181 s,
+  약36.9% 감소. 새 측정 범위0.7386–0.7604 s. 동기화된 sim.step만 측정했다.
+  Zero action OSC pose hold에서 hand는 중간 굽힘 target으로 움직이는 진단이다.
+  PPO/reset/raycast/OSC 계산은 측정 구간 밖이며 전체 iteration 1–2초 달성을 의미하지 않는다.
+- Artifacts: `outputs/contact_manipulation/hand_proxy_20261014/`의
+  `scene_before.py`, `benchmark.py`, `baseline.json`(이 폴더에서는 새 proxy 결과),
+  `validation.json`, `validation_reference.json`, `validate.py`, `validate_reference.py`.
+  비교 이전 물리 결과는 `physics_reaudit_20261014/baseline.json`이다.
+
+### 2026-10-15 — 장시간 학습 중 PhysX CUDA 719 조사
+
+사용자가 1024환경 학습 중 CUDA719 및 DOF velocity 읽기 실패를 보고했다.
+현재는 근본 원인이 확정되지 않았으며, Hand collider rollback이나 GPU buffer 증설을
+해결책으로 적용하지 않았다. UR5e/Hand/제어/MDP/PPO production 코드는 이 조사에서 변경하지 않았다.
+
+확인한 증거:
+- 원본 run: `logs/rsl_rl/contact_manipulation/2026-10-14_23-25-08`.
+  Kit log `.../Isaac-Sim/5.1/kit_20261014_232454.log:5207`의 오류 시각은
+  UTC2026-10-14 17:33:10 = KST2026-10-15 02:33:10. 약3시간8분 실행 후 발생했다.
+- 같은 시각 `/var/log/syslog`에 `NVRM Xid13 / MISSING_INLINE_DATA`, PID68242가 기록됐다.
+  이는 CUDA kernel/command 실행 실패 증거이며, DOF velocity 예외는 PhysX CUDA 실패 뒤의 후속 오류다.
+  Xid13만으로 application kernel, PhysX, driver, hardware 중 하나를 확정할 수 없다.
+- 직전 Kit 로그에 GPU capacity overflow/OOM/NaN 경고가 없다. 종료 중 allocator 경고는
+  CUDA 실패 이후의 메시지이므로 선행 메모리 부족 증거로 해석하지 않는다.
+- TensorBoard 마지막 완료 iteration3556. 모든 scalar가 finite였다.
+  마지막 collection2.058s/learning0.883s로 지속적인 속도 저하도 관찰되지 않았다.
+  단, scalar의 finite 여부가 개별 물리 상태의 finite 여부를 보장하지 않는다.
+- 마지막 checkpoint `model_3550.pt`의 actor/critic/optimizer tensor를 CPU로 검사해
+  NaN/Inf가 없음을 확인했다. Checkpoint에는 물리 state/실패 당시 scene/RNG 진행 상태가 저장되지 않는다.
+- Custom Triton/Warp의 padding mask, 고정 크기 배열 인덱스, stream/메시·tensor lifetime,
+  CUDA graph buffer 소유권을 검토했으나 명확한 범위 밖 접근이나 소유권 문제는 발견하지 못했다.
+- 물체 pool과 Hand proxy는 최초 template에서 생성하며 reset은 pose/velocity만 다시 쓴다.
+  reset을 반복할 때 collider가 누적 생성되는 경로는 확인되지 않았다.
+
+재실행:
+```bash
+CUDA_LAUNCH_BLOCKING=1 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py \
+  --headless --num_envs 1024 --resume \
+  --load_run 2026-10-14_23-25-08 --checkpoint model_3550.pt \
+  --max_iterations 20 --run_name cuda719_resume_probe
+```
+- 실제로는 같은 env_isaaclab Python을 직접 실행했다. Native runner/환경 흐름과 모델을 유지했다.
+  3550–3569의20iteration을86.98초에 오류 없이 완료했고 정상 종료했다.
+  생성 run: `logs/rsl_rl/contact_manipulation/2026-10-15_11-51-09_cuda719_resume_probe`.
+- 새 초기 scene이므로 원래 실패한113824+policy step의 물리 상태를 재현한 시험이 아니다.
+  짧은 재실행 통과는 장시간 안정성 검증 또는 근본 해결을 의미하지 않는다.
+- CUDA_LAUNCH_BLOCKING은 최초 CUDA 실패 위치를 더 가깝게 확인하기 위한 진단 옵션이다.
+  동기화 때문에 학습 속도가 감소하므로 정상 throughput 비교에는 사용하지 않는다.
+- 원래 PID68242는 조사 시점에 stopped(Tl/do_signal_stop) 상태이며 VRAM5866MiB를 점유했다.
+  해당 기존 프로세스를 종료하거나 재개하지 않았다. CUDA719가 난 프로세스의 context를
+  재사용하여 계속 학습하는 것은 복구 방법이 아니며 새 프로세스로 checkpoint를 로드해야 한다.
+- GPU smoke test는 새 프로세스에서 통과. 조사 시 driver580.173.02, RTX3090,
+  Torch2.7.0+cu128. 이를 근거로 driver/hardware의 장시간 문제를 배제하지는 않는다.
+- 증거 artifact: `outputs/contact_manipulation/cuda719_20261015/incident.json`,
+  `original_error_context.log`, `kernel_xid.log`, `resume_probe.log`.
+- NVIDIA Xid13 분류/진단 권고: https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html
+  다음 장시간 재현에서는 동기화 진단 로그의 최초 실패 지점을 우선 확인하고,
+  불명확하면 Compute Sanitizer memcheck로 custom/native kernel 접근을 구분해야 한다.
+
+### 2026-10-15 — PhysX 추가 최적화 후보 실측 (production 미적용)
+
+사용자가 PhysX 연산을 더 줄일 부분을 요청했다. UR5e 모델·제어와 articulation16/2,
+100Hz physics/50Hz policy를 유지한 후보를 우선 조사했다. Production Python/config는
+변경하지 않고 `outputs/contact_manipulation/physx_candidates_20261015/benchmark.py`의
+진단용 config/임시 USD library/native PhysX property에서만 변형했다.
+
+측정 조건:
+- RTX3090,1024환경,10물체,현재 Hand46shapes/41bodies/18DOFs.
+- 기존 fixed_states.pt의 동일 물체·선반·로봇 시작 상태 및 동일 mass/COM/inertia 사용.
+  이전 Hand 측정의 단순 timing과 달리 이번 비교는 로봇 질량 속성도 동일 snapshot으로 명시 복원.
+- 각 조건5블록, 매블록64step warmup+64step timed. Zero action OSC pose hold이며
+  Hand는 중간 굽힘 target으로 움직인다. 실제 policy의 pushing/pivoting 학습 rollout이 아니다.
+- apply_actions 뒤 동기화, scene.write_data_to_sim 전후 동기화, sim.step 전후 동기화로
+  데이터 전달과 순수 물리 호출 wall time을 분리했다. reset/vision/PPO는 측정 밖이다.
+  이전0.750s와 절대값을 섞지 않고 이번 동일 protocol 기준0.798937s와 비교한다.
+
+| 진단 조건 | 물리64step 평균 | 기준 대비 감소 | scene.write64회 평균 |
+|---|---:|---:|---:|
+| 현재 구성 |0.798937s|—|0.080530s|
+| 접촉 보고34→17body |0.800178s|-0.16%|0.079678s|
+| 전체 active일 때0인 permanent wrench 제출 생략 |0.798095s|0.11%|0.051415s|
+| 물체 cfg만 solver16/2→8/1 |0.793508s|0.68%|0.078627s|
+| Mustard32hull→1 + YCB박스2종 중복 collider 비활성화 보존 |0.745398s|6.70%|0.079632s|
+| YCB 전체 collider contact offset20→5mm |0.689108s|13.75%|0.082024s|
+| 위 YCB형상 정리+offset5mm |0.664220s|16.86%|0.080088s|
+| GPU max partitions8→4 |0.737557s|7.68%|0.082572s|
+| GPU max partitions8→1 |0.698532s|12.57%|0.079910s|
+| YCB형상 정리+offset5mm+partitions1+0외력 제출 생략 |0.607671s|23.94%|0.051721s|
+
+결합 조건 물리 시간 범위0.604829–0.614805s. 각 단독 개선율을 합산하지 않고 직접 측정했다.
+모든 사용한 비교 실행 exit0이며 finite 상태 검사를 통과했다. 단기 pose-hold 시험이므로
+contact-rich 밀기/pivoting, 관통·접촉력·F/T·17채널 tactile 및 장시간 안정성은 별도 검증 대상이다.
+특히 mustard 단일 hull은 형상을 바꾸는 진단이며 그대로 production 채택한 것이 아니다.
+
+실제 남은 비용과 해석:
+- 현재 구성64step GPU trace: artiSolveInternalConstraints175.9ms/1152회,
+  stepArticulation84.1ms/1024회, solveBlockUnified81.6ms/9216회,
+  solveStaticBlock55.8ms/1152회. Convex-plane은19.0ms 수준이다.
+- 결합 구성: 내부 articulation 제약179.9ms/1152회, 적분77.5ms/1024회는 남지만
+  solveBlockUnified가29.3ms/1152회로 줄었다. Partition8→1의 batch/launch 감소가 확인된다.
+  이 kernel duration들은 별도 CUDA trace의 합이며 물리 wall time의 배타적 분해가 아니다.
+  Trace 전체에는 측정 physics 구간 밖의 OSC/data-transfer kernel도 있으므로 전부를
+  PhysX 내부 비용으로 합산하지 않는다.
+- Official Factory/Automate 조립 예제도 gpu_max_num_partitions=1을 사용한다.
+  우리 설정은 기본8이었다. 이는 solver iteration 자체를 낮추지 않는 후보다.
+  Factory의 다른 solver/마찰 설정까지 가져온 것은 아니다.
+- Hand와 UR5e는 하나의 articulation이므로 articulation root16/2를 줄이면 UR5e도 영향을 받는다.
+  Hand만 solver iteration을 줄이는 독립 설정으로 설명하면 안 된다. 이번에는 root16/2 유지.
+- 일반 fixed-joint merge는17 tactile body channel을 없앤다. 비센서 palm 고정연결2개만
+  선택 병합하면41→39body 후보지만 효과 미측정이고 우선순위는 낮다.
+
+발견한 불필요한 작업/설정 주의점:
+- Hand import는32body 전부, F/T spacer는2body에 PhysxContactReportAPI를 활성화한다.
+  실제 reader는17 tactile만 사용하고 F/T는incoming joint reaction을 읽는다.
+  Native runtime report34→17을 확인했지만 이번 시험에서 순수 물리 개선은 관찰되지 않았다.
+- pool10개와 min/max active10개가 같아 주차 물체가 없다. refresh_parking은 그 경우에도
+  0force를 set하여 native permanent WrenchComposer.active=True로 만든다.
+  Native collection은 매step10,240objects의 force/torque를 제출한다. reset()으로 composer를
+  inactive로 두면 데이터 전달 약29ms/64step를 줄일 수 있었다. Zero force가 모든 actor를
+  깨운다고 단정하지 않으며, 순수 물리의 큰 개선은 이 시험에서 확인되지 않았다.
+- 실제 native contact offsets: 기존6종 약1.962mm, YCB4종20mm. YCB끼리의 contact generation
+  시작 거리는 두 offset의 합40mm다. Rest offset 또는 실제 정지 간격이40mm라는 뜻은 아니다.
+- 처음 cfg.collision_props만5mm로 설정한 시험은 box proxy만5mm, 원본 YCB는20mm로 남았다.
+  USD reference/instance 공유가 descendant override를 잃는 기존 문제와 연결된다.
+  이 불완전한 시험은 objects_offset_partial로 보관하고 전체5mm 결과에서 제외했다.
+  최종 offset 비교는 native RigidBodyView.set_contact_offsets()로 최초 한 번 적용하고
+  get_contact_offsets()로 전체 YCB5mm, 기존6종1.962mm를 확인했다. 매step/episode 조작이 아니다.
+- YCB box2종에는 원본 mesh collider와 FlatBoxCollision이 중복 활성화되는 문제가 남아 있다.
+  강한 baked reference로 disabled override를 보존한 진단에서 정리 효과를 측정했다.
+  Mustard의32hull도 별도 기하 정확도 검토 후 소수 compound proxy로 줄일 후보다.
+- 선반은 이미17개 native Cube, self-collision/CCD/추가 stabilization은 꺼져 있고 Fabric은 켜져 있다.
+  이전 giant ground box 교체는 느렸으므로 다시 우선 후보로 제안하지 않는다.
+
+자료:
+- summary.json, 각 variant.json/.log, baseline/combined_trace.json 및 _kernels.json,
+  각 *_object_offsets.json. 진단 실행 스크립트는 같은 outputs 폴더에 있다.
+- IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/factory/factory_env_cfg.py:111
+  및 direct/automate/{assembly,disassembly}_env_cfg.py의 partitions1 설정.
+- IsaacLab/source/isaaclab/isaaclab/sim/simulation_cfg.py 및 native WrenchComposer/collection.
+- https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/docs/AdvancedCollisionDetection.html
+- https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/_api_build/classPxSceneDesc.html
+
+### 2026-10-15 — 전체 물체 contact offset2mm 대 YCB5mm 비교 (미적용)
+
+사용자가 전체 물체의 offset을 약2mm로 맞추면 더 빨라질지 질문하여 진단 비교를 수행했다.
+1024환경,RTX3090,물리100Hz/정책50Hz,robot41bodies18DOFs46shapes,solver16/2,
+GPU partitions8을 유지했다. 동일 저장 초기상태와 mass/COM/inertia를 복원하고 각 조건
+5블록×(64warmup+64timed physics steps)를 측정했다. Reset/vision/PPO/OSC 계산은
+순수 물리 시간에서 제외했다. 단기 zero-action OSC hold이며 실제 밀기/pivoting rollout은 아니다.
+
+| 설정 | 물리64step 평균 | 블록 범위 |
+|---|---:|---:|
+| 현재: 기존6종1.962mm/YCB20mm |0.757462s|아래 summary.json 참조|
+| 기존6종유지/YCB5mm |0.647007s|아래 summary.json 참조|
+| 조작물체10종 전체2mm |0.652493s|아래 summary.json 참조|
+
+- Native get/set_contact_offsets()로 실제 전체10종의2mm 적용을 확인했다.
+  Robot/Hand/Shelf/ground offset은 바꾸지 않았다. Rest offset은 기존0을 유지하고 getter로 확인했다.
+- YCB5mm는 현재 대비14.58% 감소, 전체2mm는현재대비13.86% 감소했다.
+  전체2mm는5mm보다평균약0.85%느렸고, 이번짧은시험에서 추가성능이득은 확인하지 못했다.
+  이 작은 차이로2mm가항상느리다고일반화하지 않는다.
+- 기존6종1.962→2mm는거의같은값이며, 주된변화는YCB5→2mm다.
+  값을통일하는것자체가연산을줄이는것은아니고 실제생성되는접촉의수/범위가중요하다.
+  20→5mm의큰개선율을5→2mm에비례외삽하면안된다.
+- 모든실행exit0,finite상태검사통과. 전체2mm에서support이후물체최대이동은약1.73mm,
+  물체최대선속도약0.0191m/s로진단동안큰발산은없었다. 빠른밀기·모서리pivot·관통과
+  F/T/tactile17채널정확성또는장기안정성의검증으로해석하지않는다.
+- 추가물체이동지표의초기baseline/5mm실행은world/local좌표를혼합해무효였다.
+  해당max_object_displacement필드는사용하지않으며timed영역밖의지표여서성능비교에는영향없다.
+  2mm실행은env origin을제거한올바른좌표차이를사용했다.
+- Production 기본값은변경하지않았다. 자료:
+  outputs/contact_manipulation/contact_offset_2mm_20261015/summary.json,
+  benchmark.py,run_suite.py,각variant.json/.log및*_object_offsets.json.
+
+### 2026-10-15 — YCB 5 mm 적용과 native API·iteration·로깅 재점검
+
+사용자는 YCB offset 5 mm 적용, 직접 구현한 코드의 Isaac Lab 기능 재사용 여부,
+전체 iteration 비용을 검토하도록 요청했다. 추가로 로깅·디버깅 지연도 포함하도록 했다.
+
+적용 내용:
+
+- YCB 4종의 `UsdFileCfg`/`FlatBoxUsdCfg`에 native
+  `CollisionPropertiesCfg(contact_offset=0.005)`를 설정했다. 기존 6종은 `None`으로
+  원래 자동 값을 유지하며 rest offset도 변경하지 않는다.
+- `share_rigid_body_geometry`는 최종 flattened body library만 reference로 사용한다.
+  원본 reference와 추가 reference를 함께 남기면 local descendant override가 instance
+  생성 뒤 원본의 강한 설정에 가려질 수 있었다. 원본 USD를 수정하거나 매 reset/step에서
+  `set_contact_offsets()`를 호출하지 않고 최초 native spawn에서 설정이 유지되도록 했다.
+- 전부 활성인 pool은 permanent wrench composer를 reset한 뒤 비활성으로 둔다.
+  Native composer는 0-force라도 set 호출을 하면 active가 되어 매 물리 step SDK 제출을
+  실행하므로 이를 생략한다. 비활성 물체가 있는 경우에는 전체 parked mask의 보상력을
+  다시 설정하여 부분 reset 뒤 다른 행의 보상도 보존한다.
+- F/T 조회는 raw PhysX view 호출에서 public
+  `ArticulationData.body_incoming_joint_wrench_b`로 변경했다. 기존 센서 축·부호·SI-200-8
+  처리와 자중·관성 보상은 유지한다. 설치된 SDK의 해당 property에는 `time_stamp` 오타가
+  있으나 SensorReader 자체의 timestamp cache가 같은 tick의 중복 조회를 막는다.
+- Quaternion 부호 정규화는 native `quat_unique`, 물리 FK 검사의 xyzw→wxyz/회전행렬
+  변환은 `convert_quat`/`matrix_from_quat`를 사용한다.
+- Reset joint velocity 0 tensor를 재사용하고, 공통 template의 읽기 전용 배치 필드는
+  broadcast한다. 수정하는 camera/robot 필드 4개만 clone한다.
+- 한 forward에 들어가는 batch이면 singleton `torch.cat`을 생략한다. 독립 critic 조회는
+  사용하지 않는 actor head를 계산하지 않는다. 파라미터 이름·크기와 checkpoint는 유지한다.
+
+직접 구현을 유지한 근거:
+
+- OSC/hand position controller, Scene/Manager, FrameTransformer/ContactSensor,
+  pool force 제출, 기본 PPO update/storage/GAE/logger/checkpoint는 이미 native이다.
+- Native reset은 Target·Blocker/밀집도/재배치 공간/충돌 없는 elbow-up 초기 자세와 공통
+  초기 vision 규약을 제공하지 않으므로 event의 연구 sampler를 유지한다.
+- Native DifferentialIKController는 미적용 후보 pose의 FK·충돌 탐색을 제공하지 않는다.
+  Native raycast의 dynamic mesh 지원 여부와는 별개로 후보 pose·역할별 무가림 분모·보이는
+  표면 OBB를 함께 계산하는 현재 fused query와 동등한 대체가 아니다.
+- Native history의 reset padding, Gaussian의 bounded action log-prob 규약이 달라 연구
+  history/tanh distribution을 유지한다. F/T 자중·관성 보상과 OBB reward도 연구 내용이다.
+- Native OSC와 COM→TCP Jacobian·속도 보정은 함께 유지한다. Hand의 측정 위치 기준
+  lead 제한은 EMA action과 의미가 달라 단순 대체하지 않는다.
+
+검증:
+
+- CPU 전체 suite 185개 중 177개 통과, CUDA/native USD 의존 8개 skip.
+- Isaac Sim 안에서 geometry sharing 4개 검사 통과. 외부 reference의 collision enable/
+  contact offset override가 hand marker 없이도 살아남는 회귀 검사를 추가했다.
+- GPU 4환경에서 YCB 4종의 모든 native shape offset이 5 mm, 기존 6종은 약 1.962 mm,
+  rest offset 0임을 확인했다. 로봇 41 body·46 shape와 mass/COM/inertia는 이전 snapshot과
+  같았다. 8 policy step의 reward·244D observation이 finite이고 전부 활성일 때 composer가
+  비활성임을 확인했다. `max_shapes`에는 비활성 slot도 포함될 수 있으므로 이 값만으로
+  YCB box의 중복 활성 collider 수나 제거 효과를 주장하지 않는다.
+
+자료는 `outputs/contact_manipulation/native_audit_20261015/`에 보존한다. 첫 진단 실행은
+임시 파일 `profile.py`가 Python 표준 모듈을 가려 AppLauncher에 재진입하면서 startup
+실패했다. `stage_timing.py`로 변경한 재실행이 위 검증이며 production 경로와 무관하다.
+
+Forward 분할 최적화:
+
+- 기본 1024환경×32step÷4minibatches=8192 샘플을 다시 1024개씩8회 forward하던
+  상한을8192로늘렸다. PPO minibatch/4epochs/16optimizersteps/learning rate는그대로이며
+  `max_microbatch_size=8192`이므로 native `PPO.update()`를 사용한다.
+- 동일8192sample을 사용한 standalone native update 평균은 chunk1024 0.829초,
+  2048 0.543초,4096 0.404초,8192 0.314초였다. Allocated peak는589→613MiB,
+  reserved는610→790MiB였다. Physics/GAE/storage는제외한측정이다.
+- 모델은 BatchNorm/Dropout/RNN/running state가없고 LayerNorm은 feature축만쓴다.
+  고정entropy noise의CPU FP32/FP64검사에서 출력/loss는같고 gradient상대L2차이는
+  최대2.62e−7/2.39e−15였다. GPU TF32에서16Adamstep뒤 최대parameter차이는
+  0.00145–0.00199여서 bitwise 동일trajectory를보장하지않는다.
+- 자료: `outputs/contact_manipulation/native_ppo_review_20261015/`의
+  chunks.json/equivalence.json 및재현스크립트.
+
+전체 iteration과logging 측정:
+
+- RTX3090,1024환경,10물체,100Hz physics/50Hz policy,32step rollout,4epochs×4minibatches,
+  seed0,headless/no video. YCB5mm/native API수정은두구성모두적용했다.
+- 각30iteration을새학습으로실행했다. 최초iteration을제외한29개평균이며공통scene교체
+  2회와부분reset을포함한다. 수집/학습trajectory가부동소수오차뒤달라져reset횟수도
+  조금다르므로 전체차이를순수GNN속도차이로간주하지않는다. 단독같은batch측정도함께확인했다.
+
+| 구간 | Forward 상한1024 | Forward 상한8192(적용) |
+|---|---:|---:|
+| Native collection |2.028s|1.960s|
+| Native learning(GAE+update) |0.933s|0.320s|
+| collection+learning |2.961s|2.280s|
+| PPO update(learning내부) |0.926s|0.313s|
+| Physics step 64회 |0.719s|0.697s|
+| Action apply 64회 |0.409s|0.402s|
+| Action process 32회 |0.127s|0.122s|
+| Termination manager(공통MDP갱신포함) |0.441s|0.429s|
+| Reset 전체(위manager내부포함) |0.081s|0.072s|
+| 콘솔·TensorBoard Logger.log |7.61ms|7.26ms|
+| Episode log bookkeeping 32회 |7.39ms|7.23ms|
+| check_nan 32회 |4.72ms|4.55ms|
+| 초기/마지막저장포함총native학습30회wall time |90.78s|70.44s|
+
+위구간은inclusive이므로하위구간을더하여전체를재계산하면안된다. Python wall timing은
+GPU비동기작업의대기가다음호출로넘어갈수있어kernel실행시간과도다르다. Profiler는
+함수별timer만활성이고torch.profiler/cProfile/추가CUDA synchronize는꺼져있었다.
+진단JSON은종료후한번저장하여iteration중계측파일쓰기비용을제거했다.
+
+Logging/debug 검토결과:
+
+- 기본 `check_for_nan=True`: 매step observation/reward/done의GPU scalar검사3개로
+  96회/iteration의잠재동기화가있다. 측정한전체호출비용은4.6ms수준이라유지한다.
+- Native Logger.process_env_step의dones.nonzero 및reward/length CPU복사도7.2ms수준이다.
+- Logger.log는20개scalar기록/iteration을포함해7.3ms. 이중SummaryWriter.add_scalar
+  누적은약0.92ms다. 콘솔과TensorBoard,bookkeeping,NaN검사합계약19ms로주병목이아니다.
+- Native Logger.log와checkpoint저장은RSL-RL이출력하는Iteration time에포함되지않는다.
+  초기checkpoint실제저장은1024/8192구성각약21.6/16.6ms였다. 50iteration주기+마지막
+  저장을유지한다. TensorBoard flush는native기본10초주기이다.
+- 모델/geometry/schema출력은시작때뿐이고reset반복print는비활성이다. Train기본경로에
+  torch.profiler,cProfile,detect_anomaly,CUDA_LAUNCH_BLOCKING,명시적synchronize는없다.
+  tactile/EEF debug_vis=False. NativePPO의minibatch별loss.item()은GPU결과완료를기다릴수
+  있으므로그전체대기시간을로깅계산비용으로돌려서는안된다.
+
+남은유력절감후보:
+
+- Native `ArticulationData.body_com_pose_b`의고정local COM조회비용은약0.351s/iteration이다.
+  여러property호출약194회중timestamp당최대1회실제조회하며현재64physics tick마다
+  CPU get_coms→GPU복사를다시한다. 이는OSC/MDP시간내부에포함되며따로더하지않는다.
+  mass/COM randomization이없는현재구성의캐시는유망하지만public정적cache설정은없다.
+  추후적용시관측·torque동등성과COM변경invalidate를검증해야하므로SDK패치는추가하지않았다.
+- Physics약0.697초와제어/MDP약0.5/0.43초가남는다. 앞서측정한native
+  gpu_max_num_partitions1 및YCBmustard의collision근사는후보이나이번요청에서는
+  solver/UR5e/physics주기/추가물체형상을변경하지않았다.
+
+자료: `outputs/contact_manipulation/native_audit_20261015/summary.json`,
+`timing*/{metadata,iterations,total}.json`, `chunk{1024,8192}.log` 및재현스크립트.
+
+최종 기본흐름재개검증:
+
+- 별도profiler/timer wrapper없는native train복사본에서기존`model_3550.pt`를strict로드하여
+  1024환경·16iteration재개가exit0으로끝났다. Native collection+learning평균2.489초,
+  최초iteration제외15개평균2.376초(collection2.043/learning0.334),전체wall40.19초였다.
+  첫iteration은4.185초였다. 앞선fresh30회와policy/resettrajectory가달라같은benchmark로
+  섞지않는다. 실제다른학습상태에서도처리량개선설정이동작하는호환성검증이다.
+- 모든10240object의mass/COM/inertia를이전fixed_states.pt와비교하여최대차이0을확인했다.
+  YCB두box의USD원본Mesh collision_enabled=False,FlatBoxCollision=True도확인했다.
+- 위실행은장기밀기/pivot접촉안정성이나이전3시간후CUDA719의해결을증명하지않는다.
+- 자료: `resume3550.log`, `resume_summary.json`, `object_properties.json`, `train_smoke.py`.
+  `train_smoke.py`는시작시1회물성비교만추가했으며학습중계측은없다.
+- Compileall과git diff공백검사도통과했다. Production파일을추가하지않고기존파일에서수정했다.
+
+### 2026-10-15 — 시작 시 URDF·Fabric 경고 검토
+
+사용자가 학습 시작 로그의 지연/문제 여부를 질문했다. 첨부 로그와 URDF·native converter·
+현재 FK/센서 코드를 읽기 전용으로 대조했으며 production 코드는 변경하지 않았다.
+
+- Axis 경고22개는 `axis="0 0 0"`인 fixed joint19개(17 tactile+2 palm),
+  `axis="0.17365 0 -0.98481"`인 thumb revolute3개다. Fixed joint에는 회전 자유도가 없다.
+- NVIDIA 공개 importer의 addJoint는 X축 표현에 필요한 보상 회전을 joint localRot0/1
+  양쪽에 적용한다. 문구의 "reorienting bodies"만으로 실제 손이 잘못 돌아간 것으로
+  해석하면 안 된다. 공개 소스와 설치된2.4.31 바이너리의 완전한 일치를 가정하지는 않는다.
+- 현재 FK는 변환 후 USD의 joint frames/axis에서 구성하고 전체41body를 PhysX와 비교한다.
+  F/T는 별도 authored mount frame이고 tactile binary는 world force norm을 사용한다.
+  직전 native FK·17채널 접촉 검증에서 이 경고에 따른 오류 증거는 없었다.
+- 경고 첫/마지막 timestamp16.077–16.843초의 간격0.766초는 import 작업이 섞인 구간이다.
+  순수 로그 출력 비용 또는 전체 URDF 변환 시간으로 해석하지 않는다. Import는 template
+  생성 때만 일어나며 reset/iteration에서 반복되지 않는다. 다만 hand UrdfFileCfg에 usd_dir가
+  없어 native converter가 실행마다 새로운 /tmp 경로를 만들고 재변환한다. 고정 USD cache는
+  프로세스 시작 시간의 개선 후보이며 iteration 비용과 구분한다. Mesh 변경 시 native
+  converter hash가 자동 갱신되지 않는 제한도 캐시 적용 시 고려해야 한다.
+- No Viewport Window는 headless viewport 부재 알림이다. Fabric removePath의 경로는
+  Hand proxy 교체에서 의도적으로 비활성화한 right_index_2 원본 collision mesh와 일치한다.
+  초기 USD/Fabric 삭제 동기화의 중복 알림으로 보이며, 이 한 줄로 native 내부 상태 전체를
+  증명하지는 못한다. 직전 native46shape/대체proxy/17채널 검증은 정상이다.
+- IOMMU는 URDF와 별개인 시스템 설정이다. Isaac Sim5.1 공식 문서는 bare-metal Linux의
+  multi-GPU 성능을 위해 비활성화를 권고한다. 현재 단일GPU 지연의 원인이라는 측정은 없다.
+
+근거: IsaacLab native asset_converter_base.py65–106/urdf_converter.py,
+scene.py516–530/943–949/1014–1026, mdp/sensors.py145–149/198–203,
+https://github.com/isaac-sim/urdf-importer-extension/blob/main/source/extensions/isaacsim.asset.importer.urdf/plugins/import/UrdfImporter.cpp#L976,
+https://docs.isaacsim.omniverse.nvidia.com/5.1.0/reference_material/sim_performance_optimization_handbook.html#disabling-iommu-on-linux .
+
+### 2026-10-15 — local COM 조회 경로와 공식 OSC 비교
+
+사용자가 고정COM 반복조회가 언제 발생하며 공식기능/예제는 어떻게 처리하는지 질문했다.
+코드수정없이 설치된버전의공식소스와 현재호출경로를대조했다.
+
+- 고정인것은 각link원점에대한localCOM이며 worldCOM이나전체로봇COM이아니다.
+- actions.py93의TCP Jacobian보정이body_com_pos_b를읽고,101의native body_link_vel_w도
+  내부에서동일값을쓴다. events.py610의F/T보상은native body_com_pose_w를통해같은값을쓴다.
+- articulation_data.py713–727은sim timestamp변경후첫접근에서get_coms().to(device)를한다.
+  PhysXTensors api.py2478은(count,max_links,7)을device=-1(CPU)에만들어반환한다.
+  같은tick의반복접근은cache되므로세호출경로마다별도복사하는것은아니다.
+- 현재32policy step/decimation2에서기본64physics tick동안반복된다. TCP한링크만선택해도
+  property가전체1024×41×7을먼저조회한다. 약1.12MiB/회지만0.35초포함시간을순수
+  memory copy비용이나보장된절감량으로해석하지않는다.
+- 공식run_osc.py314–342와native OSCAction653–716은직접PhysX Jacobian/body_pos_w/
+  body_vel_w를사용해이localCOM경로를조회하지않는다. 현재alias body_pos_w는linkpose,
+  body_vel_w는COMvelocity이므로우리의COM→TCP기준점보정을삭제하는근거로삼지않는다.
+- Native body_offset은지정TCP의고정변환을초기화때GPUtensor로만들어사용한다(325–330).
+  localCOM영구cache스위치는아니다. Native randomize_rigid_body_com(events.py400)은
+  CPUtensor를쓰며초기화때만사용하도록권장한다.
+- examples/Sweeping-Policy-DRL-Sim-Train의joint_pos_env_cfg.py39는JointPositionActionCfg를
+  사용하고있어OSC Jacobian/TCP보정과같은조회요구가없다.
+- 향후방향은native OSC유지+localCOM초기GPUcache+현재linkpose로worldCOM갱신이다.
+  COM/관성변경시cache를갱신해야하며현재publicAPI에는정적cache설정이없다.
+
+### 2026-10-15 — 공식 ManagerBased ActionCfg로 제어 구조 전환
+
+사용자는 action 코드가 공식 controller 예제와 달라 보인다며 Isaac Lab 예제 구조를
+요청했다. 두 차례 선택을 통해 다음을 명시했다.
+
+1. Env cfg에서 공식 ActionCfg를 설정하고 실행은 native 클래스에 맡긴다.
+2. 기존 custom 동작을 보존하는 adapter를 남기지 않고, 공식 ActionCfg의 기본 동작을
+   사용하며 차이를 문서화한다.
+3. OSC는 원격 `min` branch 설정에 stiffness 입력을 사용하는 형태로 맞춘다.
+   Joint-position은 examples의 구성을 참고한다.
+
+참조한 원격 현재 `min`의 `osc_random_sweep_env_cfg.py`에는 fixed-impedance base와
+`UR5eSweepKpOSCRelativeObsEnvCfg`의 variable_kp variant가 이미 있다. 후자를 기준으로
+제어 설정을 맞췄다. 로컬 origin/min의 과거 pose_abs/gravity=True 분석과 혼동하지 않는다.
+원격 경로:
+https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py
+
+적용 구조:
+
+- 공통 ShelfManipulationEnvCfg의 ActionsCfg는 arm/hand ActionTermCfg를 MISSING으로 선언한다.
+- config/ur5e/ur5e_env_cfg.py::__post_init__에서 native
+  OperationalSpaceControllerActionCfg와 JointPositionToLimitsActionCfg를 생성한다.
+- mdp/actions.py의 ArmOscAction/HandPositionAction과 helper/cfg subclass를 전부 제거했다.
+  mdp/__init__.py의 custom action lazy export도 제거했다. Controller/math 구현을 복제하거나
+  native 클래스 private hook을 override하지 않는다.
+- Arm: native ActionManager.process_action → OSCAction.process_actions/set_command →
+  physics substep의 OSCAction.apply_actions/OperationalSpaceController.compute →
+  joint effort target → scene.write_data_to_sim. Hand: native soft-limit mapping →
+  joint position target → 기존 ImplicitActuator/PhysX position drive.
+- MDP는 action subclass의 joint_ids/tcp_body_id/invalid_control에 의존하지 않는다.
+  Native robot.find_joints/find_bodies로 ID를 한 번 resolve하고 raw action 및 public
+  robot.data.applied_torque의 finite 여부를 GPU에서 확인한다. CUDA graph 입력에도
+  두 tensor를 명시적으로 포함했다. F/T 자중·관성 보상과 연구 MDP는 유지한다.
+
+최종 설정과 이전 동작의 차이:
+
+| 항목 | 현재 native/min 설정 |
+|---|---|
+| Arm action | pose_rel6 + stiffness6 |
+| position/orientation scale | 모두1.0; 이전0.015/0.08 제거 |
+| stiffness_scale |100.0|
+| stiffness limit | 모든축50–200; 이전 병진100–800/회전5–40의 affine mapping 제거 |
+| 실제정책kp범위 | bounded action[-1,1]이므로 clip(100a,50,200)=50–100;200은native상한 |
+| inertial decoupling | full=True,partial=False |
+| gravity compensation |False (원격현재min과동일)|
+| damping ratio / nullspace |1 / none|
+| motion/wrench control axes |전축motion / wrench제어없음|
+| TCP |우리자산의right_plam_force_sensor;Robotiq용0.13m offset은사용하지않음|
+| Hand |독립6관절,순서고정,[-1,1]→live soft limits의nativeposition target|
+
+- Raw position0.01=1cm,rotation0.01=0.01rad다. ±1m/±1rad까지의 raw bounded 입력을
+  예전 ±15mm/±0.08rad 제한과 혼동하지 않는다. Network/distribution의 tanh bounds는 그대로다.
+- 추가 workspace 목표 clipping, COM→TCP Jacobian/속도 보정, custom effort clipping,
+  hand measured-relative lead 제한, action sanitization은 제거했다. Native frame 처리와
+  기존 asset의 actuator/PhysX 한계를 사용한다. UR5e/Hand geometry·질량·관성은 변경하지 않았다.
+- Native OSC에서 localCOM조회가없어졌지만 F/T보상의worldCOM계산은여전히native COM API를쓴다.
+  이번변경을localCOM완전cache최적화로해석하지않는다.
+- Action18D/observation244D,initialvision·GNN·attention·PPO설정은유지한다. 입력의물리적의미가
+  달라졌으므로 action_contract=isaaclab_min_osc_variable_kp_joint_position_to_limits_v1을
+  checkpoint metadata에추가하여이전customcontroller checkpoint의자동resume/play를거절한다.
+  모델parameter shape가같다는이유로같은제어로이어학습할수있다고표현하지않는다.
+
+검증:
+
+- test_mdp.py:133개중125통과,CUDA/native8skip. test_learning.py:51개중50통과,CUDA1skip.
+- Isaac Sim안에서native controller 검사3개통과(native hand mapping/reset,
+  nativeOSC action gain scaling/clamp,nativeOSC relative latch/inertia-scaledPD).
+- GPU4환경에서stock action class의정확한type,12+6=18D,실제resolvedjoint/TCP ID,
+  stiffness[-1,0,1,2]→[50,50,100,200],handsoftlimit중간값을확인했다.
+  410policy/820physics step에서observation244D/reward/applied torque가finite였고
+  선택행reset의다른환경상태보존,53회자동reset,공통scene교체1회를검증했다.
+- 자료: outputs/contact_manipulation/native_actions_20261015/의validate.py,
+  validation.json/log,actions_before.py,events_before.py. Production파일추가없이actions.py를삭제했다.
+
+최종1024환경학습검증은16iteration을exit0으로완료했다. Native collection평균3.651초,
+learning평균0.328초,합계3.979초/iteration(최초제외3.814초),전체학습wall64.06초였다.
+현재min의scale1.0/gravityFalse/nativehand동작으로초기랜덤정책의행동·termination양상이
+달라졌으므로앞선custom제어2.35초와동등조건성능비교로해석하지않는다. Episode length의
+native최근100episode평균지표를16회평균하면77.8step이었다. 단순히구조정리로iteration이
+단축됐다고주장하지않는다. 이후성능/학습안정성비교시동일물리action범위와policy상태를
+고정한측정이필요하다.
+
+새model_15.pt의action_contract와저장을확인했다. 학습위치:
+logs/rsl_rl/contact_manipulation/2026-10-15_14-05-26_native_min_actions/.
+자료: native_actions_20261015/train1024.log,training_summary.json.
+
+현재native/min checkpoint를production play.py로4환경·64controlstep재생하여exit0으로
+완료했다. play.log의Playing iteration15/Played64controlsteps를확인했다. README의재생예시도
+구계약model2050에서새계약model15로갱신했다. Compileall/git diff공백검사통과.
+
+## 2026-10-15 — min branch를 프로젝트 전반의 구조 기준으로 사용
+
+사용자는 Sweeping-Policy의 `min` branch가 유사한 로봇·환경에서 다른 과제를 학습시키는
+프로젝트임을 강조했다. 제어뿐 아니라 전체 코드 구조와 실행 흐름을 주요 참고 대상으로
+삼는다. 이후 개발에서도 먼저 해당 구조와 Isaac Lab public 기능으로 표현할 수 있는지
+확인하고, 이 연구에 필요한 계산을 그 안의 cfg/MDP/model 확장으로 넣는다.
+
+원격의 현재 `min`을 다시 읽어 공통 환경 cfg, OSC cfg, hand·sensor 변형 cfg,
+Gym 등록, train/play 및 PPO 설정을 비교했다. 로컬 examples checkout과 원격 min은
+동일한 버전이 아니므로 혼동하지 않는다. 주요 참고 파일:
+
+- https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/shelf_sweep_random_env_cfg.py
+- https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py
+- https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/joint_pos_random_single_inspire_mass_sensors_env_cfg.py
+- https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/train.py
+- https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/play.py
+
+적용한 구조 정리:
+
+- 공통 `shelf_manipulation_env_cfg.py`: ground/light, manager term 선언, physics 100 Hz,
+  policy 50 Hz, episode 8초 및 viewer/render 설정을 관리한다.
+- `config/ur5e/ur5e_env_cfg.py`: 공통 cfg를 상속하고 robot/shelf/object/sensor와
+  공식 OSC·joint-position action을 구체화한다. 값과 제어 의미는 앞선 native/min 구성과 같다.
+- Observation을 단일 `measurements` term에서 `initial_scene` 100D, `current` 72D,
+  `previous` 72D의 native `ObservationTermCfg`로 선언한다. 구성과 순서가 cfg에 드러난다.
+  각 함수는 동일한 packed snapshot의 view이며 native manager가 순서대로 연결한다.
+  관측 정보·244D 순서·모델 parameter·action 계약은 그대로여서 직전 native checkpoint를
+  그대로 사용할 수 있다. 새 history encoder나 mask/role feature를 추가하지 않았다.
+- 관측·reward·termination이 공유하는 `TaskState`는 한 step의 센서·이력·차분 값을
+  일치시키고 reset 직전 terminal observation을 보존하므로 유지한다. 세 observation term이
+  센서 취득/기하 계산/이력 갱신을 세 번 실행하지 않는다. Native manager의 작은 clone 호출이
+  두 번 늘어나므로 이 변경을 속도 최적화라고 설명하지 않는다.
+- Production 파일 수를 늘리지 않았다. Asset 준비와 GPU FK/IK는 기존 `scene.py`,
+  reset/sampler/공유 상태는 기존 `events.py`, 모델은 기존 `agents`에서 관리한다.
+
+학습 실행 계층 검토 결과:
+
+- `min`은 task 등록 후 `runpy`로 stock train/play를 실행한다. 우리도 AppLauncher → Hydra →
+  gym.make → RslRlVecEnvWrapper → OnPolicyRunner 순서다. 별도 runner나 환경 step/reset
+  subclass를 추가하지 않고 native rollout/GAE/logger/checkpoint를 사용한다.
+- 직접 launcher만 남기면 stock train의 `init_at_random_ep_len=True`가 초기 vision·history·
+  경과 시간과 어긋난다. 따라서 기존 False를 유지한다. Stock play의 무조건 JIT/ONNX export는
+  현재 graph adapter에서 지원하지 않으므로 native inference로 바로 재생하는 차이도 유지한다.
+- 공유 GNN/attention과 tanh 분포, optimizer 중복 등록 방지, terminal 관측 bootstrap은
+  연구 adapter에 유지한다. 기본 1024환경의 PPO update는 이미 native `super().update()`다.
+  Minibatch 8192 초과일 때만 메모리 제한을 위한 microbatch 경로를 사용한다.
+- `min`의 다른 과제용 reward, observation, MLP와 PPO 수치를 복사하지 않는다. 구조를
+  참고하되 연구 수식·센서 의미·정책 설계의 변경은 별도로 판단한다.
+
+README에 대응표, 전체 실행 흐름, native 예제와 달라지는 이유를 정리했다.
+Train/play docstring에도 짧은 launcher로 대체하지 않은 구체적인 이유를 남겼다.
+
+검증 결과:
+
+- CPU MDP 127개 통과·8개 skip, 모델/PPO 50개 통과·1개 skip. 새 관측 term을 역순으로
+  조회해도 이력이 한 번만 갱신되고, concat 결과와 terminal snapshot이 보존되는 회귀 검사 포함.
+- GPU 4환경·410 policy step에서 native manager의 term 이름과 100/72/72 차원을 확인했다.
+  모든 step에서 합쳐진 244D가 기존 packed snapshot과 tolerance 0으로 일치했다.
+  반복 관측 조회의 이력 보존, 선택 행 reset의 다른 행 보존, 이전 terminal snapshot 보존,
+  49회 자동 reset과 공통 장면 교체 1회를 확인했다. Exit 0.
+- Production train.py로 직전 native `2026-10-15_14-05-26_native_min_actions/model_15.pt`를
+  불러와 1024환경·4 iteration 이어 학습을 완료했다. Exit 0, 학습 wall 17.59초.
+  단기 호환성 검사이며 처리량 개선이나 장시간 학습 안정성의 증거로 해석하지 않는다.
+- Compileall과 git diff 공백 검사 통과. 검증 스크립트·로그·JSON은
+  `outputs/contact_manipulation/min_structure_20261015/`에 있다.
+
+## 2026-10-15 — 2026-10-14_23-25-08 reward 로그와 수식 재검토
+
+사용자는 접근 보상을 따로 주지 않아도 물체와 접촉하는 행동이 나타난 점을 긍정적으로
+보고 reward weight/scale을 검토하도록 요청했다. 추가로 수식 자체를 바꾸거나 같은 목적을
+더 적절하고 저렴한 계산으로 달성하는 방안도 검토하도록 했다. 아래는 분석과 제안이며
+새 reward 설계로 확정하거나 production 수식/weight를 변경한 것은 아니다.
+
+해당 run의 저장 env/agent YAML, git diff의 기준 commit 7be67ac 및 TensorBoard event를
+확인했다. rewards.py는 해당 기준 commit과 현재 코드가 같다. 반면 당시 action은 이전
+custom controller의 position/orientation scale 0.015/0.08이었다. 현재 native/min action과
+학습 결과를 직접 대조하면 controller 변경 효과가 섞이므로 후속 실험은 controller를 고정한다.
+
+기록은 iteration 0~3556, 총 3557개이며 1024환경×32step 기준 116,555,776 transition이다.
+`Episode_Termination/success`는 모든 기록에서 0이었다. 각 구간의 scalar 평균:
+
+| 구간 | Train/mean_reward | Train/mean_episode_length × 0.02 |
+|---|---:|---:|
+| 0~99 | 416.04 | 5.04초 |
+| 500~999 | 277.63 | 3.65초 |
+| 3000~3556 | 490.06 | 5.61초 |
+
+이는 일관된 단조 향상이 아니다. 사용자가 본 접촉은 유용한 행동 관찰이나, 저장된 로그에는
+접촉률·raw overlap·path length·분리된 motion cost·원인별 failure가 없어 접촉 증가와 그 원인을
+직접 검증할 수 없다. Reward 상승만으로 통로 확보가 개선됐다고 결론 내리지 않는다.
+
+로그의 단위:
+
+- `Episode_Reward/*`는 reset 대상들의 episode sum 평균 / 설정된 8초다. 실제 episode
+  길이로 나눈 step quality가 아니다. Logger는 reset 크기로 가중하지 않고 extras를 평균하며
+  reset 없는 step에는 이전 extras가 남을 수 있다.
+- `Train/mean_reward`, `Train/mean_episode_length`는 최근 완료 episode 100개의 평균이다.
+- `Episode_Termination/*`는 전체 환경의 가장 최근 종료 원인 flag 평균이다. 현재 완료한
+  episode의 event 비율과 다르다. 따라서 terminal reward와 failure 지표의 분모가 다르다.
+
+기존 수식의 관찰 가능한 구조 문제:
+
+1. Clearance는 지정 Blocker만 보지만 success는 모든 non-target의 A0 overlap 합을 본다.
+   다른 물체가 통로를 막거나 들어오면 clearance가 높아도 성공할 수 없다. 전체 overlap은
+   이미 같은 GPU kernel에서 계산하므로 재사용하는 데 추가 geometry query는 필요 없다.
+2. Rearrangement는 누적 L에 대한 exp(-2L)을 매 step 지급한다. 0.1m 이동 후에는
+   이후 매 step 0.1813점씩 적게 받는다. 초기 blocker overlap ratio가 0.3이면 완전히 비워도
+   clearance 개선은 0.2592인데, 누적 L=0.15m의 rearrangement 감소도 정확히 0.2592다.
+   이는 전체 조작량 외에 조작 시점/남은 시간에 따른 추가 영향을 만든다.
+3. Motion의 normalized acceleration 제곱합은 여러 joint가 움직이면 쉽게 지수 score를
+   포화시킨다. 팔 6축이 각각 기준 5rad/s²일 때 exp(-6)=0.00248이다. 이는 예시이며
+   실제 run에서 포화됐다는 증거는 없다. wrench가 안정적이면 합성 Motion은 약 0.5012다.
+4. 앞의 세 항은 per-step score이고 Time만 초 기준 적분이다. 8초 dense 최대합 1200에
+   비해 Time 총합은 -7.5379, 마지막 step은 -0.1070이다. 모든 weight=1이어도 균형이 아니다.
+5. 성공 +500은 이 로그에서 경험한 기록이 없으므로 dominant했다는 근거가 없다.
+   gamma=0.99에서 step400의 +500은 시작점 할인값 약9.066이다. 반대로 즉시 가능한
+   성공을 무조건 미루는 것이 유리한 것도 아니다: dense 무한 할인 상한은 3/(1-.99)=300이다.
+
+수식 변경 후보(검토 중):
+
+- Clearance: 전체 non-target overlap B_t를 쓰고 초기 B_0 또는 A0 면적으로 정규화한
+  exp 품질값을 고려한다. 분모 선택은 목적/scale 변경이며 단순 최적화가 아니다.
+  품질값을 매 step 주는 대신 진행량을 보상하는 후보도 있다. 단순 Phi_t-Phi_prev는
+  gamma<1에서 potential-based policy invariance를 보장하지 않는다. 그 성질이 필요하다면
+  gamma*Phi(next)-Phi(current), true terminal의 potential=0, timeout의 pre-reset final
+  state bootstrap 처리를 함께 맞춰야 한다. 이는 기존 state score와 같은 objective가 아니다.
+  참고: https://people.eecs.berkeley.edu/~pabbeel/cs287-fa09/readings/NgHaradaRussell-shaping-ICML1999.pdf
+- Rearrangement: 합의한 전체 조작량 최소화에 가장 직접적인 transition 비용은
+  -w_r*DeltaL이다. 할인 전 합은 정확히 -w_r*L_total이며 왕복도 남는다.
+  exp(-aL_t)-exp(-aL_prev)는 최종 누적 exp 비용으로 telescoping하지만 총 비용이 포화된다.
+  exp(-a*DeltaL)-1은 작은 움직임에서 선형에 가깝지만 큰 한 번의 움직임을 상대적으로 덜
+  벌주고 step 분할에 따라 합이 달라진다. 모든 항을 exp로 맞추는 기존 방침도 재검토할 수 있다.
+- Motion: 가속도·힘/토크 크기 증가율이라는 목적은 유지하면서 joint 평균/Huber 등의
+  비포화 비용을 검토한다. 합→평균, exp→Huber는 목적의 상대 weighting을 바꾸므로 동등한
+  계산 최적화로 표현하지 않는다. 속도 자체·지속 하중·힘 감소에는 새 벌점을 주지 않는다.
+- Time: 지수 증가 개형과 해석적 적분은 유지할 수 있다. 기존 수식 기준 scale0.1~0.2는
+  8초 비용37.69~75.38의 비교 후보지만, 다른 수식을 바꾸면 이 수치도 재설정한다.
+  현재 observation에는 elapsed time이 없으므로 매우 강한 시간 의존성도 별도로 검토한다.
+- 기존 수식만 쓰는 비교군의 한 후보는 clearance/rearrangement/motion=2/0.5/0.5다.
+  최대 dense합3을 유지하면서 task 신호 비중을 늘리지만, 위 수식 변경 후 그대로 쓸 수 있는
+  최종 weight 제안은 아니다. Gamma와 terminal을 동시에 바꾸지 않는다.
+
+Pose 기반 조작량 계산 최적화 후보:
+
+OBB 중심 변화 dc, local half-extents h, q_rel=conj(q_prev)*q_now의 vector부 u에 대해
+8-corner RMS 변위는 다음과 같이 직접 계산할 수 있다.
+
+`d_RMS² = ||dc||² + 4*sum_i[u_i²*(sum_j h_j² - h_i²)]`
+
+이 식은 8개 corner의 norm 대신 물체당 sqrt 하나를 쓰며 평행이동·회전·pivot을 함께 반영한다.
+단 기존 산술평균 corner distance와는 다른 metric이며 RMS가 더 크거나 같다. OBB 중심과
+half-extents의 좌표계가 정확히 일치해야 한다. Synthetic float64 pose 10,000개에서 explicit
+8-corner RMS와 최대 오차2.01e-16을 확인했다. 기존 mean 대비 RMS 증가 중앙값4.33%,
+95백분위11.32%는 합성 표본의 결과이며 실제 학습 물체의 분포나 성능 향상을 뜻하지 않는다.
+
+계산 비용은 큰 병목과 구분한다. 이전 custom-action 1024환경×32step profiler에서
+reward_components 약17.57ms, projected_areas9.85ms, corner_path3.51ms/iteration이었다.
+중첩 측정이므로 합산하지 않으며 현재 native action의 절대 성능으로 해석하지 않는다.
+Exp 자체를 바꿔 전체 iteration을 크게 줄일 근거는 없다. Full3D projected OBB hull은 이미
+Warp GPU kernel이며, yaw-only/AABB 대체는 tilt/pivot에서 기하 의미가 달라지는 근사다.
+
+분석 자료: `outputs/contact_manipulation/reward_review_20261015/`의 scalars.csv,
+summary.json, training_trends.png/pdf, rms_geometry_check.json.
+
+
+## 2026-10-15 — Blocker 기준 Clearance와 발생량 기반 비용 적용
+
+**아래 선형/pseudo-Huber 보상 및 이에 맞춘 weight는 다음 사용자 정정에 따라 철회했다.**
+검증 기록은 당시 실험의 이력이며 현재 보상 설계가 아니다. 현재 정의는 다음 절을 따른다.
+
+사용자가 직전 reward 검토의 네 항목을 구체화했다. Clearance는 다른 non-target 물체를
+포함하지 않고 **지정 Blocker가 A0를 가리는 면적 / Blocker 전체 footprint 면적**으로
+정의한다. Rearrangement의 반복 누적 감점을 발생한 조작량의 비용으로 바꾸는 데 동의했다.
+Motion은 examples/의 구현을 참고하며, Time·Terminal scale은 이 수정 이후 검토한다.
+직전 절의 전체 non-target Clearance 제안은 채택하지 않는다.
+
+적용한 수식과 native manager 연결:
+
+- Clearance: `exp(-clamp(B/A_blocker,0,1))` 유지. B와 분모는 현재 Blocker의 XY 투영 OBB
+  footprint에서 계산한다. 성공 overlap gate도 Blocker의 B<=1e-5 m²로 맞춘다.
+  주변 물체 overlap은 이 gate에서 제외하되 Target 보호, 모든 active 물체의 안정화·안전
+  조건은 유지한다. GPU projected hull/clipping은 blocker mask 밖의 object를 건너뛴다.
+  CPU fallback이 mask를 무시하던 차이도 회귀 검사에서 확인하고 수정했다.
+- Rearrangement: `r_R=-2*DeltaL`. DeltaL은 모든 active 물체 각각의 대응 OBB corner
+  8개 변위 norm을 평균하고 물체 간 합산한 m 단위 거리다. Target·Blocker·초기 vision에
+  없는 물체도 포함하며 privileged physical pose를 사용한다. 회전·pivot·왕복도 비용이
+  남는다. 누적 path_length는 진단용으로만 유지하고 멈춘 후 과거 이동을 다시 과금하지
+  않는다. 할인 전 총 비용은 -2*L_total이다. RMS metric 제안은 적용하지 않았다.
+- Motion: 예제의 음수 RewardTermCfg 비용 구조를 따르되 예제의 joint velocity/action-rate
+  목적은 그대로 복사하지 않는다. 공식 joint_acc_l2를 arm 독립6관절/hand 독립6관절에
+  각각 적용한다. Native tensor의 가속도를 사용하므로 기존 policy velocity-history와
+  custom acceleration 계산을 제거한다. Mimic/passive 관절은 중복 계산하지 않는다.
+- 공식 제곱합으로 `x_arm=sum(arm_acc²)/5²`, `x_hand=sum(hand_acc²)/10²`를 계산한다.
+  큰 가속도의 극단적인 quadratic 비용을 완화하되 포화시키지 않기 위해
+  `rho(x)=2*(sqrt(1+x)-1)`를 적용한다. 이는 정규화한 vector 크기에 대한 pseudo-Huber다.
+  작은 변화에는 제곱 비용, 큰 변화에는 변화량 크기에 비례한 비용이며 상한이 없다.
+  작은 x의 소거 오차를 피하는 동등식 `2*x/(sqrt(1+x)+1)`을 GPU tensor로 계산한다.
+  Wrapper가 공식 함수의 결과를 변환하는 연구 수식이며 native 함수와 동등하다고 주장하지 않는다.
+- F/T는 기존의 보상된 wrench를 world 축·episode 초기 sensor 원점에 고정하여 비교한다.
+  `x_FT=(max(norm(F_t)-norm(F_prev),0)/(dt*200))²
+  +(max(norm(tau_t)-norm(tau_prev),0)/(dt*10))²`에도 같은 rho를 적용한다.
+  일정한 하중·힘 감소·같은 크기의 방향 변화는 이 비용이 없다. 일정한 관절 속도도 가속도
+  비용을 만들지 않는다. raw x_FT는 wrench_rate_cost에 진단용으로 유지한다.
+- 최종 초기 Motion weight는 arm/hand/F/T 각각 -0.05이다. 따라서
+  `r_M=-0.05*dt*(rho(x_arm)+rho(x_hand)+rho(x_FT))`다.
+  기존 양의 exp score를 음수 비용으로 바꿨으므로 단순한 계산 최적화나 동등 scale이 아니다.
+- Native joint_acc는 매 physics step에서 갱신된다. Reward 시점 값은 마지막10ms substep의
+  가속도이며 종전20ms policy 구간 평균과 다르다. 두 physics substep의 제곱 가속도 평균
+  또는 정확한 시간적분이 아니다. Native joint-velocity reset은 해당 행의 이전 속도 cache와
+  가속도를 함께 초기화하므로 reset 점프를 별도 history로 보정하지 않는다.
+- Time은 `-integral[elapsed,elapsed+dt]0.02*(exp(0.7s)-1)ds`, Terminal은 성공+500/
+  실패-100, gamma0.99를 그대로 둔다. 새 수식의 분포를 보고 별도 조정하며 지금 정한
+  비용 weight를 최종 균형값으로 해석하지 않는다. 이전 reward로 학습한 critic의 return
+  scale은 달라지므로 수식 비교는 새 run에서 수행한다.
+
+설정은 기존 RewardsCfg의7개 native term(clearance, rearrangement, arm_acceleration,
+hand_acceleration, wrench_increase, time, terminal)에 모았다. Arm/hand 관절 선택은
+UR5e cfg가 공식 ActionCfg의 동일 joint_names를 SceneEntityCfg에 연결한다. Native logger가
+Motion을 세 항으로 기록한다. Production 파일은 추가하지 않았고 observation/action/model
+계약은 변경하지 않았다. Geometry·Time·Terminal은 discrete 값/dt를 반환하며 가속도·F/T는
+비용률을 반환한다. 따라서 native weight*dt가 중복 적분을 만들지 않는다.
+
+초기 scale 선택 근거:
+
+- 과거 exp 식의 normalization 기준을 그대로 quadratic 비용에 적용한4환경 검증에서
+  Motion 평균 크기30.684/step, Clearance0.369였다. 1024환경4iteration에서는 드문 hand
+  가속도 값이 cost와 value target을 크게 만들었다. 해당 run은 수식 후보의 검증이며 채택하지 않는다.
+- 단순 weight축소 후보에서도 131,072 transition의 hand 비용 중앙값은 약5.0e-6이지만
+  최대값은12603.65였다. 평균만 맞추기 위해 scale을 더 내리면 일반적인 동작 신호도 약해져
+  큰 변화에서 선형 증가하는 rho를 선택했다. 물리 상태의 큰 가속도를 해결한 것은 아니다.
+- 위 동일 표본의 raw 제곱 비용을 최종 rho와 weight -0.05로 재계산하면 Motion 평균0.0881,
+  Clearance평균0.3705다. 첫 reset후 step평균0.0754/이후0.0885, failure step평균0.5903/
+  nonfailure0.0763이다. 모든 raw 표본은 finite였다. Motion p50/p90/p99는0.0598/0.1545/0.5630,
+  최대72.43으로 여전히 큰 급격한 변화에 비용이 남는다. 작은 값으로 clipping한 것이 아니다.
+- 이 수치는 같은 표본의 비용 재계산이다. 새 reward로 학습한 성능 개선이나 장시간 안정성의
+  증거가 아니며, controller와 초기화는 그대로 둔 초기 coefficient 선택 근거다.
+
+검증 자료는 outputs/contact_manipulation/reward_update_20261015/에 저장한다.
+CPU 회귀 검사는 Blocker/주변 물체의 overlap 분리, 새 이동량만 과금, 왕복·비관측 물체 포함,
+실제 native joint_acc_l2 호출/관절 선택, rho의 작은 값·큰 값 특성, 일정 속도/하중/힘 감소
+무과금, FT와 Rearrangement의 native weight·dt 계약을 포함한다. 기본 pytest는 ROS 자동
+플러그인의 lark 의존성 때문에 수집 전에 실패하여 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1로
+프로젝트 테스트를 실행한다.
+
+최종 코드 검증 결과:
+
+
+- CPU MDP/모델/PPO 185개 통과, 12개 skip, subtest112개 통과. Compileall·공백 검사 통과.
+- GPU 4환경 410 policy step, 자동 reset 49회, 공통 장면 교체 1회를 완료했다. Native 7 reward term,
+  arm/hand 독립 관절 선택, 실제 공식 가속도 값에 rho/ref/weight/dt를 적용한 결과, FT/조작량
+  accounting, 244D 관측·선택 행 reset·native 가속도 reset을 검증했다. Exit 0.
+- 최종 수식으로 1024환경 4 iteration, 131072 transition의 native PPO를 실행했다. 모든 reward와
+  value loss가 finite이고 Exit 0. 기록용 계측은 검증 스크립트에만 추가하고 production에는 넣지 않았다.
+  Per-transition 평균 Clearance +0.3712, Motion 합 -0.08476. 학습 wall 19.49초는 짧은 실행 결과이며
+  장시간 수렴·안정성이나 성능 향상을 보장하지 않는다. Time·Terminal을 이 수치로 자동 조정하지 않았다.
+- 최종검증의 validation.json/log, train1024_robust.log, robust_motion_distribution.json,
+  final_training_summary.json과 후보 분석 자료를 위 artifact 경로에 보존했다.
+
+
+## 2026-10-15 — exp(-a·x) 유지: 수식 검토 범위 정정
+
+사용자가 “수식 변경 검토”는 **exp(-a·x)를 유지하면서 x에 넣을 것을 고민하자는 의미**라고
+명확히 정정했다. 바깥 함수를 선형 비용/pseudo-Huber 비용으로 바꾼 것은 assistant의 잘못된
+해석이었다. 해당 변환과 -2/-0.05의 음수 외부 weight를 철회했다. exp-1 변환도 하지 않는다.
+
+현재 정의:
+
+- Clearance: x_C=Blocker의 A0 교차 면적/Blocker의 현재 XY 투영 footprint 전체 면적.
+  exp(-x_C)이며 주변 물체 overlap은 제외한다. Blocker 기준 성공 overlap gate와 Target
+  보호·모든 active 물체의 안정화 및 안전 조건은 직전 수정대로 유지한다.
+- Rearrangement: x_R=이번 transition의 ΔL_OBB. 대응하는 corner8개 변위 norm의 물체별
+  평균을 모든 active 물체에 대해 합산한 m 단위 값이다. 누적 L은 보상 입력에 넣지 않는다.
+  exp(-2·ΔL)을 지급하므로 멈춘 다음 step에는1로 복귀한다. 왕복·회전·비관측 물체도 포함한다.
+  누적 보상 감소가 -2·L_total과 정확히 같지는 않으며, step 분할에 따른 비선형 영향은 남는다.
+- Motion은0.5 exp(-a_acc·x_acc)+0.5 exp(-a_FT·x_FT).
+  x_acc=sqrt((joint_acc_l2(arm)/5²+joint_acc_l2(hand)/10²)/(n_arm+n_hand)).
+  공식 joint_acc_l2를 사용하며 n_arm=n_hand=6, mimic 제외. Native SceneEntityCfg로 관절을
+  선택하고 count는 CPU metadata에서 얻는다. Tensor 값을 CPU로 복사하거나 환경별로 순회하지 않는다.
+  관절 수 때문에 지수가 커지는 효과와 제곱 증폭을 줄이기 위해 정규화 RMS를 x로 사용한다.
+- x_FT=sqrt(((Δ⁺norm(F)/(dt·200))²+(Δ⁺norm(tau)/(dt·10))²)/2).
+  기존 고정 world 축·episode 초기 sensor 원점의 보상 wrench를 사용한다. 증가만 입력하며
+  일정 하중·힘 감소는 x=0이다. 일정 속도도 x_acc=0이다. Raw FT 제곱합은 진단용으로 유지한다.
+- Native 가속도는 마지막10ms physics substep 값이며20ms policy 평균이 아니다. 이전 custom
+  속도 history를 복구하지 않는다. Reset 때 native 가속도 cache가 초기화되는 동작을 사용한다.
+- a_C=1,a_R=2,a_acc=1,a_FT=1은 기존 계수 기준으로 유지한다. 이전 음수 비용에 맞춘 새
+  weight는 이식하지 않는다. RewardsCfg를5개 term(clearance,rearrangement,motion,time,terminal),
+  외부 weight 모두1로 복구했다. Time의 기존 적분식, Terminal+500/-100, gamma0.99는 유지한다.
+- 모든 term adapter는 discrete score/payment를 step_dt로 나눠 native RewardManager의 dt와
+  상쇄한다. Clearance/Rearrangement/Motion은 step당 최대1이다. Time은 적분값이다.
+  전체 return의 제어주기 불변성은 보장하지 않으며 현재50Hz 기준으로 비교한다.
+
+남은 x/scale 검토 사항:
+
+이전 motion_samples.pt의131072 transition을 새 x로 재계산하면 x_acc p50/p90/p99는
+약8.72/21.83/61.98이다. a_acc=1에서 exp score의83.0%가0.01미만이다. RMS만 적용해 포화가
+해결됐다고 해석하지 않는다. 동일 표본의 a_acc=.1/.05 평균 점수는 .410/.610으로 후속 비교
+후보일 뿐 이번 코드에 적용하지 않는다. x_R의 표본 중앙값은약0.000127m이므로 a_R=2에서는
+score가1에 매우 가깝다는 점도 검토 대상이다. 바깥 exp 형태를 바꾸지 않고 x 정의·a·단위·
+항 간 비중을 따로 검토한다. 앞 절의 선형/pseudo-Huber 검증은 이 수식의 학습 검증이 아니다.
+
+이번 변경 검증: CPU MDP/모델/PPO 186개 통과, 12개 skip, subtest114개 통과.
+GPU 4환경 64 policy step과 자동 reset 6회에서 native 5개 term의 weight=1, 0~1 score,
+공식 joint_acc_l2와 독립 계산한 RMS/exp의 일치, RewardManager dt 상쇄, Rearrangement의
+현재 step 이동량, 244D 관측·부분 reset 보존을 확인했다. Exit 0. Compileall·공백 검사 통과.
+장기 학습이나 새 수식의 1024환경 PPO를 실행한 결과는 아니며, 기존 131072개 표본의 지수
+입력 재계산과 구분한다. 검증 및 표본 재계산 자료는 outputs/contact_manipulation/reward_exp_20261015/.
+
+
+## 2026-10-15 — 최근 iteration 속도 저하 원인 계측
+
+사용자가 최근 수정 과정에서 연산 속도가 느려졌다고 보고하여 실제1024환경 학습16iteration을
+별도 계측 스크립트로 실행했다. Production의 제어·보상·reset 설정과 실행코드는 변경하지 않았다.
+현재 RTX3090에는 중지된 기존 사용자 학습 PID68242가 약5866MiB만 점유했고 실행 중인 다른
+GPU학습은 없었다. 해당 프로세스는 종료/재개하지 않았다.
+
+기존 로그를 먼저 비교했다. 최신15-23-21은1024환경3iteration,15-17-51은2048환경62iteration,
+14-22-35는4환경GUI라 직접비교할수없다. 최신1024 첫회제외2회평균은collection3.899+
+learning0.285=4.185초. 직전native_min_actions의같은iteration1~2는4.537초이므로 최근exp/RMS
+수식만으로추가회귀가발생했다고결론낼수없다. Native action전환 전후에는collection증가가일관된다.
+
+이번 계측은1024환경·물체10개·robot41body/46shape·센서2개·physics100Hz/policy50Hz·
+rollout32·PPO4epochs/4minibatches·forward8192·seed0·headless/no video로실행했다.
+첫iteration0과cProfile를켠iteration4를제외한1~15의14개를동일index의이전측정과비교했다.
+이전값은native_audit_20261015/timing_chunk8192(이전customaction)의보존자료다.
+
+| 단계 | 이전 custom action | 현재 native action |
+|---|---:|---:|
+| Collection |1.901s|3.251s|
+| PPO learning |0.322s|0.313s|
+| 합계 |2.223s|3.564s|
+| Reset 전체 |0.050s|1.406s|
+| Reset의로봇시작자세탐색(상위reset에포함) |0.035s|0.808s|
+| Physics step64회 |0.665s|0.875s|
+| Action process+apply |0.522s|0.268s|
+| Termination/common MDP manager |0.428s|0.406s|
+| Reward manager |0.0148s|0.0231s|
+| Console/TensorBoard Logger.log |0.0070s|0.0085s|
+
+전체증가약1.341s에대해reset증가약1.356s가가장크다. 현재는iteration당reset호출31.36회/
+선택된환경375.43개이고이전은0.571회/73.79개였다. 전체1024환경을매step리셋한다는뜻은아니며,
+32policy step중거의매step에서일부환경이종료되어다른subset으로작은reset을반복한다는뜻이다.
+작은batch의고정launch/검증/동기화비용이누적된다. 초기자세IKsolve/collision은현재139.14회/
+iteration,이전3.57회였다. 현재전체16회학습wall60.55초,마지막iteration2.92초로초기구간보다
+낮아졌으므로짧은3iteration로그만으로정상상태평균을추정하지않는다.
+
+원인과해석:
+
+- 공식nativeaction클래스의계산시간자체는이번측정에서감소했다. 하지만의미도바뀌었다:
+  position scale0.015→1.0,orientation0.08→1.0,hand목표lead제한제거,workspace/customeffort
+  제한제거,gravitycompensationTrue→False. 예를들어위치action0.1은종전1.5mm에서현재10cm다.
+  같은정책출력분포라도접촉·실패·episode길이와reset부하가달라진다. 이원인분리는서로다른
+  행동trajectory를비교한것이므로각설정의단독인과효과까지증명한것은아니다.
+- Reset은공통물체배치와초기vision을재사용한다. 이번raycapture시간평균은약0.0004s/iteration
+  (공통장면교체1회포함)으로주병목이아니다. 매번새EEF자세를찾는GPU IK/전체로봇충돌검사,
+  선택행상태쓰기와metadata/초기센서검증이남아있다. CPUprofile에서는IK/충돌재시도가반복됐다.
+- 새exp/RMS reward의manager증가는약8.3ms다. 전체초단위회귀를설명하지못한다.
+  가속도는nativecache를읽으며새PhysXread가아니다. 관측3term도동일snapshot의view다.
+- Logging은약8.5ms로주병목이아니다. 별도디버그출력이나productionprofiler를추가하지않았다.
+- 고정COM의nativeget_coms→GPU조회는여전히약0.333s/iteration이지만이전도약0.348s로
+  이번증가원인과구분한다. 향후고정metadatacache는절감후보다.
+
+가장우선인개선대상은정상동작을만드는공식ActionCfg의연구용scale검토와작은partialresetbatch의
+IK후보일괄처리/충돌검사launch절감이다. 관측·제어주기를낮추거나초기자세randomization을없애는
+변경은하지않았다. 이번요청은원인확인이며production최적화는적용하지않았다.
+
+계측은호스트wall시간이며CUDA비동기작업의대기위치에따라귀속이달라질수있다. 중첩단계를
+합산하지않는다. 서로다른제어매핑·reward·policy상태라동일trajectory의알고리즘A/B도아니다.
+진단JSON은종료시저장했고추가cProfile는한iteration만켰다. 최초계측스크립트의nativeaction
+import경로오류두번은시뮬레이션진입전실패로,위정상계측자료와분리한다.
+
+자료: outputs/contact_manipulation/slowdown_20261015/의stage_comparison.json,
+log_audit_summary.json,current_timing.log,current_timing/{iterations.json,cpu.txt,metadata.json}.
+
+
+## 2026-10-15 — 구조 변경 중 reset/물리 최적화의 보존 여부 확인
+
+사용자가 구조 변경 때문에 앞서 줄인 reset/physics 연산이 이전 상태로 되돌아갔는지 질문했다.
+단순 HEAD 비교 대신 실행 시 저장한 git diff를 공통 commit7be67ac에서 복원해 코드와 설정을
+대조했다. 보존된 빠른 실행13-30native_audit_chunk8192,13-32resume3550,14-05native_min_actions,
+14-20min_structure,15-23현재 실행을 확인했다.
+
+확인 결과 reset/physics의 주요 연산 최적화가 되돌아간 증거는 없다.
+
+- events.py의 Shared layout preparation 이후2694줄(현재739행~끝)은 위 실행본과 현재가
+  byte-for-byte 동일하다. SHA256은 a066fce3b5b052372e245a17e7ef1cd5f1e8543d7f79b8487ee5bd2e826e1bc2.
+  배치 생성, GPU IK·충돌 검사, 공통 template, 부분 reset 알고리즘이 포함된다.
+- sensors.py 전체755줄도13-30 이후 현재까지 동일하다. 실제 카메라/render product를 만들지
+  않는 물체-only GPU raycast, 공유 BVH, tactile17채널 통합 센서 및 전체 batch 갱신 fast path가 유지된다.
+- reset_task는 동일한 선택 행 처리이며 전체 환경 초기화로 돌아가지 않았다. 정상 step의
+  transition CUDA graph capture/replay도 유지된다. 관측3term은 같은 cache의 view다.
+- 공통 scene round에서 singleton env0만 배치/vision을 만들고, 중간 reset에서는 template를
+  재사용한다. 물체 재spawn·raycast 재생성이 없다. 선택 행의 물체/선반/로봇 tensor state를
+  쓰며, reset 중 settling simulation을 추가하지 않았다. sim.forward는 기존부터 있던 갱신이다.
+- 저장 YAML의 sim/scene 설정은13-30,13-32,14-05,14-20,15-23 실행에서 동일하다.
+  physics100Hz/policy50Hz,headless render 비활성,10개 물체 pool,robot solver16/2,
+  Hand 충돌 proxy 단순화, YCB5mm와 box proxy,geometry sharing,17tactile 통합,금지접촉센서
+  제거 설정이 보존됐다. 별도 새1024물리 생성을 반복한 검증은 아니며 저장 설정/소스의 동등성이다.
+- 고정 mass/inertia cache와 전체 활성 시 parking force composer 비활성 최적화도 유지된다.
+  Native COM 조회는 이전에도 매tick 발생하던 남은 비용으로, 새로운 cache 삭제가 아니다.
+
+실제로 제거/변경된 것은 native ActionCfg 전환 시의 custom 제어 매핑·workspace/effort/hand lead
+제약과 gravity/gain 설정이다. 이는 당시 공식 기본 동작 사용 및 min branch 설정 요청에 따라
+변경·문서화한 항목이며, reset이나 collider 최적화를 복구 전 상태로 되돌린 변경은 아니다.
+다만 제어량·접촉/종료 양상을 바꾸어 기존 reset 경로를 더 자주 호출하게 만들 수 있다.
+
+기존8개씩 IK 후보 처리와 first.cpu().tolist 동기화/pending 반복은23-25 실행본에도 있었다.
+현재 계측의 작은 reset 평균12환경/호출에서는 이 고정비가 두드러진다. iteration당 reset
+0.571→31.36회,전체reset비용0.050→1.406초라는 이전 절의 계측과 일치한다. 향후 해당 작은
+batch에서 후보 폭을 늘리는 최적화는 남아 있지만 이번 확인에서 production은 변경하지 않았다.
+
+증거는 outputs/contact_manipulation/slowdown_20261015/reset_optimization_forensics.json 및
+동일 폴더의 로그/설정 비교 자료에 보존한다. 기존 HEAD는 공유 배치 도입 이전 코드도 포함하므로
+HEAD와의 차이만으로 최근 구조 정리에서 회귀했다고 판단하지 않는다.
+
+
+## 2026-10-15 — 예제와 robot velocity 제한 비교
+
+사용자가 현재 로봇 속도 제한과 examples/의 차이를 질문했다. 설정과 설치된 actuator 구현을
+읽기 전용으로 확인했으며 production 값은 바꾸지 않았다.
+
+- 현재 scene.py의 arm velocity_limit_sim은 shoulder_pan/lift/elbow 각각3.14rad/s,
+  wrist1/2/3 각각6.28rad/s다. 로컬 examples/src/ur5e.py의 명시 숫자 및 보존된 min의
+  ur5e.py 숫자와 같다. 보존된 min은 velocity_limit_sim을 사용한다.
+- 로컬 examples는 구형 ImplicitActuatorCfg.velocity_limit만 지정한다. 설치된 Isaac Lab
+  actuator_pd.py81~91은 이 경우 해당 값을 무시하고 USD에서 읽은 제한을 사용한다. 따라서
+  로컬 설정 숫자가 같다고 실제 solver 값까지 같다고 단정하지 않는다. 우리 코드는
+  velocity_limit_sim이므로 위 숫자를 PhysX joint max velocity로 명시한다.
+- 우리 Inspire Hand의 모든 가동 관절은 velocity_limit_sim=1rad/s다. 원본 URDF thumb는
+ 2rad/s, 다른 손가락은1rad/s지만 actuator 설정이 최종 override한다. 로컬 예제 gripper의
+  지정값2rad/s는 Robotiq이며 동일한 손 모델의 비교가 아니다.
+- 로컬 예제에는 추가로 hand_velocity termination threshold1rad/s가 있다. 이름과 달리
+  terminations.py160은 UR5e 앞6관절의 abs(joint_vel)을 검사한다. 이는 속도 clamp가 아니라
+  초과 시 episode 종료다. 현재 연구 환경에는 로봇 속도 자체에 의한 종료 조건이 없다.
+- 예제 joint_vel_l2 reward weight-.03도 현재 연구 목적과 차이가 있다. 우리는 일정한 고속
+  자체보다 가속도와 F/T 크기의 급격한 증가에 비용을 주는 설계다.
+- 앞서 native action 전환에서 제거했다고 설명한 hand 제약은 **측정 관절 위치 기준 목표
+  위치의 lead 제한**이다. 물리 관절 속도 상한1rad/s는 제거되지 않았다. 또한 OSC의 pose
+  action scale은 관절 속도 상한과 별개의 설정이다. 큰 목표 오차가 물리 속도 제한 안에서도
+  큰 torque/급격한 가속을 만들 수 있으므로 속도 상한이 같다고 제어 동작까지 같지는 않다.
+
+근거: current config/ur5e/scene.py642~656, 로컬예제sweeping_policy/src/ur5e.py80~116,
+예제shelf_sweep_ramdom_env_cfg.py185 및 mdp/terminations.py150~160,
+IsaacLab/source/isaaclab/isaaclab/actuators/actuator_pd.py80~101.
+
+
+## 2026-10-15 — UR5e 제어 설정을 예제 기준으로 명시
+
+사용자가 UR5e 설정을 examples/를 참고해 구성하라고 요청했다. 추가 범위 질문에는
+**제어·물리 설정만 예제 기준으로 유지**를 선택했다. 예제의1rad/s초과 episode 종료 조건을
+연구 MDP에 추가하지 않는다.
+
+현재 UR5e의 velocity_limit_sim(shoulder/elbow3.14,wrist6.28rad/s),effort_limit_sim
+(shoulder/elbow150,wrist28Nm)은 예제와 이미 같아 수치를 유지했다. 구형 velocity_limit의
+무시 동작을 따라하지 않고 현재 Isaac Lab의 *_sim 필드로 PhysX에 적용한다.
+OSC는 보존된 min의 UR5eSweepKpOSCRelativeObsEnvCfg 기준 pose_rel/variable_kp,
+position/orientation_scale1,stiffness_scale100,stiffnesslimits50~200,dampingratio1,
+full inertia decoupling,gravity compensation=False,nullspace none을 유지했다.
+
+코드는 예제처럼 UR5eContactManipulationEnvCfg.__post_init__에서도 arm actuator의
+stiffness와 damping을0으로 명시하도록 정리했다. Asset factory에서도 이미0이었으므로
+이번 명시는 현재 실행의 제어값을 바꾸지 않는다. Joint position 예제의 높은 arm PD gain을
+OSC에 복사하여 torque가 중복되는 일을 막는 설정 위치다. Hand 설정과 초기자세/센서,
+충돌 형상 최적화·기존접촉해소속도1m/s·solver16/2는 보존했다. 접촉해소속도는 관절의일반
+velocity 상한이 아니며, 예제5m/s를 단순복사하면 조립된 hand에도 적용되므로 올리지 않았다.
+
+Production 변경은 기존 UR5e cfg의2개 대입과참조주석,README 설명에 한정한다. 새파일이나
+controller subclass는 추가하지 않았다. Compileall·git diff공백 검사를 통과했다.
+
+GPU1환경에서실제PhysX max-velocity와ArticulationData effort/gain을확인했다. Arm6관절의
+속도3.14/6.28rad/s,토크150/28Nm,stiffness/damping0이모두기대값과일치했다. Hand6독립관절의
+속도1rad/s및기존3개termination term도확인했다. Native OperationalSpaceControllerAction으로
+4policy step의관측·보상이finite였다. 자료는outputs/contact_manipulation/ur5e_example_20261015/
+validation.json/log이다. 초기검증스크립트는PhysX최대속도조회가CPU tensor를반환하는데GPU
+기대값과비교하여중단됐고,비교device만수정한재실행에서위검증을완료했다. Production문제가아니다.
+
+
+## 2026-10-15 — Scene reset 연산 절감 검토와 후보 batch 실험
+
+사용자가 현재 구조에서 scene reset 시간을 더 줄일 수 있는지 검토하도록 요청했다. 이번에는
+production을 변경하지 않고 기존 계측, 소스의 데이터 사용 여부, 실제 GPU sampler의 임시
+복사본을 비교했다. 현재의 공유 배치/초기 vision, 매 reset 새로운 연속 EEF pose, elbow-up/
+forearm/충돌 조건, 선택 행만 복원하는 규약을 유지하는 방안이다.
+
+우선순위가 높은 개선 후보:
+
+1. Reset용 선택 행 snapshot: 현재 reset_task는 _read_transition을 호출해 정상 step과 같은
+   물체 COM/속도, 모든 로봇 링크의 COM/가속도/각속도, F/T 자중·관성 보상까지 계산한다.
+   그러나 TaskState.reset은 초기물체 pose/corners, sensor위치, TCP pose, joint q/dq를 사용하고
+   sample의FT/tactile/action은 즉시0/-1/0으로 덮어쓴다. 초기물체속도/보상wrench/overrange/
+   state_valid도 reset에서 소비하지 않는다. 필요한 native pose·joint만 선택 행으로 읽으면
+   이 불필요한 연산을 생략할 수 있다. 정상 step의 센서 보상은 유지한다.
+   기존 계측 reset 전체1.406s/iteration 중 reset MDP는0.411s, 그 안의 _read_transition은
+   0.274s이고, 그 안의 world COM 조회·변환은0.176s다. 중첩 시간이며 합산하지 않는다.
+2. 작은 reset batch의 IK 후보 폭 조정: 현재 후보8개 고정 폭과 CPU acceptance 왕복을 반복한다.
+   현재 평균약12환경/호출에서 이를 더 크게 묶으면 GPU launch와 CPU동기화 횟수를 줄인다.
+   단순히 가능한 최대80개를 쓰는 것은 과도한 후보 연산을 늘릴 수 있으므로 아래 실험 결과를
+   바탕으로 batch 크기별 폭을 정해야 한다. 총 동시후보 상한1024는 유지한다.
+3. 공통 template 검증·전처리 cache: catalog lower/upper/upright 유효성은 초기1회, role관계와
+   초기 vision정렬·local corners·장면 obstacle OBB·로봇시작영역은 scene generation당1회
+   계산한다. 부분 reset에서는 template tensor를 재사용하며 실제 새 robot/shelf pose 검사만
+   수행한다. 현재 _validate_reset_data의 별도 CPUprofile는 약0.036s/iteration이었다.
+4. SAT GPU kernel 합치기: 현재 world AABB로 분리가 확인된 pair나 IK실패 후보도 뒤의15축
+   tensor SAT를 계산한다. Device kernel에서 저렴한 pose/IK조건 실패 시 후보를 건너뛰고,
+   AABB분리 pair의 세부 SAT를 생략하며 첫 충돌에서 종료하면 launch/임시tensor/불필요한
+   세부연산을 줄일 수 있다. 검사 조건·거리 여유를 삭제하는 변경이 아니다. 기존 평균
+   collision검사0.466s는 위 IK부모0.808s의 일부다.
+
+실제 GPU microbenchmark:
+
+RTX3090에서 실제 RobotPoseModel/GPU IK/충돌검사를 사용했다. 물리환경1개에서 공통장면을
+초기화한 뒤1/4/12/32개 reset요청을 만들고, sampler의 후보 폭만8/32/64/80으로 바꾼 임시
+함수들을 비교했다. Warmup 후각5회, 호출전후 CUDA synchronize로 sampler 전체wall시간을
+쟀다. 아래는 한 shared scene·동일 seed 표본의 평균이며 전체 reset/학습 시간이 아니다.
+
+| 선택 환경 수 | 기존8후보 | 32후보 | 64후보 | 80후보 |
+|---:|---:|---:|---:|---:|
+|1|6.17ms|6.02ms|6.36ms|7.53ms|
+|4|34.29ms|13.39ms|11.14ms|11.76ms|
+|12|33.17ms|19.79ms|23.06ms|26.30ms|
+|32|56.26ms|40.61ms|59.86ms|70.10ms|
+
+12환경에서는8→32후보로약40.3%감소했고, solver호출은6→2회였다. 32환경에서80후보는
+오히려기존보다느렸다. 따라서 “작은batch는항상80개”를확정하지않는다. 1환경의첫8개에서
+해가발견되는표본에는확대의이득이작았다. 폭에따른early-exit와불필요한후보수의tradeoff다.
+12환경의peak allocated는8후보약50.8MiB,32후보174.7MiB,80후보423.0MiB였다.
+
+비교한모든16case에서최초유효후보index가정확히같았고,선택jointpose는rtol1e-4/atol1e-5
+내에서일치했다. RNG가절대후보번호에기반하고branch=%4,strength=absolute_attempt//8을
+유지했기때문이다. 다른scene/경계값의동등성과실제1024환경전체iteration개선은적용후별도
+검증해야한다. 이실험에서physics simulation이나PPO학습을반복하지않았다.
+
+낮은우선순위는sim.forward제거(현재약0.0036s/iteration)다. 초기FK갱신역할에비해절감이작다.
+센서중복reset이나Python tuple재조립도후보지만위큰항목뒤에처리한다. 고정localCOMcache는
+정상step에도효과가있을수있으나reset snapshot절감과중복계산하지않는다.
+
+이번production최적화는미적용이다. 검토/재현자료는
+outputs/contact_manipulation/reset_review_20261015/{review_summary.json,candidate_widths.json,
+candidate_widths.log,benchmark_candidates.py}에보존한다.
+
+
+## 2026-10-15 — 작은 reset의 IK batch와 공유 장면 cache 적용
+
+사용자는 COM 비용이 OSC 정리 때 해결되지 않았는지, 충돌 검사가 이미 GPU가 아니었는지
+확인했다. 제어 경로의 COM→TCP 보정 조회는 native OSC 전환으로 제거됐다. 그러나
+`_read_transition → body_com_pos_w → body_com_pose_b`는 F/T 자중·관성 보상을 위해 남아 있고,
+현재 Isaac Lab은 physics timestamp마다 `get_coms().to(device)`로 고정 local COM도 다시 읽는다.
+이 두 경로를 구분해야 한다. 충돌 검사는 기존부터 GPU tensor 연산이었다. Kernel 합치기란
+CPU 검사를 GPU로 옮기는 뜻이 아니라 launch·임시 tensor·불필요한 세부 SAT를 줄이자는 뜻이다.
+이번에 승인·구현한 범위는 아래 두 가지다. F/T 보상이나 collision kernel 자체는 변경하지 않았다.
+
+- 작은 reset의 IK 후보 폭: 32환경 이하 요청은 최대32후보, 나머지는8후보씩 검사한다.
+  동시 후보 총량은 기존 `ik_batch_size` 이하이며 절대 후보 번호별 RNG, branch `%4`,
+  perturbation strength `absolute_attempt//8`, 첫 유효 후보 선택, 충돌 margin/조건을 유지한다.
+- 공유 장면의 입력 재사용: singleton proposal·obstacle OBB·robot start region을 cache한다.
+  역할 mask·local center/corners/upright·역할 순서의 initial vision과 producer 검증도 장면당1회다.
+  새 template은 cache를 교체하고, robot/spawn 규칙 변경은 robot scene cache를 갱신한다.
+  실제 새 로봇 자세의 IK·충돌·허용영역 검사 및 로봇/선반 finite pose 검사는 매번 유지한다.
+
+Native reset_scene이 정상 적용을 마친 뒤 같은 env_ids에만1회 사용 가능한 marker를 전달한다.
+reset_task는 marker를 소비하고 template identity로 검증된 공통 geometry를 재사용한다.
+외부 SceneBatch나 다른 reset 대상은 기존 검증을 유지한다. Catalog/template은 생성 후
+불변이라는 native producer 계약이다. 공통 vision의 robot-base frame은 유지하고 EEF frame
+변환은 기존 observation 경로에서 계속 수행한다. Native EventManager/asset writes와
+sim.forward를 유지했고 production 파일은 추가하지 않았다.
+
+검증: CPU 기존/추가 테스트와 임시 후보 선택 oracle을 합쳐283passed,12skipped,145subtests.
+그 중 임시 후보 폭 oracle은92case다. 실제 CUDA IK는3장면×7요청크기(1/4/12/32/64/128/1024)
+×4변형(cache유무,8후보/변경폭),총84case에서 성공/실패와 첫 유효 후보 번호 및 시작영역이
+정확히 같았고, 관절값/TCP는rtol1e-4/atol1e-5내에서 같았다. 규칙 변경 cache invalidation도
+3장면에서 통과했다. 미세 수치 차이 이후의 전체 물리/학습 궤적이 동일하다는 의미는 아니다.
+
+실제 RTX3090,1024환경,10물체,seed0,dt0.01/decimation2,native OSC/PPO로 변경 전후 각각
+16iteration을 새로 실행했다. 첫 iteration0과 cProfile을 켠 iteration4를 제외한14개 평균이다.
+변경 전은 보존한 이전 reset 함수만 임시 계측 프로세스에서 복원했고 production은 수정하지 않았다.
+
+| 항목 | 변경 전 | 변경 후 |
+|---|---:|---:|
+| 전체 iteration(collection+learn) |3.5667s|3.2081s|
+| reset 전체/iteration |1.4112s|1.0180s|
+| 로봇 시작 탐색/iteration |0.8458s|0.5214s|
+| reset MDP/iteration |0.4088s|0.3358s|
+| IK solve/충돌 검사 호출/iteration |142.21회|56.64회|
+| physics64step/iteration |0.8666s|0.8711s|
+| PPO update/iteration |0.3167s|0.3224s|
+
+전체 약10.1%,reset 약27.9% 감소했다. 위 하위 구간은 중첩된 host wall time이며 합산하지 않는다.
+두 새 학습의 reset 대상 수는 평균336.4→367.4행/iteration으로 달랐고 reset 호출 수는
+31.07→31.36회였다. 완전히 같은 궤적의 replay나 장기 처리량 보장이 아닌 짧은 실행 비교다.
+공유 데이터 검증은 평균31회/iteration에서 scene 교체 때만으로 줄었다.
+
+후보 확대는 모든 장면에 이득이 아니다.3장면 sampler 별도 평균에서12요청은19.21→14.94ms였지만
+32요청은29.77→31.80ms였다. 쉬운 장면은 첫8개에서 모두 해를 찾아32개 계산이 낭비된다.
+현재 학습의 작은 reset 분포에서 얻은 이득을 전체 장면/크기에 일반화하지 않는다. 쉬운 장면의
+후보 폭 자동 조정은 후속 검토 후보이며 현재 결과는1~2초/iteration 목표에 아직 도달하지 않았다.
+
+자료: outputs/contact_manipulation/reset_optimization_20261015/의 comparison.json,
+before/after/iterations.json,cuda_equivalence.json과 계측·검증 스크립트.
+
+추가 실제 rollout 검증:4환경410policy step에서 자동reset49개와 수동부분reset1회를 확인했다.
+초기geometry/producer검증은 generation0(step0),generation1(step400)에서 각singleton1회뿐이었다.
+부분reset시 미선택환경의nativepose·state·metadata·관측과terminal snapshot이 유지됐으며,
+244D observation packing도 전step에서 정확히 일치했다. cache_rollout_validation.json에 저장했다.
+
+
+## 2026-10-15 — CPU 한정이 아닌 전체 연산 절감 추가 검토
+
+사용자는 CPU→GPU 전환뿐 아니라 연산을 빠르게 할 수 있는 요소 전반을 검토하도록 명확히 했다.
+이번 범위는 소스·기존 계측 검토이며 production 변경은 하지 않았다. 추가 native 기능 재작성이나
+정책/물리 주기·reward/모델 구조 변경을 속도 최적화에 섞지 않는다.
+
+현재 unprofiled14회 평균에서 관련 비용은 reset MDP0.3358s(그 안의 transition0.2802s,
+worldCOM0.1801s), 정상step worldCOM0.1802s/objectCOM0.0547s, IK 후보검사0.5024s
+(충돌0.3523s,IK solve0.0818s),physics64step0.8711s,action처리+적용0.2775s,
+정책 rollout0.1009s,PPO0.3161s,step저장/bootstrap0.0889s다. 중첩·GPU대기 포함 시간이며
+합산하거나 전부 절감 가능한 시간으로 보지 않는다. broader_audit.json에 근거를 저장했다.
+
+우선 후보:
+
+1. Reset 전용 snapshot. TaskState.reset이 쓰는 center/corners/rotation/shelfpose/sensorposition/
+   TCP/jointsample[:31]만 읽는다. 현재 불필요한 object COM/velocity·bodyCOM/가속도·F/T 보상을
+   계산한 뒤 F/T/tactile/action을0/−1/0으로 덮는다. 실제 초기 observation을 유지하며 해당
+   연산과 native 조회 자체를 생략할 수 있다.
+2. 정상step의 고정 local COM을1회 GPU cache. Native get_coms는 CPU tensor(device−1)를 만들고
+   body_com_pose_b는 physics timestamp마다 이를GPU로 복사한다. Reset joint state write도
+   localCOMtimestamp를−1로 만든다. 현재 COM/mass/inertia randomization이 없으므로 task reader에서
+   localCOM캐시+GPU link→COM 변환으로 대체 가능하다. 공식 OSC/native asset writes는 유지한다.
+3. 충돌 검사. 현재 IK실패·ground/elbow실패 후보도 전체 OBB SAT를 계산하고, AABB로분리된 pair도
+   세부15축을 계산한다. 조건/margin은 유지하고 Warp kernel에서 조기 탈락·분리 pair 건너뛰기,
+   첫 충돌 종료 및 임시 tensor/launch 감소를 검토한다. IK는 이미 Warp CUDA다.
+4. Native PhysxCfg.gpu_max_num_partitions. 현재 기본8. 기존 별도실험은8→1로64physics가
+   0.799→0.699s(12.6%),8→4는0.738s였다. 현재nativeOSC/동적접촉에서1/2/4/8 A/B가 필요하다.
+   기존combinedtrace에서는 solveBlockUnified launch9216→1152였지만 다른 최적화도 함께있어
+   현재 개선량으로 단정하지 않는다. 물리/정책Hz를 바꾸지 않는 native설정 후보다.
+5. Timeout이 없는 step의 terminal critic 생략. process_env_step은 terminal_env_ids가비지않으면
+   time_outs가모두False인실패종료때도final GNN/critic을계산하고 이후0을곱한다. 실제 공통round
+   boundary의 timeout metadata로필요성만전달하면 불필요추론을생략할수있다. 기존 nativePPO와
+   실패bootstrap0,실제timeoutfinalstate bootstrap은유지해야한다. 무작정torch.any→Python판단은
+   새GPU동기화를만드므로피한다. 저장/bootstrap전체0.089s가상한성관련구간이지보장절감은아니다.
+6. 후보폭조정. 현재count≤32이면무조건32후보인데쉬운장면은12요청6.44→13.46ms,
+   32요청10.69→27.50ms로손해다. 초기1024공통reset의이미host로받는acceptedindex분포로
+   장면별8/16/32폭을정하면추가GPU읽기없이과잉계산을줄일수있다. firstvalid/RNG는보존가능하다.
+7. Candidate accepted/pending을GPUmask와batchedtensor로유지. first.cpu().tolist왕복과
+   Pythonresultlist→stack을줄인다. Warp IK/충돌kernel이이미성공한행을조기건너뛰어야하며,
+   host분기만없애고80후보를모두돌리는방법은오히려느릴수있다. Seed CPU생성만옮기는이득은작다.
+8. 순수tensor단위 compile/CUDA graph. 정상transition은이미graph,IK는이미fused다. 부분reset의
+   새snapshot/충돌검사·모델mask/MLP등에적용여지. nativeasset조회/PhysX전체를capture하려고
+   ManagerBased흐름을재작성하는것은피한다. 모델AMP는현재FP32전용Tritonedgekernel을우회하여
+   densefallback으로가므로단순활성화가오히려느릴수있다. 지원dtype확장후비교해야한다.
+
+낮은우선순위: groupedtactile0.0067s,logger0.0091s,NaN검사0.0044s,vision평균0.00044s,
+CPUseed metadata(sampler바깥약0.019s),sim.forward약0.0036s. 이미카메라렌더없음·Fabric·
+selfcollision/CCD비활성·handproxy/YCBbox·무효물체0wrench최적화가있다. 물체solver16/2→8/1은
+기존물리실험이득0.7%라후순위다. Hand의19fixed중17tactile과F/T연결은보존해야하며,
+비센서palm2fixed병합은제한적후보다. 다른6종contactoffset은기존USD약1.962mm여서5mm로
+통일하면오히려커진다. GNN scene 결과는EEF frame에따라매step달라져episode전체cache는부적절하다.
+
+Reset1.018s를완전히없애도기준3.208s−1.018s=2.190s이므로1~2초목표에는정상step/physics/
+policy경로개선도필요하다. 사용자승인없이제어주기·rollout길이·PPOepoch·termination을변경하지않는다.
+
+
+## 2026-10-15 — 전체 연산 최적화 적용,1024환경 평균1.84초/iteration
+
+사용자가 앞선 전체 개선안을 진행하도록 승인했다. Production파일을 추가하지 않고 기존
+nativeManagerBased환경·공식OSC/handActionCfg·nativePPO 흐름 안에서 작업했다. 제어주기100Hz,
+정책50Hz,solver16/2,18Daction/244Dobs,initialvision/role/mask/이력·reward/termination 수식,
+PPO4epochs/4minibatches/rollout32는 유지했다.
+
+구현:
+
+- `_read_reset_snapshot`: reset이 실제소비하는 OBB·jointq/dq·TCP·sensor위치·shelfpose만읽는다.
+  초기화때버리는F/T/tactile/action, COM/가속도/물체속도/자중관성보상을계산하지않는다.
+- `_bind_scene`: nativepublic body_com_pos_b/object_com_pos_b를1회GPUcache한다. 정상transition은
+  rawlink/objectquaternion으로localCOM을회전해worldCOM을구하고distalbody만FT보상한다.
+  COM/mass/inertiarandomization은없으며추가시cache갱신필요. 공식OSC/nativeassetwrite는보존한다.
+- FP32CUDA충돌검사는Warpkernel로collidertransform/ground/elbow/scene/self조건통합.
+  IKinvalid·AABB분리·첫충돌조기종료. CPU/다른dtype는eageroracle. Scene15mm/self2mm여유유지.
+  거의평행한축에서기존relativeFP32식이겹침을놓치던오류를발견해해당축만directworldFP64
+  projection으로계산한다. 수정후20kCUDA판정은수정eager와일치,doubleoracle19999/20000일치.
+  남은1개는경계11.1nm FP32차이. 영구회귀fixture도tests/test_mdp.py에넣었다.
+- CUDA후보탐색은첫8개,이후작은reset은최대32개/큰reset은8개씩고정GPUrow로처리한다.
+  acceptedmask를GPU에유지해성공행의비선형IK/충돌을건너뛰고절대firstvalid를선택한다.
+  동시후보상한1024와최대8개power-of-two CUDAgraphcache. 장면inputs는매replay복사한다.
+  Graphcapture/warm/buffer를inference_mode(False)로생성해Native학습/일반reset간전환시
+  PyTorchPhiloxinferenceTensor inplace오류를막았다. 정상transitiongraph도같이정리했다.
+  첫validindexCPU왕복은후보chunk마다에서탐색종료1회로줄이고nativewriter는batchedtensor직접사용.
+  CPUgenericlistAPI·episodeSeed문자열MT난수·Warp절대candidateRNG/branch%4/strength//8은유지.
+- `scene_time_out`은reset전에공통round의hostcounter로time_outs_possible을제공한다.
+  PPO는False면실패종료의무의미한terminalGNN/critic을생략하고진짜timeoutfinalstatebootstrap은
+  유지한다. Generic환경은기존fallback. nativecounter와init_at_random_ep_len=False가전제이며
+  외부에서episodecounter를임의로채우는방식은지원하지않는다.
+- `agent.actor.compile_model=True`: CUDApuremodel+maskforward를Inductorfullgraph로compile.
+  모델/파라미터/checkpointkey와FP32유지,CPUeager,Falseoverride지원. Reduce-overheadCUDAgraph는
+  inference→training전환replay오류가재현돼사용하지않는다. 기본Inductor는통합검증통과했다.
+- Native PhysxCfg.gpu_max_num_partitions=1. 실제1024환경410nativeenv.step에서1/2/4/8을비교:
+  physics64hostwall은각0.7572/0.7634/0.7889/0.8579s였다. 처음의자동reset없는긴pose-hold진단은
+  비정상drift를만들어discarded_raw_*로분리하고채택근거에서제외했다. 선택된비교는native
+  termination/reset을포함하고같은초기상태/고정난수작은행동으로수행했다.
+
+주요분리benchmark:
+
+- 실제RobotPoseModel충돌1024후보:원본eager24.093ms→fused0.413ms,
+  임시GPU메모리440.37MiB→0.0508MiB. 수정eager26.239ms는별도기록해비교과장을피했다.
+- 같은fused충돌을쓰는sampler12환경:어려운장면5.729→2.353ms,쉬운장면3.061→1.544ms.
+  1024환경은213.227→60.724ms/51.695→43.063ms였다. 일부쉬운64환경은0.3ms느려지는경우가
+  있어모든scene·size에보편이득이라고하지않는다. 2장면×7크기×반복/모드비교28case통과.
+- 모델1024inference1.982→0.776ms,8192forward+backward16.423→9.986ms.
+  Puremodel수치이며Gaussian/loss/optimizer전체절감으로오해하지않는다. 초기compile약14s별도.
+
+통합학습계측:RTX3090,1024physicalenv,10objects,seed0,nativeOSC/PPO로30iteration실행.
+0(초기compile/warm),4(cProfile)를제외한28평균1.8370s,median1.8209s,범위1.7280~2.0216s.
+같은index의직전14개평균3.2081s와새14개1.8460s비교는약42.46%감소다.
+
+| 관련구간/iteration | 직전14회 | 새14회 | 새28회 |
+|---|---:|---:|---:|
+| 전체collection+learn |3.2081s|1.8460s|1.8370s|
+| reset전체 |1.0180s|0.3188s|0.3133s|
+| robotstart탐색 |0.5214s|0.0794s|0.0745s|
+| resetMDP |0.3358s|0.0858s|0.0858s|
+| 정상 transition + reset transition 읽기 |0.5634s|0.0429s|0.0428s|
+| physics64step |0.8711s|0.6823s|0.6793s|
+| PPOupdate |0.3161s|0.2295s|0.2275s|
+| rolloutpolicy |0.1009s|0.0640s|0.0631s|
+| storage/bootstrap |0.0889s|0.0062s|0.0061s|
+
+중첩hostwall시간이므로합산하지않는다. 새학습trajectory와reset행수는같지않고,이전innerGNN
+계측wrapper는torch.compilefullgraph를방해하므로새계측은puremodel내부wrapper를제거했다.
+학습기본실행에profiler/추가CUDA강제동기화/디버그로그는추가하지않았다. 90000iteration성능이나
+장기수렴/안정성을검증한것이아니며현재28회속도단순환산은약45.9시간이다.
+
+검증:기존FT보상readeroracle와비교하는실제4env410step을통과했다. 정상hotpath COM조회0회,
+8회의명시적oracle만robot/objectCOM을각8회조회했다. 초기관측앞31D/사용posefield와packing이
+일치하고부분reset의다른행보존/commonround400cache갱신을통과했다. 독립SciPy13env임의3D
+quat/localCOM/36morigin검사최대오차1.49e−8m,속도9.31e−10m/s였다. 모델실제NativeActor의
+inference→gradient→parameterupdate→inference/checkpoint키검증도통과했다.
+
+CPU198passed/14skipped. GPU전체회귀중기존testfixture가Warp초기cache=None을복원해다음IK
+테스트를 깨뜨리는 문제를 발견했다. Fixture 초기화 순서를 수정한 최종 GPU 전체 검사에서
+205 passed,7 skipped,145 subtests passed였다. Compileall과 git diff 공백 검사도 통과했다.
+자료는outputs/contact_manipulation/full_optimization_20261015/의comparison.json,final/,partition_*,
+clearance_*,candidate_gpu.*,model_compile_benchmark.*,validate_rollout.*,review_com_snapshot.*,tests_gpu.log.
+
+### 2026-10-16 — 장시간 CUDA 719 재발: Xid69와 OSC 입력 토크 조사
+
+이번 사고는 `logs/rsl_rl/contact_manipulation/2026-10-15_17-57-45`, PID246920이다.
+Kit log `kit_20261015_175732.log:5224`의 UTC2026-10-15 18:14:15는
+KST2026-10-16 03:14:15이며 uptime33,403,465ms(약9시간16분43초) 후 발생했다.
+DOF velocity getter는 PhysX CUDA 실패 뒤에 실패하므로 getter 자체를 근본 원인으로
+보지 않는다. 현재까지 CUDA719를 일으킨 단일 근본 원인은 확정하지 못했다.
+
+- 같은 시각의 kernel journal에는 Xid69(ClassError), Class0xc7c0, Offset0x1b0,
+  Data0x41, ErrorCode0x53이 있다. NVIDIA 공개 header에서 Class는 AMPERE_COMPUTE_B,
+  Offset은 LAUNCH_DMA이다. GPU compute 명령/DMA 처리 중 포착된 오류라는 단서이며,
+  드라이버 결함이나 특정 custom kernel의 범위 밖 접근을 확정하는 정보는 아니다.
+  ErrorCode0x53의 공식 공개 정의는 찾지 못했다. 이전 사고는 Xid13/MISSING_INLINE_DATA로
+  이번과 다르며, CUDA719라는 표면 증상만으로 두 사고의 원인을 동일시하지 않는다.
+- 마지막 완료 iteration19099(총19100), 최신 checkpoint model_19050.pt이다.
+  TensorBoard20개 scalar 전구간과 0/1000/10000/19000/19050의 모델·optimizer tensor가
+  모두 finite였다. 직전100회 collection평균1.388s/learning0.230s로 처리량 붕괴도 없다.
+  이 통계는 각 환경의 순간 관절 상태나 제어 입력의 정상성을 보장하지 않는다.
+- 초기화 이후 최초 오류 전까지 Kit의 buffer overflow/OOM/NaN 경고는 없다.
+  allocator 경고는 CUDA 실패와 종료 처리 이후 발생했다. 따라서 이 메시지만으로
+  VRAM 부족을 원인으로 보지 않는다. 해당 시간대 kernel journal에도 추가 OOM/PCIe
+  오류는 없었다. 사고 당시 VRAM peak/온도 이력은 저장돼 있지 않아 배제까지는 못 한다.
+- 19100×32=611200=400×1528이므로 마지막 완료 rollout은 공통 장면 교체 경계와
+  맞는다. 새 장면 첫 physics와의 연관성을 조사할 단서지만, 다음 iteration의 실제
+  실패 substep과 개별 환경 상태가 저장되지 않아 reset 원인으로 단정하지 않는다.
+- transition/reset CUDA graph의 입력·출력 소유권/eviction, Warp IK padding/indices,
+  충돌/raycast indices를 검토했으나 명확한 OOB/dangling buffer는 발견하지 못했다.
+  이는 정적 검토이며 Compute Sanitizer 검증이나 비동기 race 부재 증명이 아니다.
+
+새 프로세스에서 최신 checkpoint를 불러 native env.step/reset/OSC를 사용하는 진단:
+
+- 128환경800policy/1600physics step,466reset,28.97초를 오류 없이 완료했다.
+  OSC raw토크와 PhysX get_dof_actuation_forces 입력값이 정확히 같았고 최대492512Nm였다.
+  반면 data.applied_torque는150Nm 이하로 보였다. Jacobian 최소 singular value7.65e-7,
+  최대 condition2.53e6, 전체 articulation 최대 관절 속도156.46rad/s였다.
+- seed0의 scene_generation1528을 다시 생성한128환경400policy/800physics step도
+  CUDA719 없이15.44초에 완료했다. 여기서 OSC/PhysX 입력 최대800880.94Nm,
+  configured limit 대비 최대5339.2배, Jacobian condition1.44e7을 확인했다.
+  checkpoint에는 물리/RNG/환경별 reset 횟수가 없어 원래 실패 trajectory 재현은 아니다.
+- 진단에서는 순수 정책 compile만 startup 절감을 위해 껐고, 정책 출력은 stochastic으로
+  사용했다. production 제어/모델/MDP/물리 설정은 이 조사에서 변경하지 않았다.
+- 설치된 native ImplicitActuator.compute는 computed/applied_effort 통계만 clip하고
+  원래 control_action을 반환한다. 따라서 gain0의 arm에 입력한 feed-forward OSC effort가
+  통계에 보이는150/28Nm 상한으로 제한되어 제출된다고 가정하면 안 된다. 실제 SDK 입력
+  조회로 초과를 확인했다. 이 값은 solver에서 적분 후 측정한 모터 토크와는 구별한다.
+  native OSC의 full inertial inverse가 near-singular Jacobian에서 큰 유한 토크를 만들고,
+  native implicit actuator 경로가 그 입력을 그대로 전달하는 위험이 실재한다.
+- 상세 재실행에서는 최대800880.94Nm가 새 scene의 첫 physics step에 나왔다.
+  해당 초기 arm q의 wrist_2=-0.00010765rad이고 관절 속도는 모두0이었다. 즉 외부 접촉이
+  누적된 후에만 생기는 현상이 아니라 충돌 없는 elbow-up IK도 손목 특이점에 가까울 수
+  있다. 초기 자세 검사에는 Jacobian condition/singular value 기준이 없다. 이 실행의
+  전체 최대 arm/독립hand/mimic 속도는110.18/970.08/889.49rad/s였으나 모두 finite라
+  기존 invalid-state 검사로는 구별되지 않았다. 이 값은 장시간 사고 당시 상태가 아닌
+  동일 정책/장면의 새128환경 진단 실행에서 측정한 것이다.
+- min branch도 gain0 ImplicitActuator와 native OSC를 조합하고 별도 effort clamp가 없다.
+  예제를 따른 사실 자체가 이 구성에서 feed-forward 상한의 실효성을 보장하지 않는다.
+  또한 min 예제는 arm 속도1rad/s 초과 종료가 있지만 사용자는 제어/물리 설정만 예제에
+  맞추기로 하여 우리에는 그 종료 조건이 없다. 이를 이번 조사에서 무단 추가하지 않았다.
+  native IdealPDActuator(gain0)의 명시적 effort clipping을 진단 대안으로 비교했다.
+  이러한 토크 급증은 우선 해결할 물리 안정성 문제이나 CUDA719의 직접 원인으로 아직
+  입증되지 않았다. 유한성 검사만으로는 이를 검출하지 못하고 종료 검사는 physics 이후다.
+
+같은128환경/scene1528/19050policy/400step에서 arm actuator만 공식 IdealPD로 바꾼
+진단 A/B(Hand actuator는 유지):
+
+| 측정 | 현재 Implicit | 진단 IdealPD(gain0,effort_limit150/28) |
+|---|---:|---:|
+| 최대 raw OSC 명령 |800880.94Nm|800880.94Nm|
+| 최대 PhysX 입력 명령 |800880.94Nm|150Nm|
+| 최대 arm 속도 |110.18rad/s|6.28263rad/s|
+| 최대 독립hand 속도 |970.08rad/s|3.68736rad/s|
+| 최대 mimic 속도 |889.49rad/s|2.26674rad/s|
+
+첫 step의 q/dq/action/rawOSC는 정확히 같고, 첫 물리 적분 직후 arm/hand 속도는
+A10.2828/151.8687rad/s, B6.28134/1.41771rad/s였다. 따라서 잘못된 초과 입력 경로가
+물리 불안정에 실제 영향을 주는 것을 확인했다. 양쪽 모두 CUDA719는 재현되지 않았다.
+이후 trajectory/reset횟수(241vs560)가 달라 학습 성능이나 정책 품질의 동등성 비교는
+아니며, IdealPD만으로 특이점 inverse의 문제까지 해결했다는 의미도 아니다.
+Production 변경은 하지 않았고 다음 수정 후보는 arm의 native explicit effort 제한과
+초기 IK의 near-singular 해 제외다. 물리 timestep/solver를 낮추거나 UR5e mesh를 변경할
+근거로 이 결과를 사용하지 않는다.
+
+조사 시점 RTX3090/driver580.173.02이고 이전 PID68242(stopped,5866MiB) 및
+현재 PID246920(stopped,6340MiB)가 남아 있었다. 기존 사용자 프로세스는 종료/재개하지
+않았다. 자료는 `outputs/contact_manipulation/cuda719_20261016/`의 log_analysis.json,
+system_analysis.json,kernel_xid.log,physics_probe*.py/json/pt/log에 보존한다.
+
+공식 근거:
+- https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html
+- https://raw.githubusercontent.com/NVIDIA/open-gpu-doc/master/classes/compute/clc7c0.h
+- https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html
+
+### 2026-10-16 — 사용자 결정: min의 native implicit OSC 구성 유지
+
+사용자는 CUDA719 조사 이후에도 다음 구성을 `min`과 동일하게 사용하도록 명시했다.
+
+- 팔 actuator는 `ImplicitActuatorCfg`를 유지한다.
+- `effort_limit_sim`은 shoulder_pan/shoulder_lift/elbow 150Nm,
+  wrist_1/wrist_2/wrist_3 28Nm이다.
+- 팔의 actuator stiffness/damping은 모두0이며 공식
+  `OperationalSpaceControllerActionCfg`가 OSC 명령을 계산/전달한다.
+- 별도의 OSC 출력 토크 clamp나 `IdealPDActuatorCfg` 전환은 적용하지 않는다.
+  IdealPD A/B 결과는 진단 근거로 보존하며 구현 계획으로 취급하지 않는다.
+
+현재 production은 이미 위 설정과 일치하여 제어 동작은 변경하지 않았다. scene.py의
+설명과 README에 이 결정을 반영했다. 앞선 조사에서 제안한 explicit actuator 전환은
+이번 사용자 결정으로 채택하지 않는다. 초기 IK의 특이점 처리도 이번 작업에서는
+변경하지 않았다. CUDA719의 직접 원인은 여전히 확정되지 않았다.
