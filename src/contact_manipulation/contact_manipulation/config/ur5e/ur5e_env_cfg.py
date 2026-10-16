@@ -55,8 +55,8 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Match Sweeping-Policy's OSC specialization: the native controller
-        # supplies arm efforts, so implicit position/velocity drives stay off.
+        # The native OSC supplies feed-forward efforts. Zero actuator gains
+        # preserve torque control; IdealPD applies the configured effort limits.
         self.scene.robot.actuators["arm"].stiffness = 0.0
         self.scene.robot.actuators["arm"].damping = 0.0
         self.actions.arm_action = OperationalSpaceControllerActionCfg(

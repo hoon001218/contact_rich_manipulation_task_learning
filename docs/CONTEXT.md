@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-12, Asia/Seoul**.
+최종 갱신: **2026-10-16, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -5272,6 +5272,9 @@ system_analysis.json,kernel_xid.log,physics_probe*.py/json/pt/log에 보존한�
 
 ### 2026-10-16 — 사용자 결정: min의 native implicit OSC 구성 유지
 
+아래는 당시 결정 기록이다. 이후 같은 날짜의 "팔 IdealPD 적용 및 측정 torque 연구"에서
+사용자가 explicit actuator 전환을 승인하여 현재 구성은 변경되었다.
+
 사용자는 CUDA719 조사 이후에도 다음 구성을 `min`과 동일하게 사용하도록 명시했다.
 
 - 팔 actuator는 `ImplicitActuatorCfg`를 유지한다.
@@ -5286,3 +5289,825 @@ system_analysis.json,kernel_xid.log,physics_probe*.py/json/pt/log에 보존한�
 설명과 README에 이 결정을 반영했다. 앞선 조사에서 제안한 explicit actuator 전환은
 이번 사용자 결정으로 채택하지 않는다. 초기 IK의 특이점 처리도 이번 작업에서는
 변경하지 않았다. CUDA719의 직접 원인은 여전히 확정되지 않았다.
+
+### 2026-10-16 — 실패 원인별 native 종료 로그 및 manipulability 검토
+
+사용자는 실패 원인별 종료 로그 구현과 Motion의 manipulability 항 검토를 요청했다.
+
+- `TerminationsCfg`의 통합 failure term을 object_drop/object_tilt/workspace_exit/
+  object_lift/hard_load_or_overrange/shelf_displacement/invalid_state의7개 native term으로
+  대체했다. timeout/success는 유지한다. Console/TensorBoard에서
+  `Episode_Termination/<원인>`으로 구분하며 별도 logger나 디버그 출력은 추가하지 않았다.
+- `mdp.failure(env, reason=...)`는 기존 TaskState의 failure_reasons 열 view만 반환한다.
+  `failure(env)`의 aggregate API는 유지한다. 첫 호출만 완료 transition을 평가하고 이후
+  원인별 term/observation/reward는 같은 캐시를 공유한다. 물리·센서 조회는 늘리지 않았다.
+- 기존 임계값/OR 종료/실패 보상−100 단일 지급은 그대로다. 여러 원인이 동시 발생하면
+  모두 기록한다. Native 로그는 환경별 마지막 완료 episode의 원인 비율이며 원인별 비율을
+  단순 합산해 전체 실패율로 해석하지 않는다. 선반은 접촉 자체가 아닌1cm/2° 변위 기준이다.
+- 기존 test_mdp.py에7개 단독 원인·복합 원인·단일 payment·step당 계산1회·부분reset 및
+  checkout의 실제 TerminationManager.compute/reset 로그 동작 검사를 추가했다.
+  CPU 전체 검사201 passed,14 skipped,145 subtests passed였다.
+
+Manipulability는 아직 reward에 추가하지 않았다. 검토 목적은 속도/힘 크기 제한이 아니라
+제어성이 급락하는 자세 회피다. 후보는 단위를 정규화한 full6D Jacobian의
+mu=sigma_min/sigma_max에 대해 안전 수준 이상은 포화하고 이하만 비용을 주는
+`x_m=max(0,1-mu/mu_safe)^2`, `r_m=exp(-a_m*x_m)`이다. mu_safe와 정규화 규칙은
+확정되지 않았고 실제 reset/학습 자세 분포를 보고 결정해야 한다. Raw determinant를
+무한히 키우는 보상이나 linear/angular block을 따로만 검사하는 방식은 권장하지 않는다.
+현재 q 관측으로 기구학 지표가 결정되므로 observation 추가는 필요하지 않다.
+
+SVD/eigvalsh는 CUDA 연산이어도 host synchronization이 있어 기본 hotpath에 바로 넣지
+않았다. Native OSC의 public jacobian_b도 새로운 PhysX 조회이며 내부 buffer를 재사용하면
+마지막 physics substep 직전 값이라는 시간 차이를 고려해야 한다. GPU batch determinant
+등 대안은 정확도/척도/처리량을 대조한 후 선택한다. Motion 결합식/weight 및 초기 IK,
+actuator/OSC 설정은 이번 작업에서 변경하지 않았다. Reward/종료만으로 첫 substep의
+특이점 토크 또는 CUDA fault를 예방할 수 있다고 주장하지 않는다.
+
+참고: https://modernrobotics.northwestern.edu/nu-gm-book-resource/5-4-manipulability/
+및 https://docs.pytorch.org/docs/stable/generated/torch.linalg.svdvals.html .
+
+### 2026-10-16 — Manipulability 방향성과 Motion 결합식에 대한 사용자 정정
+
+사용자는 sigma_min/sigma_max가 약한 방향으로의 움직임 자체를 구분하지 못한다고
+지적했다. 이 비율은 자세의 등방성/조건수 지표이며, 같은 자세의 서로 다른 행동에
+동일한 값을 준다. Jacobian의 선형/각 성분 단위 정규화와 이 축 비율은 별개다.
+약한 방향의 이동 요구를 억제하려면 명령한 EEF 이동·회전 방향을 함께 평가하는
+directional manipulability를 검토해야 한다. 실제 속도만 쓰면 명령했지만 움직이지
+못하는 경우를 놓칠 수 있다. 명령의 단위 방향을 쓰면 크기 자체의 비용과 구분할 수
+있으며 무명령은 방향 비용0으로 정의한다. 지표/정규화/안전 기준은 아직 미확정이다.
+
+사용자가 명시한 Motion 결합식은 각 요소를 exp(-a*x)로 계산한 뒤 전체 Motion weight를
+요소 수N으로 나누는 산술평균이다. 현재 구현은 N=2로 acceleration/F-T score의
+0.5*(score_acc+score_FT)이며 이 설계와 일치한다. Manipulability를 추가한다면 N=3으로
+W_motion/3*(exp(-a_A*x_A)+exp(-a_F*x_F)+exp(-a_M*x_M)) 형태를 유지한다.
+앞서 제안한 exp(-(a_A*x_A+a_F*x_F+a_M*x_M)) 곱형 결합은 구현하지 않았으며 채택하지
+않는다. 한 요소 점수가 낮아도 다른 요소 점수가 남는 것은 평균 설계의 trade-off이며
+이를 구현 오류로 취급하지 않는다. 이번 정정에서 reward/제어 코드는 변경하지 않았다.
+
+### 2026-10-16 — Joint torque observation은 명령값이 아닌 측정값
+
+사용자는 joint torque를 observation에 추가하는 방안을 검토하면서, OSC의 토크 명령이
+아닌 측정 joint torque를 사용해야 한다고 정정했다. 정책에 관절 부하 피드백을 주는
+목적과 OSC 명령 폭주를 진단하는 목적을 구분한다. `joint_effort_target`을 측정값으로
+사용하지 않으며, implicit actuator의 `applied_torque` 추정값도 측정값으로 취급하지 않는다.
+
+Isaac Sim5.1의 공식 `get_measured_joint_efforts()`는 내부에서 PhysX Tensor API의
+`get_dof_projected_joint_forces()`를 사용한다. 이는 solver가 계산한 incoming joint force를
+DOF 운동 방향에 투영한 값이며, revolute joint에서는 부호 있는 torque(Nm)다. 실제 로봇의
+모터 전류 기반 토크/축 토크 센서/외력 토크 추정값과 자동으로 동일하다고 가정하지 않는다.
+구현 시 기존 articulation view에서 환경 전체를 batch로 읽고 observation/reward가 결과를
+공유하는 방향을 검토한다. 현재 CUDA backend의 실제 지원·측정 의미·비용 검증은 남아 있다.
+
+측정 토크 observation과 토크 reward는 아직 구현하지 않았다. 앞서 제안한 명령 토크의
+상한 초과 reward를 측정 토크에 그대로 적용하는 것도 확정하지 않는다. 물리 부하 또는
+급격한 토크 증가 억제와 명령 폭주 억제는 평가 대상이 다르며, reward의 x와 scale은
+이를 구분하여 결정해야 한다. 기존 Motion의 요소별 exp(-a*x) 산술평균 원칙은 유지한다.
+
+참고: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/sensors/isaacsim_sensors_physics_articulation_force.html
+
+### 2026-10-16 — Actuator 상한과 실현 가능한 OSC 명령 학습은 별개
+
+사용자는 IdealPDActuatorCfg로 출력 토크를 제한해도 정책이 상한 안의 토크를 요구하는
+delta pose를 학습한다고 보장할 수 없으며, 추종 부족에 대해 더 큰 명령을 선택할 수도
+있다고 지적했다. 이 구분을 유지한다. 팔 gains0인 explicit actuator의 clipping은
+OSC 계산 이후의 출력 제한이며, raw OSC 요구량이나 정책의 pose/stiffness를 제한하지 않는다.
+같은 상한으로 포화되는 여러 명령은 측정 응답/진행 보상만으로 초과 정도를 구별하지
+못할 수 있다. 더 큰 명령을 선택하는 것은 가능한 학습 결과이며 필연적인 증가는 아니다.
+
+현재 native OSC에는 적분항이 없고, pose_rel 목표는 매 정책 step의 측정 EEF pose에서
+다시 계산한다. 이를 PID integral windup이나 목표 pose의 무한 누적으로 설명하지 않는다.
+측정 joint torque observation이라는 사용자 결정은 유지한다. 물리 부하/증가량 reward와
+raw OSC 과대 요구 억제는 별개이며, 후자가 필요하면 raw 명령 초과량/포화 차이를 reward나
+진단 지표로 검토할 수 있다. 이는 명령값을 observation에 넣자는 뜻이 아니다. 측정된
+projected joint torque가 actuator 명령 상한과 반드시 같은 범위라고도 가정하지 않는다.
+이번 논의에서 actuator/clipping/observation/reward 구현은 변경하지 않았다.
+
+### 2026-10-16 — 팔 IdealPD 적용 및 측정 torque 연구
+
+사용자는 먼저 팔을 IdealPDActuatorCfg로 변경하고, 측정 joint torque observation/reward는
+관련 자료와 설계를 검토한 뒤 진행하도록 요청했다. 앞선 implicit 유지 결정을 대체한다.
+
+**적용한 변경**
+
+- `config/ur5e/scene.py`의 arm만 공식 IdealPDActuatorCfg로 전환했다. explicit actuator의
+  `effort_limit`과 PhysX의 `effort_limit_sim`을 모두 shoulder/elbow150, wrist28Nm로 지정했다.
+  `effort_limit_sim`만 유지하면 explicit 모델의 clipping 값은 USD에서 별도로 가져오므로,
+  `effort_limit`도 반드시 명시한다. 별도 controller/clamp 구현은 추가하지 않았다.
+- 팔 actuator gains0, 속도 제한3.14/6.28rad/s, USD armature/friction, native OSC의
+  pose_rel·variable_kp와 scale, Hand implicit position PD를 유지했다. Action18D와
+  observation244D 및 기존 reward는 그대로다. 측정 torque 채널은 아직 추가하지 않았다.
+- 이 변경은 PhysX에 전달하는 유한한 토크를 제한한다. 특이점 inverse/NaN이나 CUDA719의
+  원인을 해결했다고 주장하지 않으며, 정책의 과도한 pose/stiffness 요구 학습과 구분한다.
+
+**검증**
+
+- 기존 test_mdp.py의 회귀 검사에서 production config와 checkout의 실제 IdealPD/Implicit/
+  Articulation 메서드를 실행한다.3환경·비연속 관절 인덱스에서 양/음 과대 토크·정상 토크,
+  raw/computed 보존, 실제 set_dof_actuation_forces 입력 clipping, Hand 목표 전달을 검사한다.
+- CPU 전체 검사202 passed,14 skipped,145 subtests passed.
+- 실제 CUDA8환경에서 시험 명령 최대800880Nm를150Nm로 제한하고,64policy/128physics step의
+  native OSC 출력 최대721328.625Nm가 관절별150/28Nm 이내로 전달됨을 확인했다.
+  PhysX getter와 기대 clipping 값의 최대 차이0, 최대 상한 비율1, 최종 joint state finite.
+  장시간 학습이나1024환경 안정성 검증을 대신하지 않는다.
+- 같은 진단에서 공식 get_dof_projected_joint_forces()가 cuda:0의[8,18] finite tensor를
+  반환했다. 워밍업 후100회 연속 조회의 평균 wall time은 약0.0148ms였다. 고정 상태8환경의
+  getter 미세 측정이며1024환경이나 매 step 전체 overhead로 일반화하지 않는다.
+- 재현 코드·결과: `outputs/contact_manipulation/ideal_pd_20261016/verification.py`,
+  `verification.json`, `verification.log`. 추가 진단 코드는 학습 경로에 연결하지 않았다.
+
+**측정 torque observation/reward 검토: 아직 미구현**
+
+1. Isaac Sim5.1 measured effort는 incoming joint wrench의 DOF 운동축 투영이다. 기존
+   articulation view의 GPU batch getter를 정책 sample마다 한 번 읽고 cache를 공유하는
+   방향이 적절하다. 매 관절 sensor 객체·환경별 Python loop는 필요하지 않지만 SDK 비용은 있다.
+2. 실기 채널을 먼저 맞춰야 한다. URScript get_joint_torques()는 로봇 자체 운동에 필요한
+   중력·마찰 등을 보정한6D torque이다. ROS2 driver의 기본 effort는 actual_current_as_torque
+   (전류 환산)이며, use_currents_as_efforts=True는 토크가 아닌 전류다. raw simulator
+   projection과 이 값들이 동일하다고 가정하지 않는다. 보정·부호·단위를 확인해야 한다.
+3. Closing the Reality Gap(2026)의 force-adaptive grasping은 actor에12D joint torque와
+   tactile을 제공하고(TableI), 접촉 중 목표 torque 오차를 Gaussian exponential reward로
+   평가한다(Eq3). torque feedback의 실제 사용 사례이지만 목표 부하 추종 과제이므로 우리
+   비파지 재배치의 수식/scale을 그대로 옮기는 근거로 삼지 않는다.
+4. 우리 목적은 큰 유효 부하 자체를 무조건 억제하는 것이 아니다. 측정 torque 증가량이
+   단순 torque L2보다 목적에 가깝다. positive magnitude growth는 unloading을 허용하지만
+   +torque→-torque 반전을 놓치고, signed difference 크기는 반전을 잡지만 unloading도
+   비용으로 본다. 어떤 물리 행동을 억제할지와 signal filtering/scale은 아직 미정이다.
+5. clipping 이후의 측정 부하만으로 raw OSC 과대 요구를 구분할 수는 없다. actuator의
+   computed/applied torque 차이는 별도의 포화 진단 후보이며 측정값으로 부르지 않는다.
+   측정 torque가 반드시150/28Nm 이내라고 가정하지도 않는다. observation은 측정값이라는
+   사용자 결정을 유지한다. Reward가 필요하면 각 exp(-a*x)를 구하고 요소 수로 평균한다.
+
+자료:
+- https://docs.isaacsim.omniverse.nvidia.com/5.1.0/sensors/isaacsim_sensors_physics_articulation_force.html
+- https://www.universal-robots.com/manuals/EN/HTML/SW5_23/Content/prod-scriptmanual/all_scripts/get_joint_torques.htm
+- https://docs.universal-robots.com/Universal_Robots_ROS_Documentation/rolling/doc/ur_robot_driver/ur_robot_driver/doc/hardware_interface_parameters.html
+- https://arxiv.org/html/2607.04940v1
+
+### 2026-10-16 — 측정 torque reward 설계 전 최신 학습 로그 검토
+
+사용자는 새 torque reward를 고민하기 전에 가장 최근 학습 로그에서 기존 reward의
+이슈를 먼저 검토하도록 요청했다. Reward/MDP/학습 설정은 변경하지 않았다.
+
+**분석 기준**
+
+- 최신 run은 `logs/rsl_rl/contact_manipulation/2026-10-15_17-57-45`이며1024환경,
+  50Hz policy,8초 episode,32step rollout,19100iteration(index0–19099)이다.
+  마지막 scalar 기록은2026-10-16 03:14:14 KST다.
+- 당시 commit7be67ac와 저장된 dirty diff를 확인했다. 당시 rewards.py/events.py의
+  postimage는 현재 코드와 일치한다. 당시 arm은Implicit이며 오늘 적용한IdealPD와
+  원인별failure logging은 이 로그에 반영되지 않았다.
+
+**실제 로그에서 확인한 추세: 처음1000 vs 마지막1000 iteration 평균**
+
+| 지표 | 처음1000 | 마지막1000 |
+|---|---:|---:|
+| Train/mean_reward | 80.913 | 193.561 |
+| Train/mean_episode_length(step) | 90.291 | 144.515 |
+| 위 길이를 초로 환산 | 1.806 | 2.890 |
+| 마지막 종료 상태의timeout 지표 | 28.15% | 75.29% |
+| 마지막 종료 상태의failure 지표 | 71.91% | 24.81% |
+| Episode_Reward/clearance | 5.572 | 10.102 |
+| Episode_Reward/rearrangement | 11.687 | 20.708 |
+| Episode_Reward/motion | 5.616 | 9.865 |
+| Episode_Reward/time | -0.0336 | -0.1149 |
+| Episode_Reward/terminal | -12.427 | -12.444 |
+
+Success가 양수인iteration 기록은 전체에서10개뿐이며 마지막은8099다. 이후11000iteration은
+success 기록이모두0이다. 이는 성공10회라는 뜻이 아니다. Mean reward와episode length의
+상관은0.9877이다. 안전하게 더 오래 유지하는 방향의 개선과 양립하지만 작업 달성의
+개선으로 해석할 수 없다. Clearance/Rearrangement 누적 로그의 합 비율은0.4768→0.4878,
+Motion/Rearrangement는0.4805→0.4764로, 단순한 누적 항 증가와 구분해서 보아야 한다.
+이 비율을 정확한 per-step score 또는 가림 비율로 역산하지 않는다.
+
+**로그 집계의 한계**
+
+- Native Episode_Reward는 reset batch의episode 누적합 평균을 고정 최대길이8초로 나눈다.
+  실제episode 길이 또는step수로 나눈quality 평균이 아니다. 길게 유지하면 점수가 커진다.
+- RSL logger는 각step의 extras log dict를 동일 가중 평균한다. batch크기로 가중하지 않고,
+  reset 없는step에는 마지막dict가 재사용될 수도 있다.
+- Episode_Termination은 전체환경 각각의가장최근종료 상태 평균이다. 완료episode 전체의
+  성공률/실패율이 아니다. timeout과failure가 동시에 참일수도 있다.
+- Train reward/length는 최근100개완료episode의deque 평균이며,1024개공유reset에서는
+  환경인덱스 순서 영향도 있다. 공유장면은400common step마다교체되어 부분reset episode도
+  경계에서잘린다. 다른모집단의지표들을 조합해정확한 성공률/평균step quality를 만들지 않는다.
+
+**수식상 우선 점검 요소**
+
+1. Time 누적비용은1/2/4/6/8초에0.00896/0.04729/0.36128/1.75675/7.53790이다.
+   8초직전한step비용은0.1070으로, valid Clearance 최저점e^-1=0.3679보다작다.
+   완전히가려지고정지해도 Rearrangement=Motion=1이면 매step합2.3679를얻는다.
+   양의quality를유지하는보상이시간효율보다강하며, 높은return을작업진전으로 볼수없다.
+2. gamma=.99는50Hz에서반감기약1.38초다. 성공500의시작시점할인가치는
+   2/4/8초후184.86/67.67/9.07이다(terminal은N번째step,지수N-1).
+   8초Time전체할인비용은0.3530이다. Terminal숫자만비교해서dominant하다고판정하지않는다.
+   단, 최대densecontinuationvalue300보다즉시성공500이크므로이사실만으로성공지연이
+   최적이라고단정하지도않는다. 목표까지의행동quality와도달시간을함께평가해야한다.
+3. Rearrangement=exp(-2*이번step의총corner이동량)는1/5/10mm에서
+   0.9980/0.9900/0.9802다. 주파수50Hz의작은step변위에대해거의1일수있으므로
+   실제x분포와a를먼저검토해야한다. baseline누적점수상승은재배치가줄었다는증거가아니다.
+4. Motion은각exp점수의평균으로사용자설계와일치한다. 문제후보는x의scale/포화다.
+   팔6관절가속도50→100rad/s²,hand정지·F/T증가0인예시에서합성점수는
+   0.500425→0.500000으로거의구별되지않는다. 실제run은두구성점수/raw x를저장하지
+   않았으므로이포화가실제분포에서발생했다고확정하지않는다. 마지막physics substep만
+   보는가속도측정도앞substep급변을놓칠수있다.
+5. Clearance가높아도success는별도다. Blocker면적0.01m²,가림2e-5m²면
+   score≈0.998이지만성공가림상한1e-5m²는넘는다. Targetpose보호·전체물체정착5step도
+   별도gate다. 가림제거/Target보호/정착중어디서실패했는지현재로그로는구별할수없다.
+
+다음검토는새torque항추가보다기존x분포,Motion구성점수,성공gate의진행상태와
+Time/할인율의상대척도를먼저확인하는방향이다. 기존exp형태와요소별평균원칙은유지한다.
+새reward나weight를확정하거나적용하지않았다. 물체접근항이없다는사실만으로항을추가하지않는다.
+
+재현자료: `outputs/contact_manipulation/reward_log_review_20261016/`의
+`analyze.py`, `summary.json`, `scalars.csv`, `reward_trends.png`.
+
+### 2026-10-16 — 사용자의 최신 checkpoint play 관찰과 비조작 보상 검토
+
+사용자는 약19100 iteration checkpoint를 play했을 때 선반 앞에서 이상한 팔 동작만
+반복하고 timeout까지 물체를 조작하지 않았다고 보고했다. 이는 영상/새 replay를 확인한
+결과가 아닌 사용자 관찰이다. 보상이 늘어도 성공 기록이 없는 최신 로그와 일치한다.
+사용자는 후속 메시지에서 이 play가 IdealPD 변경 전이었다고 확인했다. 따라서 당시
+학습과 같은 implicit 구성에서 비조작 행동을 관찰한 것이다. 기본 play.py는
+deterministic inference다. 이 관찰을 IdealPD 변경의 결과로 해석하지 않는다.
+
+현재 수식에서 물체가 움직이지 않으면 Rearrangement=1이다. F/T 증가가 없으면
+wrench quality=1이므로, 가속도 score가0이어도 Motion은 평균 규칙에 따라0.5를 준다.
+완전 가림(Clearance=e^-1), Rearrangement=1, Motion=0.5가400 step 유지된 예시의
+할인 전 누적 return은400*(e^-1+1+0.5)-7.537897=739.614다. 완전히 안정된
+Motion=1이면939.614다. 성공하거나 물체를 조작하지 않아도 이 양의 누적값을 얻을 수 있다.
+실제 play의 측정 return이라고 주장하거나 이를 terminal500과 직접 비교하지 않는다.
+
+문제 후보는 Rearrangement/Motion만이 아니다. 변하지 않는 Clearance도 매 step 양의
+점수를 준다. 같은 경과 시간에서 Time은 조작/비조작 행동에 똑같이 적용되므로 scale을
+키우는 것만으로 유효한 접촉의 방향을 알려주지 않는다. 물체에 접근하는 새 항이나 torque
+항을 바로 추가하기보다 작업 진전과 품질 항 사이의 상대 유인을 먼저 검토한다.
+
+기존 합의상 exp(-a*x)와 요소별 산술평균을 유지하며 exp(-a*x)-1 이동은 채택하지 않았다.
+계수 a를 키워도 비조작의 x=0에서 점수1은 그대로이며, Rearrangement의 a만 키우면
+조작 중의 점수가 더 내려가 비조작 선호를 강화할 수 있다. 현 형태를 유지하는 조정은
+Clearance 대비 품질 항의 weight, Time scale, 할인율의 상대 효과부터 비교하는 방향이다.
+Progress/potential 보상이나 baseline 변경은 별도의 설계 변경으로 명시하여 검토해야 한다.
+양의 baseline 자체가 원인 전부이거나 비조작이 항상 전역 최적이라고 단정하지 않는다.
+이번 검토에서도 reward 수식/weight/학습 설정은 변경하지 않았다.
+
+후속 검토에서는 Clearance의 상대 weight를 높이는 초기 후보로 C:R:M=3:1:1을 검토했다.
+기존 최대 dense 합3을 유지하도록 정규화하면1.8/0.6/0.6이다. 이는 제안이며 적용/확정하지
+않았다. 단순히 C만3으로 올리는 설정(3/1/1)은 최대 dense 합을5로 키워 survival baseline과
+Time/Terminal의 상대 scale도 바꾸므로 구분한다. 가림비율1→0.5의 개선은1.8가중 시
+약0.430점이며, 같은 step의 Motion1→0.5와2mm 조작량 손실은 약0.302점이다.
+이 순간 비교는 후보의 설명이며 작은 진행량, 접근 지연, 장기 return의 검증을 대신하지 않는다.
+
+측정 torque observation은 관절 부하 피드백으로 검토를 유지한다. Torque quality를
+Motion 평균의 세 번째 항으로 추가하면 각 요소 weight는W_M/3이다. 예를 들어 가속도
+점수0·F/T점수1인 상태의 Motion0.5에 torque점수1을 추가하면2/3이 된다. 평균 자체가
+오류는 아니지만 기존 항의 영향이 줄어드므로 단순 추가가 비조작 유인을 해결하지 않는다.
+Torque observation/항 추가와 weight 변경은 아직 구현하지 않았다.
+
+### 2026-10-16 — Torque 보류, F/T·가속도 점수의 의미와 허용 구간 검토
+
+사용자는 joint torque 추가를 추후로 미루고, 현재 F/T와 가속도가 작은 변화에도 점수를
+낮추어 정지를 선호하게 만드는지, 현재 수식·문제·해결 방향을 검토하도록 요청했다.
+이번 작업은 분석이며 production reward/weight/관측은 변경하지 않았다.
+
+현재 a_acc=a_FT=1, dt_policy=0.02초다.
+
+```
+x_acc = sqrt((sum_arm((qddot/5)^2) + sum_hand((qddot/10)^2)) / 12)
+g_F = max(0, norm(F_k)-norm(F_previous)) / 0.02
+g_M = max(0, norm(M_k)-norm(M_previous)) / 0.02
+x_FT = sqrt(((g_F/200)^2 + (g_M/10)^2) / 2)
+r_motion = (exp(-x_acc) + exp(-x_FT)) / 2
+```
+
+- 가속도는 증가량/jerk가 아닌 크기다. 선택된 관절에 nonzero 가속도가 있으면 점수가
+  낮아진다. 감속도 포함한다. 일정 joint velocity는 가속도0이므로 이상적으로 최고점이다.
+- F/T는 크기의 양의 증가만 평가한다. 일정 크기 하중·하중 감소·크기 유지 방향 변화는
+  최고점이다. 이상적인 정지는 Motion=1이지만 정지만이 최고점인 것은 아니다.
+- 현재5/10rad/s²와200N/s·10Nm/s는 정규화 scale이며 허용 구간이 아니다. 어떠한 작은
+  양의 입력도 exp에서 점수를 낮춘다. 큰 x에서는 서로 다른 심각한 동작들의 점수가
+  모두0에 가까워져 구별력이 약해진다. PPO가 reward를 직접 미분하지 않으므로 이를
+  reward gradient의 backprop vanishing으로 설명하지 않는다.
+- 예: 팔 한 관절만1rad/s²이면 acceleration score0.94390, 팔6개 모두5이면0.49307.
+  F norm이20ms에0.1/1/4N 증가하면 F/T score0.98248/0.83797/0.49307이다.
+  센서 토크 norm0.005Nm 증가도0.98248이다. 이것은 구성 점수이며 합성 Motion은 평균이다.
+
+**새로 확인한 F/T 평가 원점 문제**
+
+현재 events.advance는 자중·관성 보상된 센서 모멘트를 episode 초기 sensor 위치로 옮긴다.
+`M_fixed=R*M_sensor+(p-p0)×(R*F_sensor)`는 센서 중심 부하와 다른 물리량이다.
+Norm을 비교하므로 축 회전만으로 생기는 차이는 없으며, 고정 원점으로 옮길 필요가 없다.
+센서 중심의 부하 증가 억제가 목적이면 보상된 sensor-frame 힘/토크 norm을 직접 비교하는
+방향이 적합하다. 기존 구현·테스트는 고정 원점 합력 모멘트 평가를 의도적으로 보장하므로
+단순 수치 버그가 아닌 보상 의미의 수정으로 취급해야 한다.
+
+현재 순수 reward_components 함수로 계산한 구성 예시: F=(0,50,0)N, 센서 토크0이 계속
+일정하고20ms 동안X로2mm 이동하면, 초기 원점 모멘트는0→0.1Nm가 된다. 현재 F/T score는
+0.70219, sensor 중심 norm을 직접 비교하면1이다. 실제 rollout 관측이라고 주장하지 않는다.
+반대로 센서 토크 증가가 원점 이동 항과 상쇄되어 비용이 줄어들 수도 있다.
+
+**권장 검토 방향: exp와 요소별 평균은 유지**
+
+1. 먼저 F/T를 센서 중심의 보상된 load norm으로 평가하도록 의미를 맞춘다.
+2. x에 원래 크기 전체가 아닌 허용 범위 초과량을 넣는다.
+   `u_acc_j=max(0, abs(qddot_j)-acc_allow_j)/acc_scale_j`,
+   `u_F=max(0,g_F-rate_allow_F)/rate_scale_F`, M도 같은 방식이다.
+   x_acc=RMS(u_acc), x_FT=RMS(u_F,u_M), r_motion은 기존 두 exp의 평균을 유지한다.
+   정상 조작과 정지가 동일 최고점을 얻고 과도한 가속/하중 증가만 점수를 낮추게 한다.
+   허용 구간과 정규화 scale은 서로 다른 파라미터이며 기존 scale을 한계로 재해석하지 않는다.
+3. 임계값은 무접촉 정지·이동의 보상 잔차와 정상 조작의 필요한 증가율을 보고 정한다.
+   현재 원시 축별0.1N/0.005Nm 양자화 후 연속 self-load를 빼므로 작은 잔차가 생긴다.
+   양의 증가만 평가하면 왕복 오차도 일부 비용이 된다. 양자화 한 tick만으로 큰 Motion
+   저하가 설명되지는 않는다. 실제 tare는 없고 wrench_bias는 현재0이다.
+4. 가속도/F-T 개별 점수·원시 x·포화 비율을 분리해 scale을 재조정한다. 단순히 제곱하면
+   작은 값에는 완만해져도 큰 값에서 포화가 빨라질 수 있으므로 자동 해결로 보지 않는다.
+5. native 가속도는 각10ms physics step에서 갱신되지만 reward는 마지막 것만 읽는다.
+   두 substep RMS 집계를 검토한다. F/T substep peak도 필요하다면 추가 반력 SDK 조회
+   비용을 측정해야 한다. 단순 policy 끝점 차분이나 강한 필터는 짧은 충격을 숨길 수 있다.
+6. 허용 구간을 두어도 양의 품질 baseline은 유지된다. 작업 진전은 Clearance가 구분하도록
+   상대 weight를 함께 검토한다. 움직임 자체에 보상을 추가해 허공 동작을 유도하지 않는다.
+
+구성 예시·곡선 재현: `outputs/contact_manipulation/motion_score_review_20261016/`의
+`analyze.py`, `equations.json`, `motion_quality.png`. 우측 곡선의 허용값1은 입력을 허용값으로
+나눈 일반적인 형태의 예시이며 실제 threshold를 결정/적용한 것이 아니다.
+
+### 2026-10-16 — Motion 재설계를 위한 예제·논문 검토
+
+사용자는 Motion을 다시 설계하기 전에 기존 예제와 관련 논문을 확인하도록 요청했다.
+이번에는 자료 조사와 비교만 수행했다. Reward 수식·weight·PPO·observation은 변경하지
+않았고, joint torque 추가도 계속 보류한다. 목표는 지속적인 빠른 속도나 필요한 힘을
+일괄적으로 억제하는 것이 아니라 과도한 가속과 급격한 하중 증가를 줄이는 것이다.
+
+**예제 구현에서 확인한 것**
+
+- 로컬 `examples/Sweeping-Policy-DRL-Sim-Train`와 현재 원격 `min`의 기본 reward는
+  `action_rate_l2=sum((a_t-a_previous)^2)`, arm `joint_vel_l2=sum(qdot^2)`에 각각
+  weight -0.03을 사용한다. OSC 변형도 이를 상속한다. `/dt`가 없는 입력 차이이며
+  실제 joint acceleration이나 F/T 증가율을 평가하는 항이 아니다. Native RewardManager의
+  dt 곱이 적용되므로 우리 품질 항의 weight와 직접 비교하지 않는다.
+  [원격 min RewardsCfg](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/shelf_sweep_random_env_cfg.py#L164)
+- 공식 Isaac Lab v2.3.0(commit `3c6e67bb5c7ada942a6d1884ab69338f57596f77`)의
+  Reach/Franka OSC는 action-rate weight를 -0.0001에서 -0.005로, joint-velocity는
+  -0.0001에서 -0.001로 강화하는 curriculum을 상속한다. 공통 policy step counter가
+  4500을 넘은 뒤 첫 reset에서 변경되며, PPO iteration이나 환경 수를 곱한 transition
+  수가 아니다. 성공률을 확인하는 schedule은 아니다. 초반 규제를 약하게 두는 구조는
+  참고할 수 있지만 속도 비용 자체는 우리 목표와 다르다.
+  [공식 reward·curriculum](https://github.com/isaac-sim/IsaacLab/blob/3c6e67bb5c7ada942a6d1884ab69338f57596f77/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/reach_env_cfg.py#L155)
+- 공식 FORGE는 `relu(norm(F_smooth)-force_threshold)` 비용을 사용한다. 기본 threshold는
+  episode마다 5–10N에서 선택하며 정책에도 제공한다. Factory의 action difference norm
+  비용도 상속하고 weight 0.1로 활성화한다. 이는 힘 **크기** 초과 비용이며 증가율 비용이
+  아니다. 제어기 내부 dead-zone randomization과 reward threshold도 구분해야 한다.
+  [공식 FORGE reward](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py#L232),
+  [설정](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab_tasks/isaaclab_tasks/direct/forge/forge_tasks_cfg.py#L11)
+
+**관련 1차 논문과 적용 한계**
+
+1. [Learning Gentle Object Manipulation with Curiosity-Driven Deep Reinforcement
+   Learning (2019)](https://arxiv.org/html/1903.08542), §III-C/IV-A:
+   힘의 양의 증가 `m=max(0,f_next-f)`와 비선형 비용
+   `m*sigmoid(lambda1*(m-lambda2))`를 사용한다. 작은 증가를 약하게 평가해도 curiosity가
+   없으면 접촉을 피하는 local optimum을 보고했다. 실험은 fingertip force channel별
+   증가를 합하며 `/dt`가 없다. 우리의 보상된 wrist 합력 norm·증가율·토크 확장과 다르다.
+2. [FORGE (2024/2025)](https://arxiv.org/abs/2408.04587), §III-A:
+   필요한 접촉 하중을 허용하면서 설정된 힘 threshold의 초과량에 비용을 부여한다.
+   Force-threshold conditioning까지 포함한 방법이다. 우리에게 옮기는 교훈은 필요한
+   접촉과 과도한 접촉의 구분이며, 5–10N이나 힘 크기 비용을 그대로 복사하는 것은 아니다.
+3. [CAPS, Regularizing Action Policies for Smooth Control with Reinforcement
+   Learning (ICRA 2021)](https://arxiv.org/html/2012.06644v2), 식1–3:
+   시간상 인접한 상태의 정책 출력 차이와 유사한 상태의 출력 차이를 정책 학습 목적에
+   regularization으로 넣는다. 환경 reward가 아니며 실제 가속도·F/T smoothness를
+   직접 보장하지 않는다. 도입하면 PPO update와 추가 forward 계산을 검토해야 한다.
+4. [Grad-CAPS (2024)](https://arxiv.org/html/2407.04315v1), 식11–18:
+   `norm((a_t-a_previous)-(a_next-a_t))`와 displacement normalization을 사용해 일정한
+   명령 변화와 zigzag를 구별한다. 과도한 smoothing이 응답성을 떨어뜨리는 문제를
+   다룬다. 단순한 action 2차 차분이 전체 방법은 아니며 physical joint jerk와도 다르다.
+5. [Variable Impedance Control in End-Effector Space: An Action Space for
+   Reinforcement Learning in Contact-Rich Tasks (IROS 2019)](https://arxiv.org/pdf/1906.08880),
+   §V-B/C: 문 열기·닦기의 작업 진행과 필요한 접촉을 허용하고 과도한 하중에 비용을 준다.
+   정책20Hz·제어500Hz 사이에 명령 보간도 사용하므로 reward만의 결과로 해석하지 않는다.
+
+**우리 Motion에 대한 연구 기반 검토안 — 미확정·미구현**
+
+- 기존 `r_motion=(exp(-a_acc*x_acc)+exp(-a_FT*x_FT))/2`와 요소별 평균 원칙은 유지한다.
+  논문의 음의 비용을 그대로 추가하거나 `exp(-x)-1`로 이동하는 변경은 하지 않았다.
+- F/T의 목적에는 양의 부하 증가가 직접 맞는다. 다만 episode 초기 원점으로 이동한
+  moment 대신 sensor 중심의 자중·관성 보상된 F/T norm을 비교하는 의미 수정이 먼저다.
+  Wrist 합력의 norm은 서로 상쇄되는 국소 접촉 증가를 모두 표현하지 못한다.
+- 앞서 검토한 정확한 허용 구간 `relu(u-b)` 외에, Gentle Manipulation의 비용 형태를
+  참고한 `phi(u)=u*sigmoid(k*(u-b))`를 **exp 안의 x**에 넣는 비교 후보가 생겼다.
+  `u`는 단위 없는 양의 증가율, `b`는 전이 위치, `k`는 전이의 가파름이다. 작은 증가의
+  비용을 낮추지만 정확한 zero-cost band는 아니다. 큰 값에서는 선형에 접근하고 exp의
+  포화는 여전히 남는다. 이 변환과 토크 적용은 우리의 제안이며 원 논문 수식 그대로가 아니다.
+  Gate 효과만 비교할 때는 F/T 내부의 기존 RMS 집계도 유지해 별도 변경과 섞지 않는다.
+- 가속도는 현재 RMS 크기, 정규화한 제곱 평균, 허용 범위 초과량을 비교할 수 있다.
+  제곱 평균은 작은 값에서 완만하지만 큰 값에서는 exp가 더 빨리 포화한다. Jerk만으로
+  교체하면 큰 일정 가속을 충분히 구별하지 못하므로 자동 대체하지 않는다.
+- Raw18D action 차이에는 relative EEF pose·clipped stiffness·absolute hand target의
+  의미가 섞인다. 같은 raw 변화가 실제 제어에 같은 영향을 주지 않으므로 예제의
+  action_rate를 그대로 Motion으로 바꾸지 않는다.
+- 허용 구간이나 완만한 비용만으로 비조작 문제 해결을 보장할 수 없다. Clearance의
+  실제 진전과 Motion 손실의 상대 크기, 접촉률·성공률, 초반 낮은 Motion weight 후
+  강화하는 curriculum을 함께 비교할 후보로 둔다. Curriculum은 native 기능을 우선한다.
+  새 curiosity predictor·접촉 보너스·temporal encoder를 자동으로 추가하지 않는다.
+- 먼저 가속도/F-T 구성 점수와 원시 물리량, 정상 접촉의 범위를 분리해 측정해야 한다.
+  임계값은 논문 수치나 현재 정규화 scale을 허용 한계로 재해석하여 결정하지 않는다.
+  Tensor 기반 차분·norm·elementwise shaping은 기존 GPU 경로에 얹을 수 있으나 추가
+  physics-substep F/T SDK 조회나 정책 regularization은 별도 비용 측정이 필요하다.
+
+### 2026-10-16 — 구체적인 첫 reward 수정 실험안 제안
+
+사용자는 문헌 검토 이후 구체적인 수정 방향을 물었다. 아래는 첫 실험을 위한 제안이며
+구현하거나 확정하지 않았다. 논문 수식을 그대로 복사한 설계라고 주장하지 않는다.
+
+1. Sensor 중심의 자중·관성 보상된 F/T norm을 비교하도록 원점을 정리한다.
+   초기 sensor 위치로 moment를 옮기는 `(p-p0)×F`를 reward 경로에서 제거하는 제안이다.
+2. 현재 Motion의 지수 안 RMS에서 sqrt를 제거해 정규화한 제곱 평균으로 바꾼다.
+
+   ```
+   x_acc = (sum_arm((qddot/5)^2) + sum_hand((qddot/10)^2)) / 12
+   g_F = max(0, norm(F_sensor_k)-norm(F_sensor_previous)) / dt
+   g_M = max(0, norm(M_sensor_k)-norm(M_sensor_previous)) / dt
+   x_FT = ((g_F/200)^2 + (g_M/10)^2) / 2
+   r_motion = (exp(-x_acc) + exp(-x_FT)) / 2
+   ```
+
+   독립 관절12개, a_acc=a_FT=1, 기존 scale5/10rad/s²·200N/s·10Nm/s를 유지한다.
+   기존 normalized RMS를 z라 하면 exp(-z)→exp(-z²)다. z<1은 감점이 약해지고
+   z>1은 강해진다. 작은 nonzero에도 감점은 남으므로 정확한 허용 구간이 생기는 것은 아니다.
+   정상 분포를 측정하기 전 새 deadband·sigmoid 파라미터를 추가하지 않는 최소 초기안이다.
+3. Dense 최대합3을 유지하며 C/R/M weight를 1.8/0.6/0.6으로 조정하는 제안이다.
+   Motion 내부 가속도와 F/T의 실제 가중치는 각각0.3이다. Clearance/Rearrangement의
+   기존 수식, Time의 증가형 적분 penalty, Terminal+500/-100은 이 첫 실험에서 유지한다.
+   Curriculum은 동시에 도입하지 않고 고정 weight의 효과부터 비교한다.
+
+계산 예시는 실제 rollout이 아닌 동일 물리량에 대한 수식 비교다.
+
+| 조건 | 현재 구성 점수 | 제안 구성 점수 |
+| --- | ---: | ---: |
+| 팔6관절 각각1rad/s², hand0 | 0.868123 | 0.980199 |
+| 팔6관절 각각10rad/s², hand0 | 0.243117 | 0.135335 |
+| 힘 norm +0.1N/20ms, moment 일정 | 0.982478 | 0.999688 |
+| 힘 norm +1N/20ms, moment 일정 | 0.837967 | 0.969233 |
+| 힘 norm +8N/20ms, moment 일정 | 0.243117 | 0.135335 |
+
+제곱 평균은 큰 입력의 점수 포화를 더 빠르게 만든다. 기존에 acceleration score가
+이미0에 붙은 표본의 구별력 문제를 해결하지 않는다. 따라서 r_acc/r_FT를 분리하고
+raw normalized cost 분포·score<0.01 비율·실제 Clearance 진전·성공률을 함께 확인해야 한다.
+큰 입력 대부분이 포화된다면 scale을 다시 정해야 하며 곡선 변경만으로 해결했다고 보지 않는다.
+
+정지 최대점은 여전히1이고 완전 가림 정지 dense 합도2.367879→1.862183으로 줄 뿐 양수다.
+비조작 방지를 보장하는 제안은 아니다. 새 IdealPD와 이전 Implicit의 차이를 reward 효과로
+섞지 않도록 비교 실험에서는 같은 controller·scene 설정을 사용한다. Torque 항 추가는 보류다.
+
+### 2026-10-16 — 사용자의 기준값 차감 방식 제안
+
+사용자는 기준값으로 나누는 대신 빼는 방식을 제안하며 의견을 물었다. 허용 범위 이하는
+비용0, 초과량만 평가하는 해석이 정상 조작을 허용하려는 목적에 맞는다. 아직 파라미터나
+구현을 확정한 것은 아니며 production reward는 변경하지 않았다.
+
+```
+e_acc_j = max(0, abs(qddot_j) - acceleration_allow_j)
+e_F = max(0, positive_force_norm_rate - force_rate_allow)
+e_M = max(0, positive_moment_norm_rate - moment_rate_allow)
+quality = exp(-a * excess^2)
+```
+
+단순한 차감만 사용하면 음의 cost로 exp 점수가1을 넘으므로 반드시 양의 초과량을 쓴다.
+가속도는 절댓값을 사용해 가속과 감속을 모두 평가한다. F/T는 기존 양의 norm 증가율을
+사용하여 일정 부하와 하중 해제는 감점하지 않는다. 정확한 허용 구간이 생기므로 앞서
+제안한 threshold 없는 MSE와 구분해야 한다.
+
+허용 기준b와 감점 강도a는 역할이 다르다. 분모를 없애더라도 a가 단위와 민감도를 조절한다.
+Force와 moment의 초과량을 raw 값으로 더하지 않고 각각의 단위에 맞는 계수를 사용해야
+한다. 기존 Motion의 가속도/F-T 두 구성 점수와 산술평균을 자동으로 세 요소로 바꾸지 않는다.
+예를 들어 기존 grouping을 유지하면 r_acc=exp(-a_acc*mean(e_acc²)),
+r_FT=exp(-(a_F*e_F²+a_M*e_M²)/2), r_motion=(r_acc+r_FT)/2로 표현할 수 있다.
+
+허용 가속도5rad/s²라는 **예시 가정**에서는 가속도3과5의 초과량이0,7의 초과량은2다.
+기존 scale5/10rad/s²·200N/s·10Nm/s는 측정된 허용 한계가 아니므로 새 기준으로 그대로
+재해석하지 않는다. 기준은 정상 조작과 무접촉 센서 보상 잔차의 분포를 보고 정해야 한다.
+허용 구간을 두어도 비조작 최대점과 task reward의 상대 유인을 따로 검토해야 한다.
+
+### 2026-10-16 — Motion 초과량 수식과 실제 무접촉 측정 기반 초기 기준
+
+사용자는 초과량 방식의 식을 다시 세우고 기준을 합리적으로 정하도록 요청했다.
+정상 움직임의 참고값을 얻기 위해 현재 native OSC+IdealPD/hand implicit PD 구성으로
+8개 초기 자세, Kp50/100/200에서 무접촉 정지·작은 팔 주기동작·작은 hand 주기동작을
+측정했다. 학습/reward production 코드는 바꾸지 않았다. 아래는 초기 실험용 제안이다.
+
+**측정 조건과 한계**
+
+- Physics10ms, policy20ms 유지. 로봇 base를 world Z로3m 옮겨 선반·물체 접촉을 배제하고
+  native ActionManager의 process/apply와 Scene write/step/update를 그대로 호출했다.
+  Robot reset은 IK가 검증한8개 자세를 사용한다. 정책 추론이나 학습은 실행하지 않았다.
+  현재 tanh actor와 stiffness_scale100 조합에서 정책이 도달하는 Kp범위는50–100이다.
+  Kp200은 controller cfg가 허용하는 상단에 대한 추가 진단이며 정책의 통상 출력은 아니다.
+- Kp마다200policy step 안정화 후 각 모드200step을 수행하고 첫25step을 제외했다.
+  모드당1400 env-transition, 총12600개를 기록했다. 가속도는 두 physics substep 모두
+  저장했으며 아래 기준 계산은 현재 reward와 같은 마지막 substep 표본을 사용했다.
+- 팔 목표는0.5Hz로 Y진폭2cm·Z범위0–2cm의 작은 동작, hand는 각 독립관절0–0.2rad의
+ 0.5Hz 목표였다. 모든 tactile force는0, 모든 joint acceleration/wrench는 finite였다.
+- Gravity compensation=False인 기존 OSC를 유지했으므로 고정 목표에 대한 TCP 위치
+  오차가 Kp에 따라 약4.3–16.5cm 남았다. 이 진단은 실제 성공 조작이나 정확한 위치 추종의
+  검증이 아니며, 안정된 무접촉 상태와 작은 변화의 참고 분포다. 이를 정상적인 작업 전체의
+  upper bound로 주장하지 않는다. 첫 안정화 충격을 허용해야 한다는 결론도 아니다.
+- 기존 `reward_update_20261015/motion_samples.pt`는 Implicit 초기 탐색 자료다.
+  팔 RMS 가속도 median61rad/s² 같은 값을 허용 기준으로 채택하지 않는다. 당시 기존
+  가속도 score의 약83%가0.01미만이었으므로 threshold 없는 MSE만 적용하는 이전 제안은
+  큰 입력 포화를 심화할 수 있다. 이번 측정 기반의 초과량 설계가 최신 검토안이다.
+
+조건별 smooth-motion99.9백분위 중 최댓값은 다음과 같다.
+
+| 물리량 | 측정값 | 허용 기준 b 제안 |
+| --- | ---: | ---: |
+| 팔 관절별 abs 가속도 | 2.5822rad/s² | 3rad/s² |
+| Hand 관절별 abs 가속도 | 6.5142rad/s² | 8rad/s² |
+| 보상된 힘 norm 양의 증가율 | 1.4401N/s | 10N/s |
+| 보상된 센서 moment norm 양의 증가율 | 0.1043Nm/s | 0.5Nm/s |
+
+팔 관절별 최대는2.6752rad/s²였다. Hand에는 최대20.438rad/s²의 드문 표본이 있어
+99.9백분위 기준과 분리한다. 그 spike까지 모두 무비용으로 허용하려고 b를 올리지는 않는다.
+F/T 기준은 관측된 잔차뿐 아니라 축별해상도0.1N/.005Nm의 반올림 오차를 고려한다.
+실제 self-load 모델이 정확하고 overrange가 없을 때 두 norm 샘플 간 반올림 영향의 보수적
+rate 상한은 sqrt(3)*resolution/dt, 즉8.6603N/s·0.4330Nm/s다. 따라서10/.5를 채택한다.
+이는 보상 모델 오차 전체에 대한 보장은 아니며 센서 accuracy를 noise 표준편차로 간주하지 않는다.
+[ATI 해상도 자료](https://www.ati-ia.com/es-MX/Library/documents/Axia80_Flyer.pdf)
+
+**새 식 — 기존 가속도/F-T 두 구성 점수와 평균 유지**
+
+```
+E_arm  = mean_6(relu(abs(qddot_arm)  - 3)^2)
+E_hand = mean_6(relu(abs(qddot_hand) - 8)^2)
+g_F = (norm(F_sensor_k) - norm(F_sensor_previous)) / dt
+g_M = (norm(M_sensor_k) - norm(M_sensor_previous)) / dt
+e_F = relu(g_F - 10)
+e_M = relu(g_M - 0.5)
+r_acc = exp(-(0.00481352208722 * E_arm + 0.00143212227388 * E_hand))
+r_FT = exp(-(0.00008557372600 * e_F^2 + 0.03422949039802 * e_M^2))
+r_motion = (r_acc + r_FT) / 2
+```
+
+F_sensor/M_sensor는 센서 중심에서 자중·관성 보상된 값이며 초기 위치로 moment를 옮기는
+`r×F`를 사용하지 않는 제안이다. 음의 rate는 최종relu에서0이 되므로 일정 부하·하중 해제는
+무비용이다. 나눗셈 mean_6·/2는 개수 평균이며 기준값으로의 입력 정규화가 아니다.
+서로 다른 단위의 force/moment 비용은 각각 단위를 상쇄하는 계수를 사용한다.
+팔/hand·force/moment를 각자 exp로 만든 뒤4항 평균하는 새 grouping은 도입하지 않는다.
+그렇게 하면 나쁜 팔 움직임을 정지 hand 점수가 더 쉽게 보상하는 변경까지 섞이기 때문이다.
+
+**감점 계수의 해석**
+
+허용 기준 b와 별개로 score가0.5가 되는 지점을 명시해 a=ln(2)/(L-b)^2로 정한다.
+이 L들은 측정된 안전 한계가 아니라 초과 후 감점 강도를 정하기 위한 초기 설계 선택이다.
+
+| 항 | b | L: 해당 구성 score0.5 기준 | a |
+| --- | ---: | ---: | ---: |
+| 팔 가속도 | 3rad/s² | 6관절 모두15rad/s² | 0.0048135221 |
+| Hand 가속도 | 8rad/s² | 6관절 모두30rad/s² | 0.0014321223 |
+| 힘 증가율 | 10N/s | 100N/s | 0.0000855737 |
+| Moment 증가율 | 0.5Nm/s | 5Nm/s | 0.0342294904 |
+
+각0.5 해석은 같은 구성 점수의 다른 비용이0일 때다. 한 팔 관절만15이고 나머지가 허용
+이하면 r_acc=2^(-1/6)≈0.8909다. 두 팔/hand 그룹이 모두 L이면 r_acc=.25다.
+힘100N/s와 moment5Nm/s가 동시에 발생하면 r_FT=.25다. Force100N/s는20ms에2N,
+moment5Nm/s는20ms에0.1Nm 증가다. 힘20N/s는 r_FT≈0.99148이고, 같은20N을
+0.2s 동안 선형으로 올리는100N/s는.5다(다른 moment 비용0). Peak나 종료 한계와 다르다.
+팔15rad/s²는0.1s에 관절 속도를1.5rad/s 바꾸는 가속이고, hand30rad/s²는 현재
+1rad/s 속도 상한까지 약33ms에 도달하는 가속이다. 이 해석으로 급격한 동작에 중간 점수를
+배정하되 실제 task 성공·충격 통계를 보고 L과a를 조정할 초기 설계값으로 둔다.
+
+전체 reward weight는 앞서 제안한 C/R/M1.8/.6/.6과 Time/Terminal 유지안을 함께 검토한다.
+이번에 이를 production 설정에 적용하지 않았다. 과도한 하중·선반 변위 등의 종료 조건도
+완화하지 않았다. 정지와 허용 범위의 동작은 같은 Motion최고점을 가지므로 성공/가림 감소와
+각구성점수 분포를 확인할 짧은 재학습이 필요하며, 이 진단으로 비조작 해결을 주장하지 않는다.
+
+재현 자료: `outputs/contact_manipulation/motion_thresholds_20261016/`의
+`probe.py`, `probe.json`, `samples.pt`, `proposal.json`, `replay.json`, `probe.log`.
+Offline replay에서 현재 정책이 도달하는 Kp50/100 표본의 제안 Motion 최소값은0.9998168,
+추가 Kp200 진단까지 포함한 최소값은0.9818738이었다. 측정한 작은 무접촉 동작을 거의
+감점하지 않는지는 확인했다. 현재 probe가 resolved joint IDs를 따로 저장하지 않아 이전
+live PhysX joint metadata를 상속했으며, 해당 선택의 가속도 통계54개를9모드 probe 요약과
+대조해 모두 일치함을 확인했다. 이 provenance와 입력 hash는 replay.json에 기록했다.
+
+### 2026-10-16 — 빠른 접근 후 필요한 급감속을 구분해야 한다는 사용자 보완
+
+사용자는 빠르게 접근한 뒤 물체 접촉 직전·접촉 중 감속하여 정밀 제어해야 하므로,
+가속도 크기를 대칭적으로 벌하는 Motion이 필요한 급감속까지 억제한다고 지적했다.
+기존 코드의 joint_acc_l2와 앞선 abs(qddot) 초과량 제안 모두 가속·제동을 구분하지 않는다.
+작은 주기 동작으로 얻은 b_arm3/b_hand8만으로 이 요구를 검증하지 못했으므로 이 기준을
+실제 조작의 확정값으로 취급하지 않는다. Production reward/weight/controller는 변경하지 않았다.
+
+검토 방향은 속력 증가와 제동을 구분한 비대칭 가속도 비용이다. 물리 구간별로
+`c_j=relu(abs(qddot_j)-b_j)^2 * (beta + (1-beta)*p_j)`를 후보로 둔다.
+`p_j`는 해당 구간 중 관절 속력이 증가한 비율이며, 순수 가속1·순수 제동0이다.
+0<beta<1이면 필요한 제동에 작은 배경 비용만 남긴다. Beta값은 아직 선택/적용하지 않았다.
+이는 초기 임계값을 단순히 올려 가속/제동 모두 면제하는 변경과 다르다.
+갑작스러운 제동이 항상 좋은 것은 아니므로 모든 제동을 무조건 무료로 간주하지 않는다.
+
+Native physics interval h=.01에서 v0=v1-h*qddot로 이전 속도를 복원할 수 있다.
+구간 중 일정 가속도 근사에서는 v0*v1>=0이면 p=1[abs(v1)>abs(v0)],
+부호가 바뀌면 p=abs(v1)/(abs(v0)+abs(v1))이다. 단순한 양의 속력 끝점 차이는
+동일 속력의 반전(+.1→-.1)을0으로 평가하므로 그 식으로 바로 대체하지 않는다.
+현재 reward는 마지막 physics substep만 읽어 첫10ms의 피크를 놓칠 수 있다는 한계도 별도다.
+
+접촉에 의한 급정지는 joint velocity가 감소해도 F/T 증가 비용으로 평가한다.
+그러나 보상된 wrist net wrench가 모든 국소 충격을 관측한다는 보장은 없다.
+Jerk/일반 action-rate 항도 필요한 제동 시작을 벌할 수 있어 자동 대체하지 않는다.
+감속 허용은 접촉 직전부터 필요하므로 tactile 접촉 후에만 면제하는 gate로 해결하지 않는다.
+
+관절 속력의 감속과 EEF의 접근 속력 감속은 Jacobian과 관절 결합 때문에 일치하지 않는다.
+따라서 이 비대칭식이 필요한 EEF 제동을 전부 면제한다고 주장하지 않는다. 다음 기준 검증은
+빠른 접근→접촉 전 제동→정밀 조작의 실제 동작을 포함해야 한다. 기존 무접촉 작은 주기 동작
+측정은 센서 잔차·저주파 기준선으로 남기되 정상 조작 전체의 허용 범위를 대신하지 않는다.
+
+사용자의 plot 요청에 대해 `motion_thresholds_20261016/acceleration_braking_plot.png`와
+동명의SVG를 생성했다. b3rad/s², beta0.1, a=ln2/12²의 예시이며 적용/확정한 설정이 아니다.
+좌측은 순간 비용 c_j(시간 적분 아님), 우측은 exp(-a*c_j) 커널(전체 Motion 아님)이다.
+15rad/s²에서 순수 가속 p1의 커널은0.5, 순수 제동 p0은0.93303이다. 한 관절만 움직이면
+실제 그룹 평균의 지수에는1/6이 적용되며, 팔6관절이 같은 크기이고 hand 비용0일 때
+그림 우측이 가속도 그룹 점수와 일치한다. Production 코드는 변경하지 않았다.
+
+### 2026-10-16 — Native action-rate·joint-velocity와 F/T 급증의 조합 제안
+
+사용자는 속도·운동 측면에 action_rate_l2와 joint_vel_l2를 쓰고 큰 힘 변화에 별도 보상을
+두는 것이 효과적인지 물었다. 다음 비교 실험의 기준선으로 타당하다고 검토했으며,
+production reward/weight는 변경하지 않았다. 기존 abs(qddot)·비대칭 제동 비용을 이 항들에
+자동으로 중복 추가하지 않는다. 지금 단계에서는 이전 가속도 threshold/제동 beta 확정도 보류다.
+
+- 공식 action_rate_l2는 sum((raw_action-previous_raw_action)^2)이며 /dt가 없다.
+  명령 변경을 억제하지만 급제동 명령 변경도 비용이다. 일정한 큰 pose_rel action은
+  빠른 이동을 만들더라도 rate 비용0일 수 있다.
+- 공식 joint_vel_l2는 선택된 관절의 실제 joint_vel 제곱합이다. 감속하면 비용이 줄며
+  감속도 자체를 벌하지 않는 장점이 있으나 지속적인 빠른 운동에도 비용을 준다.
+  따라서 빠른 접근을 살리려면 이 항의 영향은 약하게 시작해야 한다. SceneEntityCfg로
+  팔6관절 또는 독립12관절을 명시하고 mimic 관절을 중복 집계하지 않는다.
+- 우리 raw18D action은 모두 bounded 수치지만 pose_rel6/Kp6/hand target6의 물리 효과는
+  다르다. Kp가 같은50으로 clamp되는 구간 내 raw 변화도 native action-rate는 벌한다.
+  이 한계를 기록한 채 공식 기본 항을 먼저 쓸 수 있으며 실제 가속/충격 제어 보장은 아니다.
+- F/T는 센서 중심의 자중·관성 보상된 norm의 큰 양의 증가를 평가하는 항으로 유지하는
+  제안이다. 하중 감소는 비용을 주지 않으며, 모든 국소 충격의 완전한 관측은 아니다.
+- 기존 exp(-a*x) 원칙을 유지하면 native 두 함수의 반환 cost를 exp의 x로 사용한다.
+  음의 weight로 native raw cost를 직접 더하는 방식과 구분한다. 기존 quality wrappers는
+  manager의 dt 곱을 상쇄하므로 예제의 raw penalty weight를 그대로 복사하지 않는다.
+- 세부 항을 늘리면서 F/T의 실제 비중을 자동으로 낮추거나 움직임 규제를 강화해 비조작을
+  악화시키지 않도록 구성 점수/실제 기여량·가림 감소·접촉률·성공률을 분리해서 확인한다.
+  이 항들은 GPU tensor 차이·제곱합이며 추가 sensor/PhysX SDK 조회는 필요하지 않는다.
+
+공식 근거:
+[native rewards](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab/isaaclab/envs/mdp/rewards.py),
+[Reach/OSC reward 구성](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/reach_env_cfg.py#L155).
+
+### 2026-10-16 — Tactile 관측·Blocker 접촉 보상 관련 연구와 공식 예제 검토
+
+사용자는 tactile을 어떻게 활용할지, Blocker 접촉 중이면 보상을 줄지, 관련 연구와
+Isaac Lab 예제를 조사하도록 요청했다. 이번에는 조사·설계 비교만 수행했고
+production 센서·observation·reward·PPO는 변경하지 않았다.
+
+**현재 신호에서 확인한 제약**
+
+- 하나의 grouped ContactSensor가17개 링크의 net normal contact force를 읽고,
+  norm>0.01N을 접촉1로 만든다. 비접촉0, 무효/reset은-1이다. 현재·이전 관측에 있으며
+  현재 모델은 이를 최종MLP에 직접 전달한다. 별도 tactile reward는 없다.
+- 이17bits는 접촉 부위만 구분하고 상대가 Blocker·Target·선반·다른 물체인지는 알 수
+  없다. Binary에서 Blocker identity를 복원했다고 주장하지 않는다. Net force 벡터의
+  상쇄 가능성이 있으며 접촉점·접선력·slip을 직접 측정하는 신호도 아니다.
+- 공식v2.3 ContactSensor는 한 환경 안에서 여러 sensing body를 묶은 센서의 partner
+  filtering을 보장하지 않는다. 현재17body 센서에 filter만 추가하면 된다고 설명하지 않는다.
+  정확한 Blocker 접촉은 별도 partner-resolved privileged 정보가 필요하며 view/버퍼/SDK
+  비용을 검토해야 한다. 예전17sensor 구성을 성능 측정 없이 복구하지 않는다.
+  [공식 센서 필터 제약](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab/isaaclab/sensors/contact_sensor/contact_sensor.py#L49)
+
+**논문 — 각 연구의 보상을 구분한다**
+
+1. [Improved Learning of Robot Manipulation Tasks via Tactile Intrinsic
+   Motivation (RA-L2021)](https://arxiv.org/html/2102.11051v1), §IV-B:
+   누적 force가 임계값을 넘으면 episode 끝까지 intrinsic reward1을 주는 latch다.
+   task/intrinsic weight는.75/.25다. 단일 물체 Push/Slide/PickPlace의 탐색을 개선했지만,
+   센서 배치에 따라 테이블을 누르는 악용도 저자들이 명시한다. 우리의 episode당1회
+   보너스와 다른 식이며 DDPG/HER·contact-prioritized replay를 PPO에 바로 복사하지 않는다.
+2. [Tac2Motion (2025)](https://arxiv.org/html/2509.17812v1), §II-B:
+   뚜껑 회전을 위해 접촉압력의 기하 proxy·contact release·접촉 품질과 회전 진전의
+   결합을 보상한다. 접촉 유지뿐 아니라 finger gaiting과 실제 작업 진전이 함께 필요하다.
+   Binary17 입력만 사용하는 우리 과제와 달리 tactile embedding·추가 접촉 모델을 사용한다.
+   Grasp/friction을 늘리는 목적을 그대로 pushing·pivoting에 적용하지 않는다.
+3. [TaRL: Learning General and Physical Rewards from Tactile Demonstrations
+   (2026 preprint)](https://arxiv.org/html/2609.36785v1), §III:
+   성공·실패 tactile deformation-map 시퀀스로 task progress reward 모델을 학습한다.
+   단순한 접촉 지속/개수 보상이 아니다. 별도 시연과 reward model이 필요하고 현재의
+   binary17·현재/이전 관측만으로 같은 방법을 바로 구현할 수 없다. 새 encoder/16step
+   history/reward network를 자동 추가하는 제안은 아니다.
+4. 앞서 검토한 Gentle Manipulation2019의 force-growth penalty와 contact-focused
+   surprise는 접촉 회피 문제의 근거다. 다만 그 predictor ensemble·추가 critic을
+   단순 contact bonus라고 설명하거나 현재 PPO에 자동 도입하지 않는다.
+
+**공식 Isaac Lab v2.3.0 — 로컬 fork와 구분해 확인**
+
+- Dexsuite Kuka–Allegro는 각 fingertip에 object-filtered ContactSensor를 두며,
+  `thumb_force>1N AND (index>1N OR middle>1N OR ring>1N)`이면 good-contact1이다.
+  Native reward weight는+0.5다. 동일 접촉 조건으로 object pose tracking reward를 gate한다.
+  이는 파지용 접촉 조건이며 많은 pad를 붙일수록 점수를 더 주는 식은 아니다.
+  [공식 설정](https://github.com/isaac-sim/IsaacLab/blob/3c6e67bb5c7ada942a6d1884ab69338f57596f77/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/dexsuite/config/kuka_allegro/dexsuite_kuka_allegro_env_cfg.py#L24),
+  [reward 구현](https://github.com/isaac-sim/IsaacLab/blob/3c6e67bb5c7ada942a6d1884ab69338f57596f77/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/dexsuite/mdp/rewards.py#L49).
+- Direct InHand ShadowHand/Allegro는 일부 asymmetric 모드에서 fingertip incoming joint
+  wrench를 critic state에 넣지만 기본 actor tactile 입력과 같지 않다. Reward에는
+  위치·회전·action²·success/fall이 있고 contact-count bonus는 없다.
+  [공식 InHand](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab_tasks/isaaclab_tasks/direct/inhand_manipulation/inhand_manipulation_env.py#L400).
+- FORGE는 force observation과 `relu(norm(F)-threshold)` penalty를 사용한다.
+  큰 force의 초과 비용이며 접촉 자체에 양의 보상을 주는 binary tactile 사례가 아니다.
+  [공식 FORGE](https://github.com/isaac-sim/IsaacLab/blob/v2.3.0/source/isaaclab_tasks/isaaclab_tasks/direct/forge/forge_env.py#L232).
+
+**우리 적용 제안 — 미확정·미구현**
+
+Tactile17D는 접촉 위치별 feedback observation으로 유지한다. 접촉 개수나 지속시간에
+매step 양의 보상을 주면 Blocker를 쥐고 정지하거나 반복 접촉을 수확할 유인이 생긴다.
+이는 현재 비조작을 해결한다고 보장할 수 없다. 단순 sum17이나 임의 물체 접촉을 Blocker
+접촉으로 취급하지 않는다. Pivoting/pushing에 특정 파지 형태를 강제하지 않는다.
+
+접촉 탐색이 병목이라면 정확한 partner 정보가 확보된 뒤 작은 첫 유효 Blocker 접촉
+milestone을 비교할 수 있다. `C_B`를 정확한 Blocker 접촉, `H_B`를 이전 episode 누적
+접촉 여부로 두고 `r_touch=eta*C_B*(1-H_B_previous)`, `H_B=H_B_previous OR C_B`다.
+Episode당1회로 제한하여 반복 tapping·유지만으로 추가 보상을 얻지 못한다. 이는 논문
+그대로가 아니라 우리 탐색 보조안이며 기존C/R/M의 연속 exp 품질 항과 별개의 이벤트다.
+실제 치우기는 Clearance가 계속 담당하고 F/T 급증 비용도 유지한다. 성공률·가림 감소를
+개선하는지 관측 전용 baseline과 비교해야 하며, partner 조회의 추가 비용도 검토해야 한다.
+
+### 2026-10-16 — Tactile 보상 보류 후 Motion 재정의안
+
+사용자는 일단 tactile 없이 진행하고 Motion을 다시 정의하도록 요청했다. 직전 논의의
+범위에 따라 tactile 기반 reward를 제외하는 안을 정리하며, 이 요청으로 tactile observation
+삭제나 모델 차원 변경을 자동 수행하지 않았다. 이번에는 수식 설계만 했으며 production
+reward·weight·센서 코드는 변경하지 않았다.
+
+기존 joint_acc 기반 점수는 제외하고 다음 네 비용을 각각 exp에 넣은 뒤 평균한다.
+
+- x_action = native action_rate_l2 = sum18((a_k-a_previous)^2). /dt나 기준값 나눗셈 없음.
+- x_velocity = native joint_vel_l2를 팔6+독립 hand6에 적용한 제곱합. Mimic은 제외한다.
+- g_F = relu(norm(F_k)-norm(F_previous))/dt,
+  x_F = relu(g_F-b_F)^2.
+- g_T = relu(norm(T_k)-norm(T_previous))/dt,
+  x_T = relu(g_T-b_T)^2.
+- M = (exp(-alpha_action*x_action) + exp(-alpha_velocity*x_velocity)
+       + exp(-alpha_F*x_F) + exp(-alpha_T*x_T))/4.
+  전체 Motion weight w_M를 네 구성 항이 w_M/4씩 나누며 최대는 w_M로 유지한다.
+  기존 두 그룹 구조와 달리 F/T 각각의 비중은1/4이다. 모든 raw cost를 더한 뒤 exp를
+  적용하는 곱셈형 점수와 구분한다. 기존 reward wrapper의 /dt 상쇄 규칙도 유지하는 안이다.
+
+F/T는 자중·관성 보상 후 센서 중심의 wrench norm을 사용한다. Norm은 좌표축 회전에는
+불변이지만 torque의 기준점에는 의존하므로 초기 센서 위치로 옮긴 moment를 쓰지 않는다.
+현재 production advance의 r×F 원점 이동은 이 재정의를 구현할 때 함께 수정해야 한다.
+하중 유지·하중 감소는 x_F/x_T=0이다. b_F/b_T는 센서 양자화·보상 잔차의 작은
+무감점 구간이며 실제 접촉에서 허용할 충격을 측정했다고 해석하지 않는다. 작은 무접촉
+probe만으로 얻은 이전 기준을 실제 조작의 확정 수치로 재사용하지 않는다.
+
+alpha는 각 비용의 단위와 민감도를 담당한다. 기준값으로 나누지 않아도 스케일 선택은
+남는다. alpha_velocity는 빠른 접근을 과도하게 억제하지 않도록 작게 시작할 필요가 있다.
+속도 감소 시 velocity 비용은 감소하지만 native action-rate는 제동 명령 변경에도 비용을
+주므로 급감속을 전부 면제하는 수식은 아니다. 원래 가속도 항과 중복 부과하지 않는다.
+
+Raw18D는 수치 범위가 같아도 pose/Kp/hand의 물리 효과가 다르며, Kp clamp 내부의
+raw 변경도 native action-rate에 포함된다. 이 항을 물리 가속도나 실제 Kp 변화의 정확한
+측정이라고 부르지 않는다. Joint velocity는 팔·hand의 속도 범위 차이로 팔이 지배할 수
+있어 구성별 통계를 확인해야 한다. 계수·dead band의 수치는 아직 선택/적용하지 않았다.
+
+정지는 여전히 Motion 최대다. 이 항의 목적은 조작 유도가 아니라 조작 중 부드러움이며,
+Clearance·성공·Time과 함께 조정해야 한다. Tactile gate, 접촉 유지 보너스, torque reward,
+새 temporal encoder는 추가하지 않는다. Native 두 함수는 이미 있는 GPU tensor를 쓰므로
+추가 ContactSensor/PhysX SDK 조회 없이 구현할 수 있다.
+
+### 2026-10-16 — Motion 네 항과 Clearance 중심 weight 적용 완료
+
+사용자가 직전 Motion 재정의안과 앞서 제안한 weight 수정을 적용하도록 요청했다.
+기존 파일만 수정했고 새로운 production 모듈·센서·모델은 추가하지 않았다.
+
+- Native RewardsCfg: Clearance1.8, Rearrangement0.6, Motion0.6. Time/Terminal은1.0 유지.
+  세 quality weight의 합은3이고, Motion의 네 하위 exp 점수는 각각 유효 weight0.15다.
+- motion은 공식 action_rate_l2 한 번과 joint_vel_l2 두 번(팔6/독립 hand6)을 사용한다.
+  Raw18D action 제곱 차이합과12joint 속도 제곱합을 그대로 사용하며 /dt·관절수 정규화·
+  sqrt가 없다. 기존 joint_acc_l2 Motion은 제거했다. 기준관절 선정은 기존 env cfg를 재사용한다.
+- action/velocity alpha는 각각0.004다. 작은 cost에서의 weighted 감점 기울기0.15×0.004는
+  min의 native weight0.03×dt0.02와 같도록 정했다. Exp 포화·baseline은 달라 전체 reward가
+  min과 같다는 의미는 아니다. 약한 초기 규제이며 빠른 접근의 성능 검증은 별도다.
+- F/T는 norm 증가율에서 각각10N/s·0.5Nm/s를 뺀 양의 초과량의 제곱이다.
+  alpha_F=ln2/90²=8.5573726e−5, alpha_T=ln2/4.5²=0.03422949로 각각100N/s·5Nm/s에서
+  해당 하위 점수0.5다. Dead band는 SI-200-8 양자화·작은 보상 잔차를 고려한 초기값이고,
+  반품질 지점은 성공 접촉 동작에서 추정한 한계가 아닌 설계값이다.
+- reward_components의 components[:,2]는 독립적인 F/T exp 점수의 평균이다. Motion은
+  (q_action+q_velocity+2*components[:,2])/4로 네 점수를 동일하게 평균한다.
+  wrench_rate_cost는(N,2)의 힘/토크 초과율 제곱으로 분리했다.
+- TaskState.advance는 보상된 현재 sensor-center wrench를 이전 값과 직접 비교한다.
+  초기 sensor 원점으로의 r×F 이동과 불필요한 축 회전을 제거했다. Norm의 회전 불변성을
+  사용하며 실제 local torque 증가를 원점 이동으로 상쇄하지 않는다.
+- Tactile observation17D·현재/이전 입력·18Daction·GNN/attention은 유지하고 tactile
+  reward/gate는 넣지 않았다. Joint torque 추가도 계속 보류다. 새로운 PhysX 조회·CPU tensor
+  동기화·환경별 반복문은 추가하지 않았다. 실제 iteration 시간 개선을 측정한 변경은 아니다.
+- Time 적분식·성공+500/실패−100·종료 조건·gamma·제어주기는 유지했다.
+
+검증:
+
+- CPU 전체:204 passed,14 skipped,142 subtests passed(15.84s).
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1, env_isaaclab python으로 tests 전체 실행.
+- 실제 GPU4환경·48 policy step(96physics step): 네 점수 수식 및 전체 reward의 native weight·dt
+  적용 일치. 명시적 부분reset2환경 후에도 일치했고 Motion 최대 oracle 오차5.9604645e−8.
+  관측 Motion 범위0.81229657~0.99421406, 비용shape(4,2), 완료exit0. 이 동작에서는 자연
+  termination은0회였다. 테스트에서 센서 이동·회전,실제localmoment성장,load유지/감소,
+  dead band·반품질·물리ramp의dt일관성,12joint선택/mimic제외,1024tensor/host조회금지를 검증했다.
+- GPU자료: outputs/contact_manipulation/motion_update_20261016/verify.py,
+  verification.json, verification.log. 장기 학습의 성공률·비조작 개선은 아직 검증하지 않았다.

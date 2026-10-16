@@ -35,14 +35,18 @@ class MdpCfg:
     max_objects: int = 10
     clearance_decay: float = 1.0
     rearrangement_decay: float = 2.0
-    motion_acceleration_decay: float = 1.0
-    motion_wrench_increase_decay: float = 1.0
-    arm_joint_acceleration_ref: float = 5.0
-    hand_joint_acceleration_ref: float = 10.0
+    # With Motion weight 0.6, each score has weight 0.15. Near zero cost,
+    # 0.15 * 0.004 matches min's native 0.03 penalty weight * 0.02 s dt.
+    motion_action_rate_decay: float = 0.004
+    motion_joint_velocity_decay: float = 0.004
+    # Initial design: half quality at +100 N/s or +5 N*m/s, respectively.
+    # Dead bands cover small sensor changes, not validated task impact limits.
+    motion_force_rate_decay: float = math.log(2.0) / 90.0**2
+    motion_torque_rate_decay: float = math.log(2.0) / 4.5**2
+    force_rate_deadband: float = 10.0
+    torque_rate_deadband: float = 0.5
     time_penalty_scale: float = 0.02
     time_penalty_growth_rate: float = 0.7
-    force_rate_ref: float = 200.0
-    torque_rate_ref: float = 10.0
     success_reward: float = 500.0
     failure_penalty: float = 100.0
     success_overlap_area: float = 1.0e-5
@@ -303,7 +307,6 @@ class TaskState:
         self.previous_corners = zeros(n, o, 8, 3)
         self.previous_wrench = zeros(n, 6)
         self.wrench_bias = zeros(n, 6)
-        self.initial_sensor_position = zeros(n, 3)
         self.path_length = zeros(n)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
@@ -312,7 +315,7 @@ class TaskState:
         self.terminal_paid = zeros(n, kind=torch.bool)
         self.failure_reasons = zeros(n, 7, kind=torch.bool)
         self.components = zeros(n, 5)
-        self.wrench_rate_cost = zeros(n)
+        self.wrench_rate_cost = zeros(n, 2)
         self.rearrangement_increment = zeros(n)
         self.blocker_overlap = zeros(n)
 
@@ -341,7 +344,6 @@ class TaskState:
         self.initial_center[ids] = batch.center[rows]
         self.initial_rotation[ids] = batch.rotation[rows]
         self.previous_corners[ids] = batch.corners[rows]
-        self.initial_sensor_position[ids] = batch.sensor_position[rows]
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
         self.history[ids] = 0
         self.history[ids, 0] = batch.sample[rows]
@@ -384,13 +386,12 @@ class TaskState:
         increment = corner_path_increment(self.previous_corners, batch.corners, self.active)
         self.rearrangement_increment.copy_(torch.nan_to_num(increment, nan=0.0, posinf=0.0, neginf=0.0))
         self.path_length.add_(self.rearrangement_increment)
-        force = quat_apply(batch.sensor_rotation, batch.sensor_wrench[:, :3])
-        moment = (quat_apply(batch.sensor_rotation, batch.sensor_wrench[:, 3:])
-                  + torch.cross(batch.sensor_position - self.initial_sensor_position, force, dim=-1))
-        fixed_wrench = torch.cat((force, moment), -1)
+        # Force/torque norms are rotation-invariant. Keep the current sensor
+        # center: adding r x F at the initial origin would charge pure travel
+        # under a constant load as a torque increase.
         components, costs = reward_components(
             self.cfg, blocked, blocker_area, self.rearrangement_increment,
-            fixed_wrench, self.previous_wrench, self.dt,
+            batch.sensor_wrench, self.previous_wrench, self.dt,
             elapsed_time=self.elapsed_time,
         )
         candidate, stable, reasons, failed = task_conditions(
@@ -417,7 +418,7 @@ class TaskState:
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
         self.tcp_pose_b.copy_(torch.nan_to_num(batch.tcp_pose_b, nan=0.0, posinf=0.0, neginf=0.0))
         self.previous_corners.copy_(batch.corners)
-        self.previous_wrench.copy_(fixed_wrench)
+        self.previous_wrench.copy_(batch.sensor_wrench)
         self.elapsed_time.add_(self.dt)
         self.observation = None
         self.last_step = step

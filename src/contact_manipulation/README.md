@@ -72,7 +72,7 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
 | 영역 | 현재 사용하는 native 기능 | 남겨 둔 연구 확장 |
 |---|---|---|
 | 환경·학습 흐름 | `ManagerBasedRLEnv`, 각 Manager, `InteractiveScene`, `OnPolicyRunner` | Scene/MDP 설정과 함수 |
-| 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및 18D 입력 설정 |
+| 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, 팔 `IdealPDActuator`·Hand `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및 18D 입력 설정 |
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
 | EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
 | 물체 주차 | `RigidObjectCollection.permanent_wrench_composer` | parked mask와 중력 상쇄 force 계산; transient force는 instantaneous composer 사용 |
@@ -234,27 +234,28 @@ OSC 설정은 원격 `min` branch의
 Scale 1.0은 위치 action 0.01이 1 cm, 회전 action 0.01이 0.01 rad라는 뜻이다.
 이전의 ±15 mm/±0.08 rad 제한과 축별 gain 매핑, workspace 목표 clipping,
 COM→TCP Jacobian/속도 보정, hand 측정 위치 기준 lead 제한, custom effort clipping은 제거했다.
-Native 예제의 frame 처리와 asset의 기존 actuator/PhysX 제한을 그대로 사용한다.
+Native 예제의 frame 처리와 기존 관절별 물리 제한을 사용한다.
 F/T 자중·관성 보상은 센서 처리이므로 유지한다. Action/적용 torque의 nonfinite는 MDP에서 검사한다.
 Arm actuator PD gain은 0이고 mimic 관절에는 별도 action을 주지 않는다.
 예제처럼 OSC 환경의 `__post_init__`에서도 arm stiffness/damping=0을 명시한다.
-팔은 `min`과 동일하게 `ImplicitActuatorCfg`를 유지한다. `velocity_limit_sim`은
-shoulder/elbow 3.14·wrist 6.28 rad/s, `effort_limit_sim`은 각각 150·28 N·m로 설정한다.
-별도의 OSC 출력 토크 clamp는 추가하지 않는다. 이는 feed-forward 명령 자체를 같은
-범위로 clipping한다는 뜻은 아니다. `IdealPDActuatorCfg`는 진단 비교에만 사용했으며,
-2026-10-16 사용자 결정에 따라 실제 학습 구성에는 적용하지 않는다.
+팔은 `IdealPDActuatorCfg`를 사용해 OSC가 계산한 토크를 PhysX에 전달하기 전에 제한한다.
+`effort_limit`과 `effort_limit_sim`은 모두 shoulder/elbow 150·wrist 28 N·m이며,
+`velocity_limit_sim`은 shoulder/elbow 3.14·wrist 6.28 rad/s다. Hand는 기존 implicit
+position PD를 유지한다. 별도 custom controller나 torque clamp는 추가하지 않는다.
+이 출력 제한이 정책의 delta pose/stiffness 요구를 제한하거나 적절한 요구를 학습하도록
+보장하지는 않는다. 측정 joint torque observation/reward는 아직 추가하지 않았다.
 속도 초과 자체에 대한 episode 종료는 연구 MDP에 추가하지 않는다.
 
 Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
 이전 custom controller checkpoint는 새 action-contract metadata 검사에서 거절하며 새 학습을 시작한다.
 
-| Reward | Discrete step 값 |
-|---|---|
-| Clearance | `exp(−a_C·x_C)`, `x_C = blocked_area / blocker_area` |
-| Rearrangement | `exp(−a_R·x_R)`, `x_R = ΔL_OBB` (이번 step의 이동량, m) |
-| Motion | `0.5·exp(−a_acc·x_acc) + 0.5·exp(−a_FT·x_FT)` |
-| Time | `−∫[t,t+dt] 0.02(exp(0.7s)−1) ds` |
-| Terminal | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
+| Reward | Weight | Weight 적용 전 discrete step 값 |
+|---|---:|---|
+| Clearance | 1.8 | `exp(−a_C·x_C)`, `x_C = blocked_area / blocker_area` |
+| Rearrangement | 0.6 | `exp(−a_R·x_R)`, `x_R = ΔL_OBB` (이번 step의 이동량, m) |
+| Motion | 0.6 | `(exp(−a_A·x_A) + exp(−a_V·x_V) + exp(−a_F·x_F) + exp(−a_T·x_T))/4` |
+| Time | 1.0 | `−∫[t,t+dt] 0.02(exp(0.7s)−1) ds` |
+| Terminal | 1.0 | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
 
 **Clearance·Rearrangement·Motion의 바깥 함수는 `exp(−a·x)`로 유지한다.**
 수식 검토의 대상은 x에 넣는 물리량과 집계 방식이다. 이전 선형 조작량 비용과 pseudo-Huber
@@ -270,35 +271,52 @@ Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개
 않는다. **멈춘 step에는 x_R=0, 보상=1**로 돌아와 과거 이동량 때문에 계속 보상이 낮아지지
 않는다. 지수 점수이므로 누적 보상 감소가 전체 이동거리와 정확히 선형 비례하지는 않는다.
 
-Motion의 x는 정규화한 변화량의 RMS다. n_A/n_H는 선택된 arm/hand 독립 관절 수(각각 6)다.
+Motion은 다음 네 비용을 **각각 exp에 넣은 뒤 평균**한다. 가속도 항과 tactile 보상은 넣지 않는다.
 
 ```text
-x_acc = sqrt((sum(arm_joint_acc²)/5² + sum(hand_joint_acc²)/10²) / (n_A+n_H))
-x_FT  = sqrt(((Δ⁺‖F‖/(dt·200))² + (Δ⁺‖τ‖/(dt·10))²) / 2)
+x_A = sum18((action - previous_action)²)
+x_V = sum12(joint_velocity²)
+g_F = max(‖F‖ - ‖previous_F‖, 0) / dt
+g_T = max(‖τ‖ - ‖previous_τ‖, 0) / dt
+x_F = max(g_F - 10, 0)²
+x_T = max(g_T - 0.5, 0)²
 ```
 
-공식 `isaaclab.envs.mdp.rewards.joint_acc_l2`로 arm/hand 제곱합을 얻고, 관절 수로 나눈 뒤
-제곱근을 취한다. 관절이 많다는 이유만으로 지수가 커지지 않게 하며 제곱합을 그대로 넣던
-기존 정의와 다르다. 모든 관절이 각 기준 가속도라면 x_acc=1이다. Mimic/passive 관절은 제외한다.
-`joint_acc`는 Isaac Lab이 갱신한 **마지막 10 ms physics substep의 가속도**다. 20 ms policy
-구간 평균이나 두 substep의 제곱 가속도 적분이 아니다. 별도 속도 이력은 없다.
+공식 `isaaclab.envs.mdp.rewards.action_rate_l2`와 `joint_vel_l2`를 사용한다. Action은 raw
+18D 제곱합이며 `/dt`가 없다. Joint velocity는 팔6+hand 독립6관절의 제곱합이고 mimic/passive
+관절은 제외한다. 기준값·관절 수로 나누거나 제곱근을 취하지 않는다. 속도는 마지막 physics
+substep의 값이며 policy 구간 적분이 아니다. 기존 GPU 버퍼를 사용하고 센서 조회를 추가하지 않는다.
 
-`Δ⁺`는 양의 증가량만 뜻한다. F/T는 world 축·episode 초기 sensor 원점으로 변환한 보상값을
-비교한다. 일정 속도이면 가속도 점수 1, 일정 하중·하중 감소이면 F/T 점수 1이다.
-Raw 정규화 증가율 제곱합은 `wrench_rate_cost`에 진단용으로 유지한다.
+F/T는 자중·관성 보상 후 **현재 센서 중심**에서 비교한다. 축 회전은 norm을 바꾸지 않으므로
+world 축으로 돌릴 필요가 없고, 초기 센서 원점으로의 `r×F` 이동도 하지 않는다. 일정 하중·하중
+감소·norm이 같은 방향 변화는 F/T 점수1이다. `wrench_rate_cost`는 `(num_envs, 2)`로 힘·토크의
+초과 증가율 제곱을 각각 저장한다. Tactile observation은 유지하되 접촉 보상/gate는 추가하지 않았다.
 
-기존 계수를 기준으로 `a_C=1, a_R=2, a_acc=1, a_FT=1`을 사용한다. 기준은 arm 5/hand
-10 rad/s², 힘 증가율 200 N/s·토크 증가율 10 N·m/s다. **RMS로 바꿔도 포화가 자동으로 해결되는
-것은 아니다.** 이전 131,072 transition 표본에 대입하면 a_acc=1에서 가속도 점수의 약83%가
-0.01 미만이었다. a_acc=0.1/0.05는 비교 후보이며 이번 수정에서 자동으로 적용하지 않았다.
-이 수치는 이전 정책 표본의 재계산이고 현재 수식의 학습 결과가 아니다.
+| 계수 | 설정값 | 의미 |
+|---|---:|---|
+| `a_C`, `a_R` | 1, 2 | 기존 Clearance·Rearrangement 지수 유지 |
+| `motion_action_rate_decay` | 0.004 | Raw action 변화 제곱합의 민감도 |
+| `motion_joint_velocity_decay` | 0.004 | 관절 속도 제곱합의 민감도 |
+| `force_rate_deadband` | 10 N/s | 작은 힘 증가율의 무감점 구간 |
+| `torque_rate_deadband` | 0.5 N·m/s | 작은 토크 증가율의 무감점 구간 |
+| `motion_force_rate_decay` | `ln(2)/90²` ≈ 8.55737e−5 | 힘 증가율100 N/s에서 해당 점수0.5 |
+| `motion_torque_rate_decay` | `ln(2)/4.5²` ≈ 0.0342295 | 토크 증가율5 N·m/s에서 해당 점수0.5 |
 
-`RewardsCfg`는 Clearance/Rearrangement/Motion/Time/Terminal의 5개 term이며 외부 weight는
-모두 1이다. 함수가 discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다.
-세 quality score는 step당 최대 1이고, Time은 위의 적분값을 지급한다. 이 구조는 현재 50 Hz
-기준이다. 양의 baseline 및 step별 ΔL 때문에 전체 return의 제어주기 불변성을 주장하지 않는다.
-Time·Terminal·γ는 유지한다. 직전 선형/pseudo-Huber 보상으로 실행한 run의 scale과 weight는
-현재 설정의 근거로 사용하지 않으며, 비교 학습은 같은 제어 설정을 고정한 새 run으로 수행한다.
+Action·velocity의 계수는 Motion 하위 weight0.15와 함께 작은 비용에서의 감점 기울기
+`0.15×0.004=0.0006`을 만든다. 이는 `min`의 native penalty weight0.03×dt0.02와 같지만,
+상수 baseline과 큰 비용의 포화는 다르다. F/T dead band는50Hz에서 양자화·작은 보상 잔차를
+무시하기 위한 초기값이며, half-score 지점도 실제 성공 조작으로 검증한 허용 한계는 아니다.
+
+Velocity 항은 빠른 움직임 자체도 감점하므로 약한 규제로 시작한다. 감속하면 이 비용은
+줄지만 action-rate는 필요한 제동 명령도 감점한다. Raw Kp가 clamp되는 구간의 action 변화도
+계산에 포함되므로 action-rate를 실제 가속도나 stiffness 변화의 정확한 측정으로 해석하지 않는다.
+정지는 여전히 Motion 최대이며 실제 조작은 Clearance·성공·Time이 유도해야 한다.
+
+`RewardsCfg`는 Clearance/Rearrangement/Motion/Time/Terminal의 5개 term이다. 함수가
+discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. 세 quality의
+weight 합은 기존과 같은3이고 Motion 하위4항의 유효 weight는 각각0.15다. Time은 위 적분값을
+지급한다. 양의 baseline 및 step별 ΔL 때문에 전체 return의 제어주기 불변성을 주장하지 않는다.
+Time·Terminal·γ는 유지하며, 비교 학습은 같은 제어 설정을 고정한 새 run으로 수행한다.
 
 성공은 **지정 Blocker의** A₀ 교차 면적 ≤ 1e−5 m², Target 이동 ≤ 2 cm·회전 ≤
 0.15 rad, 물체 선속도 ≤ 0.015 m/s·각속도 ≤ 0.1 rad/s를 5 step 연속 만족할 때다.
@@ -310,6 +328,23 @@ Sweeping-Policy 예제와 같은 100 kg dynamic body다. 관성은 PhysX가 충�
 선반 pose는 종료 조건에만 사용하며 observation에 추가하지 않는다.
 부분 reset 시 해당 환경의 선반 pose·속도를 복원하고 초기 pose 기준도 해당 행만 갱신한다.
 Timeout은 native truncation 항으로 유지한다.
+
+실패 원인은 공식 `TerminationManager`의 개별 term으로 기록한다. Console과 TensorBoard의
+`Episode_Termination/<원인>`에서 확인할 수 있으며, 기존 통합 `failure` 로그는 아래 항목으로
+대체했다. 모든 term은 같은 step의 캐시된 판정 결과를 읽으며 물리·센서 조회를 반복하지 않는다.
+
+| 원인 이름 | 기존 실패 조건 |
+|---|---|
+| `object_drop` | 활성 물체 낙하 |
+| `object_tilt` | 활성 물체 기울어짐 |
+| `workspace_exit` | 활성 물체의 허용 영역 이탈 |
+| `object_lift` | 활성 물체 들림 |
+| `hard_load_or_overrange` | 보상 F/T 과부하 또는 raw 센서 측정 범위 초과 |
+| `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
+| `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
+
+한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
+않다. 종료는 원인들의 OR이고 terminal 실패 보상은 기존대로 한 번만 지급한다.
 
 ## 병렬 계산과 reset 연결
 
@@ -616,9 +651,16 @@ Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않�
 
 ## 검증과 남은 구현
 
-현재 CPU 검사는 **198개 통과·14개 skip**이다. Exp 보상 GPU 4환경·64 policy step에서
+최신 Motion·weight 변경 후 CPU 검사는 **204개 통과·14개 skip·142 subtest 통과**다.
+실제 GPU4환경·48 policy step과 선택2환경의 부분 reset에서 새 수식, F/T 비용 및 native
+RewardManager의 weight·dt 적용을 확인했다. Motion 독립 계산과의 최대 차이는5.96e−8이다.
+자료는 `outputs/contact_manipulation/motion_update_20261016/`에 있으며, 변경 후 학습 성능은
+아직 평가하지 않았다.
+
+앞선 Exp 보상 GPU 4환경·64 policy step에서는
 5개 native reward term, 공식 joint_acc_l2 기반 RMS, score 범위와 dt 처리, 자동 reset 6회를
-확인했다. 자료는 `outputs/contact_manipulation/reward_exp_20261015/`에 있다.
+확인했다. 현재 Motion의 정의와는 다른 이전 검사이며 자료는
+`outputs/contact_manipulation/reward_exp_20261015/`에 있다.
 
 전체 최적화 후 GPU 회귀 검사는 **205개 통과·7개 skip**이다. 실제4환경·410 step에서
 기존 F/T 보상 결과와의 일치, 정상 경로의 반복 COM 조회 제거, 부분 reset의 다른 행 보존,

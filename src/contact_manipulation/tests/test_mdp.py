@@ -266,9 +266,9 @@ class WrenchTests(unittest.TestCase):
 def settings():
     return SimpleNamespace(
         clearance_decay=1.0, time_penalty_scale=0.02, time_penalty_growth_rate=0.7,
-        rearrangement_decay=2.0, motion_acceleration_decay=1.0, motion_wrench_increase_decay=1.0,
-        arm_joint_acceleration_ref=5.0, hand_joint_acceleration_ref=10.0,
-        force_rate_ref=200.0, torque_rate_ref=10.0, stable_steps=5,
+        rearrangement_decay=2.0, motion_action_rate_decay=.004, motion_joint_velocity_decay=.004,
+        motion_force_rate_decay=math.log(2) / 90**2, motion_torque_rate_decay=math.log(2) / 4.5**2,
+        force_rate_deadband=10., torque_rate_deadband=.5, stable_steps=5,
         success_reward=500.0, failure_penalty=100.0, target_translation_tolerance=0.02,
         target_rotation_tolerance=0.15, stable_linear_velocity=0.015,
         stable_angular_velocity=0.10, success_overlap_area=1.e-5,
@@ -288,19 +288,21 @@ def reward_inputs(n=1):
 
 
 @contextmanager
-def native_joint_acc_reward():
+def native_motion_rewards():
     """Execute Isaac Lab's actual reward arithmetic without importing Kit."""
     import os
     lab = Path(os.environ.get("ISAACLAB_PATH", Path(__file__).resolve().parents[3] / "IsaacLab"))
     source = lab / "source/isaaclab/isaaclab/envs/mdp/rewards.py"
-    function = next(node for node in ast.parse(source.read_text()).body
-                    if isinstance(node, ast.FunctionDef) and node.name == 'joint_acc_l2')
+    names = ('action_rate_l2', 'joint_vel_l2')
+    functions = [node for node in ast.parse(source.read_text()).body
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
     syntax = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
-                              function], type_ignores=[])
+                              *functions], type_ignores=[])
     namespace = {'torch': torch, 'SceneEntityCfg': lambda name: SimpleNamespace(name=name, joint_ids=slice(None))}
     exec(compile(ast.fix_missing_locations(syntax), str(source), 'exec'), namespace)
     native_module = types.ModuleType('isaaclab.envs.mdp.rewards')
-    native_module.joint_acc_l2 = namespace['joint_acc_l2']
+    for name in names:
+        setattr(native_module, name, namespace[name])
     with patch.dict(sys.modules, {'isaaclab.envs.mdp.rewards': native_module}):
         yield native_module
 
@@ -354,45 +356,60 @@ class RewardTests(unittest.TestCase):
         data = reward_inputs(4)
         data["previous_wrench"][:, 0] = 20.0
         data["previous_wrench"][:, 3] = 1.0
-        data["wrench"][0] = torch.tensor([40., 0., 0., 2., 0., 0.])  # Each +one rate reference.
+        data["wrench"][0] = torch.tensor([30., 0., 0., 1.5, 0., 0.])  # 100 N/s and 5 Nm/s.
         data["wrench"][1] = data["previous_wrench"][1]
         data["wrench"][2] = 0.0  # Release contributes no cost.
         data["wrench"][3] = torch.tensor([0., -20., 0., 0., -1., 0.])  # Direction only.
         scores, costs = rewards.reward_components(settings(), **data)
-        torch.testing.assert_close(costs, torch.tensor([2., 0., 0., 0.], dtype=torch.float64))
-        expected_quality = torch.tensor([math.exp(-1), 1., 1., 1.], dtype=torch.float64)
+        expected_costs = torch.zeros(4, 2, dtype=torch.float64)
+        expected_costs[0] = torch.tensor([90**2, 4.5**2], dtype=torch.float64)
+        torch.testing.assert_close(costs, expected_costs)
+        expected_quality = torch.tensor([.5, 1., 1., 1.], dtype=torch.float64)
         torch.testing.assert_close(scores[:, 2], expected_quality)
 
-    def test_wrench_growth_score_keeps_raw_diagnostics_and_normalizes_rms_rate(self):
-        data = reward_inputs(3)
-        data["wrench"][:, 0] = torch.tensor([20., 40., 200.])
-        scores, costs = rewards.reward_components(settings(), **data)
-        torch.testing.assert_close(costs, torch.tensor([1., 4., 100.], dtype=torch.float64))
-        expected_quality = torch.tensor([math.exp(-math.sqrt(x / 2)) for x in (1., 4., 100.)],
-                                        dtype=torch.float64)
-        torch.testing.assert_close(scores[:, 2], expected_quality)
+    def test_wrench_deadbands_keep_raw_excess_costs_and_average_independent_exp_scores(self):
+        data, cfg = reward_inputs(7), settings()
+        force_rates = torch.tensor([0., 5., 10., 12., 100., 100., 0.], dtype=torch.float64)
+        torque_rates = torch.tensor([0., .25, .5, 2.5, 5., 0., 5.], dtype=torch.float64)
+        data["wrench"][:, 0] = force_rates * data["dt"]
+        data["wrench"][:, 3] = torque_rates * data["dt"]
+        scores, costs = rewards.reward_components(cfg, **data)
+        expected = torch.tensor([[0., 0.], [0., 0.], [0., 0.], [4., 4.],
+                                 [8100., 20.25], [8100., 0.], [0., 20.25]], dtype=torch.float64)
+        torch.testing.assert_close(costs, expected)
+        middle = .5 * (math.exp(-4 * cfg.motion_force_rate_decay)
+                       + math.exp(-4 * cfg.motion_torque_rate_decay))
+        torch.testing.assert_close(scores[:, 2], torch.tensor([1., 1., 1., middle, .5, .75, .75],
+                                                            dtype=torch.float64))
+
+    def test_wrench_growth_quality_uses_physical_rate_at_each_control_period(self):
         # A constant physical ramp has the same per-step quality at any sample rate.
         for steps in (2, 4, 20):
             ramp = reward_inputs(steps)
             ramp["dt"] = .2 / steps
-            ramp["previous_wrench"][:, 0] = torch.arange(steps) * (200 * ramp["dt"])
-            ramp["wrench"][:, 0] = ramp["previous_wrench"][:, 0] + 200 * ramp["dt"]
-            values, _ = rewards.reward_components(settings(), **ramp)
-            torch.testing.assert_close(values[:, 2], torch.full((steps,), math.exp(-math.sqrt(.5)),
-                                                               dtype=torch.float64))
+            ramp["previous_wrench"][:, 0] = torch.arange(steps, dtype=torch.float64) * (100 * ramp["dt"])
+            ramp["wrench"][:, 0] = ramp["previous_wrench"][:, 0] + 100 * ramp["dt"]
+            values, costs = rewards.reward_components(settings(), **ramp)
+            torch.testing.assert_close(values[:, 2], torch.full((steps,), .75, dtype=torch.float64))
+            torch.testing.assert_close(costs[:, 0], torch.full((steps,), 8100., dtype=torch.float64))
 
     def test_wrench_score_decreases_with_rate_and_decay_and_stays_bounded(self):
         data = reward_inputs(5)
-        normalized_rates = torch.tensor([0., .1, 1., 2., 100.], dtype=torch.float64)
-        data['wrench'][:, 0] = normalized_rates * data['dt'] * settings().force_rate_ref
+        rates = torch.tensor([10., 11., 20., 100., 10000.], dtype=torch.float64)
+        data['wrench'][:, 0] = rates * data['dt']
         scores, costs = rewards.reward_components(settings(), **data)
-        torch.testing.assert_close(costs, normalized_rates.square())
-        torch.testing.assert_close(scores[:, 2], torch.exp(-normalized_rates / math.sqrt(2)))
+        torch.testing.assert_close(costs[:, 0], (rates - 10).square())
+        torch.testing.assert_close(costs[:, 1], torch.zeros_like(rates))
+        force_quality = torch.exp(-settings().motion_force_rate_decay * (rates - 10).square())
+        torch.testing.assert_close(scores[:, 2], .5 * (force_quality + 1))
         self.assertTrue((scores[1:, 2] < scores[:-1, 2]).all())
         cfg = settings()
-        cfg.motion_wrench_increase_decay = 2.
+        cfg.motion_force_rate_decay *= 2
         stronger, _ = rewards.reward_components(cfg, **data)
-        torch.testing.assert_close(stronger[:, 2], scores[:, 2].square())
+        torch.testing.assert_close(stronger[:, 2], .5 * (force_quality.square() + 1))
+        cfg.motion_force_rate_decay = cfg.motion_torque_rate_decay = 0.
+        disabled, _ = rewards.reward_components(cfg, **data)
+        torch.testing.assert_close(disabled[:, 2], torch.ones_like(rates))
 
     def test_corner_path_translation_rotation_return_and_inactive_nan(self):
         data = physical_inputs(objects=2)
@@ -467,62 +484,96 @@ class RewardTests(unittest.TestCase):
                  patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, 'cpu', reject):
                 components, costs = rewards.reward_components(settings(), **data)
             self.assertEqual(components.shape, (1024, 4))
-            self.assertEqual(costs.shape, (1024,))
+            self.assertEqual(costs.shape, (1024, 2))
             self.assertEqual(components.dtype, dtype)
             self.assertEqual(costs.dtype, dtype)
 
-    def test_motion_uses_native_selected_joint_acceleration_rms_and_exponential_quality(self):
-        acceleration = torch.zeros(4, 18, dtype=torch.float64)
-        acceleration[0, :6] = 5.
-        acceleration[1, :6] = 10.
-        acceleration[0, 6:12] = 10.
-        acceleration[1, 6:12] = 20.
-        acceleration[:, 12:] = 10000.  # Passive/mimic joints must not enter either group.
-        acceleration[3, 0] = math.nan
-        asset = SimpleNamespace(num_joints=18, data=SimpleNamespace(joint_acc=acceleration,
-                                                    joint_vel=torch.full_like(acceleration, 100.)))
-        state = SimpleNamespace(cfg=settings(), components=torch.ones(4, 5, dtype=torch.float64))
-        env = SimpleNamespace(scene={'robot': asset}, step_dt=.02)
-        for arm_ids, hand_ids in ((list(range(6)), list(range(6, 12))), (slice(0, 6), slice(6, 12))):
-            with self.subTest(arm_ids=arm_ids), native_joint_acc_reward() as native, \
+    def test_motion_uses_native_raw_18d_action_and_selected_velocity_sums(self):
+        action, previous = torch.zeros(5, 18, dtype=torch.float64), torch.zeros(5, 18, dtype=torch.float64)
+        action[1:3, 17] = 1.  # The last hand command belongs to the native action-rate term.
+        previous[1, 6] = -.5  # A raw Kp change counts even within the physical gain clamp's dead zone.
+        cfg = settings()
+        state = SimpleNamespace(cfg=cfg, components=torch.ones(5, 5, dtype=action.dtype))
+        cases = ((list(range(6)), [10, 15, 6, 8, 9, 7]), (slice(0, 6), slice(6, 12)))
+        for arm_ids, hand_ids in cases:
+            selected = [(list(range(18))[ids] if isinstance(ids, slice) else ids) for ids in (arm_ids, hand_ids)]
+            velocity = torch.full((5, 18), 10000., dtype=action.dtype)
+            velocity[:, selected[0] + selected[1]] = 0.  # Unselected mimic velocities must not contribute.
+            velocity[0, selected[0] + selected[1]] = 1.
+            velocity[1, selected[0] + selected[1]] = 2.
+            velocity[3, selected[0][0]] = math.nan
+            asset = SimpleNamespace(num_joints=18, data=SimpleNamespace(joint_vel=velocity))
+            env = SimpleNamespace(scene={'robot': asset}, step_dt=.02,
+                                  action_manager=SimpleNamespace(action=action, prev_action=previous))
+            with self.subTest(arm_ids=arm_ids), native_motion_rewards() as native, \
                  patch.object(task, 'get_task_state', return_value=state), \
-                 patch.object(native, 'joint_acc_l2', wraps=native.joint_acc_l2) as called:
+                 patch.object(native, 'joint_vel_l2', wraps=native.joint_vel_l2) as velocities, \
+                 patch.object(native, 'action_rate_l2', wraps=native.action_rate_l2) as actions:
                 actual = rewards.motion(env, SimpleNamespace(name='robot', joint_ids=arm_ids),
                                         SimpleNamespace(name='robot', joint_ids=hand_ids)) * env.step_dt
-            self.assertEqual(called.call_count, 2)
-            expected = torch.tensor([.5 * (math.exp(-1) + 1), .5 * (math.exp(-2) + 1), 1.],
-                                    dtype=acceleration.dtype)
+            self.assertEqual((actions.call_count, velocities.call_count), (1, 2))
+            expected = torch.tensor([(3 + math.exp(-cfg.motion_joint_velocity_decay * 12)) / 4,
+                                     (math.exp(-cfg.motion_action_rate_decay * 1.25)
+                                      + math.exp(-cfg.motion_joint_velocity_decay * 48) + 2) / 4,
+                                     (math.exp(-cfg.motion_action_rate_decay) + 3) / 4], dtype=action.dtype)
             torch.testing.assert_close(actual[:3], expected)
+            self.assertEqual(actual[4].item(), 1.)
             self.assertTrue(torch.isfinite(actual).all())
             self.assertTrue(((actual >= 0) & (actual <= 1)).all())
-        # Both the acceleration RMS and the wrench RMS at their references yield exp(-1).
-        state.components[:, 2] = math.exp(-1)
-        with native_joint_acc_reward(), patch.object(task, 'get_task_state', return_value=state):
-            actual = rewards.motion(env, SimpleNamespace(name='robot', joint_ids=slice(0, 6)),
-                                    SimpleNamespace(name='robot', joint_ids=slice(6, 12))) * env.step_dt
-        self.assertAlmostEqual(actual[0].item(), math.exp(-1))
 
-    def test_motion_quality_uses_joint_count_metadata_without_tensor_host_reads(self):
-        acceleration = torch.full((1024, 12), 5.)
-        acceleration[:, 6:] = 10.
-        cfg = settings()
-        state = SimpleNamespace(cfg=cfg, components=torch.ones(1024, 5))
-        asset = SimpleNamespace(num_joints=12, data=SimpleNamespace(joint_acc=acceleration))
-        env = SimpleNamespace(scene={'robot': asset}, step_dt=.02)
-        arm_cfg = SimpleNamespace(name='robot', joint_ids=slice(None, 6))
-        hand_cfg = SimpleNamespace(name='robot', joint_ids=slice(6, None))
+    def test_motion_averages_four_independent_exponentials_and_each_alpha_controls_only_its_input(self):
+        data, cfg = reward_inputs(), settings()
+        fields = ('motion_action_rate_decay', 'motion_joint_velocity_decay',
+                  'motion_force_rate_decay', 'motion_torque_rate_decay')
+        for field, denominator in zip(fields, (2, 4, 8, 16)):
+            setattr(cfg, field, math.log(denominator))
+        data['wrench'][0, 0] = (cfg.force_rate_deadband + 1) * data['dt']
+        data['wrench'][0, 3] = (cfg.torque_rate_deadband + 1) * data['dt']
+        velocity = torch.zeros(1, 12, dtype=torch.float64)
+        velocity[0, 0] = 1.
+        action = torch.zeros(1, 18, dtype=torch.float64)
+        action[0, -1] = 1.
+        env = SimpleNamespace(scene={'robot': SimpleNamespace(num_joints=12, data=SimpleNamespace(joint_vel=velocity))},
+                              step_dt=.02, action_manager=SimpleNamespace(action=action, prev_action=torch.zeros_like(action)))
+        arm, hand = (SimpleNamespace(name='robot', joint_ids=slice(start, start + 6)) for start in (0, 6))
+        base_quality = [.5, .25, .125, .0625]
+        for changed in (None, *fields):
+            variant = SimpleNamespace(**vars(cfg))
+            expected = base_quality.copy()
+            if changed is not None:
+                setattr(variant, changed, 2 * getattr(variant, changed))
+                expected[fields.index(changed)] **= 2
+            components, _ = rewards.reward_components(variant, **data)
+            state = SimpleNamespace(cfg=variant, components=components)
+            with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
+                score = rewards.motion(env, arm, hand) * env.step_dt
+            self.assertAlmostEqual(score.item(), sum(expected) / 4, places=12)
+
+    def test_motion_native_sum_preserves_dtype_and_dt_conversion_without_host_reads(self):
         def reject(*args, **kwargs):
             raise AssertionError('Motion must not read tensor values on the host')
-        with native_joint_acc_reward(), patch.object(task, 'get_task_state', return_value=state), \
-             patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
-             patch.object(torch.Tensor, 'cpu', reject):
-            actual = rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt
-        torch.testing.assert_close(actual, torch.full((1024,), .5 * (math.exp(-1) + 1)))
-        # Manager integration cancels the adapter's rate conversion for a fixed snapshot.
-        env.step_dt = .01
-        with native_joint_acc_reward(), patch.object(task, 'get_task_state', return_value=state):
-            faster = rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt
-        torch.testing.assert_close(faster, actual)
+        for dtype in (torch.float32, torch.float64):
+            cfg = settings()
+            state = SimpleNamespace(cfg=cfg, components=torch.ones(1024, 5, dtype=dtype))
+            asset = SimpleNamespace(num_joints=12, data=SimpleNamespace(joint_vel=torch.ones(1024, 12, dtype=dtype)))
+            action = torch.ones(1024, 18, dtype=dtype)
+            env = SimpleNamespace(scene={'robot': asset}, step_dt=.02,
+                                  action_manager=SimpleNamespace(action=action, prev_action=.5 * action))
+            arm_cfg = SimpleNamespace(name='robot', joint_ids=slice(None, 6))
+            hand_cfg = SimpleNamespace(name='robot', joint_ids=slice(6, None))
+            with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state), \
+                 patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
+                 patch.object(torch.Tensor, 'cpu', reject):
+                actual = rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt
+            expected = .25 * (math.exp(-cfg.motion_action_rate_decay * 4.5)
+                              + math.exp(-cfg.motion_joint_velocity_decay * 12) + 2)
+            torch.testing.assert_close(actual, torch.full((1024,), expected, dtype=dtype))
+            self.assertEqual(actual.dtype, dtype)
+            # The official action cost has no /dt; only the adapter's rate conversion cancels out.
+            env.step_dt = .01
+            with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
+                faster = rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt
+            torch.testing.assert_close(faster, actual)
 
 
 class TerminationTests(unittest.TestCase):
@@ -646,6 +697,107 @@ class TerminationTests(unittest.TestCase):
                 output.append(value)
         for expected, parts in zip(full, chunks):
             torch.testing.assert_close(expected, torch.cat(parts))
+
+class NativeArmEffortLimitTests(unittest.TestCase):
+    def test_explicit_arm_clips_physx_submission_while_implicit_hand_keeps_position_targets(self):
+        from unittest.mock import Mock
+
+        # Execute checkout methods; only SDK initialization/config containers are replaced.
+        root = Path(__file__).resolve().parents[3]
+        lab = root / 'IsaacLab/source/isaaclab/isaaclab'
+
+        def native_method(relative, owner, method):
+            path = lab / relative
+            cls = next(n for n in ast.parse(path.read_text()).body
+                       if isinstance(n, ast.ClassDef) and n.name == owner)
+            node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method)
+            namespace = dict(torch=torch, ArticulationActions=SimpleNamespace)
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
+            return namespace[method]
+
+        class Config(SimpleNamespace):
+            InitialStateCfg = SimpleNamespace
+        class IdealConfig(SimpleNamespace):
+            pass
+        class ImplicitConfig(SimpleNamespace):
+            pass
+
+        path = root / 'src/contact_manipulation/contact_manipulation/config/ur5e/scene.py'
+        nodes = [node for node in ast.parse(path.read_text()).body
+                 if (isinstance(node, ast.FunctionDef) and node.name == 'make_ur5e_hand_cfg')
+                 or (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                     and node.targets[0].id in ('ARM_JOINT_NAMES', 'HAND_JOINT_NAMES'))]
+        namespace = dict(os=SimpleNamespace(environ={}), DEFAULT_HAND_URDF_PATH='hand.urdf',
+                         DEFAULT_UR5E_USD_PATH='ur5e.usd', Ur5eHandSpawnerCfg=SimpleNamespace,
+                         ArticulationCfg=Config, IdealPDActuatorCfg=IdealConfig,
+                         ImplicitActuatorCfg=ImplicitConfig)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
+        cfg = namespace['make_ur5e_hand_cfg']()
+        arm_cfg, hand_cfg = cfg.actuators['arm'], cfg.actuators['hand']
+        self.assertIs(type(arm_cfg), IdealConfig)
+        self.assertIs(type(hand_cfg), ImplicitConfig)
+        names = namespace['ARM_JOINT_NAMES']
+        expected_limits = dict(zip(names, (150., 150., 150., 28., 28., 28.)))
+        self.assertEqual(arm_cfg.effort_limit, expected_limits)
+        self.assertEqual(arm_cfg.effort_limit_sim, expected_limits)
+        self.assertEqual(list(arm_cfg.velocity_limit_sim.values()), [3.14]*3 + [6.28]*3)
+        self.assertEqual((arm_cfg.stiffness, arm_cfg.damping), (0., 0.))
+        self.assertEqual((hand_cfg.effort_limit_sim, hand_cfg.velocity_limit_sim), (10., 1.))
+
+        clip = native_method('actuators/actuator_base.py', 'ActuatorBase', '_clip_effort')
+        arm_compute = native_method('actuators/actuator_pd.py', 'IdealPDActuator', 'compute')
+        hand_compute = native_method('actuators/actuator_pd.py', 'ImplicitActuator', 'compute')
+        arm_ids, hand_ids = torch.arange(0, 12, 2), torch.arange(1, 12, 2)
+        arm = SimpleNamespace(joint_indices=arm_ids, stiffness=arm_cfg.stiffness,
+                              damping=arm_cfg.damping, effort_limit=torch.tensor(list(expected_limits.values())),
+                              velocity_limit=torch.tensor(list(arm_cfg.velocity_limit_sim.values())))
+        hand = SimpleNamespace(joint_indices=hand_ids, effort_limit=hand_cfg.effort_limit_sim,
+                               velocity_limit=hand_cfg.velocity_limit_sim,
+                               stiffness=torch.tensor([hand_cfg.stiffness[n] for n in namespace['HAND_JOINT_NAMES']]),
+                               damping=torch.tensor([hand_cfg.damping[n] for n in namespace['HAND_JOINT_NAMES']]))
+        for actuator, compute in ((arm, arm_compute), (hand, hand_compute)):
+            actuator.compute = types.MethodType(compute, actuator)
+            actuator._clip_effort = types.MethodType(clip, actuator)
+        raw = torch.tensor([[800880., -800880., 100., -100., 29., -29.],
+                            [-150., 150., -149., 27., -27., 0.],
+                            [1., -1., 0., 28., -28., 1.e6]])
+        expected = torch.tensor([[150., -150., 100., -28., 28., -28.],
+                                 [-150., 150., -149., 27., -27., 0.],
+                                 [1., -1., 0., 28., -28., 28.]])
+        data = SimpleNamespace(joint_pos_target=torch.full((3, 12), .8),
+                               joint_vel_target=torch.full((3, 12), .4),
+                               **{name: torch.zeros(3, 12) for name in (
+                                   'joint_pos', 'joint_vel', 'joint_effort_target', 'computed_torque',
+                                   'applied_torque', 'soft_joint_vel_limits')})
+        data.joint_effort_target[:, arm_ids] = raw
+        view = SimpleNamespace(set_dof_actuation_forces=Mock(), set_dof_position_targets=Mock(),
+                               set_dof_velocity_targets=Mock())
+        asset = SimpleNamespace(_data=data, actuators={'arm': arm, 'hand': hand}, root_physx_view=view,
+                                _joint_effort_target_sim=torch.zeros(3, 12),
+                                _joint_pos_target_sim=torch.full((3, 12), -123.),
+                                _joint_vel_target_sim=torch.full((3, 12), -321.),
+                                _has_implicit_actuators=True, _ALL_INDICES=torch.arange(3),
+                                _instantaneous_wrench_composer=SimpleNamespace(active=False, reset=Mock()),
+                                _permanent_wrench_composer=SimpleNamespace(active=False))
+        apply = native_method('assets/articulation/articulation.py', 'Articulation', '_apply_actuator_model')
+        asset._apply_actuator_model = types.MethodType(apply, asset)
+        write = native_method('assets/articulation/articulation.py', 'Articulation', 'write_data_to_sim')
+        write(asset)
+        submitted = view.set_dof_actuation_forces.call_args.args[0]
+        torch.testing.assert_close(submitted[:, arm_ids], expected)
+        torch.testing.assert_close(data.computed_torque[:, arm_ids], raw)
+        torch.testing.assert_close(data.joint_effort_target[:, arm_ids], raw)
+        torch.testing.assert_close(data.applied_torque[:, arm_ids], expected)
+        # Hand's implicit PD stays in PhysX: telemetry is clipped, feed-forward remains zero.
+        torch.testing.assert_close(data.computed_torque[:, hand_ids], torch.full((3, 6), 16.4))
+        torch.testing.assert_close(data.applied_torque[:, hand_ids], torch.full((3, 6), 10.))
+        torch.testing.assert_close(submitted[:, hand_ids], torch.zeros(3, 6))
+        for method, field in ((view.set_dof_position_targets, 'joint_pos_target'),
+                              (view.set_dof_velocity_targets, 'joint_vel_target')):
+            torch.testing.assert_close(method.call_args.args[0][:, hand_ids], getattr(data, field)[:, hand_ids])
+        torch.testing.assert_close(asset._joint_pos_target_sim[:, arm_ids], torch.full((3, 6), -123.))
+        torch.testing.assert_close(asset._joint_vel_target_sim[:, arm_ids], torch.full((3, 6), -321.))
+
 
 @unittest.skipUnless("isaaclab.controllers" in sys.modules, "Requires Isaac Sim AppLauncher")
 class NativeControllerTests(unittest.TestCase):
@@ -865,7 +1017,8 @@ def native_fixture(n=3):
     scene = Scene(robot=robot, object_collection=objects,
                   shelf=SimpleNamespace(data=SimpleNamespace(root_link_pose_w=shelf_pose)))
     scene.env_origins = origins
-    action = types.SimpleNamespace(normalized_actions=torch.zeros(n, 18), applied_torque=data.applied_torque)
+    action = types.SimpleNamespace(normalized_actions=torch.zeros(n, 18), previous_actions=torch.zeros(n, 18),
+                                   applied_torque=data.applied_torque)
     object_ids = torch.full((n, 10), -1, dtype=torch.long)
     object_ids[:, :3] = torch.tensor([2, 0, 3])
     observed_ids = torch.full((n, 10), -1, dtype=torch.long)
@@ -895,6 +1048,10 @@ def native_fixture(n=3):
         @property
         def action(self):
             return action.normalized_actions
+
+        @property
+        def prev_action(self):
+            return action.previous_actions
 
     env = types.SimpleNamespace(
         num_envs=n, device="cpu", cfg=types.SimpleNamespace(mdp=task.MdpCfg(), actions=SimpleNamespace(
@@ -1053,20 +1210,28 @@ class StateTests(unittest.TestCase):
                                    torch.full((3,), math.exp(-.01 * state.cfg.rearrangement_decay),
                                               dtype=batch.center.dtype))
 
-    def test_wrench_transforms_to_fixed_world_axes_and_initial_sensor_origin(self):
-        state, batch, _ = fixture(1)
-        batch.sensor_rotation[:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
-        batch.sensor_position[0, 0] = 1.0
-        batch.sensor_wrench[0, 0] = 1.0
+    def test_sensor_center_growth_ignores_translation_and_rotation_without_hiding_local_moment_growth(self):
+        state, batch, _ = fixture(3)
+        batch.sensor_wrench[:, 1] = 10.
+        batch.sensor_wrench[1, 5] = 1.
         state.advance(batch, 1)
-        expected = torch.tensor([[0., 1., 0., 0., 0., 1.]], dtype=state.previous_wrench.dtype)
-        torch.testing.assert_close(state.previous_wrench, expected, rtol=1.e-6, atol=1.e-7)
-        # Same resultant wrench at the fixed origin despite moving the measurement origin.
-        batch.sensor_position[0, 0] = 2.0
-        batch.sensor_wrench[0, 5] = -1.0
+        # Translating a sensor with constant local load must not create an r x F growth cost.
+        batch.sensor_position[0, 0] = .01
+        # Here a growing local moment is cancelled by r x F at the old initial origin.
+        # The sensor-centre criterion must still see that actual moment growth.
+        batch.sensor_position[1, 0] = -.01
+        batch.sensor_wrench[1, 5] = 1.1
+        # Rotate the sensor while keeping the same world force: local components change, norm does not.
+        batch.sensor_rotation[2] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        batch.sensor_wrench[2, :3] = torch.tensor([10., 0., 0.])
         state.advance(batch, 2)
-        torch.testing.assert_close(state.previous_wrench, expected, rtol=1.e-6, atol=1.e-7)
-        torch.testing.assert_close(state.wrench_rate_cost, torch.zeros(1, dtype=expected.dtype), atol=1.e-12, rtol=0)
+        torch.testing.assert_close(state.previous_wrench, batch.sensor_wrench)
+        expected = torch.zeros(3, 2, dtype=batch.sensor_wrench.dtype)
+        expected[1, 1] = .25  # (0.1 Nm / 0.1 s - 0.5 Nm/s)^2.
+        torch.testing.assert_close(state.wrench_rate_cost, expected, atol=1.e-12, rtol=0)
+        self.assertEqual(state.components[0, 2].item(), 1.)
+        self.assertEqual(state.components[2, 2].item(), 1.)
+        self.assertLess(state.components[1, 2].item(), 1.)
 
     def test_global_step_gaps_fail_explicitly(self):
         state, batch, _ = fixture(1)
@@ -1098,6 +1263,122 @@ class StateTests(unittest.TestCase):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    @staticmethod
+    def failure_fixture():
+        """Seven isolated failures, one safe row, and one simultaneous failure."""
+        env, action, _ = native_fixture(9)
+        task.reset_task(env)
+        poses = env.scene['object_collection'].data.object_link_pose_w
+        poses[0, 0, 2] = -.02
+        poses[1, 0, 3:] = torch.tensor([math.cos(math.pi / 6), math.sin(math.pi / 6), 0., 0.])
+        poses[2, 0, 0] = 2.
+        poses[[3, 8], 0, 2] = .1
+        env.sensors.ideal_wrench[[4, 8], 0] = 201.
+        env.scene['shelf'].data.root_link_pose_w[[5, 8], 0] += .02
+        action.applied_torque[6, 0] = math.nan
+        env.common_step_counter = 1
+        return env
+
+    def test_named_failures_are_cached_independent_and_pay_once_when_causes_overlap(self):
+        env = self.failure_fixture()
+        names = ('object_drop', 'object_tilt', 'workspace_exit', 'object_lift',
+                 'hard_load_or_overrange', 'shelf_displacement', 'invalid_state')
+        expected = torch.zeros(9, 7, dtype=torch.bool)
+        expected[:7] = torch.eye(7, dtype=torch.bool)
+        expected[8, [3, 4, 5]] = True
+        with patch.object(task, '_read_transition', wraps=task._read_transition) as read, \
+             patch.object(task, 'task_conditions', wraps=task.task_conditions) as conditions:
+            actual = torch.stack([terminations.failure(env, reason=name) for name in names], -1)
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(terminations.failure(env), expected.any(-1))
+            self.assertFalse(terminations.success(env).any())
+            payment = rewards.terminal(env) * env.step_dt
+            torch.testing.assert_close(payment, -100. * expected.any(-1))
+            # Observation and all nine termination terms reuse one completed transition.
+            obs.current_robot_sample(env)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(conditions.call_count, 1)
+        env.common_step_counter += 1
+        torch.testing.assert_close(rewards.terminal(env), torch.zeros(9))
+        torch.testing.assert_close(terminations.failure(env), expected.any(-1))
+
+    def test_unknown_failure_name_rejects_configuration_before_accessing_environment(self):
+        with self.assertRaisesRegex(ValueError, 'reason|failure'):
+            terminations.failure(None, reason='shelf_contact_typo')
+
+    def test_native_termination_manager_logs_every_cause_and_retains_last_episode_after_partial_reset(self):
+        # Run the checkout's real compute/reset methods and our real term config,
+        # stubbing only base-manager setup that otherwise starts Isaac Sim.
+        class ManagerBase:
+            def __init__(self, cfg, env):
+                self.cfg, self._env = cfg, env
+                self._prepare_terms()
+
+            num_envs = property(lambda self: self._env.num_envs)
+            device = property(lambda self: self._env.device)
+
+            def _resolve_common_term_cfg(self, *args, **kwargs):
+                pass
+
+        TermCfg = dataclasses.make_dataclass('TerminationTermCfg', [
+            ('func', object), ('params', dict, dataclasses.field(default_factory=dict)), ('time_out', bool, False),
+        ])
+        root = Path(__file__).resolve().parents[3]
+        manager_path = root / 'IsaacLab/source/isaaclab/isaaclab/managers/termination_manager.py'
+        cfg_path = Path(task.__file__).parent.parent / 'shelf_manipulation_env_cfg.py'
+        namespace = dict(torch=torch, ManagerBase=ManagerBase, ManagerTermBase=type('ManagerTermBase', (), {}),
+                         TerminationTermCfg=TermCfg, configclass=lambda cls: cls, mdp=terminations)
+        for path, name in ((manager_path, 'TerminationManager'), (cfg_path, 'TerminationsCfg')):
+            source = ast.parse(path.read_text())
+            node = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == name)
+            module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')],
+                                                    level=0), node], type_ignores=[])
+            exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
+        cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
+               if isinstance(value, TermCfg)}
+        names = ['time_out', 'success', 'object_drop', 'object_tilt', 'workspace_exit', 'object_lift',
+                 'hard_load_or_overrange', 'shelf_displacement', 'invalid_state']
+        self.assertEqual(list(cfg), names)
+        env = self.failure_fixture()
+        env.episode_length_buf = torch.zeros(env.num_envs, dtype=torch.long)
+        env.max_episode_length = 400
+        manager = namespace['TerminationManager'](cfg, env)
+        with patch.object(task, '_read_transition', wraps=task._read_transition) as read:
+            dones = manager.compute()
+        self.assertEqual(read.call_count, 1)
+        torch.testing.assert_close(dones, env._contact_mdp.failure)
+        self.assertFalse(manager.time_outs.any())
+        expected = torch.zeros(9, 9, dtype=torch.bool)
+        expected[:7, 2:] = torch.eye(7, dtype=torch.bool)
+        expected[8, [5, 6, 7]] = True
+        for column, name in enumerate(names):
+            torch.testing.assert_close(manager.get_term(name), expected[:, column])
+        logged = manager.reset(torch.tensor([0, 8]))
+        self.assertEqual(set(logged), {'Episode_Termination/' + name for name in names})
+        for column, name in enumerate(names):
+            self.assertAlmostEqual(logged['Episode_Termination/' + name], expected[:, column].float().mean().item())
+
+        # Actual task reset clears only selected current causes; native manager
+        # statistics retain the completed episode's causes until its next done.
+        ids, untouched = torch.tensor([0, 8]), torch.arange(1, 8)
+        saved_reasons = env._contact_mdp.failure_reasons[untouched].clone()
+        poses = env.scene['object_collection'].data.object_link_pose_w
+        poses[ids, 0, 2] = .05
+        env.sensors.ideal_wrench[ids, 0] = 1.
+        env.scene['shelf'].data.root_link_pose_w[ids, 0] = 0.
+        task.reset_task(env, ids)
+        torch.testing.assert_close(env._contact_mdp.failure_reasons[untouched], saved_reasons)
+        self.assertFalse(env._contact_mdp.failure_reasons[ids].any())
+        self.assertEqual(env._contact_mdp.components[ids, 4].count_nonzero().item(), 0)
+        manager.compute()
+        torch.testing.assert_close(manager._last_episode_dones, expected)
+        self.assertFalse(manager.dones[ids].any())
+        for key, value in manager.reset(ids).items():
+            self.assertEqual(value, logged[key])
+        env.common_step_counter += 1
+        manager.compute()
+        torch.testing.assert_close(rewards.terminal(env), torch.zeros(9))
+
     def test_shared_geometry_cache_matches_generic_reset_and_keeps_neighbors(self):
         cached, _, _ = native_fixture(5)
         generic, _, _ = native_fixture(5)
@@ -1169,14 +1450,14 @@ class NativeAdapterTests(unittest.TestCase):
         torch.testing.assert_close(actual_path, torch.full((3,), math.exp(-.02)), atol=1.e-6, rtol=1.e-5)
         arm_cfg = SimpleNamespace(name='robot', joint_ids=list(range(6)))
         hand_cfg = SimpleNamespace(name='robot', joint_ids=list(range(6, 12)))
-        with native_joint_acc_reward():
+        with native_motion_rewards():
             actual_motion = rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt
-        expected_wrench_quality = torch.exp(-state.cfg.motion_wrench_increase_decay
-                                           * torch.sqrt(state.wrench_rate_cost / 2))
+        decays = torch.tensor([state.cfg.motion_force_rate_decay, state.cfg.motion_torque_rate_decay])
+        expected_wrench_quality = torch.exp(-state.wrench_rate_cost * decays).mean(-1)
         torch.testing.assert_close(actual_motion, .5 * (1 + expected_wrench_quality))
         env.common_step_counter = 2
         torch.testing.assert_close(rewards.rearrangement(env) * env.step_dt, torch.ones(3))
-        with native_joint_acc_reward():
+        with native_motion_rewards():
             torch.testing.assert_close(rewards.motion(env, arm_cfg, hand_cfg) * env.step_dt, torch.ones(3))
 
     def test_named_observation_terms_preserve_contract_and_advance_once_in_any_order(self):

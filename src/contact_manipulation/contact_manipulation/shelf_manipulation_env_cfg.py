@@ -72,10 +72,10 @@ class EventCfg:
 class RewardsCfg:
     """Exponential research quality scores and unchanged Time/Terminal terms."""
 
-    clearance = RewardTermCfg(func=mdp.clearance, weight=1.0)
-    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=1.0)
+    clearance = RewardTermCfg(func=mdp.clearance, weight=1.8)
+    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
     motion = RewardTermCfg(
-        func=mdp.motion, weight=1.0,
+        func=mdp.motion, weight=0.6,
         params={
             "arm_cfg": SceneEntityCfg("robot", joint_names=MISSING),
             "hand_cfg": SceneEntityCfg("robot", joint_names=MISSING),
@@ -87,11 +87,17 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    """Shared-scene timeout and research success/failure conditions."""
+    """Native cause-specific termination logs over the cached task predicates."""
 
     time_out = TerminationTermCfg(func=mdp.scene_time_out, time_out=True)
     success = TerminationTermCfg(func=mdp.success)
-    failure = TerminationTermCfg(func=mdp.failure)
+    object_drop = TerminationTermCfg(func=mdp.failure, params={"reason": "object_drop"})
+    object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
+    workspace_exit = TerminationTermCfg(func=mdp.failure, params={"reason": "workspace_exit"})
+    object_lift = TerminationTermCfg(func=mdp.failure, params={"reason": "object_lift"})
+    hard_load_or_overrange = TerminationTermCfg(func=mdp.failure, params={"reason": "hard_load_or_overrange"})
+    shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
+    invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
 
 
 @configclass

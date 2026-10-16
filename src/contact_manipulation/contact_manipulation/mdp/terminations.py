@@ -6,7 +6,15 @@ import math
 
 import torch
 
-__all__ = ["task_conditions", "terminal_transition", "scene_time_out", "success", "failure"]
+__all__ = ["FAILURE_REASON_NAMES", "task_conditions", "terminal_transition", "scene_time_out", "success", "failure"]
+
+
+# Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
+FAILURE_REASON_NAMES = (
+    "object_drop", "object_tilt", "workspace_exit", "object_lift",
+    "hard_load_or_overrange", "shelf_displacement", "invalid_state",
+)
+_FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
 
 
 def scene_time_out(env):
@@ -58,8 +66,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     settlement checks still apply.
 
     Return success candidate, updated stability count, failure reasons, failure.
-    Reasons are drop, tilt, workspace exit, lift, hard load/overrange, shelf
-    displacement, invalid state. Inactive slots never trigger a failure, even
+    Reason columns follow ``FAILURE_REASON_NAMES``. Inactive slots never trigger a failure, even
     when padded with NaN. state_valid optionally incorporates robot, tactile, or
     other integration-specific finite checks supplied by the environment.
     """
@@ -142,8 +149,16 @@ def success(env):
     return get_task_state(env).success
 
 
-def failure(env):
-    """Native TerminationTerm: physical, sensor, or invalid-state failure."""
+def failure(env, reason: str | None = None):
+    """Read an aggregate failure or one cached cause for native termination logs.
+
+    Several causes may be true in the same environment. The termination manager
+    combines them with OR; task state still pays the terminal penalty once.
+    """
     from .events import get_task_state
 
-    return get_task_state(env).failure
+    if reason is None:
+        return get_task_state(env).failure
+    if reason not in _FAILURE_REASON_INDEX:
+        raise ValueError(f"Unknown failure reason {reason!r}; expected one of {FAILURE_REASON_NAMES}.")
+    return get_task_state(env).failure_reasons[:, _FAILURE_REASON_INDEX[reason]]

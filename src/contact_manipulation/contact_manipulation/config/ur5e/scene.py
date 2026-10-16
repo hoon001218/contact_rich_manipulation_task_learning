@@ -21,7 +21,7 @@ import warp as wp
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg, RigidObjectCollection, RigidObjectCollectionCfg
 from isaaclab.sim.spawners.spawner_cfg import RigidObjectSpawnerCfg
 from isaaclab.sim.utils import clone, get_current_stage
@@ -629,10 +629,18 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             joint_vel={".*": 0.0},
         ),
         actuators={
-            # Match min: retain ImplicitActuator and its native simulator limits.
-            # OSC supplies feed-forward efforts; no separate torque clamp is added.
-            "arm": ImplicitActuatorCfg(
+            # Native explicit actuator clips OSC feed-forward efforts before
+            # submitting them to PhysX; zero gains leave OSC as the arm controller.
+            "arm": IdealPDActuatorCfg(
                 joint_names_expr=list(ARM_JOINT_NAMES),
+                effort_limit={
+                    "shoulder_pan_joint": 150.0,
+                    "shoulder_lift_joint": 150.0,
+                    "elbow_joint": 150.0,
+                    "wrist_1_joint": 28.0,
+                    "wrist_2_joint": 28.0,
+                    "wrist_3_joint": 28.0,
+                },
                 effort_limit_sim={
                     "shoulder_pan_joint": 150.0,
                     "shoulder_lift_joint": 150.0,

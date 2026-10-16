@@ -46,11 +46,14 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
     transition's corner path in exp(-a*x), including rotation and return motion.
     Its score returns to one when objects stop; past motion is not charged again.
 
-    Motion combines a native joint_acc_l2 based RMS acceleration score with this
-    wrench score. Its exponent uses the RMS of normalized positive force/torque
-    magnitude growth rates, not their squared sum. Constant load, release and
-    direction-only changes have quality one. Wrenches must use a
-    consistent frame/origin. Return the raw squared rate separately for diagnostics.
+    Motion combines native action-rate and joint-velocity qualities with two
+    independent force/torque growth qualities. This function computes their
+    mean wrench quality; each exponent uses squared positive growth above a
+    small dead band. Constant load, release and direction-only changes have
+    quality one. Wrenches are self-load compensated at the current sensor center:
+    rotations of their axes preserve norms, but translating the torque origin
+    would change the measured load. Return the two excess-rate squared costs
+    separately for diagnostics, in (N/s)^2 and (N*m/s)^2.
 
     Time is the exact integral of scale * (exp(growth * t) - 1) over
     [elapsed_time, elapsed_time + dt]. It has no T_ref and starts at zero rate.
@@ -75,9 +78,11 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
                       - torch.linalg.vector_norm(previous_wrench[..., :3], dim=-1)).clamp_min(0.0)
     torque_increase = (torch.linalg.vector_norm(wrench[..., 3:], dim=-1)
                        - torch.linalg.vector_norm(previous_wrench[..., 3:], dim=-1)).clamp_min(0.0)
-    rate_cost = ((force_increase / (dt * cfg.force_rate_ref)).square()
-                 + (torque_increase / (dt * cfg.torque_rate_ref)).square())
-    wrench_score = torch.exp(-cfg.motion_wrench_increase_decay * torch.sqrt(rate_cost / 2.0))
+    force_cost = (force_increase / dt - cfg.force_rate_deadband).clamp_min(0.0).square()
+    torque_cost = (torque_increase / dt - cfg.torque_rate_deadband).clamp_min(0.0).square()
+    rate_cost = torch.stack((force_cost, torque_cost), -1)
+    wrench_score = 0.5 * (torch.exp(-cfg.motion_force_rate_decay * force_cost)
+                          + torch.exp(-cfg.motion_torque_rate_decay * torque_cost))
 
     if cfg.time_penalty_scale == 0.0:
         time_score = torch.zeros_like(clear)
@@ -112,35 +117,25 @@ def rearrangement(env):
     return _reward_rate(env, 1)
 
 
-def _joint_count(env, asset_cfg):
-    """Count resolved joints using metadata only, including native slice selection."""
-    ids = asset_cfg.joint_ids
-    return (len(range(env.scene[asset_cfg.name].num_joints)[ids])
-            if isinstance(ids, slice) else len(ids))
-
-
 def motion(env, arm_cfg, hand_cfg):
-    """Average exp scores of normalized RMS acceleration and load increase.
+    """Average independent exp qualities of action change, speed and F/T growth.
 
-    Native ArticulationData already updates acceleration every physics step and
-    clears it when resetting joint velocity. Use its official joint_acc_l2 on the
-    independent arm/hand joints and normalize by their total count, avoiding a
-    larger exponent solely because more joints are included. No velocity history
-    or per-environment loop is needed. This is the final physics-substep sample,
-    not an average over the whole policy interval.
+    Use Isaac Lab's action_rate_l2 and joint_vel_l2 on existing device buffers.
+    Raw 18D action differences have no /dt; velocity uses only the selected
+    independent arm/hand joints and is the final physics-substep sample. Costs
+    are sums, without reference-value or joint-count normalization. The cached
+    wrench mean contains two exp scores, so double it before averaging all four.
+    There is no tactile reward or extra sensor/PhysX query.
     """
-    from isaaclab.envs.mdp.rewards import joint_acc_l2
+    from isaaclab.envs.mdp.rewards import action_rate_l2, joint_vel_l2
     from .events import get_task_state
 
     state = get_task_state(env)
     cfg = state.cfg
-    count = _joint_count(env, arm_cfg) + _joint_count(env, hand_cfg)
-    if count <= 0:
-        raise ValueError("Motion requires at least one selected independent joint.")
-    squared = (joint_acc_l2(env, arm_cfg) / cfg.arm_joint_acceleration_ref**2
-               + joint_acc_l2(env, hand_cfg) / cfg.hand_joint_acceleration_ref**2)
-    acceleration_score = torch.exp(-cfg.motion_acceleration_decay * torch.sqrt(squared / count))
-    score = 0.5 * (acceleration_score + state.components[:, 2])
+    action_score = torch.exp(-cfg.motion_action_rate_decay * action_rate_l2(env))
+    velocity_cost = joint_vel_l2(env, arm_cfg) + joint_vel_l2(env, hand_cfg)
+    velocity_score = torch.exp(-cfg.motion_joint_velocity_decay * velocity_cost)
+    score = 0.25 * (action_score + velocity_score + 2.0 * state.components[:, 2])
     return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) / env.step_dt
 
 
