@@ -314,7 +314,8 @@ class TaskState:
         self.failure = zeros(n, kind=torch.bool)
         self.terminal_paid = zeros(n, kind=torch.bool)
         self.failure_reasons = zeros(n, 7, kind=torch.bool)
-        self.components = zeros(n, 5)
+        # Clearance, rearrangement, force growth, torque growth, time, terminal.
+        self.components = zeros(n, 6)
         self.wrench_rate_cost = zeros(n, 2)
         self.rearrangement_increment = zeros(n)
         self.blocker_overlap = zeros(n)
@@ -406,8 +407,8 @@ class TaskState:
             state_valid=batch.state_valid,
         )
         successful, payment, paid = terminal_transition(candidate, failed, stable, self.terminal_paid, self.cfg)
-        self.components[:, :4] = components
-        self.components[:, 4] = payment
+        self.components[:, :5] = components
+        self.components[:, 5] = payment
         self.wrench_rate_cost.copy_(costs)
         self.stable_count.copy_(stable)
         self.success.copy_(successful)

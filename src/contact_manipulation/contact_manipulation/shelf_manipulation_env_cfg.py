@@ -74,13 +74,17 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=1.8)
     rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
-    motion = RewardTermCfg(
-        func=mdp.motion, weight=0.6,
+    # Four independently logged qualities retain the previous total weight 0.6.
+    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
+    motion_joint_velocity = RewardTermCfg(
+        func=mdp.motion_joint_velocity, weight=0.15,
         params={
             "arm_cfg": SceneEntityCfg("robot", joint_names=MISSING),
             "hand_cfg": SceneEntityCfg("robot", joint_names=MISSING),
         },
     )
+    motion_force_increase = RewardTermCfg(func=mdp.motion_force_increase, weight=0.15)
+    motion_torque_increase = RewardTermCfg(func=mdp.motion_torque_increase, weight=0.15)
     time = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 

@@ -253,7 +253,10 @@ Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 �
 |---|---:|---|
 | Clearance | 1.8 | `exp(−a_C·x_C)`, `x_C = blocked_area / blocker_area` |
 | Rearrangement | 0.6 | `exp(−a_R·x_R)`, `x_R = ΔL_OBB` (이번 step의 이동량, m) |
-| Motion | 0.6 | `(exp(−a_A·x_A) + exp(−a_V·x_V) + exp(−a_F·x_F) + exp(−a_T·x_T))/4` |
+| `motion_action_rate` | 0.15 | `exp(−a_A·x_A)` |
+| `motion_joint_velocity` | 0.15 | `exp(−a_V·x_V)` |
+| `motion_force_increase` | 0.15 | `exp(−a_F·x_F)` |
+| `motion_torque_increase` | 0.15 | `exp(−a_T·x_T)` (F/T 센서 모멘트) |
 | Time | 1.0 | `−∫[t,t+dt] 0.02(exp(0.7s)−1) ds` |
 | Terminal | 1.0 | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
 
@@ -271,7 +274,8 @@ Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개
 않는다. **멈춘 step에는 x_R=0, 보상=1**로 돌아와 과거 이동량 때문에 계속 보상이 낮아지지
 않는다. 지수 점수이므로 누적 보상 감소가 전체 이동거리와 정확히 선형 비례하지는 않는다.
 
-Motion은 다음 네 비용을 **각각 exp에 넣은 뒤 평균**한다. 가속도 항과 tactile 보상은 넣지 않는다.
+Motion은 다음 네 비용을 **각각 exp에 넣은 독립 reward term**으로 기록한다. 각 weight0.15의
+합은 이전 `0.6 × 네 점수의 평균`과 같다. 가속도 항과 tactile 보상은 넣지 않는다.
 
 ```text
 x_A = sum18((action - previous_action)²)
@@ -312,11 +316,18 @@ Velocity 항은 빠른 움직임 자체도 감점하므로 약한 규제로 시�
 계산에 포함되므로 action-rate를 실제 가속도나 stiffness 변화의 정확한 측정으로 해석하지 않는다.
 정지는 여전히 Motion 최대이며 실제 조작은 Clearance·성공·Time이 유도해야 한다.
 
-`RewardsCfg`는 Clearance/Rearrangement/Motion/Time/Terminal의 5개 term이다. 함수가
-discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. 세 quality의
-weight 합은 기존과 같은3이고 Motion 하위4항의 유효 weight는 각각0.15다. Time은 위 적분값을
-지급한다. 양의 baseline 및 step별 ΔL 때문에 전체 return의 제어주기 불변성을 주장하지 않는다.
-Time·Terminal·γ는 유지하며, 비교 학습은 같은 제어 설정을 고정한 새 run으로 수행한다.
+`RewardsCfg`는 Clearance/Rearrangement/Motion4항/Time/Terminal의 **8개 term**이다. 함수가
+discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. Quality weight 합은
+기존과 같은3이다. Time은 위 적분값을 지급한다. 양의 baseline 및 step별 ΔL 때문에 전체
+return의 제어주기 불변성을 주장하지 않는다. Time·Terminal·γ와 관측·제어는 유지한다.
+
+Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
+`motion_force_increase`, `motion_torque_increase`를 각각 확인한다. 기존 단일 `motion` 항은
+중복 지급하지 않는다. 네 로그의 합으로 이전 Motion의 기여량을 비교할 수 있다.
+이 값은 native manager가 **weight 적용 후 episode 누적값을 최대 episode 시간8초로 나눈 값**이다.
+0~1의 순간 점수나 실제 episode 길이로 정규화한 평균이 아니므로 episode 길이도 함께 확인한다.
+F/T 두 점수는 state 갱신 때 각각 한 번 계산해 캐시한다. 보상 계산에는 추가 센서·PhysX 조회나
+명시적인 CPU 변환을 넣지 않고, 로그 집계는 native manager에 맡긴다.
 
 성공은 **지정 Blocker의** A₀ 교차 면적 ≤ 1e−5 m², Target 이동 ≤ 2 cm·회전 ≤
 0.15 rad, 물체 선속도 ≤ 0.015 m/s·각속도 ≤ 0.1 rad/s를 5 step 연속 만족할 때다.
@@ -651,7 +662,12 @@ Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않�
 
 ## 검증과 남은 구현
 
-최신 Motion·weight 변경 후 CPU 검사는 **204개 통과·14개 skip·142 subtest 통과**다.
+Motion 로그 분리 후 CPU 검사는 **205개 통과·14개 skip·142 subtest 통과**다.
+실제 GPU4환경·32 policy step과 부분 reset2회에서 native8개 reward term 및 Motion4개
+로그를 확인했다. 분리 전 합산 수식과 전체 reward의 최대 차이는3.58e−7이다.
+자료는 `outputs/contact_manipulation/motion_split_20261017/`에 있다.
+
+앞선 Motion·weight 변경 후에는
 실제 GPU4환경·48 policy step과 선택2환경의 부분 reset에서 새 수식, F/T 비용 및 native
 RewardManager의 weight·dt 적용을 확인했다. Motion 독립 계산과의 최대 차이는5.96e−8이다.
 자료는 `outputs/contact_manipulation/motion_update_20261016/`에 있으며, 변경 후 학습 성능은

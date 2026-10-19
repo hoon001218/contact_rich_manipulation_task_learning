@@ -6111,3 +6111,187 @@ Clearance·성공·Time과 함께 조정해야 한다. Tactile gate, 접촉 유�
   dead band·반품질·물리ramp의dt일관성,12joint선택/mimic제외,1024tensor/host조회금지를 검증했다.
 - GPU자료: outputs/contact_manipulation/motion_update_20261016/verify.py,
   verification.json, verification.log. 장기 학습의 성공률·비조작 개선은 아직 검증하지 않았다.
+
+### 2026-10-17 — IdealPD 적용 후 CUDA719 재발 조사
+
+사용자가 제공한 UTC2026-10-16 13:06:01(한국시간10월16일22:06:01) 사고는
+`logs/rsl_rl/contact_manipulation/2026-10-16_21-36-16`, PID4340,1024환경이다.
+Kit `kit_20261016_213601.log:5204`와 정확히 일치하며 uptime1,800,676ms(약30분)다.
+직전 `kit_20261016_213547.log`는 시작 중 KeyboardInterrupt로 중단된 별도 실행이다.
+
+확인한 사실:
+
+- 저장 env.yaml에 arm IdealPD, P/D0, effort_limit/effort_limit_sim150/28Nm 및 새로운
+  Motion·C/R/M weights1.8/.6/.6이 적용돼 있다. 실행 git snapshot은 clean
+  `42b2a7bd312ccf37b8cf0ea19a0bf4484186e37c`이며 조사 당시 HEAD와 같다.
+  따라서 이전 수정 누락으로 설명하지 않는다. 실제 실패 순간의 제출토크는 저장돼 있지 않다.
+- 같은 시각 kernel journal은 Xid69,Class0xc7c0,Offset0x1b0,Data0x41,ErrorCode0x53이다.
+  이전 PID246920 사고와 Xid/Class/Offset/Data/ErrorCode가 모두 같다. 공개 NVIDIA header는
+  해당 class를 AMPERE_COMPUTE_B,offset을 LAUNCH_DMA로 정의한다. 어느 CUDA kernel이나
+  stream/PhysX/driver가 발단인지는 이 정보만으로 알 수 없다. ErrorCode0x53의 의미는 미확정이다.
+- 부팅은 같은 날21:35:09KST, driver580.173.02다. 재부팅 직후 새 프로세스에서 발생했으므로
+  이전 사고의 중지된 프로세스/context만을 이번 원인으로 삼지 않는다.
+- Physics resume 이후 첫719까지 Kit error/warning은0개다. 명시적 OOM·contact buffer overflow
+  경고도 없다. Allocator line68은719후 종료 처리 경고다. Peak VRAM/온도 기록이 없어
+  메모리/하드웨어 문제를 완전히 배제하는 근거는 아니다.
+- TB 마지막 완료 iteration939,총940회다. 마지막 scalar는13:05:59.904UTC이며 다음
+  rollout iteration940에서 실패한 것으로 보인다. 기본 common counter 흐름에서
+  940×32=30080,mod400=80이고 실패 rollout30080~30112는 공통 장면 경계를 넘지 않는다.
+  이전 사고와 공통배치reset 직후라는 원인을 묶을 수 없다. 개별 부분reset은 여전히 가능하다.
+- 마지막10iteration930~939의 hard_load_or_overrange 로그 평균0.91814,
+  Train/mean_episode_length30.957step이다. 800~899의0.59179/111.591step보다 과부하 종료가
+  우세하고 episode가 짧아지는 정황이다. Native/RSL의 종료 요약 snapshot 평균이며
+  편향 없는 전체 episode 빈도나 실제 힘 크기의 측정으로 해석하지 않는다.
+- Loss/entropy는800~899평균8.59058에서930~939평균−53.26935로 급감한다. Iteration928부터
+  −20미만이다. Gaussian latent mean std는0.58534→0.61859로 오히려 증가했다.
+  Tanh action이 경계 쪽에 집중되거나 입력 분포가 변했을 가능성을 조사할 신호지만,
+  실제 action 포화율·mean·관측·토크가 없으므로 정책 포화나 CUDA 인과를 확정하지 않는다.
+- 모든 TB scalar는finite,invalid_state 로그는전구간0이다. Checkpoint0/500/850/900의 모델 및
+  optimizer도finite다. 최신900은사고보다약40iteration 전이며 실패 순간 정상성을 보장하지 않는다.
+
+미해결 위험과 다음 진단:
+
+공식 OSC는 full inertial decoupling에서(J M^-1 J^T)의 damping 없는 역행렬을 사용한다.
+IK에는 conditioning 기준이 없다. IdealPD는 큰 finite torque를 제한하지만 NaN을 복구하거나
+특이점 계산 자체를 안정화하지 않는다. 또한 native termination은두 physics substep후이므로
+해당step이이미CUDA fault로 실패하면 과부하/invalid 검사가 실행될 수 없다. 이들은 실제 구조상
+제약이며 이번 순간 singularity/NaN이 있었다는 증거는 아니다. Hand의 nonzero implicit PD를
+이전 arm gain0 feedforward 초과경로와 동일시하지 않는다.
+
+우선 physics직전 action/OSC raw·submitted torque/유한성·관절상태·reset 여부를 분리해
+첫 이상을 보존하는 진단이 필요하다. 여전히 finite·bounded이면 CUDA graph/Warp/PhysX/driver
+경로를 독립 A/B·Compute Sanitizer로 좁혀야 한다. 단순 reward변경·토크limit만으로719를
+예방한다고 주장하지 않는다. 이번에는 production변경·새 시뮬레이션·학습을 하지 않았다.
+
+근거 artifact는 `outputs/contact_manipulation/cuda719_20261017/`의 incident.json,
+log_analysis.json,kernel_xid.log,kit_failure_excerpt.log다. 단일 근본 원인은 아직 미확정이다.
+공식 근거는 NVIDIA CUDA Runtime의 cudaErrorLaunchFailure 설명, Xid catalog와
+open-gpu-doc/clc7c0.h,PhysX5.4.1 GPU-memory 설명을 확인했다.
+
+### 2026-10-17 — 최신 저장 정책의 action→OSC→PhysX 입력 실측 재실행
+
+사용자는 실제 action과 그로 인한 OSC 출력을 계산하도록 요청했다. 원본 사고 rollout의
+obs/action/state/RNG/reset count는 checkpoint에 없어 복구할 수 없으며, 최신 model_900은
+사고 rollout940의 정책보다39회 PPO update 이전이다. 아래는 원본 사고 순간의 값이 아닌
+별도 재실행의 실측 결과다.
+
+`cuda719_20261017/replay_actions.py`로 동일 seed0·사고당시공통배치generation75
+(layout seed6136465260097156590),1024환경400policy/800physics step을 재생했다.
+학습과 같은 stochastic_output=True를 사용하고 optimizer update는 하지 않았다.
+Startup을 줄이기 위해 정책 compile만False로 두고 동일FP32/TF32수학을 사용했다.
+제어/물리/reward/센서 및 production코드는 변경하지 않았다. 원래 개별reset횟수와
+로봇상태는 미저장이라 복원하지 못한다. 공통배치75의 시작부터 새 trajectory를 측정했다.
+
+매physics직전(native action apply와 scene.write후)에 raw18D/processed명령,pose오차,
+J/M/Minv/task inertia/Kp/Kd,OSC torque,IdealPD후 SDKcommand를 동시 저장했다.
+기존행렬로 독립 계산한OSC와 실제 출력의 오차는800substep모두0이고,
+raw를150/28Nm로clip한 값과SDK제출값의 오차도0이다. SDKcommand는 측정 관절반력이 아니다.
+전체raw·submitted출력은finite였고 CUDA719없이완료했다. Reset4693회,진단loop26.22s이며
+계측부하가 포함되므로 학습 iteration성능으로 해석하지 않는다.
+
+409600개action /819200개환경physics sample의 분포:
+
+| 측정 | 중앙값 | 99percentile | 최대 |
+|---|---:|---:|---:|
+| 상대 위치 목표 norm(m) |0.668620|1.140431|1.471160|
+| 상대 회전 목표 norm(rad) |0.902465|1.404281|1.672646|
+| Kp(6축 전체) |50|91.43885|99.70876|
+| raw OSC 관절 torque abs(Nm) |8.20045|837.74092|16358637|
+
+Position scale1이므로 첫세raw값이 그대로m단위상대목표다. 이는20ms마다평균적으로수십cm
+떨어진 목표를 만들었다는 뜻이며 실제EEF이동거리나속도가 아니다. 전체18D성분의abs>.9는
+8.6316%,pose6D만은2.2356%,전체abs>.99는0.26666%다. 따라서 checkpoint900재실행에서
+모든action이끝값포화됐다고 설명하지 않는다. 끝값까지 가지 않아도 scale1에서요구변위가크다.
+한 관절이라도raw토크상한을초과한환경·substep은33.2070%,관절sample단위초과는7.31205%다.
+제출명령의관절별최대는정확히[150,150,150,28,28,28]Nm였다.
+
+최대rawtorque case는env179,zero-basedpolicy78/physics156(첫substep)이다.
+
+- delta position=[−.76739472,.00472651,.58198482]m,norm.96313204m.
+- delta rotation=[.69596422,−.92632860,−.75442189]rad,norm1.38260741rad(79.21757deg).
+- rawstiffness=[−.751207,.357124,.383675,.112954,−.871663,−.798456]→전축Kp50,Kd14.142136.
+- handraw=[.0219398,.370575,.184531,−.585129,.802944,.767651]→absoluteqtarget
+  [.847188,.424878,.851737,.298313,1.296407,1.271029]rad(설정된독립handjoint순서).
+- elbowq=.000530952rad(.030421deg),wrist2=.987133rad이다. 이전probe의wrist특이점과달리
+  이번peak는팔꿈치가거의펴진자세다. 저장J의sigma_min8.6639564e−5,condition24919.65이다.
+  J의병진/회전혼합단위condition은수치진단이며무차원물리manipulability한계로사용하지않는다.
+- acc_des=Kp*pose_error−Kd*eef_velocity=
+  [−34.814003,4.377518,24.081465,69.341919,−54.054489,−47.202793]
+  (앞3m/s²,뒤3rad/s²).
+- taskwrench=Lambda*acc_des≈[4.79954e10,−3.52411e10,1.35886e10,−8.27166e8,8.91858e8,−5.12566e9].
+  이는계산된OSCcommandwrench이며실제F/T측정값이아니다.
+- tau=J^T*taskwrench=[−1013760,−16358637,2158563,−1130003,−3228160,158208]Nm.
+- 실제SDK제출명령=[−150,−150,150,−28,−28,28]Nm. 따라서IdealPD제한은실제로작동한다.
+
+별도CPU FP64 재계산에서 M은양의정부호이고(J M^-1 J^T)의condition은9.4891e9이다.
+Production cached FP32 Lambda는대칭화최소고윳값−2.75997e9로양의정부호성을잃었다.
+같은J/M의FP64재계산Lambda는모든고윳값양수이며최대1.33359e7이다. 극심한ill-conditioning의
+수치문제가실제중간행렬에확인됐다. FP64에서안정적인6×6square-J동등식M*solve(J,acc_des)도
+최대78126.96Nm여서정밀도만높여서정상토크가되는상황은아니다. 실제FP32최대는이값의약209배다.
+TF32가켜져있고큰중간값의상쇄에도민감하지만TF32off비교실행은하지않았으므로전체오차를
+TF32하나로단정하지않는다. CPU64로cached행렬을곱한결과와GPUFP32결과의차이는이
+수치민감도의일부이며계측오차와구분한다(GPUbatchoracle은정확일치).
+
+확인한제어문제는큰상대목표·near-singular자세·fullinverse의수치증폭과빈번한토크포화다.
+원본719를재현하지않았으므로위제어문제가CUDAfault의직접원인이라는결론은여전히내리지않는다.
+Artifact: action_replay_stochastic.json/.pt/.log,replay_actions.py,
+peak_independent_analysis.json(동시snapshot의독립검산),독립계산helper. 전부
+outputs/contact_manipulation/cuda719_20261017/아래에있다.
+
+### 2026-10-17 — Motion 네 항을 native reward/log로 분리
+
+사용자가 Motion을 나눠 각각 확인하도록 요청했다. 단일motion RewardTerm을 제거하고
+아래4개 native RewardTermCfg를 각각weight0.15로 등록했다.
+
+- motion_action_rate: 공식 action_rate_l2의 raw18D 차이제곱합을exp에적용.
+- motion_joint_velocity: 공식 joint_vel_l2를 팔6+독립hand6에적용한합을exp에적용.
+- motion_force_increase: 보상된F/T힘norm의양의증가율초과량에대한exp점수.
+- motion_torque_increase: F/T센서모멘트norm의양의증가율초과량에대한exp점수.
+  Joint torque reward를추가한것이아니다.
+
+정상유한입력에서0.15*(qA+qV+qF+qT)는이전0.6*mean(qA,qV,qF,qT)와같다.
+계수/dead band·Clearance1.8·Rearrangement0.6·Time/Terminal·제어·관측은유지한다.
+중복지급할기존motion항은남기지않았다. Native8개term으로Console/TensorBoard의
+Episode_Reward/motion_action_rate,motion_joint_velocity,motion_force_increase,
+motion_torque_increase가분리된다. 기존checkpoint의입력차원/모델계약도바꾸지않았다.
+
+불필요한FTexp재계산/평균cache를없애고reward_components는(C,R,F,T,Time)의(N,5)를
+반환한다. TaskState.components는(C,R,F,T,Time,Terminal)의(N,6)이며Time4/Terminal5다.
+F/T두함수는각각캐시된column을읽는다. jointselection은UR5eEnvCfg에서
+rewards.motion_joint_velocity.params에설정한다. 새production파일·센서·물리조회·명시적
+CPUtensor변환·customlogger를추가하지않았다. Native로그집계는8개term기준으로수행된다.
+
+Native Episode_Reward값은각term의weighted episode누적값을max_episode_length_s=8로
+나눈수치다. 0~1순간quality나실제episode길이정규화평균으로읽지않는다. Episode길이도
+함께봐야하며4개로그의합으로이전Motion기여량을비교할수있다.
+
+검증은CPU205passed/14skipped/142subtestpassed(15.92s),GPU4환경32policy step및
+선택2환경부분reset2회완료다. Native8개term의이름/weight·4개Motion로그각각과
+sum기여량을확인했다. 분리수식오차최대2.98e−8,전체reward의이전합산식대비차이최대
+3.58e−7(float32합산순서차이)다. 원본연구수식·학습성능을바꾸려는변경은아니다.
+자료는outputs/contact_manipulation/motion_split_20261017/verify.py,
+verification.json,verification.log다. README도새term/로그와검증결과로갱신했다.
+
+### 2026-10-19 — Shared scene robot-start search 재시도 소진 오류 조사
+
+사용자가 _shared_reset_batch의 `exhausted retries for 1 environments` 예외 원인을 물었다.
+이번 예외는 CUDA719가 아니라 초기자세 후보가 조건을 통과하지 못해 명시적으로 발생시킨
+RuntimeError다. 외부재시도(initial_vision.max_layout_attempts)32회×내부후보(robot_start.max_attempts)
+80개로 실패행마다최대2560후보를 검사한다. 성공행은유지하고 실패행만새seed로 재시도하며,
+외부seed는base+7919*(attempt+1)이라 같은후보만반복하는구조는아니다. 물체배치/TCP영역은
+외부재시도동안고정이다. 재시도소진후복구경로없이단일실패행도전체학습예외로전파된다.
+
+조건은Blocker앞12~40cm(선반front최소6cm),Y±8cm,선반위20~28cm의TCP영역과고정정면방향,
+IK오차0.5mm/0.01rad,elbow높이5cm/forearmforward5cm,바닥·선반·물체와15mm,
+검사대상selfpair와2mm여유다. 공통layout준비는env0의유효자세한개를확인할뿐 충분한
+유효샘플영역을보장하지않는다. 유효해가존재해도허용영역이좁거나IK수렴/충돌검사에서
+반복탈락하면유한검색이실패할수있다. `1 environments`는최종pending개수이며envID나
+원래resetbatch크기가아니다. 현재는탈락사유별집계/envID/resetcount/layout정보가없어
+실제원인이IK도달성·elbow·충돌중어느것인지확정하지못한다.
+
+최신trainingrun2026-10-17_15-52-37은29574iteration을기록했지만 해당RuntimeError가
+저장stdout에없어이번예외와직접연결하지않았다. 그run이라면실패다음rollout의끝이946400
+commonstep경계이므로공통reset(generation2366)과부분reset둘다가능하다. 이를확정재현으로
+기록하지않는다. 조사만수행했고production변경·시뮬레이션실행은하지않았다.
+개선방향은탈락원인집계와유효한TCP영역확보/검증된자세주변샘플링및소진시복구정책이며,
+조건무시·무검증자세fallback·무한재시도는도입하지않았다.
