@@ -3,9 +3,11 @@
 The numerical kernels use only PyTorch and do not read simulator state. Every
 argument carries an environment leading dimension; there are no per-environment
 Python loops or device-to-host reads. Native RewardTermCfg weights remain the
-only reward weights. Clearance, rearrangement and motion keep exp(-a*x) quality
-scores. The adapters divide discrete scores/payments by dt to cancel the native
-RewardManager's dt factor; Time retains its exact elapsed-time integral.
+only reward weights. Clearance keeps its exp(-a*x) quality reward; rearrangement
+and motion use exp(-a*x) - 1 penalties. Cached components retain the original
+qualities for task-state diagnostics. The adapters divide discrete payments by
+dt to cancel the native RewardManager's dt factor; Time retains its exact
+elapsed-time integral.
 """
 
 from __future__ import annotations
@@ -45,13 +47,15 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
 
     Clearance evaluates only the designated Blocker. Rearrangement uses this
     transition's corner path in exp(-a*x), including rotation and return motion.
-    Its score returns to one when objects stop; past motion is not charged again.
+    Its quality returns to one when objects stop; the manager adapter subtracts
+    one so stopped objects have zero penalty and past motion is not charged again.
 
     Motion combines native action-rate and joint-velocity qualities with two
     independent force/torque growth qualities. Cache the two scores separately
     for native per-term logging; each exponent uses squared positive growth above a
     small dead band. Constant load, release and direction-only changes have
-    quality one. Wrenches are self-load compensated at the current sensor center:
+    quality one, which maps to zero penalty in the manager adapters. Wrenches
+    are self-load compensated at the current sensor center:
     rotations of their axes preserve norms, but translating the torque origin
     would change the measured load. Return the two excess-rate squared costs
     separately for diagnostics, in (N/s)^2 and (N*m/s)^2.
@@ -101,11 +105,14 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
             torch.nan_to_num(rate_cost, nan=0.0, posinf=0.0, neginf=0.0))
 
 
-def _reward_rate(env, index):
+def _reward_rate(env, index, *, baseline=0.0):
     # Lazy import keeps the numerical kernels independent of scene integration.
     from .events import get_task_state
 
-    return get_task_state(env).components[:, index] / env.step_dt
+    value = get_task_state(env).components[:, index]
+    if baseline:
+        value = value - baseline
+    return value / env.step_dt
 
 
 def clearance(env):
@@ -114,39 +121,40 @@ def clearance(env):
 
 
 def rearrangement(env):
-    """Exponential quality of the current step's object corner displacement."""
-    return _reward_rate(env, 1)
+    """Bounded negative exp penalty of this step's object corner displacement."""
+    return _reward_rate(env, 1, baseline=1.0)
 
 
 def motion_action_rate(env):
-    """Exp quality of native raw 18D action differences, without /dt in the cost."""
+    """Exp-minus-one penalty of native raw action differences, without /dt in x."""
     from isaaclab.envs.mdp.rewards import action_rate_l2
     from .events import get_task_state
 
     cfg = get_task_state(env).cfg
     score = torch.exp(-cfg.motion_action_rate_decay * action_rate_l2(env))
-    return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) / env.step_dt
+    # Invalid quality becomes the maximum bounded penalty, never an idle bonus.
+    return (torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) - 1.0) / env.step_dt
 
 
 def motion_joint_velocity(env, arm_cfg, hand_cfg):
-    """Exp quality of native independent-joint velocity sums at the final substep."""
+    """Exp-minus-one penalty of native joint-velocity sums at the final substep."""
     from isaaclab.envs.mdp.rewards import joint_vel_l2
     from .events import get_task_state
 
     cfg = get_task_state(env).cfg
     velocity_cost = joint_vel_l2(env, arm_cfg) + joint_vel_l2(env, hand_cfg)
     score = torch.exp(-cfg.motion_joint_velocity_decay * velocity_cost)
-    return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) / env.step_dt
+    return (torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) - 1.0) / env.step_dt
 
 
 def motion_force_increase(env):
-    """Cached exp quality of positive compensated sensor-force magnitude growth."""
-    return _reward_rate(env, 2)
+    """Cached exp-minus-one penalty of positive compensated force growth."""
+    return _reward_rate(env, 2, baseline=1.0)
 
 
 def motion_torque_increase(env):
-    """Cached exp quality of positive F/T sensor-moment growth, not joint torque."""
-    return _reward_rate(env, 3)
+    """Cached exp-minus-one penalty of F/T sensor-moment growth, not joint torque."""
+    return _reward_rate(env, 3, baseline=1.0)
 
 
 def time_penalty(env):

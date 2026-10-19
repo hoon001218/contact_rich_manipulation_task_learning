@@ -15,6 +15,7 @@ from dataclasses import asdict
 import torch
 from torch import Tensor, nn
 from rsl_rl.algorithms import PPO
+from rsl_rl.modules import GaussianDistribution
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups
 from tensordict import TensorDict
@@ -57,9 +58,9 @@ class NativeContactActor(nn.Module):
         if obs_normalization:
             raise ValueError("Research observations retain physical values for observation-derived masks.")
         if distribution_cfg is not None and distribution_cfg != {
-            "class_name": "tanh_gaussian", "init_std": self.cfg.initial_std,
+            "class_name": "GaussianDistribution", "std_type": "log", "init_std": self.cfg.initial_std,
         }:
-            raise ValueError("The actor requires the model's tanh_gaussian output distribution and initial_std.")
+            raise ValueError("The actor requires GaussianDistribution with log std and the model's initial_std.")
         if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
             raise ValueError("max_forward_batch_size must be a positive integer.")
         self.obs_groups = list(obs_groups[obs_set])
@@ -78,9 +79,7 @@ class NativeContactActor(nn.Module):
         # PPO updates require gradients, and shared graph replay cannot safely
         # cross those contexts in the pinned PyTorch version.
         self._compiled_forward = None
-        self._normal: torch.distributions.Normal | None = None
-        self._entropy: Tensor | None = None
-        self._entropy_noise: Tensor | None = None
+        self._distribution_ready = False
         self._cached_values: tuple | None = None
         self.get_policy_observation(obs)
 
@@ -146,62 +145,51 @@ class NativeContactActor(nn.Module):
         masks: Tensor | None = None,
         hidden_state=None,
         stochastic_output: bool = False,
-        entropy_noise: Tensor | None = None,
     ) -> Tensor:
         if masks is not None or hidden_state is not None:
             raise ValueError("The finite observation history does not use recurrent state or trajectory masks.")
         observation = self.get_policy_observation(obs)
         mean, values = self._forward_policy(observation)
-        self._normal = self.policy._distribution(mean)
-        if entropy_noise is not None and (
-            entropy_noise.shape != mean.shape or entropy_noise.device != mean.device or entropy_noise.dtype != mean.dtype
-        ):
-            raise ValueError("Entropy noise must match the action mean shape, device, and dtype.")
-        self._entropy, self._entropy_noise = None, entropy_noise
+        self.policy.distribution.update(mean)
+        self._distribution_ready = True
         token = self._cache_token(obs, observation)
         self._cached_values = (token, values)
-        return self.policy._bounded_action(self._normal.rsample() if stochastic_output else mean)
+        return (self.policy.distribution.sample() if stochastic_output
+                else self.policy.distribution.deterministic_output(mean))
 
-    def _current_distribution(self) -> torch.distributions.Normal:
-        if self._normal is None:
+    def _current_distribution(self) -> GaussianDistribution:
+        if not self._distribution_ready:
             raise RuntimeError("Call the actor before querying its current action distribution.")
-        return self._normal
+        return self.policy.distribution
 
     @property
     def output_mean(self) -> Tensor:
-        """Mean of the underlying Gaussian, before the action tanh transform."""
-        return self._current_distribution().loc
+        """Mean of the Gaussian action distribution, without an output transform."""
+        return self._current_distribution().mean
 
     @property
     def output_std(self) -> Tensor:
         """Standard deviation of the underlying Gaussian, matching PPO state."""
-        return self._current_distribution().scale
+        return self._current_distribution().std
 
     @property
     def output_distribution_params(self) -> tuple[Tensor, Tensor]:
-        return self.output_mean, self.output_std
+        return self._current_distribution().params
 
     @property
     def output_entropy(self) -> Tensor:
-        if self._entropy is None:
-            distribution = self._current_distribution()
-            sample = distribution.rsample() if self._entropy_noise is None else distribution.loc + distribution.scale * self._entropy_noise
-            self._entropy = -self.policy._action_log_prob(distribution, self.policy._bounded_action(sample))
-        return self._entropy
+        return self._current_distribution().entropy
 
     def get_output_log_prob(self, outputs: Tensor) -> Tensor:
         distribution = self._current_distribution()
-        if outputs.shape != distribution.loc.shape:
-            raise ValueError(f"Actions must have shape {tuple(distribution.loc.shape)}, got {tuple(outputs.shape)}.")
-        return self.policy._action_log_prob(distribution, outputs)
+        if outputs.shape != distribution.mean.shape:
+            raise ValueError(f"Actions must have shape {tuple(distribution.mean.shape)}, got {tuple(outputs.shape)}.")
+        return distribution.log_prob(outputs)
 
     def get_kl_divergence(
         self, old_params: tuple[Tensor, Tensor], new_params: tuple[Tensor, Tensor],
     ) -> Tensor:
-        return torch.distributions.kl_divergence(
-            torch.distributions.Normal(*old_params, validate_args=False),
-            torch.distributions.Normal(*new_params, validate_args=False),
-        ).sum(-1)
+        return self.policy.distribution.kl_divergence(old_params, new_params)
 
     def reset(self, dones: Tensor | None = None, hidden_state=None) -> None:
         self._cached_values = None
@@ -356,6 +344,9 @@ class ContactManipulationPPO(PPO):
             "force_torque": {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES,
                              "resolution": SI_200_8_RESOLUTION},
             "action_contract": ACTION_CONTRACT,
+            "output_distribution": {
+                "class_name": "GaussianDistribution", "std_type": "log", "init_std": actor.cfg.initial_std,
+            },
         }
         return algorithm_class(
             actor, critic, storage, device=device, checkpoint_metadata=metadata,
@@ -420,9 +411,9 @@ class ContactManipulationPPO(PPO):
                 stop = min(start + chunk_size, total)
                 inputs = self.actor.get_policy_observation(batch.observations[start:stop])
                 means, _ = self.actor.policy(inputs, masks=build_policy_masks(inputs, self.actor.policy.cfg))
-                std = self.actor.policy.log_std.clamp(-5.0, 2.0).exp().expand_as(means)
+                self.actor.policy.distribution.update(means)
                 old_params = tuple(parameter[start:stop] for parameter in batch.old_distribution_params)
-                kl_sum += self.actor.get_kl_divergence(old_params, (means, std)).sum()
+                kl_sum += self.actor.get_kl_divergence(old_params, self.actor.policy.distribution.params).sum()
             kl_mean = float(kl_sum / total)
         if kl_mean > self.desired_kl * 2.0:
             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -442,7 +433,7 @@ class ContactManipulationPPO(PPO):
         """Accumulate native PPO losses, then clip/step once per original minibatch.
 
         Splitting changes memory use only. Unequal final chunks contribute their
-        sample share, and one entropy-noise draw is shared across the chunks.
+        sample share; native Gaussian entropy is analytic in every chunk.
         The native storage controls minibatch order and epoch count.
         """
         names = ("value", "surrogate", "entropy", "grad_norm", "approximate_kl", "clip_fraction")
@@ -454,7 +445,6 @@ class ContactManipulationPPO(PPO):
             if self.normalize_advantage_per_mini_batch:
                 batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             self._adapt_learning_rate(batch, chunk_size)
-            entropy_noise = torch.randn_like(batch.actions)
             self.optimizer.zero_grad(set_to_none=True)
             metrics = torch.zeros_like(totals)
             for start in range(0, count, chunk_size):
@@ -462,7 +452,6 @@ class ContactManipulationPPO(PPO):
                 inputs = self.actor.get_policy_observation(batch.observations[start:stop])
                 log_prob, entropy, values = self.actor.policy.evaluate_actions(
                     inputs, batch.actions[start:stop], masks=build_policy_masks(inputs, self.actor.policy.cfg),
-                    entropy_noise=entropy_noise[start:stop],
                 )
                 old_log_prob = batch.old_actions_log_prob[start:stop].squeeze(-1)
                 advantage = batch.advantages[start:stop].squeeze(-1)
@@ -502,13 +491,19 @@ class ContactManipulationPPO(PPO):
         return saved
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
-        """Reject incompatible actions and observation/F/T profiles before loading."""
+        """Reject incompatible actions, output distributions, or observation/F/T profiles before loading."""
         metadata = loaded_dict.get("research_metadata")
         if not isinstance(metadata, Mapping) or metadata.get("action_contract") != ACTION_CONTRACT:
             raise ValueError(
                 "Checkpoint action contract is missing or differs from the native Isaac Lab OSC "
                 "and joint-position-to-limits actions. Previous custom-action checkpoints have "
                 "different 18D action semantics; start a new training run."
+            )
+        if (not isinstance(self.checkpoint_metadata, Mapping)
+                or metadata.get("output_distribution") != self.checkpoint_metadata.get("output_distribution")):
+            raise ValueError(
+                "Checkpoint output distribution is missing or differs from this Gaussian policy. "
+                "Previous tanh-Gaussian checkpoints cannot be loaded as Gaussian actions; start a new training run."
             )
         if metadata != self.checkpoint_metadata:
             raise ValueError(

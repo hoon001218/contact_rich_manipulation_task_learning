@@ -168,7 +168,7 @@ class DynamicObservationTests(unittest.TestCase):
         torch.testing.assert_close(sample[:, 24:31], values["tcp_pose_b"])
         torch.testing.assert_close(sample[0, 31:37], torch.tensor([1., -1., 1., -1., 1., 5.]))
         torch.testing.assert_close(sample[0, [37, 42, 53]], torch.tensor([1., -1., -1.]))
-        self.assertEqual(float(sample[0, 54]), 1.0)
+        self.assertEqual(float(sample[0, 54]), 2.0)
 
     def test_pack_has_exactly_geometry_current_previous_with_no_role_or_mask_channels(self):
         geometry = scene(batch=3, objects=10)
@@ -307,8 +307,8 @@ def native_motion_rewards():
         yield native_module
 
 
-def split_motion_qualities(env, arm_cfg, hand_cfg):
-    """Undo native dt integration for each independently logged reward term."""
+def split_motion_penalties(env, arm_cfg, hand_cfg):
+    """Integrate each native rate into the unweighted per-step penalty."""
     return torch.stack((rewards.motion_action_rate(env),
                         rewards.motion_joint_velocity(env, arm_cfg, hand_cfg),
                         rewards.motion_force_increase(env),
@@ -375,6 +375,12 @@ class RewardTests(unittest.TestCase):
         expected_quality = torch.tensor([.5, 1., 1., 1.], dtype=torch.float64)
         torch.testing.assert_close(scores[:, 2], expected_quality)
         torch.testing.assert_close(scores[:, 3], expected_quality)
+        env = SimpleNamespace(step_dt=data['dt'])
+        with patch.object(task, 'get_task_state', return_value=SimpleNamespace(components=scores)):
+            force = rewards.motion_force_increase(env) * env.step_dt
+            torque = rewards.motion_torque_increase(env) * env.step_dt
+        torch.testing.assert_close(force, torch.tensor([-.5, 0., 0., 0.], dtype=torch.float64))
+        torch.testing.assert_close(torque, force)
 
     def test_wrench_deadbands_keep_raw_excess_costs_and_split_independent_exp_scores(self):
         data, cfg = reward_inputs(7), settings()
@@ -390,6 +396,14 @@ class RewardTests(unittest.TestCase):
         torque_quality = [1., 1., 1., math.exp(-4 * cfg.motion_torque_rate_decay), .5, 1., .5]
         torch.testing.assert_close(scores[:, 2], torch.tensor(force_quality, dtype=torch.float64))
         torch.testing.assert_close(scores[:, 3], torch.tensor(torque_quality, dtype=torch.float64))
+        env = SimpleNamespace(step_dt=data['dt'])
+        with patch.object(task, 'get_task_state', return_value=SimpleNamespace(components=scores)):
+            force = rewards.motion_force_increase(env) * env.step_dt
+            torque = rewards.motion_torque_increase(env) * env.step_dt
+        torch.testing.assert_close(force[:3], torch.zeros(3, dtype=torch.float64))
+        torch.testing.assert_close(torque[:3], torch.zeros(3, dtype=torch.float64))
+        self.assertLess(float(force[3]), 0.)
+        self.assertLess(float(torque[3]), 0.)
 
     def test_wrench_growth_quality_uses_physical_rate_at_each_control_period(self):
         # A constant physical ramp has the same per-step quality at any sample rate.
@@ -521,19 +535,20 @@ class RewardTests(unittest.TestCase):
                  patch.object(task, 'get_task_state', return_value=state), \
                  patch.object(native, 'joint_vel_l2', wraps=native.joint_vel_l2) as velocities, \
                  patch.object(native, 'action_rate_l2', wraps=native.action_rate_l2) as actions:
-                actual = split_motion_qualities(env, SimpleNamespace(name='robot', joint_ids=arm_ids),
+                actual = split_motion_penalties(env, SimpleNamespace(name='robot', joint_ids=arm_ids),
                                                 SimpleNamespace(name='robot', joint_ids=hand_ids))
             self.assertEqual((actions.call_count, velocities.call_count), (1, 2))
             expected = torch.tensor([[1., math.exp(-cfg.motion_joint_velocity_decay * 12), 1., 1.],
                                      [math.exp(-cfg.motion_action_rate_decay * 1.25),
                                       math.exp(-cfg.motion_joint_velocity_decay * 48), 1., 1.],
                                      [math.exp(-cfg.motion_action_rate_decay), 1., 1., 1.]], dtype=action.dtype)
-            torch.testing.assert_close(actual[:3], expected)
-            torch.testing.assert_close(actual[4], torch.ones(4, dtype=action.dtype))
+            torch.testing.assert_close(actual[:3], expected - 1)
+            torch.testing.assert_close(actual[3], torch.tensor([0., -1., 0., 0.], dtype=action.dtype))
+            torch.testing.assert_close(actual[4], torch.zeros(4, dtype=action.dtype))
             self.assertTrue(torch.isfinite(actual).all())
-            self.assertTrue(((actual >= 0) & (actual <= 1)).all())
+            self.assertTrue(((actual >= -1) & (actual <= 0)).all())
 
-    def test_split_motion_preserves_weighted_sum_and_each_alpha_controls_only_its_input(self):
+    def test_split_motion_costs_divide_weight_equally_and_each_alpha_controls_only_its_input(self):
         data, cfg = reward_inputs(), settings()
         fields = ('motion_action_rate_decay', 'motion_joint_velocity_decay',
                   'motion_force_rate_decay', 'motion_torque_rate_decay')
@@ -558,10 +573,10 @@ class RewardTests(unittest.TestCase):
             components, _ = rewards.reward_components(variant, **data)
             state = SimpleNamespace(cfg=variant, components=components)
             with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
-                scores = split_motion_qualities(env, arm, hand)
-            torch.testing.assert_close(scores, torch.tensor([expected], dtype=action.dtype))
-            # Each native weight is .15: no duplicate .6 aggregate, no total-reward change.
-            self.assertAlmostEqual((.15 * scores).sum().item(), .6 * sum(expected) / 4, places=12)
+                penalties = split_motion_penalties(env, arm, hand)
+            torch.testing.assert_close(penalties, torch.tensor([expected], dtype=action.dtype) - 1)
+            # Four independently bounded costs share the .6 Motion budget.
+            self.assertAlmostEqual((.15 * penalties).sum().item(), .6 * (sum(expected) / 4 - 1), places=12)
 
     def test_motion_native_sum_preserves_dtype_and_dt_conversion_without_host_reads(self):
         def reject(*args, **kwargs):
@@ -578,16 +593,86 @@ class RewardTests(unittest.TestCase):
             with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state), \
                  patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
                  patch.object(torch.Tensor, 'cpu', reject):
-                actual = split_motion_qualities(env, arm_cfg, hand_cfg)
+                actual = split_motion_penalties(env, arm_cfg, hand_cfg)
             expected = torch.tensor([math.exp(-cfg.motion_action_rate_decay * 4.5),
                                      math.exp(-cfg.motion_joint_velocity_decay * 12), 1., 1.], dtype=dtype)
-            torch.testing.assert_close(actual, expected.expand(1024, -1))
+            torch.testing.assert_close(actual, (expected - 1).expand(1024, -1))
             self.assertEqual(actual.dtype, dtype)
             # The official action cost has no /dt; only the adapter's rate conversion cancels out.
             env.step_dt = .01
             with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
-                faster = split_motion_qualities(env, arm_cfg, hand_cfg)
+                faster = split_motion_penalties(env, arm_cfg, hand_cfg)
             torch.testing.assert_close(faster, actual)
+
+    def test_clearance_is_only_positive_dense_payment_and_costs_are_bounded_per_transition(self):
+        cfg, data = settings(), reward_inputs(4)
+        data['dt'] = .02
+        data['blocked'][:] = torch.tensor([1., .75, .5, 0.])
+        data['path_increment'][:] = torch.tensor([0., .01, .25, 1.e6])
+        data['wrench'][:, 0] = torch.tensor([0., 5., 100., 1.e6]) * data['dt']
+        data['wrench'][:, 3] = torch.tensor([0., .25, 5., 1.e6]) * data['dt']
+        components, _ = rewards.reward_components(cfg, **data)
+        # Nonzero terminal entries ensure this conversion never offsets terminal payments.
+        terminal = torch.tensor([0., 500., -100., 0.], dtype=components.dtype)
+        state = SimpleNamespace(cfg=cfg, components=torch.cat((components, terminal[:, None]), -1))
+        cached_quality = state.components.clone()
+        action = torch.zeros(4, 18, dtype=components.dtype)
+        action[:, 0] = torch.tensor([0., 1., 2., 1.e6])
+        velocity = torch.zeros(4, 12, dtype=components.dtype)
+        velocity[:, 0] = action[:, 0]
+        env = SimpleNamespace(
+            scene={'robot': SimpleNamespace(num_joints=12, data=SimpleNamespace(joint_vel=velocity))},
+            step_dt=data['dt'], action_manager=SimpleNamespace(action=action, prev_action=torch.zeros_like(action)),
+        )
+        arm, hand = (SimpleNamespace(name='robot', joint_ids=slice(start, start + 6)) for start in (0, 6))
+        with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
+            clear = rewards.clearance(env) * env.step_dt
+            rearr = rewards.rearrangement(env) * env.step_dt
+            motion = split_motion_penalties(env, arm, hand)
+            time = rewards.time_penalty(env) * env.step_dt
+            paid_terminal = rewards.terminal(env) * env.step_dt
+        torch.testing.assert_close(state.components, cached_quality, rtol=0, atol=0)
+        torch.testing.assert_close(clear, components[:, 0])
+        torch.testing.assert_close(time, components[:, 4])
+        torch.testing.assert_close(paid_terminal, terminal)
+        torch.testing.assert_close(rearr[0], torch.zeros((), dtype=components.dtype))
+        torch.testing.assert_close(motion[0], torch.zeros(4, dtype=components.dtype))
+        costs = torch.cat((.6 * rearr[:, None], .15 * motion), -1)
+        bounds = torch.tensor([.6, .15, .15, .15, .15], dtype=components.dtype)
+        self.assertTrue(((costs <= 0.) & (costs >= -bounds)).all())
+        self.assertTrue((costs[1:, :3] < 0.).all())
+        torch.testing.assert_close(costs[1, 3:], torch.zeros(2, dtype=components.dtype))
+        torch.testing.assert_close(costs[-1], -bounds)
+        # Clearance improvement is preserved exactly; no contact/progress gate was added.
+        torch.testing.assert_close(1.8 * torch.diff(clear), 1.8 * torch.diff(components[:, 0]))
+        # Changing quality payments to costs removes exactly the old 1.2 baseline per step.
+        old_dense = 1.8 * clear + .6 * components[:, 1] + .15 * (motion + 1).sum(-1)
+        new_dense = 1.8 * clear + costs.sum(-1)
+        torch.testing.assert_close(new_dense, old_dense - 1.2)
+        self.assertAlmostEqual(float(new_dense[0]), 1.8 * math.exp(-1), places=12)
+
+    def test_nonfinite_inputs_produce_finite_maximum_costs_without_corrupting_other_rows(self):
+        cfg, data = settings(), reward_inputs(4)
+        data['path_increment'][0] = math.nan
+        data['wrench'][1, 0] = math.nan
+        data['wrench'][2, 3] = math.inf
+        components, _ = rewards.reward_components(cfg, **data)
+        state = SimpleNamespace(cfg=cfg, components=components)
+        action, velocity = torch.zeros(4, 18, dtype=components.dtype), torch.zeros(4, 12, dtype=components.dtype)
+        action[0, 0], velocity[1, 0] = math.nan, math.inf
+        env = SimpleNamespace(
+            scene={'robot': SimpleNamespace(num_joints=12, data=SimpleNamespace(joint_vel=velocity))},
+            step_dt=data['dt'], action_manager=SimpleNamespace(action=action, prev_action=torch.zeros_like(action)),
+        )
+        arm, hand = (SimpleNamespace(name='robot', joint_ids=slice(start, start + 6)) for start in (0, 6))
+        with native_motion_rewards(), patch.object(task, 'get_task_state', return_value=state):
+            rearr = rewards.rearrangement(env) * env.step_dt
+            motion = split_motion_penalties(env, arm, hand)
+        torch.testing.assert_close(rearr, torch.tensor([-1., 0., 0., 0.], dtype=components.dtype))
+        expected = torch.tensor([[-1., 0., 0., 0.], [0., -1., -1., 0.],
+                                 [0., 0., 0., -1.], [0., 0., 0., 0.]], dtype=components.dtype)
+        torch.testing.assert_close(motion, expected)
+        self.assertTrue(torch.isfinite(motion).all())
 
     def test_native_reward_config_logs_four_motion_terms_without_duplicate_aggregate(self):
         source = Path(__file__).resolve().parents[1] / 'contact_manipulation/shelf_manipulation_env_cfg.py'
@@ -1472,7 +1557,7 @@ class NativeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'distinct active target and blocker'):
             task.reset_task(env, torch.tensor([1]))
 
-    def test_native_reward_adapters_preserve_quality_and_do_not_repenalize_past_motion(self):
+    def test_native_reward_adapters_charge_current_cost_and_do_not_repenalize_past_motion(self):
         env, _, _ = native_fixture()
         task.reset_task(env)
         env.scene['object_collection'].data.object_link_pose_w[:, 0, 0] += .01
@@ -1480,23 +1565,23 @@ class NativeAdapterTests(unittest.TestCase):
         env.sensors.ideal_wrench[:, 0] += 4.
         env.common_step_counter = 1
         state = task.get_task_state(env)
-        # Native RewardManager's dt integrates the adapter back to the chosen step score.
+        # Native RewardManager's dt integrates the adapter back to the chosen step cost.
         actual_path = rewards.rearrangement(env) * env.step_dt
-        torch.testing.assert_close(actual_path, torch.full((3,), math.exp(-.02)), atol=1.e-6, rtol=1.e-5)
+        torch.testing.assert_close(actual_path, torch.full((3,), math.exp(-.02) - 1), atol=1.e-6, rtol=1.e-5)
         arm_cfg = SimpleNamespace(name='robot', joint_ids=list(range(6)))
         hand_cfg = SimpleNamespace(name='robot', joint_ids=list(range(6, 12)))
         with native_motion_rewards():
-            actual_motion = split_motion_qualities(env, arm_cfg, hand_cfg)
+            actual_motion = split_motion_penalties(env, arm_cfg, hand_cfg)
         decays = torch.tensor([state.cfg.motion_force_rate_decay, state.cfg.motion_torque_rate_decay])
         expected_wrench_quality = torch.exp(-state.wrench_rate_cost * decays)
-        torch.testing.assert_close(actual_motion[:, :2], torch.ones(3, 2))
-        torch.testing.assert_close(actual_motion[:, 2:], expected_wrench_quality)
+        torch.testing.assert_close(actual_motion[:, :2], torch.zeros(3, 2))
+        torch.testing.assert_close(actual_motion[:, 2:], expected_wrench_quality - 1)
         torch.testing.assert_close(rewards.time_penalty(env) * env.step_dt, state.components[:, 4])
         torch.testing.assert_close(rewards.terminal(env) * env.step_dt, state.components[:, 5])
         env.common_step_counter = 2
-        torch.testing.assert_close(rewards.rearrangement(env) * env.step_dt, torch.ones(3))
+        torch.testing.assert_close(rewards.rearrangement(env) * env.step_dt, torch.zeros(3))
         with native_motion_rewards():
-            torch.testing.assert_close(split_motion_qualities(env, arm_cfg, hand_cfg), torch.ones(3, 4))
+            torch.testing.assert_close(split_motion_penalties(env, arm_cfg, hand_cfg), torch.zeros(3, 4))
 
     def test_named_observation_terms_preserve_contract_and_advance_once_in_any_order(self):
         env, action, _ = native_fixture()
@@ -1545,15 +1630,65 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertIs(env.extras["terminal_observation"], terminal_snapshot)
         self.assertEqual(env.sensor_read_count, reads_after_reset)
 
+    def test_gaussian_actions_above_unit_range_survive_current_and_previous_observations(self):
+        env, action, _ = native_fixture()
+        task.reset_task(env)
+        first = torch.linspace(-3., 3., 18).expand(3, -1).clone()
+        action.normalized_actions.copy_(first)
+        env.common_step_counter = 1
+        current = obs.current_robot_sample(env)
+        torch.testing.assert_close(current[:, -18:], first, rtol=0, atol=0)
+
+        second = -2. * first
+        action.normalized_actions.copy_(second)
+        env.common_step_counter = 2
+        packed = obs.policy_observation(env)
+        self.assertEqual(packed.shape, (3, 244))
+        torch.testing.assert_close(packed[:, 154:172], second, rtol=0, atol=0)
+        torch.testing.assert_close(packed[:, 226:244], first, rtol=0, atol=0)
+        self.assertTrue(task._read_transition(env, env._contact_mdp).state_valid.all())
+
     def test_native_actions_and_applied_effort_have_independent_finite_checks(self):
         env, action, _ = native_fixture(4)
         task.reset_task(env)
         action.normalized_actions[:] = torch.linspace(-2, 2, 18)
         action.normalized_actions[0, 0] = math.nan
+        action.normalized_actions[0, 1] = math.inf
+        action.normalized_actions[0, 2] = -math.inf
         action.applied_torque[1, 0] = math.nan
         batch = task._read_transition(env, env._contact_mdp)
-        torch.testing.assert_close(batch.sample[:, -18:], torch.nan_to_num(action.normalized_actions).clamp(-1, 1))
+        torch.testing.assert_close(batch.sample[:, -18:], torch.nan_to_num(
+            action.normalized_actions, nan=0., posinf=1., neginf=-1.
+        ))
         torch.testing.assert_close(batch.state_valid, torch.tensor([False, False, True, True]))
+
+    def test_reset_diagnostics_survive_native_log_replacement_and_flush_once_at_same_step(self):
+        env, _, _ = native_fixture()
+        task.reset_task(env)
+        state = task.get_task_state(env)
+        reads = env.sensor_read_count
+        diagnostics = {'Reset/robot_fallback_fraction': torch.tensor(.25),
+                       'Reset/robot_retry_rounds': torch.tensor(2.)}
+        env._episode_reset = SimpleNamespace(pending_reset_metrics=diagnostics)
+        # Native _reset_idx replaces extras['log'] after the event has returned.
+        native_log = {'Episode_Reward/clearance': torch.tensor(3.)}
+        env.extras['log'] = native_log
+        self.assertIs(task.get_task_state(env), state)
+        self.assertIs(env.extras['log'], native_log)
+        self.assertEqual(set(native_log), {*diagnostics, 'Episode_Reward/clearance'})
+        for name, value in diagnostics.items():
+            self.assertIs(native_log[name], value)
+        self.assertIsNone(env._episode_reset.pending_reset_metrics)
+        self.assertEqual(env.sensor_read_count, reads)
+        # A later native log reset must not receive stale metrics from an old reset.
+        env.extras['log'] = {'Episode_Termination/time_out': torch.tensor(.5)}
+        task.get_task_state(env)
+        self.assertEqual(set(env.extras['log']), {'Episode_Termination/time_out'})
+        env._episode_reset.pending_reset_metrics = diagnostics
+        del env.extras['log']
+        task.get_task_state(env)
+        self.assertEqual(set(env.extras['log']), set(diagnostics))
+        self.assertEqual(env.sensor_read_count, reads)
 
     def test_missing_scene_and_sensor_provider_fail_before_native_binding(self):
         env, _, _ = native_fixture()
@@ -2267,7 +2402,8 @@ class EpisodeResetTests(unittest.TestCase):
             setattr(robot.data, field, value)
         robot.root_physx_view = SimpleNamespace(get_link_transforms=Mock(return_value=torch.zeros(5, 1, 7)))
         env.cfg = SimpleNamespace(seed=73, target_asset=None, blocker_asset=None,
-                                  initial_vision=SimpleNamespace(max_layout_attempts=2))
+                                  initial_vision=SimpleNamespace(max_layout_attempts=2),
+                                  robot_start=task.RobotStartRules())
         env.spawn_rules, env.spawn_geometries = task.SpawnRules(), ()
         env.task_scene_data.lower = torch.tensor([[-.05, -.05, 0.]]).repeat(4, 1)
         env.task_scene_data.upper = torch.tensor([[.05, .05, .1]]).repeat(4, 1)
@@ -2390,11 +2526,12 @@ class EpisodeResetTests(unittest.TestCase):
         self.assertEqual(int(env._episode_reset.reset_counts.sum()), 512)
 
     @staticmethod
-    def shared_fixture():
-        env, template = episode_reset_fixture(selected=1)
+    def shared_fixture(batch=5):
+        env, template = episode_reset_fixture(batch=batch, selected=1)
         env.common_step_counter, env.max_episode_length = 0, 400
         env.episode_length_buf = torch.zeros(env.num_envs, dtype=torch.long)
-        env.cfg = SimpleNamespace(seed=73, initial_vision=SimpleNamespace(max_layout_attempts=2))
+        env.cfg = SimpleNamespace(seed=73, initial_vision=SimpleNamespace(max_layout_attempts=2),
+                                  robot_start=task.RobotStartRules())
         env._episode_reset.specs = (None,) * 4
         env._episode_reset.support_heights = torch.ones(4)
         sample = task.SceneSample(
@@ -2499,16 +2636,99 @@ class EpisodeResetTests(unittest.TestCase):
             self.assertIsNot(env._episode_reset.shared_inputs, cached)
             self.assertEqual(propose.call_count, 2)
 
-    def test_shared_ik_exhaustion_does_not_commit_or_change_cache(self):
+    def test_shared_ik_exhaustion_restores_verified_anchor_without_changing_neighboring_rows(self):
+        import json
+        import tempfile
         env, template, sample = self.shared_fixture()
         env._episode_reset.shared_template, env._episode_reset.shared_sample = template, sample
         env._episode_reset.next_scene_step = 400
-        with patch.object(task, '_sample_robot_starts', return_value=[None, None]):
-            with self.assertRaisesRegex(RuntimeError, 'robot-start search exhausted'):
+        before = {field.name: getattr(template, field.name).clone() for field in dataclasses.fields(template)}
+        calls = []
+        def fail(_env, samples, seeds, **kwargs):
+            calls.append(kwargs)
+            return [None] * len(samples)
+        with tempfile.TemporaryDirectory(prefix='contact_reset_diagnostics_') as directory:
+            env.cfg.log_dir = directory
+            with patch.object(task, '_sample_robot_starts', side_effect=fail):
                 task.reset_scene(env, torch.tensor([4, 1]))
+            records = [json.loads(line) for line in (Path(directory) / 'robot_start_fallbacks.jsonl').read_text().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['env_ids'], [4, 1])
+        self.assertEqual(records[0]['reset_counts'], [0, 0])
+        self.assertEqual(records[0]['reason'], 'bounded_robot_start_search_exhausted_verified_template_restored')
+        self.assertIsNone(env._episode_reset.last_robot_start_fallback)
+        rules = env.cfg.robot_start
+        self.assertEqual(len(calls), rules.reset_attempts + rules.recovery_attempts)
+        self.assertEqual([bool(call.get('recovery', False)) for call in calls],
+                         [False] * rules.reset_attempts + [True] * rules.recovery_attempts)
+        self.assertEqual(env.scene['object_collection'].writes, 1)
+        torch.testing.assert_close(env._episode_reset.reset_counts, torch.tensor([0, 1, 0, 0, 1]))
+        torch.testing.assert_close(env.scene['robot'].position[[4, 1]], template.joint_positions.expand(2, -1))
+        torch.testing.assert_close(env._episode_reset.robot_tcp[[4, 1]],
+                                   template.robot_tcp + env.scene.env_origins[[4, 1]])
+        self.assertTrue((env.scene['robot'].position[[0, 2, 3]] == -9.).all())
+        self.assertTrue((env.scene['object_collection'].state[[0, 2, 3]] == -7.).all())
+        self.assertIs(env._episode_reset.shared_template, template)
+        self.assertIs(env._episode_reset.shared_sample, sample)
+        self.assertEqual(env._episode_reset.pending_reset_metrics['Reset/robot_start_fallback_count'], 2.)
+        self.assertEqual(env._episode_reset.pending_reset_metrics['Reset/robot_start_fallback_fraction'], 1.)
+        for field, expected in before.items():
+            torch.testing.assert_close(getattr(template, field), expected, rtol=0, atol=0)
+
+    def test_1024_shared_reset_preserves_accepted_starts_when_one_row_uses_anchor_recovery(self):
+        env, template, sample = self.shared_fixture(batch=1024)
+        calls, first = [], None
+        def starts(env, samples, seeds, **kwargs):
+            nonlocal first
+            calls.append((seeds.copy(), kwargs))
+            if first is None:
+                first = self.shared_starts(env, samples, seeds)
+                result = first.copy()
+                result[513] = None
+                return result
+            return [None] * len(samples)
+        ids = torch.arange(1024).roll(17)
+        with patch.object(task, '_sample_robot_starts', side_effect=starts):
+            batch = task._shared_reset_batch(env, env._episode_reset, ids, template, sample)
+        rules = env.cfg.robot_start
+        self.assertEqual([len(seeds) for seeds, _ in calls],
+                         [1024] + [1] * (rules.reset_attempts + rules.recovery_attempts - 1))
+        mask = torch.arange(1024) != 513
+        expected = torch.stack([start[0] for start in first])
+        torch.testing.assert_close(batch.joint_positions[mask], expected[mask], rtol=0, atol=0)
+        torch.testing.assert_close(batch.joint_positions[513], template.joint_positions[0], rtol=0, atol=0)
+        torch.testing.assert_close(batch.robot_tcp[513], template.robot_tcp[0], rtol=0, atol=0)
+        torch.testing.assert_close(batch.geometry_b, template.geometry_b.expand(1024, -1, -1), rtol=0, atol=0)
+        torch.testing.assert_close(batch.object_state, template.object_state.expand(1024, -1, -1), rtol=0, atol=0)
         self.assertEqual(env.scene['object_collection'].writes, 0)
         self.assertEqual(int(env._episode_reset.reset_counts.sum()), 0)
-        self.assertIs(env._episode_reset.shared_template, template)
+        fallback = env._episode_reset.last_robot_start_fallback
+        self.assertEqual(fallback['env_ids'], [int(ids[513])])
+        self.assertEqual(fallback['seeds'], [int(batch.seeds[513])])
+        self.assertEqual(fallback['reset_counts'], [0])
+        metrics = env._episode_reset.pending_reset_metrics
+        self.assertEqual(metrics['Reset/robot_start_fallback_fraction'], 1. / 1024)
+        self.assertEqual(metrics['Reset/robot_start_fallback_total'], 1.)
+
+    def test_shared_recovery_accepts_new_pose_before_template_fallback_and_counts_separately(self):
+        env, template, sample = self.shared_fixture()
+        calls, accepted = [], None
+        def starts(env, samples, seeds, **kwargs):
+            nonlocal accepted
+            calls.append(kwargs)
+            if not kwargs['recovery']:
+                return [None] * len(samples)
+            accepted = self.shared_starts(env, samples, seeds)
+            return accepted
+        with patch.object(task, '_sample_robot_starts', side_effect=starts):
+            batch = task._shared_reset_batch(env, env._episode_reset, torch.tensor([4, 1]), template, sample)
+        self.assertEqual(len(calls), env.cfg.robot_start.reset_attempts + 1)
+        torch.testing.assert_close(batch.joint_positions, torch.stack([row[0] for row in accepted]), rtol=0, atol=0)
+        self.assertFalse(torch.equal(batch.joint_positions, template.joint_positions.expand(2, -1)))
+        self.assertIsNone(getattr(env._episode_reset, 'last_robot_start_fallback', None))
+        metrics = env._episode_reset.pending_reset_metrics
+        self.assertEqual(metrics['Reset/robot_start_recovery_count'], 2.)
+        self.assertEqual(metrics['Reset/robot_start_fallback_count'], 0.)
 
     def test_episode_seeds_are_reproducible_and_independent_of_reset_batch_order(self):
         expected = {(index, count): task._episode_seed(123, index, count)
@@ -2521,6 +2741,73 @@ class EpisodeResetTests(unittest.TestCase):
                 self.assertGreaterEqual(value, 0)
                 self.assertLess(value, 2**63)
         self.assertNotEqual(task._episode_seed(123, 7, 2), task._episode_seed(124, 7, 2))
+
+    def test_shared_domain_probe_uses_distinct_single_targets_and_preserves_anchor_inputs(self):
+        env, template, sample = self.shared_fixture()
+        start = (template.joint_positions[0], template.robot_regions[0], template.robot_tcp[0], .08, 1)
+        proposals = task._episode_proposals([sample], 4, 'cpu', torch.float32)
+        inputs_before = [value.clone() for value in proposals]
+        outcomes = [start, None, start, None, start, None, start, None]
+        with patch.object(task, '_sample_robot_starts', return_value=outcomes) as sampler:
+            actual = task._robot_start_domain_successes(env, sample, start, proposals, 571)
+            again = task._robot_start_domain_successes(env, sample, start, proposals, 571)
+        self.assertEqual((actual, again), (4, 4))
+        first, second = sampler.call_args_list
+        expected_seeds = [task._episode_seed(571, index, 0) for index in range(8)]
+        self.assertEqual(first.args[2], expected_seeds)
+        self.assertEqual(second.args[2], expected_seeds)
+        self.assertEqual(len(set(expected_seeds)), 8)
+        self.assertTrue(all(value is sample for value in first.args[1]))
+        self.assertEqual(first.kwargs['max_attempts'], 1)
+        self.assertFalse(first.kwargs['return_tensors'])
+        cache = first.kwargs['scene_cache']
+        self.assertIs(cache.proposals, proposals)
+        self.assertIs(cache.sample, sample)
+        torch.testing.assert_close(cache.template.joint_positions, template.joint_positions)
+        torch.testing.assert_close(cache.template.robot_tcp, template.robot_tcp)
+        for value, original in zip(proposals, inputs_before):
+            torch.testing.assert_close(value, original, rtol=0, atol=0)
+        result = torch.zeros(8, 17)
+        result[:4, -1] = 1.
+        # Tensor-return counting is host-only arithmetic here; no GPU runtime is required.
+        with patch.object(task.torch, 'device', return_value=SimpleNamespace(type='cuda')), \
+             patch.object(task, '_sample_robot_starts', return_value=(result, template.robot_regions)) as sampler:
+            self.assertEqual(task._robot_start_domain_successes(env, sample, start, proposals, 571), 4)
+        self.assertTrue(sampler.call_args.kwargs['return_tensors'])
+
+    def test_shared_builder_rejects_narrow_anchor_domain_then_accepts_threshold(self):
+        env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
+        env._episode_reset.vision.capture_batch.side_effect = lambda requests, object_poses, root_poses: [
+            snapshot(request['env_id'], pose) for request, pose in zip(requests, object_poses)]
+        with patch.object(task, 'sample_scene', side_effect=sample_scene) as propose, \
+             patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
+             patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
+             patch.object(task, '_robot_start_domain_successes', side_effect=[3, 4]) as domain, \
+             patch.object(task, '_check_physical_robot_starts', return_value=torch.ones(1, dtype=torch.bool)) as physical:
+            template, sample = task._build_episode_batch(env, env._episode_reset, torch.tensor([0]), scene_generation=9)
+        self.assertEqual((propose.call_count, domain.call_count, physical.call_count), (2, 2, 1))
+        self.assertEqual(env.scene['object_collection'].writes, 1)
+        self.assertEqual(template.object_state.shape[0], 1)
+        self.assertAlmostEqual(sample.positions[0][0], -.78)
+        self.assertNotEqual(domain.call_args_list[0].args[-1], domain.call_args_list[1].args[-1])
+        self.assertEqual(int(env._episode_reset.reset_counts.sum()), 0)
+
+    def test_shared_builder_rejects_anchor_only_domain_and_rolls_back(self):
+        env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
+        before = env.scene['object_collection'].state.clone()
+        env._episode_reset.vision.capture_batch.side_effect = lambda requests, object_poses, root_poses: [
+            snapshot(request['env_id'], pose) for request, pose in zip(requests, object_poses)]
+        with patch.object(task, 'sample_scene', side_effect=sample_scene), \
+             patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
+             patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
+             patch.object(task, '_robot_start_domain_successes', return_value=1) as domain, \
+             patch.object(task, '_check_physical_robot_starts') as physical:
+            with self.assertRaisesRegex(RuntimeError, 'only 1/8.*requires 4'):
+                task._build_episode_batch(env, env._episode_reset, torch.tensor([0]), scene_generation=9)
+        self.assertEqual(domain.call_count, env.cfg.initial_vision.max_layout_attempts)
+        physical.assert_not_called()
+        torch.testing.assert_close(env.scene['object_collection'].state, before, rtol=0, atol=0)
+        self.assertEqual(int(env._episode_reset.reset_counts.sum()), 0)
 
     def test_builder_retries_only_rejected_rows_and_retains_corresponding_initial_vision(self):
         env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
@@ -3145,6 +3432,75 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
                                          torch.eye(3, device='cuda').expand(8, -1, -1), truth[:8])
         self.assertFalse(valid.any())
 
+    @unittest.skipUnless(torch.cuda.is_available(), 'Robot-start graph capture requires CUDA.')
+    def test_robot_start_graph_captures_and_replays_updated_anchor_inputs(self):
+        # Exercise the actual sampler graph, rather than only its IK kernel.
+        # CPU->CUDA constant construction inside candidate_inputs must fail
+        # this test at capture, even if every standalone CUDA kernel passes.
+        device = 'cuda'
+        default = torch.zeros(7, device=device)
+        arm_ids = torch.arange(6, device=device)
+        constants = dict(default=default, arm_ids=arm_ids,
+                         scene_half=torch.full((2, 3), .02, device=device))
+
+        def forward(arm):
+            cosine, sine = arm[:, 0].cos(), arm[:, 0].sin()
+            zero, one = torch.zeros_like(cosine), torch.ones_like(cosine)
+            rotation = torch.stack((cosine, -sine, zero, sine, cosine, zero, zero, zero, one), -1)
+            tcp = torch.eye(4, device=device).expand(len(arm), -1, -1).clone()
+            tcp[:, :3, :3] = rotation.reshape(-1, 3, 3)
+            tcp[:, 0, 3], tcp[:, 2, 3] = -.24, 1.29
+            return None, None, tcp
+
+        def solve(positions, rotations, seeds, *, active_mask):
+            # Encode both graph inputs in the selected result. The final joint
+            # carries a rotation component solely for this dispatch regression.
+            q = torch.cat((seeds, rotations[:, :1, 0]), -1)
+            tcp = torch.eye(4, device=device).expand(len(seeds), -1, -1).clone()
+            tcp[:, :3, 3], tcp[:, :3, :3] = positions, rotations
+            frames = positions.new_zeros((len(seeds), 1, 4, 4))
+            return q, active_mask.clone(), frames, frames, tcp
+
+        def clear(_env, frames, *_args, candidate_valid=None):
+            return candidate_valid, frames.new_full((len(frames),), .1)
+
+        model = SimpleNamespace(joint_names=tuple(range(7)), base_origin=np.zeros(3),
+                                _tensor_constants=lambda *_: constants,
+                                arm_forward_batch=forward, solve_batch=solve)
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        rules = task.RobotStartRules(max_attempts=8, ik_batch_size=16, orientation_range=(0., 0., 0.))
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry,
+                              spawn_rules=task.SpawnRules(x_range=(-.8, -.4)),
+                              cfg=SimpleNamespace(robot_start=rules), device=device)
+        anchor = default[None].clone()
+        anchor[:, 0] = .2
+        cache = SimpleNamespace(sample=sample, proposals=task._episode_proposals([sample], 2, device, torch.float32),
+                                robot=None, template=SimpleNamespace(joint_positions=anchor))
+        boxes = (torch.zeros((1, 1, 3), device=device),
+                 torch.eye(3, device=device).reshape(1, 1, 3, 3),
+                 torch.ones((1, 1, 3), device=device),
+                 torch.zeros((1, 1), device=device, dtype=torch.bool))
+        wp.init()
+        with patch.object(task, '_scene_boxes_tensor', return_value=boxes), \
+             patch.object(task, '_robot_candidate_clearance', side_effect=clear), torch.inference_mode():
+            first, _ = task._sample_robot_starts(env, [sample]*2, [17, 18], scene_cache=cache, return_tensors=True)
+            graph = next(iter(model._robot_start_graphs.values()))[1]
+            replay, _ = task._sample_robot_starts(env, [sample]*2, [17, 18], scene_cache=cache, return_tensors=True)
+            torch.testing.assert_close(replay, first, rtol=0, atol=0)
+            torch.testing.assert_close(first[:, :6], anchor[:, :6].expand(2, -1))
+            torch.testing.assert_close(first[:, 6], anchor[:, 0].cos().expand(2))
+            updated = anchor.clone()
+            updated[:, :6] += .5
+            cache.template = SimpleNamespace(joint_positions=updated)
+            changed, _ = task._sample_robot_starts(env, [sample]*2, [17, 18], scene_cache=cache, return_tensors=True)
+            self.assertEqual(len(model._robot_start_graphs), 1)
+            self.assertIs(next(iter(model._robot_start_graphs.values()))[1], graph)
+            torch.testing.assert_close(changed[:, :6], updated[:, :6].expand(2, -1))
+            torch.testing.assert_close(changed[:, 6], updated[:, 0].cos().expand(2))
+            self.assertTrue((changed[:, -1] == 1).all())
+
     def test_collapsed_tensor_fk_matches_all_scalar_links_including_reverse_and_default_finger(self):
         model = self.model()
         q = torch.tensor(np.tile(model.default_joint_positions, (17, 1)), dtype=torch.float64)
@@ -3263,7 +3619,7 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
             rules.ik_batch_size = cap
             proposals = []
             def solve(positions, rotations, seeds):
-                proposals.append(seeds.clone())
+                proposals.append(torch.cat((positions, rotations.flatten(1), seeds), -1))
                 n = len(seeds)
                 # Force all proposals to be visited, isolating RNG/batching
                 # from solver convergence and geometric acceptance.
@@ -3281,6 +3637,76 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
                 expected = actual
             else:
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_shared_start_perturbs_eef_orientation_and_retries_same_target_from_anchor_first(self):
+        model = self.model()
+        model.shelf_boxes = []
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        rules = task.RobotStartRules(max_attempts=80)
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry,
+                              spawn_rules=task.SpawnRules(x_range=(-.8, -.4)),
+                              cfg=SimpleNamespace(robot_start=rules), device='cpu')
+        anchor = torch.tensor(model.default_joint_positions[None], dtype=torch.float32)
+        anchor[:, :6] += torch.tensor([.05, -.1, .12, -.07, .03, .04])
+        nominal = model.arm_forward_batch(anchor[:, :6])[2][0, :3, :3]
+        proposals = task._episode_proposals([sample], 2, 'cpu', torch.float32)
+        cache = SimpleNamespace(sample=sample, proposals=proposals, robot=None,
+                                template=SimpleNamespace(joint_positions=anchor))
+        captured = []
+
+        def solve(positions, rotations, seeds):
+            captured.append((positions.clone(), rotations.clone(), seeds.clone()))
+            n = len(seeds)
+            tcp = torch.eye(4).expand(n, -1, -1).clone()
+            tcp[:, :3, 3], tcp[:, :3, :3] = positions, rotations
+            return (anchor.expand(n, -1).clone(), torch.zeros(n, dtype=torch.bool),
+                    torch.zeros(n, 7, 4, 4), torch.zeros(n, 6, 4, 4), tcp)
+
+        with patch.object(model, 'solve_batch', side_effect=solve), \
+             patch.object(task, '_robot_candidate_clearance',
+                          side_effect=lambda _env, frames, *_a: (torch.ones(len(frames), dtype=torch.bool),
+                                                                 torch.full((len(frames),), .1))):
+            self.assertEqual(task._sample_robot_starts(env, [sample], [571], scene_cache=cache), [None])
+        positions, rotations, seeds = (torch.cat([candidate[column] for candidate in captured]) for column in range(3))
+        self.assertEqual(len(positions), rules.max_attempts)
+        # A pose is proposed once, then four IK branches solve exactly that pose.
+        torch.testing.assert_close(positions.reshape(-1, 4, 3), positions[::4, None].expand(-1, 4, -1), rtol=0, atol=0)
+        torch.testing.assert_close(rotations.reshape(-1, 4, 3, 3),
+                                   rotations[::4, None].expand(-1, 4, -1, -1), rtol=0, atol=0)
+        torch.testing.assert_close(seeds[::4], anchor[:, :6].expand(len(seeds) // 4, -1), rtol=0, atol=0)
+        self.assertTrue((seeds[1::4] - seeds[::4]).abs().any())
+        relative = nominal.T[None] @ rotations[::4]
+        perturbation = torch.tensor(Rotation.from_matrix(relative.numpy()).as_rotvec())
+        limits = torch.tensor(rules.orientation_range, dtype=perturbation.dtype)
+        self.assertTrue((perturbation.abs() <= limits + 2.e-6).all())
+        self.assertTrue((perturbation > 0).any(0).all())
+        self.assertTrue((perturbation < 0).any(0).all())
+        self.assertGreater(float(perturbation.abs().max()), math.radians(1.))
+        torch.testing.assert_close(rotations.transpose(-1, -2) @ rotations,
+                                   torch.eye(3).expand(len(rotations), -1, -1), atol=3.e-6, rtol=0)
+        geometry_cache = cache.robot
+        updated_q = anchor.clone()
+        updated_q[:, 0] += .2
+        cache.template = SimpleNamespace(joint_positions=updated_q)
+        captured.clear()
+        with patch.object(model, 'solve_batch', side_effect=solve), \
+             patch.object(task, '_robot_candidate_clearance',
+                          side_effect=lambda _env, frames, *_a: (torch.ones(len(frames), dtype=torch.bool),
+                                                                 torch.full((len(frames),), .1))):
+            result, bounds = task._sample_robot_starts(
+                env, [sample], [571], scene_cache=cache, max_attempts=1, return_tensors=True)
+        self.assertEqual(result.shape, (1, len(model.joint_names) + 5))
+        self.assertEqual(bounds.shape, (1, 6))
+        self.assertEqual(float(result[0, -1]), 0.)
+        self.assertEqual(len(captured), 1)
+        torch.testing.assert_close(captured[0][2], updated_q[:, :6], rtol=0, atol=0)
+        updated_nominal = model.arm_forward_batch(updated_q[:, :6])[2][0, :3, :3]
+        torch.testing.assert_close(updated_nominal.T[None] @ captured[0][1], relative[:1], atol=2.e-6, rtol=0)
+        # Refresh only the anchor: immutable scene boxes/regions remain reusable.
+        self.assertIs(cache.robot, geometry_cache)
+        self.assertIs(cache.start_anchor[0], cache.template)
 
     def test_shared_robot_geometry_cache_reuses_boxes_and_invalidates_on_rule_change(self):
         model = self.model()
@@ -3315,6 +3741,53 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for actual, expected in zip(proposals, before):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_robot_start_recovery_restricts_position_and_rotation_around_same_scene_anchor(self):
+        model = self.model()
+        model.shelf_boxes = []
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        rules, spawn = task.RobotStartRules(), task.SpawnRules(x_range=(-.8, -.4))
+        bounds = np.array(task.robot_start_region(sample, geometry, spawn, rules))
+        center = (bounds[::2] + bounds[1::2]) / 2
+        anchor = torch.tensor(model.default_joint_positions[None], dtype=torch.float32)
+        initial_tcp = model.arm_forward_batch(anchor[:, :6])[2][0]
+        model.root_transform[:3, 3] += center - initial_tcp[:3, 3].numpy()
+        model._tensor_cache = {}
+        nominal = model.arm_forward_batch(anchor[:, :6])[2][0, :3, :3]
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry, spawn_rules=spawn,
+                              cfg=SimpleNamespace(robot_start=rules), device='cpu')
+        cache = SimpleNamespace(sample=sample, proposals=task._episode_proposals([sample], 2, 'cpu', torch.float32),
+                                robot=None, template=SimpleNamespace(joint_positions=anchor))
+        captured = []
+        def solve(positions, rotations, seeds):
+            captured.append((positions.clone(), rotations.clone()))
+            n = len(seeds)
+            tcp = torch.eye(4).expand(n, -1, -1).clone()
+            tcp[:, :3, 3], tcp[:, :3, :3] = positions, rotations
+            return (anchor.expand(n, -1).clone(), torch.zeros(n, dtype=torch.bool),
+                    torch.zeros(n, 7, 4, 4), torch.zeros(n, 6, 4, 4), tcp)
+        with patch.object(model, 'solve_batch', side_effect=solve), \
+             patch.object(task, '_robot_candidate_clearance',
+                          side_effect=lambda _env, frames, *_a: (torch.ones(len(frames), dtype=torch.bool),
+                                                                 torch.full((len(frames),), .1))):
+            _, actual_bounds = task._sample_robot_starts(
+                env, [sample], [912], scene_cache=cache, recovery=True, max_attempts=9, return_tensors=True)
+        position, rotation = (torch.cat([value[column] for value in captured]) for column in range(2))
+        half = torch.tensor(rules.recovery_position_half_width)
+        expected_low = torch.tensor(center, dtype=half.dtype) - half
+        expected_high = torch.tensor(center, dtype=half.dtype) + half
+        torch.testing.assert_close(actual_bounds[0, ::2], expected_low, atol=2.e-7, rtol=0)
+        torch.testing.assert_close(actual_bounds[0, 1::2], expected_high, atol=2.e-7, rtol=0)
+        self.assertTrue((position >= actual_bounds[0, ::2]).all())
+        self.assertTrue((position <= actual_bounds[0, 1::2]).all())
+        local = torch.tensor(Rotation.from_matrix((nominal.T[None] @ rotation).numpy()).as_rotvec())
+        limits = torch.tensor(rules.orientation_range) * rules.recovery_rotation_scale
+        self.assertTrue((local.abs() <= limits + 2.e-6).all())
+        self.assertGreater(float(local.abs().max()), 0.)
+        self.assertEqual(len(position), 9)
+        self.assertEqual(rules.max_attempts, 80)
 
     def test_tensor_rotation_error_handles_exact_pi_without_silent_zero(self):
         model = self.model()

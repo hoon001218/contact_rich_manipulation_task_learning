@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from rsl_rl.modules import GaussianDistribution
 import triton
 import triton.language as tl
 
@@ -248,7 +249,7 @@ class SceneGraphEncoder(nn.Module):
 
 
 class ContactManipulationPolicy(nn.Module):
-    """Tanh-Gaussian 18D actor and a critic sharing the scene encoder and final MLP."""
+    """Gaussian 18D actor and a critic sharing the scene encoder and final MLP."""
 
     def __init__(self, cfg: ModelCfg | None = None):
         super().__init__()
@@ -261,7 +262,9 @@ class ContactManipulationPolicy(nn.Module):
         )
         self.actor = nn.Linear(self.cfg.latent_dim, self.cfg.action_dim)
         self.critic = nn.Linear(self.cfg.latent_dim, 1)
-        self.log_std = nn.Parameter(torch.full((self.cfg.action_dim,), math.log(self.cfg.initial_std)))
+        self.distribution = GaussianDistribution(
+            self.cfg.action_dim, init_std=self.cfg.initial_std, std_type="log",
+        )
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
 
@@ -302,61 +305,18 @@ class ContactManipulationPolicy(nn.Module):
         # Standalone final-state/bootstrap queries only need the critic head.
         return self.critic(self.encode(observation, masks=masks)).squeeze(-1)
 
-    def _distribution(self, mean: Tensor) -> torch.distributions.Normal:
-        # Tensor validation in Normal performs GPU-to-host Boolean reads on
-        # construction and log_prob. Scale positivity is guaranteed here.
-        return torch.distributions.Normal(
-            mean, self.log_std.clamp(-5.0, 2.0).exp().expand_as(mean), validate_args=False,
-        )
-
-    @staticmethod
-    def _bounded_action(unconstrained: Tensor) -> Tensor:
-        # Leave a representable inverse even when float32 tanh rounds to +/-1.
-        return unconstrained.tanh().clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-
-    @staticmethod
-    def _action_log_prob(distribution: torch.distributions.Normal, actions: Tensor) -> Tensor:
-        bounded = actions.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-        unconstrained = torch.atanh(bounded)
-        # Stable exact log|d tanh(u)/du| for interior actions.
-        log_jacobian = 2.0 * (math.log(2.0) - unconstrained - F.softplus(-2.0 * unconstrained))
-        elementwise = distribution.log_prob(unconstrained) - log_jacobian
-        # Numerical clipping puts the tail probability at each boundary.  Use
-        # that actual probability mass instead of attributing a distant latent
-        # sample to the edge density; PPO ratios then remain consistent even
-        # when a large mean or variance saturates tanh.
-        limit = torch.atanh(actions.new_tensor(1.0 - 1e-6))
-        upper = torch.special.log_ndtr((distribution.loc - limit) / distribution.scale)
-        lower = torch.special.log_ndtr((-limit - distribution.loc) / distribution.scale)
-        elementwise = torch.where(actions >= 1.0 - 1e-6, upper, elementwise)
-        elementwise = torch.where(actions <= -1.0 + 1e-6, lower, elementwise)
-        return elementwise.sum(-1)
-
     def act(self, observation: Tensor, deterministic: bool = False, *, masks: PolicyMasks) -> tuple[Tensor, Tensor, Tensor]:
         mean, value = self.forward(observation, masks=masks)
-        distribution = self._distribution(mean)
-        unconstrained = mean if deterministic else distribution.rsample()
-        actions = self._bounded_action(unconstrained)
-        return actions, self._action_log_prob(distribution, actions), value
+        self.distribution.update(mean)
+        actions = self.distribution.deterministic_output(mean) if deterministic else self.distribution.sample()
+        return actions, self.distribution.log_prob(actions), value
 
     def evaluate_actions(
-        self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks, entropy_noise: Tensor | None = None,
+        self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks,
     ) -> tuple[Tensor, Tensor, Tensor]:
         mean, value = self.forward(observation, masks=masks)
         if actions.shape != mean.shape:
             raise ValueError(f"Actions must have shape {tuple(mean.shape)}, got {tuple(actions.shape)}.")
-        distribution = self._distribution(mean)
-        log_prob = self._action_log_prob(distribution, actions)
-        # Squashed-Gaussian entropy has no analytic expression.  Use one
-        # differentiable Monte Carlo sample of the actual bounded distribution.
-        # A caller splitting a PPO minibatch can supply slices of one shared
-        # noise draw so tensor chunk sizes do not change that sampled objective.
-        if entropy_noise is None:
-            sample = distribution.rsample()
-        else:
-            if entropy_noise.shape != mean.shape or entropy_noise.device != mean.device or entropy_noise.dtype != mean.dtype:
-                raise ValueError("Entropy noise must match the action mean shape, device, and dtype.")
-            sample = mean + distribution.scale * entropy_noise
-        entropy = -self._action_log_prob(distribution, self._bounded_action(sample))
-        return log_prob, entropy, value
+        self.distribution.update(mean)
+        return self.distribution.log_prob(actions), self.distribution.entropy, value
 

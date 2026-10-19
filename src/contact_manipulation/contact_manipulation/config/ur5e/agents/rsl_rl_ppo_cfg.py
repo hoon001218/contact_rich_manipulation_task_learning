@@ -16,7 +16,9 @@ class ContactActorCfg:
     # Inductor fuses the unchanged FP32 model/mask math; no CUDA graph replay.
     compile_model: bool = True
     obs_normalization: bool = False
-    distribution_cfg: dict = {"class_name": "tanh_gaussian", "init_std": ModelCfg().initial_std}
+    distribution_cfg: dict = {
+        "class_name": "GaussianDistribution", "std_type": "log", "init_std": ModelCfg().initial_std,
+    }
     # Compatibility with Isaac Lab's native RSL-RL configuration migration.
     stochastic: bool = False
 
@@ -58,7 +60,7 @@ class ContactManipulationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 50
     experiment_name = "contact_manipulation"
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
-    clip_actions = None  # The research actor already emits bounded tanh actions.
+    clip_actions = None  # Match the min baseline's Gaussian output without an extra action clip.
     actor = ContactActorCfg()
     critic = ContactCriticCfg()
     algorithm = ContactPpoAlgorithmCfg()

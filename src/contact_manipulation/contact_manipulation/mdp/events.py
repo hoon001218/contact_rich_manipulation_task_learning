@@ -10,7 +10,9 @@ from collections.abc import Mapping
 from functools import lru_cache
 import math
 import random
+import json
 from itertools import combinations
+from pathlib import Path
 from typing import Sequence
 from types import SimpleNamespace
 
@@ -613,7 +615,7 @@ def _transition_tensors(env, state, rows, values):
     sample = dynamic_sample(
         joint_pos, joint_vel, tcp_pose, wrench,
         torch.linalg.vector_norm(tactile_force, dim=-1) > state.cfg.tactile_threshold,
-        tactile_valid, torch.nan_to_num(actions[rows], nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1, 1), joint_position_scale=state.cfg.joint_position_scale,
+        tactile_valid, torch.nan_to_num(actions[rows], nan=0.0, posinf=1.0, neginf=-1.0), joint_position_scale=state.cfg.joint_position_scale,
         joint_velocity_scale=state.cfg.joint_velocity_scale, wrench_ranges=b.ranges,
     )
     valid = (torch.isfinite(sample).all(-1) & torch.isfinite(raw_wrench).all(-1)
@@ -791,6 +793,13 @@ def get_task_state(env):
         env.extras["terminal_observation"] = state.observation
         env.extras["terminated"] = (state.success | state.failure).clone()
         env.extras["terminal_env_ids"] = state.empty_env_ids
+    # Native _reset_idx clears extras['log'] after calling reset events. Merge
+    # their small diagnostics here, during the subsequent observation read.
+    runtime = getattr(env, "_episode_reset", None)
+    metrics = getattr(runtime, "pending_reset_metrics", None)
+    if metrics is not None:
+        env.extras.setdefault("log", {}).update(metrics)
+        runtime.pending_reset_metrics = None
     return state
 
 
@@ -865,6 +874,13 @@ class RobotStartRules:
     collision_clearance: float = 0.015
     max_attempts: int = 80
     ik_batch_size: int = 1024
+    orientation_range: tuple[float, float, float] = (math.radians(10.0),) * 3
+    reset_attempts: int = 3
+    recovery_attempts: int = 2
+    recovery_position_half_width: tuple[float, float, float] = (0.02, 0.02, 0.015)
+    recovery_rotation_scale: float = 0.25
+    domain_probe_count: int = 8
+    domain_probe_min_success: int = 4
     enabled: bool = True
 
 
@@ -966,6 +982,18 @@ def footprint_polygon(geometry: ObjectGeometry, center_xy: Point, yaw: float) ->
 
 
 def _validate_robot_start_rules(spawn_rules, robot_start):
+    for name in ("orientation_range", "recovery_position_half_width"):
+        values = getattr(robot_start, name)
+        if len(values) != 3 or not all(math.isfinite(value) and value >= 0 for value in values):
+            raise ValueError(f"Robot start {name} must contain three finite nonnegative values.")
+    for name in ("reset_attempts", "recovery_attempts", "domain_probe_count", "domain_probe_min_success"):
+        value = getattr(robot_start, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"Robot start {name} must be a positive integer.")
+    if robot_start.domain_probe_min_success > robot_start.domain_probe_count:
+        raise ValueError("Robot start domain probe successes cannot exceed its candidate count.")
+    if not math.isfinite(robot_start.recovery_rotation_scale) or not 0 < robot_start.recovery_rotation_scale <= 1:
+        raise ValueError("Robot start recovery_rotation_scale must be in (0, 1].")
     values = (
         *robot_start.front_distance_range, robot_start.shelf_front_clearance,
         robot_start.lateral_half_width, *robot_start.height_above_shelf,
@@ -3087,12 +3115,13 @@ def _robot_start_noise(seeds: wp.array(dtype=wp.int64), noise: wp.array3d(dtype=
     row, attempt = wp.tid()
     state = wp.rand_init(int(seeds[row] & wp.int64(4294967295)),
                          attempt ^ int(seeds[row] >> wp.int64(32)) ^ 1563339036)
-    for component in range(9):
+    for component in range(12):
         noise[row, attempt, component] = wp.randf(state)
 
 
 @torch.no_grad()
-def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=None, return_tensors=False):
+def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=None, return_tensors=False,
+                         recovery=False, max_attempts=None):
     """Sample continuous starts with bounded batched GPU IK and OBB acceptance.
 
     Returns one device-tensor start tuple or ``None`` per requested scene. Failed
@@ -3108,6 +3137,9 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
     model, rules = env.robot_pose_model, env.cfg.robot_start
     device, dtype = env.device, torch.float32
     count = len(samples)
+    attempts_limit = rules.max_attempts if max_attempts is None else max_attempts
+    if not isinstance(attempts_limit, int) or isinstance(attempts_limit, bool) or attempts_limit <= 0:
+        raise ValueError("Robot start candidate budget must be a positive integer.")
     if not isinstance(rules.ik_batch_size, int) or isinstance(rules.ik_batch_size, bool) or rules.ik_batch_size <= 0:
         raise ValueError("Robot start ik_batch_size must be a positive integer.")
     # The shared producer owns immutable singleton proposals. Cache only scene
@@ -3133,20 +3165,71 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
     centers, rotations, half, obstacle_valid, regions = (
         value.expand(count, *value.shape[1:]) for value in cached[1])
     constants = model._tensor_constants(device, dtype)
-    lower, upper = regions[:, ::2], regions[:, 1::2]
     if "start_origin" not in constants:
         constants["start_origin"] = torch.as_tensor(model.base_origin, device=device, dtype=dtype)
         constants["start_rotation"] = torch.tensor(ROBOT_START_TCP_ROTATION, device=device, dtype=dtype)
     origin, rotation = constants["start_origin"], constants["start_rotation"]
+    template = getattr(scene_cache, "template", None)
+    anchored = template is not None
+    if anchored:
+        anchor = getattr(scene_cache, "start_anchor", None)
+        if anchor is None or anchor[0] is not template:
+            arm = template.joint_positions[0, constants["arm_ids"]].to(device=device, dtype=dtype)
+            tcp = model.arm_forward_batch(arm[None])[2][0]
+            anchor = (template, arm, tcp[:3, :3].clone(), tcp[:3, 3] - origin)
+            scene_cache.start_anchor = anchor
+        anchor_arm = anchor[1].expand(count, -1)
+        nominal_rotation = anchor[2].expand(count, -1, -1)
+        if recovery:
+            half_width = regions.new_tensor(rules.recovery_position_half_width)
+            low = torch.maximum(regions[:, ::2], anchor[3] - half_width)
+            high = torch.minimum(regions[:, 1::2], anchor[3] + half_width)
+            regions = torch.stack((low, high), -1).flatten(-2)
+    else:
+        if recovery:
+            raise ValueError("Robot start recovery requires a validated scene template.")
+        anchor_arm = constants["default"][constants["arm_ids"]].expand(count, -1)
+        nominal_rotation = rotation.expand(count, -1, -1)
+    lower, upper = regions[:, ::2], regions[:, 1::2]
+    orientation_range = regions.new_tensor(rules.orientation_range) * (
+        rules.recovery_rotation_scale if recovery else 1.0)
+    if not anchored:
+        # The scene producer first establishes the nominal shelf-facing anchor.
+        # Its local-domain probe and every subsequent reset add pose variation.
+        orientation_range = torch.zeros_like(orientation_range)
+    if "start_lifts" not in constants:
+        constants["start_lifts"] = regions.new_tensor((-2.0, -1.6, -.6, -1.0))
+        constants["start_elbows"] = regions.new_tensor((1.8, 1.2, -1.8, -1.2))
+
+    def candidate_inputs(random, low, high, reference_rotation, reference_arm, offset, width):
+        absolute = torch.arange(offset, offset + width, device=device)
+        # Four joint seeds solve the SAME sampled pose. A change of memory cap
+        # therefore never changes either the target or its random stream.
+        selected = random[:, absolute // 4]
+        target = low[:, None] + selected[..., :3] * (high - low)[:, None] + origin
+        rotvec = (2 * selected[..., 3:6] - 1) * orientation_range
+        angle = rotvec.norm(dim=-1, keepdim=True)
+        quaternion = torch.cat(((angle * .5).cos(), .5 * torch.sinc(angle / (2 * math.pi)) * rotvec), -1)
+        target_rotation = reference_rotation[:, None] @ matrix_from_quat(quaternion)
+        branch = absolute % 4
+        lifts = constants["start_lifts"][branch]
+        elbows = constants["start_elbows"][branch]
+        arm = constants["default"][constants["arm_ids"]].expand(len(low), width, -1).clone()
+        arm[..., 1], arm[..., 2], arm[..., 3] = lifts, elbows, -lifts - elbows
+        strength = (absolute // 8).clamp_max(2).to(dtype)
+        arm += (selected[..., 6:] - .5) * strength[None, :, None]
+        if anchored:
+            arm = torch.where((branch == 0)[None, :, None], reference_arm[:, None], arm)
+        return target, target_rotation, arm
     # Local generators keep each episode independent of reset subset/order.
     if torch.device(device).type == "cuda":
-        noise = torch.empty((count, rules.max_attempts, 9), device=device, dtype=dtype)
+        noise = torch.empty((count, attempts_limit, 12), device=device, dtype=dtype)
         seed_tensor = torch.tensor(seeds, device=device, dtype=torch.int64)
         wp.launch(_robot_start_noise, dim=noise.shape[:2], inputs=[wp.from_torch(seed_tensor), wp.from_torch(noise)],
                   stream=wp.stream_from_torch(torch.cuda.current_stream(device)))
     else:
         noise = torch.as_tensor(np.stack([np.random.default_rng(int(seed) ^ 0x5D2EA91C).random(
-            (rules.max_attempts, 9), dtype=np.float32) for seed in seeds]), device=device)
+            (attempts_limit, 12), dtype=np.float32) for seed in seeds]), device=device)
     result = torch.zeros((count, len(model.joint_names) + 5), device=device, dtype=dtype)
     if torch.device(device).type == "cuda":
         # Keep capture buffers and PyTorch generator bookkeeping ordinary
@@ -3154,52 +3237,43 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
         # They can then be replayed safely from either execution mode.
         with torch.inference_mode(False):
             result = result.clone()
-            if "start_lifts" not in constants:
-                constants["start_lifts"] = result.new_tensor((-2.0, -1.6, -.6, -1.0))
-                constants["start_elbows"] = result.new_tensor((1.8, 1.2, -1.8, -1.2))
             # A small first chunk handles easy scenes without running unnecessary
             # nonlinear solves. Later chunks retain fixed rows and skip accepted
             # rows inside the IK/clearance kernels; there is no host readback or
             # variable-size GPU nonzero between chunks. Capture the tensor dispatch
             # as one graph so inactive tail chunks have little Python overhead.
-            maximum = min(32 if count <= 32 else 8, rules.max_attempts, rules.ik_batch_size)
+            maximum = min(32 if count <= 32 else 8, attempts_limit, rules.ik_batch_size)
             group_size = 1 << max(0, (rules.ik_batch_size // maximum).bit_length() - 1)
             cache = getattr(model, "_robot_start_graphs", {})
             model._robot_start_graphs = cache
             for begin in range(0, count, group_size):
                 rows = min(group_size, count - begin)
                 bucket = 1 << (rows - 1).bit_length()
-                key = (str(noise.device), dtype, bucket, centers.shape[1], maximum,
+                key = (str(noise.device), dtype, bucket, centers.shape[1], maximum, attempts_limit, anchored, recovery,
                        tuple(vars(rules).items()), torch.backends.cuda.matmul.allow_tf32)
                 if key not in cache:
                     # These are independent input buffers. Scene changes update
                     # them on replay instead of retaining stale obstacle geometry.
                     inputs = [value[begin:begin + 1].expand(bucket, *value.shape[1:]).clone()
-                              for value in (noise, centers, rotations, half, obstacle_valid, regions)]
+                              for value in (noise, centers, rotations, half, obstacle_valid, regions,
+                                            nominal_rotation, anchor_arm)]
                     enabled = torch.zeros(bucket, device=device, dtype=torch.bool)
                     inputs.append(enabled)
 
                     def candidates(values):
-                        random, scene_centers, scene_rotations, scene_half, scene_valid, bounds, enabled_rows = values
+                        (random, scene_centers, scene_rotations, scene_half, scene_valid, bounds,
+                         reference_rotation, reference_arm, enabled_rows) = values
                         low, high = bounds[:, ::2], bounds[:, 1::2]
                         accepted_rows = ~enabled_rows
                         output = torch.zeros((bucket, result.shape[1]), device=device, dtype=dtype)
                         offset = 0
-                        while offset < rules.max_attempts:
-                            width = min(8 if offset == 0 else maximum, maximum, rules.max_attempts - offset)
-                            selected_noise = random[:, offset:offset + width]
-                            target = low[:, None] + selected_noise[..., :3] * (high - low)[:, None] + origin
-                            arm = constants["default"][constants["arm_ids"]].expand(bucket, width, -1).clone()
-                            absolute = torch.arange(offset, offset + width, device=device)
-                            branch = absolute % 4
-                            lifts = constants["start_lifts"][branch]
-                            elbows = constants["start_elbows"][branch]
-                            arm[..., 1], arm[..., 2], arm[..., 3] = lifts, elbows, -lifts - elbows
-                            strength = (absolute // 8).clamp_max(2).to(dtype)
-                            arm += (selected_noise[..., 3:] - .5) * strength[None, :, None]
+                        while offset < attempts_limit:
+                            width = min(8 if offset == 0 else maximum, maximum, attempts_limit - offset)
+                            target, target_rotation, arm = candidate_inputs(
+                                random, low, high, reference_rotation, reference_arm, offset, width)
                             active_candidates = (~accepted_rows[:, None]).expand(-1, width).reshape(-1).contiguous()
                             q, valid, frames, joints, tcp = model.solve_batch(
-                                target.reshape(-1, 3), rotation.expand(bucket * width, -1, -1),
+                                target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3),
                                 arm.reshape(-1, 6), active_mask=active_candidates)
                             clear, heights = _robot_candidate_clearance(
                                 env, frames, joints, tcp,
@@ -3236,9 +3310,10 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
                         cache.pop(next(iter(cache)))
                     # CUDA graph capture owns intermediate buffers, but these two
                     # tensors were created outside capture and must stay alive.
-                    cache[key] = (inputs, graph, output, origin, rotation)
+                    cache[key] = (inputs, graph, output, origin, orientation_range)
                 inputs, graph, output, _, _ = cache[key]
-                for buffer, value in zip(inputs[:-1], (noise, centers, rotations, half, obstacle_valid, regions)):
+                for buffer, value in zip(inputs[:-1], (noise, centers, rotations, half, obstacle_valid, regions,
+                                                       nominal_rotation, anchor_arm)):
                     buffer[:rows].copy_(value[begin:begin + rows])
                 inputs[-1].zero_()
                 inputs[-1][:rows] = True
@@ -3253,28 +3328,19 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
     # Small asynchronous resets benefit from processing more candidates per
     # launch; full resets already have enough rows to fill the GPU. Keep the
     # same total scratch cap and the absolute candidate random streams.
-    proposals = min(32 if count <= 32 else 8, rules.max_attempts, rules.ik_batch_size)
+    proposals = min(32 if count <= 32 else 8, attempts_limit, rules.ik_batch_size)
     group_size = max(1, rules.ik_batch_size // proposals)
     for begin in range(0, count, group_size):
         pending = list(range(begin, min(count, begin + group_size)))
-        for offset in range(0, rules.max_attempts, proposals):
+        for offset in range(0, attempts_limit, proposals):
             if not pending:
                 break
-            width = min(proposals, rules.max_attempts - offset)
+            width = min(proposals, attempts_limit - offset)
             rows = torch.tensor(pending, device=device, dtype=torch.long)
-            random_values = noise[rows, offset:offset + width]
-            target = lower[rows, None] + random_values[..., :3] * (upper - lower)[rows, None] + origin
-            arm = constants["default"][constants["arm_ids"]].expand(len(pending), width, -1).clone()
-            branch = torch.arange(offset, offset + width, device=device) % 4
-            lifts = arm.new_tensor((-2.0, -1.6, -.6, -1.0))[branch]
-            elbows = arm.new_tensor((1.8, 1.2, -1.8, -1.2))[branch]
-            arm[..., 1], arm[..., 2], arm[..., 3] = lifts, elbows, -lifts - elbows
-            # Candidate-index strength preserves the same seeds even when a
-            # small memory cap splits the usual groups of eight proposals.
-            strength = (torch.arange(offset, offset + width, device=device) // 8).clamp_max(2).to(dtype)
-            arm += (random_values[..., 3:] - .5) * strength[None, :, None]
+            target, target_rotation, arm = candidate_inputs(
+                noise[rows], lower[rows], upper[rows], nominal_rotation[rows], anchor_arm[rows], offset, width)
             q, valid, frames, joints, tcp = model.solve_batch(
-                target.reshape(-1, 3), rotation.expand(len(pending) * width, -1, -1), arm.reshape(-1, 6))
+                target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3), arm.reshape(-1, 6))
             obstacle_rows = rows.repeat_interleave(width)
             clear, heights = _robot_candidate_clearance(
                 env, frames, joints, tcp, centers[obstacle_rows],rotations[obstacle_rows],
@@ -3296,6 +3362,8 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
                 for index in selected:
                     accepted[pending[index]] = True
             pending = [row for row in pending if not accepted[row]]
+    if return_tensors:
+        return result, regions
     return [(result[row, :-5],regions[row],result[row, -5:-2],result[row, -2],result[row, -1])
             if accepted[row] else None for row in range(count)]
 
@@ -3545,6 +3613,30 @@ def _check_physical_robot_start(env, sample, expected, poses, origin):
         raise RuntimeError(f"Physical robot reset failed collision clearance: {reason}")
 
 
+def _robot_start_domain_successes(env, sample, start, proposals, seed):
+    """Probe independent 6D targets once before admitting a shared layout.
+
+    A valid anchor alone does not show that its configured position/orientation
+    domain is usable. Each row receives one target and the anchor IK seed, so
+    retries cannot turn a tiny feasible pocket into an apparent broad domain.
+    These are analytical GPU IK/clearance checks, without live physics writes.
+    """
+    count = env.cfg.robot_start.domain_probe_count
+    anchor = SimpleNamespace(
+        joint_positions=torch.as_tensor(start[0], device=env.device).unsqueeze(0),
+        robot_tcp=torch.as_tensor(start[2], device=env.device).unsqueeze(0),
+    )
+    cache = SimpleNamespace(template=anchor, sample=sample, proposals=proposals, robot=None)
+    tensor_starts = torch.device(env.device).type == "cuda"
+    starts = _sample_robot_starts(
+        env, [sample] * count, [_episode_seed(seed, index, 0) for index in range(count)],
+        scene_cache=cache, return_tensors=tensor_starts, max_attempts=1,
+    )
+    if tensor_starts:
+        return int((starts[0][:, -1] > 0).sum().item())
+    return sum(start is not None for start in starts)
+
+
 def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
     """Prepare checked episodes, or a singleton template for a shared scene round.
 
@@ -3659,6 +3751,22 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                         errors[row] = "No collision-free elbow-up pose in the bounded batched IK search."
                 if not feasible:
                     continue
+                if scene_generation is not None:
+                    # A shared template needs a usable randomized domain, not
+                    # just one lucky start. The singleton stage never touches
+                    # other environments or integrates simulation time.
+                    index = feasible[0]
+                    successes = _robot_start_domain_successes(
+                        env, samples[index], starts[index], tuple(t[index:index + 1] for t in proposed),
+                        seeds[candidates[index]] + 7_919 * (attempt + 1),
+                    )
+                    rules = env.cfg.robot_start
+                    if successes < rules.domain_probe_min_success:
+                        errors[candidates[index]] = (
+                            f"Robot start domain has only {successes}/{rules.domain_probe_count} "
+                            f"valid single-target probes; requires {rules.domain_probe_min_success}."
+                        )
+                        continue
                 candidates = [candidates[index] for index in feasible]
                 samples = [samples[index] for index in feasible]
                 starts = [starts[index] for index in feasible]
@@ -3761,12 +3869,19 @@ def _shared_reset_batch(env, runtime, ids, template, sample):
         cache = SimpleNamespace(template=template, sample=sample, proposals=_episode_proposals(
             [sample], len(runtime.specs), env.device, batch.object_state.dtype,
             support_heights=runtime.support_heights), robot=None)
+    rules = env.cfg.robot_start
     pending = list(range(count))
-    for attempt in range(env.cfg.initial_vision.max_layout_attempts):
+    recovery_count, searches = 0, 0
+    for attempt in range(rules.reset_attempts + rules.recovery_attempts):
+        if not pending:
+            break
+        recovering = attempt >= rules.reset_attempts
+        before = len(pending)
+        searches += 1
         tensor_starts = torch.device(env.device).type == "cuda"
         starts = _sample_robot_starts(
             env, [sample] * len(pending), [seeds[row] + 7_919 * (attempt + 1) for row in pending],
-            scene_cache=cache, return_tensors=tensor_starts)
+            scene_cache=cache, return_tensors=tensor_starts, recovery=recovering)
         if tensor_starts:
             result, regions = starts
             rows = torch.tensor(pending, device=env.device)
@@ -3789,10 +3904,36 @@ def _shared_reset_batch(env, runtime, ids, template, sample):
                         torch.as_tensor(starts[index][column], device=env.device, dtype=batch.object_state.dtype)
                         for index in accepted])
             pending = [row for row, start in zip(pending, starts) if start is None]
-        if not pending:
-            runtime.shared_inputs = cache
-            return batch
-    raise RuntimeError(f"Shared scene robot-start search exhausted retries for {len(pending)} environments.")
+        if recovering:
+            recovery_count += before - len(pending)
+    # A bounded search must not kill a long run when just one environment has
+    # unlucky proposals. This exception restores ONLY the failed row from the
+    # same scene's collision/FK-validated template. It deliberately forfeits a
+    # new random pose for that episode, and is recorded separately from search
+    # success so frequent recovery cannot silently collapse the start domain.
+    if pending:
+        rows = torch.tensor(pending, device=env.device, dtype=torch.long)
+        for name in ("joint_positions", "robot_regions", "robot_tcp"):
+            getattr(batch, name)[rows] = getattr(template, name).expand(len(pending), -1)
+        runtime.last_robot_start_fallback = dict(
+            env_ids=ids[rows].cpu().tolist(), seeds=[seeds[row] for row in pending],
+            reset_counts=runtime.reset_counts[ids[rows]].cpu().tolist(),
+            scene_generation=getattr(runtime, "scene_generation", -1)
+                + int(getattr(runtime, "shared_template", None) is not template),
+            candidate_budget=rules.max_attempts,
+            reset_attempts=rules.reset_attempts, recovery_attempts=rules.recovery_attempts,
+            reason="bounded_robot_start_search_exhausted_verified_template_restored",
+        )
+    runtime.robot_start_fallback_total = getattr(runtime, "robot_start_fallback_total", 0) + len(pending)
+    runtime.pending_reset_metrics = {
+        "Reset/robot_start_fallback_count": float(len(pending)),
+        "Reset/robot_start_fallback_fraction": len(pending) / count,
+        "Reset/robot_start_fallback_total": float(runtime.robot_start_fallback_total),
+        "Reset/robot_start_recovery_count": float(recovery_count),
+        "Reset/robot_start_search_rounds": float(searches),
+    }
+    runtime.shared_inputs = cache
+    return batch
 
 
 @torch.no_grad()
@@ -3825,3 +3966,16 @@ def reset_scene(env, env_ids=None):
         runtime.next_scene_step = env.common_step_counter + env.max_episode_length
     runtime.mdp_reset_scene = env.task_scene_data
     runtime.mdp_reset_ids = env_ids
+    fallback = getattr(runtime, "last_robot_start_fallback", None)
+    if fallback is not None:
+        # Only exceptional anchor recovery reaches the host/file path. Normal
+        # reset diagnostics stay in the native runner's TensorBoard logs.
+        log_dir = getattr(env.cfg, "log_dir", None)
+        if log_dir:
+            path = Path(log_dir) / "robot_start_fallbacks.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = dict(fallback, step=int(env.common_step_counter),
+                          scene_generation=int(getattr(runtime, "scene_generation", 0)))
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        runtime.last_robot_start_fallback = None

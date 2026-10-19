@@ -4,6 +4,10 @@ Sweeping-Policy의 **`min` branch 구조**를 기준으로 구성한 Isaac Lab �
 **장면·센서 생성, episode reset, MDP, GNN·attention 정책과 native PPO를 연결한 프로젝트다.**
 기존 `src/contact_rearrangement`와 별도 패키지이고, 해당 패키지를 import하지 않는다.
 
+본 학습의 설정·결과·종료 원인과 미해결 수정 과제는
+[학습 기록](../../docs/TRAINING_LOG.md)에 정리한다. 연구·개발 전체 이력은
+[CONTEXT.md](../../docs/CONTEXT.md)를 참고한다.
+
 주요 구조 기준은 [Sweeping-Policy/min](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/tree/min)이다.
 로컬 [Sweeping-Policy 예제](../../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/)와
 [Isaac Lab manager-based 템플릿](../../IsaacLab/tools/template/templates/tasks/manager-based_single-agent/env_cfg)도 함께 참고한다.
@@ -98,8 +102,8 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
   Quaternion 부호 정규화와 물리 FK 검사의 회전 변환도 `isaaclab.utils.math`를 사용한다.
   SI-200-8 양자화·범위와 hand 링크의
   자중/운동 관성 보상, OBB 조작량·clearance 등은 연구 수식이다.
-- 설치된 RSL-RL은 기본 Gaussian을 제공한다. 기존 bounded tanh-Gaussian과 그 log-prob,
-  GNN/attention은 연구 모델로 유지한다. PPO 알고리즘 자체의 기본 실행은 native에 위임한다.
+- 출력 분포는 RSL-RL의 `GaussianDistribution`을 사용한다. Sampling·log-probability·
+  analytic entropy·KL은 native 구현에 맡기고 GNN/attention과 공유 actor–critic 연결을 유지한다.
 
 비교한 공식 구현은 [OSC 예제](../../IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/config/franka/osc_env_cfg.py),
 [관절 범위 매핑 예제](../../IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/inhand/inhand_env_cfg.py),
@@ -133,7 +137,7 @@ scripts/train.py
 
 - Train: 위 episode clock 규칙 때문에 stock 학습의 무작위 초기 episode counter를 사용하지 않는다.
 - Play: 현재 graph 모델에서 지원하지 않는 JIT/ONNX export를 실행하지 않고 native inference로 재생한다.
-- 모델 연결: 공유 GNN·attention, bounded action 분포와 checkpoint 계약을 RSL-RL adapter에서 처리한다.
+- 모델 연결: 공유 GNN·attention, native Gaussian 분포 연결과 checkpoint 계약을 adapter에서 처리한다.
 
 Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 첫 함수가 물체·로봇의
 초기 상태와 vision을 준비하고, 두 번째가 초기 snapshot·이력·누적량을 초기화한다.
@@ -151,7 +155,7 @@ Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 
 현재·직전 sample [N,2,72] ── 결측 masking → flatten 144D (별도 encoder 없음)
                                    ↓
                       concat 464 → MLP 256 → latent 128
-                                   ├─ tanh-Gaussian actor: 18D
+                                   ├─ Gaussian actor: 18D
                                    └─ critic: 1D
 ```
 
@@ -167,6 +171,17 @@ GNN 및 최종 MLP의 활성화는 **ReLU**다. `fusion = nn.Sequential(...)`은
 이전 temporal encoder 모델의 checkpoint는 구조가 달라 resume할 수 없다.
 Activation도 checkpoint metadata에 기록하므로 이전 SiLU checkpoint의 그대로 resume는 거절한다.
 
+Actor는 학습 시 `a=μ+σε`, 일반 재생 시 `a=μ`를 사용한다. Tanh와 별도 action clipping은 없다.
+RSL-RL `GaussianDistribution(std_type="log")`가 양수 표준편차를 학습하고 정확한 log-probability·
+entropy·KL을 계산한다. 초기 std는 **0.3을 유지**해 tanh 제거 효과를 분리한다.
+Min의 초기 std1.0까지 맞춘 변경은 아니다. Scale1.0의 pose action에는 이제 ±1 상한도 없다.
+현재/직전 observation의 action 값도 ±1로 자르지 않고 실제 raw 값을 보존한다.
+Hand 관절 한계와 OSC Kp·actuator 토크 제한은 각 native 클래스에서 적용한다.
+
+출력 분포는 checkpoint의 `output_distribution`에 기록한다. 이전 tanh checkpoint는
+새 Gaussian으로 resume/play하지 않도록 weights·optimizer 로드 전에 명시적으로 거절한다.
+변경된 분포는 새 학습으로 평가해야 한다.
+
 `build_policy_masks()`가 observation의 extent·quaternion·센서 유효값과 고정 슬롯에서
 mask를 만든 다음 모델에 별도로 전달한다. Mask·role ID를 observation이나 학습 feature에
 붙이지 않는다. 물체 padding, reset 시 직전 step 이력의 결측, tactile 결측은 해당 mask로 제외한다.
@@ -180,7 +195,7 @@ Mask 판정에 필요한 원래 값을 유지하므로 추가 running observatio
 | Learning rate / schedule | 3e−4 / fixed |
 | γ / GAE λ / PPO clip | 0.99 / 0.95 / 0.2 |
 | Value loss / entropy coefficient | 0.25 / 0.01 |
-| Max gradient norm / 초기 action std | 0.5 / 0.3 (tanh 이전) |
+| Max gradient norm / 초기 Gaussian std | 0.5 / 0.3 (학습 가능한 log std) |
 | 추론 chunk / 학습 microbatch | 최대 8,192 / 8,192 sample |
 | 학습 iteration / checkpoint 주기 | 1,000 / 50 |
 | Physics / policy 주파수 / timeout | 100 Hz / 50 Hz / 8 s |
@@ -227,9 +242,9 @@ OSC 설정은 원격 `min` branch의
 |---|---|
 | Arm 앞 6D | Base 축 `pose_rel`; position/orientation scale 모두 1.0 (m, rad) |
 | Arm 뒤 6D | `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
-| 현재 bounded 정책의 Kp 범위 | raw action ∈ [−1,1]이므로 실제 50–100; 200은 native 상한 |
+| 현재 Gaussian 정책의 Kp 범위 | raw 출력에 ±1 상한이 없어 native 범위 50–200을 사용 가능 |
 | OSC | Full inertia decoupling, damping ratio 1, gravity compensation=False, nullspace 없음 |
-| Hand 6D | [−1,1]을 각 관절의 live soft limit 범위에 매핑하여 position target으로 전달 |
+| Hand 6D | raw action을 native에서 [−1,1]로 clamp한 뒤 live soft limit 범위에 매핑 |
 
 Scale 1.0은 위치 action 0.01이 1 cm, 회전 action 0.01이 0.01 rad라는 뜻이다.
 이전의 ±15 mm/±0.08 rad 제한과 축별 gain 매핑, workspace 목표 clipping,
@@ -251,18 +266,20 @@ Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 �
 
 | Reward | Weight | Weight 적용 전 discrete step 값 |
 |---|---:|---|
-| Clearance | 1.8 | `exp(−a_C·x_C)`, `x_C = blocked_area / blocker_area` |
-| Rearrangement | 0.6 | `exp(−a_R·x_R)`, `x_R = ΔL_OBB` (이번 step의 이동량, m) |
-| `motion_action_rate` | 0.15 | `exp(−a_A·x_A)` |
-| `motion_joint_velocity` | 0.15 | `exp(−a_V·x_V)` |
-| `motion_force_increase` | 0.15 | `exp(−a_F·x_F)` |
-| `motion_torque_increase` | 0.15 | `exp(−a_T·x_T)` (F/T 센서 모멘트) |
-| Time | 1.0 | `−∫[t,t+dt] 0.02(exp(0.7s)−1) ds` |
+| Clearance | 1.8 | $\exp(-a_C x_C)$, $x_C=A_{\mathrm{blocked}}/A_{\mathrm{blocker}}$ |
+| Rearrangement | 0.6 | $\exp(-a_R x_R)-1$, $x_R=\Delta L_{\mathrm{OBB}}$ (이번 step의 이동량, m) |
+| `motion_action_rate` | 0.15 | $\exp(-a_A x_A)-1$ |
+| `motion_joint_velocity` | 0.15 | $\exp(-a_V x_V)-1$ |
+| `motion_force_increase` | 0.15 | $\exp(-a_F x_F)-1$ |
+| `motion_torque_increase` | 0.15 | $\exp(-a_T x_T)-1$ (F/T 센서 모멘트) |
+| Time | 1.0 | $-\int_t^{t+\Delta t}0.02\bigl(\exp(0.7s)-1\bigr)\,ds$ |
 | Terminal | 1.0 | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
 
-**Clearance·Rearrangement·Motion의 바깥 함수는 `exp(−a·x)`로 유지한다.**
-수식 검토의 대상은 x에 넣는 물리량과 집계 방식이다. 이전 선형 조작량 비용과 pseudo-Huber
-Motion 비용은 의도를 잘못 해석한 변경이어서 제거했다. `exp(−a·x)−1`로 이동시키지도 않는다.
+**Clearance는 양의 주 보상, Rearrangement·Motion은 penalty로 지급한다.**
+품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지하며, 뒤의 두 그룹은 `q−1`을 지급한다.
+비용이 0이면 penalty도 0이고, 비용이 커지면 −1에 가까워진다. 품질 캐시는 0~1을 유지한다.
+이전의 R/M 정지 보상 1.2/step을 제거한 변경이며, 작은 Clearance 개선이 항상 모든 비용을
+이기도록 보장하는 우선순위 제약은 아니다. Clearance 증가량 보상이나 접촉 gate는 추가하지 않았다.
 
 Clearance의 분모는 **현재 Blocker의 XY 투영 footprint 전체 면적**이다. x_C는 초기 접근영역
 A₀와 Blocker의 교차 면적을 이 분모로 나눈 0~1 값이다. Target·주변 물체의 overlap은 제외한다.
@@ -271,20 +288,22 @@ GPU 다각형 clipping도 Blocker에 대해서만 수행한다.
 Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개의 변위 norm을 평균한 뒤
 물체끼리 합산한 이번 step의 이동량이다. 회전·pivot·왕복 이동, Target·Blocker·초기 vision에
 보이지 않은 물체도 privileged pose로 반영한다. 누적 `path_length`는 진단용이며 보상에 넣지
-않는다. **멈춘 step에는 x_R=0, 보상=1**로 돌아와 과거 이동량 때문에 계속 보상이 낮아지지
-않는다. 지수 점수이므로 누적 보상 감소가 전체 이동거리와 정확히 선형 비례하지는 않는다.
+않는다. **멈춘 step에는 x_R=0, penalty=0**이므로 과거 이동량에 반복 감점을 주지 않는다.
+지수 점수이므로 누적 비용이 전체 이동거리와 정확히 선형 비례하지는 않는다.
 
-Motion은 다음 네 비용을 **각각 exp에 넣은 독립 reward term**으로 기록한다. 각 weight0.15의
-합은 이전 `0.6 × 네 점수의 평균`과 같다. 가속도 항과 tactile 보상은 넣지 않는다.
+Motion은 다음 네 비용을 **각각 exp에 넣고 1을 뺀 독립 term**으로 기록한다. 각 weight0.15의
+합은 `0.6 × 네 penalty의 평균`과 같다. 가속도 항과 tactile 보상은 넣지 않는다.
 
-```text
-x_A = sum18((action - previous_action)²)
-x_V = sum12(joint_velocity²)
-g_F = max(‖F‖ - ‖previous_F‖, 0) / dt
-g_T = max(‖τ‖ - ‖previous_τ‖, 0) / dt
-x_F = max(g_F - 10, 0)²
-x_T = max(g_T - 0.5, 0)²
-```
+$$
+\begin{aligned}
+x_A &= \sum_{j=1}^{18}(a_{j,k}-a_{j,k-1})^2, \\
+x_V &= \sum_{j=1}^{12}\dot q_{j,k}^{\,2}, \\
+g_F &= \frac{\max(\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2,\,0)}{\Delta t}, \\
+g_T &= \frac{\max(\lVert \tau_k\rVert_2-\lVert \tau_{k-1}\rVert_2,\,0)}{\Delta t}, \\
+x_F &= \max(g_F-10,\,0)^2, \\
+x_T &= \max(g_T-0.5,\,0)^2.
+\end{aligned}
+$$
 
 공식 `isaaclab.envs.mdp.rewards.action_rate_l2`와 `joint_vel_l2`를 사용한다. Action은 raw
 18D 제곱합이며 `/dt`가 없다. Joint velocity는 팔6+hand 독립6관절의 제곱합이고 mimic/passive
@@ -314,16 +333,17 @@ Action·velocity의 계수는 Motion 하위 weight0.15와 함께 작은 비용�
 Velocity 항은 빠른 움직임 자체도 감점하므로 약한 규제로 시작한다. 감속하면 이 비용은
 줄지만 action-rate는 필요한 제동 명령도 감점한다. Raw Kp가 clamp되는 구간의 action 변화도
 계산에 포함되므로 action-rate를 실제 가속도나 stiffness 변화의 정확한 측정으로 해석하지 않는다.
-정지는 여전히 Motion 최대이며 실제 조작은 Clearance·성공·Time이 유도해야 한다.
+정지 시 Motion 기여는 0이며 실제 조작은 Clearance·성공·Time이 유도해야 한다.
 
 `RewardsCfg`는 Clearance/Rearrangement/Motion4항/Time/Terminal의 **8개 term**이다. 함수가
-discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. Quality weight 합은
-기존과 같은3이다. Time은 위 적분값을 지급한다. 양의 baseline 및 step별 ΔL 때문에 전체
-return의 제어주기 불변성을 주장하지 않는다. Time·Terminal·γ와 관측·제어는 유지한다.
+discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. Weight는 유지하며
+C의 최대 기여는1.8, R의 최소 기여는−0.6, Motion 합의 최소 기여는−0.6이다.
+Time은 위 적분값을 지급한다. Step별 지급이므로 전체 return의 제어주기 불변성을 주장하지
+않는다. Time·Terminal·γ와 관측·제어는 유지한다.
 
 Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
 `motion_force_increase`, `motion_torque_increase`를 각각 확인한다. 기존 단일 `motion` 항은
-중복 지급하지 않는다. 네 로그의 합으로 이전 Motion의 기여량을 비교할 수 있다.
+중복 지급하지 않는다. R/M 로그는 이제 0 이하이며 이전 양의 점수 로그와 직접 비교하지 않는다.
 이 값은 native manager가 **weight 적용 후 episode 누적값을 최대 episode 시간8초로 나눈 값**이다.
 0~1의 순간 점수나 실제 episode 길이로 정규화한 평균이 아니므로 episode 길이도 함께 확인한다.
 F/T 두 점수는 state 갱신 때 각각 한 번 계산해 캐시한다. 보상 계산에는 추가 센서·PhysX 조회나
@@ -364,7 +384,7 @@ Timeout은 native truncation 항으로 유지한다.
 새 scene round: Target/Blocker·물체 배치 1개 생성
               → 한 장면의 GPU ray casting·가시성 검증·template 저장
 reset(env_ids): 공통 초기 배치·vision 복사
-              → 선택 환경마다 Blocker 앞 EEF 위치를 새로 샘플링
+              → 선택 환경마다 Blocker 앞 EEF 위치·회전을 새로 샘플링
               → GPU 배치 IK·elbow-up·전체 로봇 충돌 검사
               → 물체·선반·로봇 상태를 선택 행에 일괄 적용
               → reset_mdp: 초기 vision·역할·누적 reward·직전 이력 확정
@@ -372,7 +392,8 @@ reset(env_ids): 공통 초기 배치·vision 복사
 ```
 
 공통 배치·역할·가상 시점은 8초 round마다 교체한다. 중간 auto-reset에서는 해당 환경만
-저장된 초기 배치로 복원하며, 로봇 자세는 매번 새로 생성한다. 고정 자세 후보 bank는 없다.
+저장된 초기 배치로 복원하며, 로봇 자세는 매번 새로 생성한다. 탐색을 소진한 예외 행만
+같은 장면의 검증된 기준 자세로 복구한다. 일반 sampling용 고정 자세 bank는 없다.
 배치 seed는 기본 seed와 공통 round 번호로, 로봇 seed는 기본 seed·환경 ID·reset 횟수로
 정한다. 다른 환경의 reset 대상 순서는 로봇의 난수열을 바꾸지 않는다.
 
@@ -587,8 +608,28 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 전체 환경은 **8초(400 policy step)의 공통 scene round** 동안 같은 초기 물체 배치와
 가상 카메라 시점·vision 정보를 공유한다. 움직이기 시작한 뒤 물리 상태는 환경별로 독립적이다.
 중간 성공·실패 시 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
-**로봇은 매 reset마다 Blocker 앞 허용 영역에서 EEF 위치를 연속적으로 다시 샘플링**하며,
-GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 고정된 자세 후보 bank를 사용하지 않는다.
+**로봇은 매 reset마다 Blocker 앞 허용 영역에서 EEF 위치·회전을 연속적으로 샘플링**하며,
+GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 기준 EEF는 `right_plam_force_sensor`다.
+위치는 기존 Blocker 앞 12–40 cm, 좌우±8 cm, 선반 위20–28 cm와 선반 앞 여유를 유지한다.
+기준 방향 R₀의 축이 환경 축의 순열이므로 이 직사각형은 중심 p₀에 대해
+`p*=p₀+R₀δp`인 EEF-local 범위와 동등하다. 위치 범위를 임의 회전과 함께 돌리지는 않는다.
+회전은 검증된 기준 관절값의 실제 EEF 방향에 local rotation vector 각 성분±10°를 합성한다.
+이는 Euler 각별 범위나 총 회전각10° 상한을 뜻하지 않는다. 기존 hand 장착−90°는 유지한다.
+
+같은 목표 pose마다 기준 관절값과 다른3개 branch seed를 사용하며, 총80개 IK후보를 검사한다.
+성공한 행은 유지하고 실패 행만 최대3회 일반 탐색, 이어2회 기준점 주변의 좁은 범위에서
+재제안한다. 복구 위치는 환경 축별±(2,2,1.5)cm와 원래 영역의 교집합, 회전 범위는±2.5°다.
+Robot 전용 budget은 `robot_start.reset_attempts/recovery_attempts`이며 vision budget과 분리했다.
+새 공유 배치는 anchor를 찾은 뒤 독립seed의 위치·회전 목표8개를 각1회 검사해 최소4개가
+유효할 때 채택한다. 이 유한 probe가 전체 영역의 유효성이나 모든 IK수렴을 보장하지는 않는다.
+
+끝까지 실패한 행은 같은 장면에서 충돌·물리 FK를 검증한 기준 관절값·TCP·영역으로 복구한다.
+그 행은 새 randomization을 포기하며, 다른 행이나 공유 배치를 변경하지 않는다.
+Native 로그 `Reset/robot_start_fallback_count`, `fallback_fraction`, `fallback_total`,
+`recovery_count`, `search_rounds`(뒤 네 이름에도 `robot_start_` prefix)를 확인한다.
+예외 상세는 실행 로그 폴더의 `robot_start_fallbacks.jsonl`에 환경ID·seed·reset횟수·장면번호와
+budget을 기록한다. Normal reset에는 파일 쓰기를 추가하지 않는다. Native runner의 평균 로그를
+fallback 총횟수로 합산하지 말고 누적 `fallback_total`과 JSONL을 사용한다.
 카메라 관측은 robot-base frame으로 캐시하고 각 환경의 EEF frame으로 변환한다.
 Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세 때문에 재촬영하지 않는다.
 
@@ -629,6 +670,7 @@ IK 결과의 관절값·TCP·시작 영역도 tensor로 전달한다. 종류/ins
 물리 pose 조립의 ID/slot은 평탄화한 배열로 준비하며 지지 높이는 catalog별 GPU tensor로 캐시한다.
 GPU IK 난수 생성기로 바뀌어 이전 코드와 같은 seed의 구체적인 시작 자세는 달라진다.
 로봇 자세의 환경/episode별 독립 난수와 동일 버전에서의 재현성은 유지한다.
+2026-10-19 위치·회전/seed축 분리로 같은 seed의 구체적인 자세는 이전 버전과 달라진다.
 물체 배치·역할·시점은 공통 round의 seed로 선택한다.
 
 각 공통 layout에서 가상 시점은 최대 32회 제안하며, 최대 32개 layout까지 재시도한다.
@@ -662,7 +704,14 @@ Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않�
 
 ## 검증과 남은 구현
 
-Motion 로그 분리 후 CPU 검사는 **205개 통과·14개 skip·142 subtest 통과**다.
+2026-10-19 R/M penalty·IK복구 적용 후 실제GPU4환경·32step·부분reset2회를 검증했다.
+Native보상 수식의 최대오차는1.19e−7이며 다른환경 상태·공유template이 보존됐다.
+같은장면의1,024행GPU자세sampler는1,024개모두통과했고 준비후3회29.5–29.8ms였다.
+이는 전체reset·학습iteration시간이 아니다. 코드변경·검사결과·한계는
+[학습 기록8절](../../docs/TRAINING_LOG.md)에, 실제결과는
+[verification.json](../../outputs/contact_manipulation/reward_ik_20261019/verification.json)에 둔다.
+
+아래는 이전변경의 검증이력이다. Motion 로그 분리 후 CPU 검사는 **205개 통과·14개 skip·142 subtest 통과**다.
 실제 GPU4환경·32 policy step과 부분 reset2회에서 native8개 reward term 및 Motion4개
 로그를 확인했다. 분리 전 합산 수식과 전체 reward의 최대 차이는3.58e−7이다.
 자료는 `outputs/contact_manipulation/motion_split_20261017/`에 있다.
@@ -848,14 +897,14 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 `CONTACT_MANIPULATION_UR5E_USD_PATH`, `CONTACT_MANIPULATION_HAND_URDF_PATH`로 지정한다.
 
 ```bash
-./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless --run_name gaussian
 ```
 
 1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비로
 첫 학습 로그까지 수 분이 걸릴 수 있다. 한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
 
 ```bash
-./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name gaussian
 ```
 
 기하 관측과 IK의 임시 메모리는 native Hydra 설정으로 조절할 수 있다. 다음 예시는
@@ -871,22 +920,23 @@ Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
 다른 checkout을 사용하면 `ISAACLAB_PATH`를 지정한다.
 
 저장된 정책을 GUI에서 재생하려면 저장소 루트에서 다음과 같이 실행한다.
-`--checkpoint`에 재생할 파일을 지정한다. 아래는 현재 native/min action 구성의 검증용 모델이다.
+아래는 위 명령으로 학습한 Gaussian run의 마지막 checkpoint를 선택한다.
+`--checkpoint`로 특정 Gaussian checkpoint 파일을 직접 지정할 수도 있다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
-  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-15_14-05-26_native_min_actions/model_15.pt \
+  --load_run '.*_gaussian' \
   --num_envs 4 --real-time
 ```
 
 `--checkpoint`를 생략하면 native `get_checkpoint_path()`로 최신 run의 마지막 checkpoint를
-선택한다. 특정 run은 `--load_run 2026-10-15_14-05-26_native_min_actions`로 지정한다. 기본 환경 수는 1이고,
+선택한다. 이전 tanh run은 분포 계약 검사에서 거절되므로 새 Gaussian run을 지정한다. 기본 환경 수는 1이고,
 중간 episode 종료 시 공유 배치를 복원하고 로봇 자세를 다시 샘플링한다.
 공통 round 경계에서는 학습과 동일하게 새 배치·초기 관측으로 교체한다.
 `--real-time`은 실행이 빠를 때 환경의 정책 주기(기본 50 Hz)에 맞춰 기다리며 느린 reset을 가속하지 않는다.
 
 Play는 `RslRlVecEnvWrapper → OnPolicyRunner.load() → get_inference_policy()` 흐름을
-사용하며 탐색 noise 없이 정책의 `tanh(mean)` action을 적용한다. 모델·F/T·action-contract metadata와
+사용하며 탐색 noise 없이 정책의 `mean` action을 적용한다. 모델·F/T·action/output-distribution metadata와
 state dict를 엄격하게 검사하고 optimizer는 불러오지 않는다. 학습 업데이트나 자동 모델
 export는 수행하지 않는다. 모델 구조와 action 계약이 모두 같은 checkpoint를 재생할 수 있으며,
 현재 환경 설정을 사용하므로 과거의 배치·관측 모델까지 복원하는 기능은 아니다.
@@ -897,7 +947,7 @@ GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`�
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
-  --checkpoint logs/rsl_rl/contact_manipulation/2026-10-15_14-05-26_native_min_actions/model_15.pt \
+  --load_run '.*_gaussian' \
   --num_envs 1 --headless --video --video_length 300
 ```
 

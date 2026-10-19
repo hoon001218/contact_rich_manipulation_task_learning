@@ -168,7 +168,7 @@ def dynamic_sample(
     normalized_wrench = (compensated_wrench / wrench_ranges).clamp(-5.0, 5.0)
     tactile = torch.where(tactile_valid, tactile_contacts.to(joint_pos.dtype), -1.0)
     return torch.cat((joint_pos / joint_position_scale, joint_vel / joint_velocity_scale,
-                      tcp_pose_b, normalized_wrench, tactile, previous_action.clamp(-1.0, 1.0)), dim=-1)
+                      tcp_pose_b, normalized_wrench, tactile, previous_action), dim=-1)
 
 
 def self_motion_wrench(

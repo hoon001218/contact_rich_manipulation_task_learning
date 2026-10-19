@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-16, Asia/Seoul**.
+최종 갱신: **2026-10-19, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,35 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 1. 현재 위치와 상태 구분
+## 최신 진입점 — 2026-10-19
+
+현재 개발·학습 대상은 **`src/contact_manipulation`**,
+`Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
+`contact_rearrangement` 프로젝트의 당시 상태이며 최신 구현 안내로 사용하지 않는다.
+현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
+본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
+
+- 현재 observation은 **244D**(초기 물체 기하 100 + 현재/직전 각각 72)다.
+  초기 기하만 사용하며 별도 temporal encoder 없이 GNN·역할 attention 결과와 concat한다.
+- 10개 물체의 공통 배치·초기 object-only mesh raycast 정보를 공유하고,
+  각 환경의 초기 로봇 자세는 reset마다 새로 샘플링한다. 실제 카메라는 생성하지 않는다.
+- 공식 OSC·hand position ActionCfg와 arm IdealPD(P/D=0, 150/28 N·m)를 사용한다.
+  Physics 100 Hz·policy 50 Hz·공통 장면 최대 8초다.
+- 출력은 RSL-RL 공식 GaussianDistribution으로 전환했다. Tanh 없이 학습 시 Gaussian sample,
+  play 시 mean을 사용하며 초기 std0.3은 유지했다. 이전 tanh checkpoint는 분포 검사에서 거절한다.
+- Native reward는 Clearance 1.8·Rearrangement 0.6·Motion 4개 각각 0.15·Time·Terminal의 8개다.
+  Clearance는 `q=exp(−ax)`, Rearrangement·Motion은 `q−1` penalty로 지급한다.
+  정지 시 R/M 기여는0이며, Time·Terminal과 각 비용 x·weight는 유지했다.
+  선반 변위 1 cm/2° 등 실패 원인 7개도 분리돼 있다.
+- 최신 본 학습 `2026-10-17_15-52-37`은 29,574회 기록, 최신 checkpoint 29550이다.
+  사용자는 초기 접촉 후 hand가 선반 반대 방향으로 이동하는 행동을 관찰했다.
+  Return 상승을 작업 성공으로 판단하지 않으며, 접촉 후 작업 진행/성공 gate 진단이 필요하다.
+- 초기자세는 Blocker 앞 위치와 EEF-local 회전을 randomize하고 검증된 기준 관절값을
+  우선 seed로 쓴다. 같은 목표에 다른 branch를 재시도하며, 실패 행만 제한적으로 복구한다.
+  최종 실패 시 같은 장면의 검증된 기준 자세로 복구하고 횟수·환경 ID·seed를 남긴다.
+  이는 해당 예외의 새 자세 randomization을 포기하는 정책이다. CUDA719의 원인 해결과 구분한다.
+
+## 1. 이전 프로젝트의 당시 위치와 상태 구분
 
 **스폰·센서 위에 학습용 MDP와 모델·PPO를 구현했으며, 시간 입력을 현재·직전
 두 sample로 변경했다.**
@@ -6295,3 +6323,79 @@ commonstep경계이므로공통reset(generation2366)과부분reset둘다가능�
 기록하지않는다. 조사만수행했고production변경·시뮬레이션실행은하지않았다.
 개선방향은탈락원인집계와유효한TCP영역확보/검증된자세주변샘플링및소진시복구정책이며,
 조건무시·무검증자세fallback·무한재시도는도입하지않았다.
+
+### 2026-10-19 — 본 학습 기록과 수정 과제 정리
+
+사용자가 테스트를 제외한 학습 기록과 수정 방향을 정리하도록 요청했다.
+`logs/rsl_rl/contact_manipulation`의 72개 실행을 검토해 본 학습 근거가 있는 6개를
+[TRAINING_LOG.md](TRAINING_LOG.md)에 기록했다. 본 학습 후보 3개·목적 불명 단기 실행 36개·
+초기화만 남은 2개는 테스트로 단정하지 않고 보류했다. 명시적 진단·단기 검증 25개는
+학습 성능 비교에서 제외했다. Run별 iteration/checkpoint·제어/weight 변화·종료 원인과
+근거 자료를 연결하고 native reward/termination 로그의 집계 한계를 명시했다.
+
+최신 `2026-10-17_15-52-37`은 29574회 기록, 마지막 완료 iteration 29573,
+최신 checkpoint 29550이다. 첫1000회→마지막1000회 return59.15→227.18,
+episode길이75.64→152.08step이나 weight를 제거한 C/R aggregate비율은0.4865→0.4995로
+거의 변하지 않았다. Success로그 양수 iteration은7개, 마지막16037이며 실제 성공 episode
+7개라는 뜻은 아니다. 사용자의 “초기 물체 접촉 후 hand가 선반 반대쪽으로 이동” 관찰을
+기록했으며, scalar만으로 접촉 상대·진행량·후퇴의 인과를 확정하지 않았다.
+
+남은 작업은 초기자세 탐색 소진의 원인 기록/유효영역/검증된 복구, 작업 진행과 성공 gate의
+episode단위 진단, 큰 상대pose명령과 OSC수치조건, exp내부비용·weight 및 Time/Terminal/γ
+검토다. 통로 확보 후 안정화를 기다리는 올바른 후퇴와 미완료 후퇴를 먼저 구분한다.
+Joint torque observation/reward·tactile reward·추가 temporal encoder는 여전히 보류다.
+이번 작업은 문서·기존 로그 분석 artifact만 갱신했고 production코드 수정이나 새 학습/재생은 하지 않았다.
+
+### 2026-10-19 — Clearance 우선 보상·OSC scale·초기 pose sampling 후속 교정
+
+사용자는 Clearance를 main reward로 두고 R/M은 penalty 또는 조건부 누적으로 쓰는 방향을
+검토하도록 했다. 우선 제안은 exp를 quality로 유지하면서 R/M을 `−w(1−q)`로 바꾸는 대조다.
+이는 비활동 R/M 보너스를 없애지만 양의 Clearance 상태 보상은 남으며, 코드에는 아직 적용하지 않았다.
+Clearance 증가 시에만 비용을 부과하는 gate는 productive contact/pivot 준비를 불리하게 할 수 있어
+즉시 비용 구성을 먼저 검토한다. Weight·Time·Terminal·γ의 최종 수치는 확정하지 않았다.
+
+공식 v2.3.2 Franka OSC Reach의 scale은 position1/orientation1/stiffness100이나 pose_abs의
+절대 위치·quaternion 입력이다. 우리 pose_rel 증분과 직접 동등 비교하지 않는다. 이전0.015/.08은
+우리 과거 대조값이며 공식 상대OSC 기본값으로 설명하지 않는다. 출처는 TRAINING_LOG 6절에 연결했다.
+
+사용자가 원하는 시작 상태는 Blocker 정면의 기준 EEF pose에 position·orientation randomization을
+주고 IK를 푸는 순서다. 현재 위치만 random이고 orientation은 고정이므로 이 차이를 수정 설계에 반영한다.
+기준 손바닥EEF frame에서 p=p0+R0δp, R=R0δR로 합성하고 기존 GPU batched IK/충돌/elbow 검사를
+활용한다. 기존 위치 분포 재사용과 작은 회전 범위를 검토하며 최종 범위·코드 적용은 미확정이다.
+CUDA719는 사용자의 의견대로 이후 실행에서 더 확인한다. 이번에는 문서 조사·설계 검토만 수행했다.
+
+### 2026-10-19 — min과 유사한 표준 Gaussian 출력으로 전환
+
+사용자는 tanh 압축 때문에 더 큰 action을 지속했을 가능성을 제시하며 min과 유사한 출력
+방향을 원했다. 포화 현상은 가능하지만 원인은 확정하지 않았다. RSL-RL의 GaussianDistribution을
+policy가 단일 소유하도록 바꾸고 학습 sample/일반 play mean·logprob·analytic entropy·KL을
+native 구현에 위임했다. Tanh 관련 확률 보정과 Monte Carlo entropy를 삭제했다.
+초기 std0.3과 log parameterization은 유지해 tanh 제거 효과를 분리한다. Min의 초기1.0이나
+다른 PPO hyperparameter까지 모두 맞춘 것은 아니다. 새 production 파일은 만들지 않았다.
+
+GNN/attention·244D/18D·native OSC/hand·scale1.0·Kp/토크/관절 제한·reward/reset은 유지했다.
+이전 action을 observation에서 ±1로 자르던 두 처리는 제거했다. 이제 Gaussian raw action의
+크기가 current/previous에 보존된다. Checkpoint output_distribution metadata를 추가해 기존
+tanh 분포를 새 Gaussian으로 조용히 실행하지 않도록 weights/optimizer 전에 거절한다.
+README의 현재 모델/제어 범위·새 Gaussian run의 train/play 안내도 갱신했다.
+
+CPU learning57pass2skip/20subtest, MDP152pass12skip/125subtest, 실제 RTX3090 learning59pass/
+20subtest를 확인했다. GPU 컴파일 추론/학습 전환·native PPO/microbatch·정확한 분포 계산·
+구 checkpoint 거절·action>1 이력 보존을 포함한다. 실제 PhysX 학습·CUDA719 재현이나
+정책 성공 개선을 검증한 것은 아니다. 본 학습 기록과 전환 내용은 TRAINING_LOG 7절에 구분했다.
+
+### 2026-10-19 — R/M penalty와 IK 실패 복구 적용
+
+사용자 승인으로 Clearance는 양의 exp점수, Rearrangement·Motion4항은 exp점수−1로 지급한다.
+Weight1.8/0.6/각0.15·비용x·Time·Terminal은 유지한다. R/M정지보너스1.2/step을 없애지만
+Clearance의 양의상태보상은 남으며 성공률개선을 입증한 것은 아니다.
+
+Blocker앞 기존위치영역과 anchorEEF-local 회전벡터 각성분±10°를 샘플링하고 같은목표에
+검증된관절값 우선/다른3branch IK를 적용한다. 새장면은8개단일6Dprobe중4개이상 유효해야
+채택한다. 실패행만 일반3회/근방2회 탐색후 같은장면의검증된anchor로 복구한다. 예외적으로
+그행의새randomization을 포기하는 정책이며 nativeReset로그와 JSONL에 기록한다.
+
+실제RTX3090 IsaacSim4환경32step·부분reset2회에서 수식오차1.19e−7과 neighbor/template
+보존을 확인했다. 같은실제장면의1,024행 GPU sampler는모두성공, warm-up뒤약29.5–29.8ms였다.
+이는전체reset/학습iteration시간이아니다. CUDAgraph내부host상수전송 오류도 캐시로수정했다.
+상세수식·파일·회귀검사·한계는 TRAINING_LOG8절과 README에 기록했다. 장기학습은하지 않았다.

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 from rsl_rl.algorithms import PPO
+from rsl_rl.modules import GaussianDistribution
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils.logger import Logger
@@ -311,20 +312,25 @@ class ModelTests(unittest.TestCase):
             torch.testing.assert_close(first, second, atol=0, rtol=0)
             torch.testing.assert_close(first, third, atol=0, rtol=0)
 
-    def test_action_bounds_and_tanh_log_probability_agree(self):
+    def test_gaussian_actions_match_analytic_log_probability_and_entropy(self):
         masks = self.masks()
         actions, log_probs, values = self.model.act(self.observation, masks=masks)
         evaluated, entropy, evaluated_values = self.model.evaluate_actions(self.observation, actions, masks=masks)
-        self.assertTrue((actions.abs() <= 1).all())
+        mean, _ = self.forward(self.observation)
+        std = self.model.distribution.std
+        expected_log_probability = -.5 * (
+            ((actions - mean) / std).square() + 2 * std.log() + math.log(2 * math.pi)
+        ).sum(-1)
+        expected_entropy = (.5 * math.log(2 * math.pi * math.e) + std.log()).sum(-1)
         torch.testing.assert_close(log_probs, evaluated, atol=2e-5, rtol=1e-5)
+        torch.testing.assert_close(evaluated, expected_log_probability)
+        torch.testing.assert_close(entropy, expected_entropy)
         torch.testing.assert_close(values, evaluated_values)
         self.assertTrue(torch.isfinite(entropy).all())
         first = self.model.act(self.observation, deterministic=True, masks=masks)
         second = self.model.act(self.observation, deterministic=True, masks=masks)
         torch.testing.assert_close(first[0], second[0], atol=0, rtol=0)
-        near_limits = torch.full_like(actions, 1 - 1e-6)
-        near_limits[:, ::2] *= -1
-        self.assertTrue(torch.isfinite(self.model.evaluate_actions(self.observation, near_limits, masks=masks)[0]).all())
+        torch.testing.assert_close(first[0], mean, atol=0, rtol=0)
 
     def test_scene_encoder_and_final_mlp_receive_policy_and_value_gradients(self):
         masks = self.masks()
@@ -336,35 +342,50 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients))
             self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
 
-    def test_fixed_entropy_noise_preserves_objective_across_subbatches(self):
-        noise = torch.randn(3, self.model.cfg.action_dim)
-        actions = torch.zeros_like(noise)
-        full = self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise)
+    def test_analytic_entropy_preserves_objective_across_subbatches_without_sampling(self):
+        actions = torch.randn(3, self.model.cfg.action_dim)
+        random_state = torch.get_rng_state().clone()
+        full = self.model.evaluate_actions(self.observation, actions, masks=self.masks())
         chunks = [self.model.evaluate_actions(self.observation[start:stop], actions[start:stop],
-                                              masks=self.masks(self.observation[start:stop]),
-                                              entropy_noise=noise[start:stop])
+                                              masks=self.masks(self.observation[start:stop]))
                   for start, stop in ((0, 2), (2, 3))]
+        torch.testing.assert_close(torch.get_rng_state(), random_state, atol=0, rtol=0)
         for column, expected in enumerate(full):
             torch.testing.assert_close(torch.cat([result[column] for result in chunks]), expected,
                                        rtol=1e-5, atol=1e-6)
-        with self.assertRaisesRegex(ValueError, "Entropy noise"):
-            self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise[:, :-1])
-        with self.assertRaisesRegex(ValueError, "Entropy noise"):
-            self.model.evaluate_actions(self.observation, actions, masks=self.masks(), entropy_noise=noise.double())
 
-    def test_saturated_actions_preserve_probability_ratios_and_finite_gradients(self):
+    def test_large_means_remain_unrestricted_with_finite_probability_and_gradients(self):
         with torch.no_grad():
             self.model.actor.bias[::2] = 20.0
             self.model.actor.bias[1::2] = -20.0
         masks = self.masks()
         actions, logs, _ = self.model.act(self.observation, masks=masks)
         evaluated, entropy, values = self.model.evaluate_actions(self.observation, actions, masks=masks)
-        self.assertTrue((actions.abs() < 1.0).all())
+        self.assertTrue((actions[:, ::2] > 1.0).all())
+        self.assertTrue((actions[:, 1::2] < -1.0).all())
         torch.testing.assert_close(logs, evaluated, atol=0, rtol=0)
         self.assertTrue(torch.isfinite(entropy).all())
+        deterministic, _, _ = self.model.act(self.observation, deterministic=True, masks=masks)
+        mean, _ = self.forward(self.observation)
+        torch.testing.assert_close(deterministic, mean, atol=0, rtol=0)
         (evaluated.mean() + entropy.mean() + values.mean()).backward()
         self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
                             for parameter in self.model.parameters()))
+
+    def test_native_gaussian_standard_deviation_is_positive_and_learnable(self):
+        self.assertIsInstance(self.model.distribution, GaussianDistribution)
+        self.assertEqual(self.model.distribution.std_type, "log")
+        parameter = self.model.distribution.log_std_param
+        torch.testing.assert_close(parameter.exp(), torch.full((18,), self.cfg.initial_std))
+        before = parameter.detach().clone()
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=.01)
+        actions = torch.zeros(3, self.cfg.action_dim)
+        _, entropy, _ = self.model.evaluate_actions(self.observation, actions, masks=self.masks())
+        (-entropy.mean()).backward()
+        torch.testing.assert_close(parameter.grad, -torch.ones_like(parameter))
+        optimizer.step()
+        self.assertTrue((parameter > before).all())
+        self.assertTrue((parameter.exp() > 0).all())
 
     def test_arbitrary_leading_batch_dimensions(self):
         repeated = self.observation[None].expand(2, -1, -1)
@@ -606,6 +627,9 @@ class NativeLearningTests(unittest.TestCase):
     def test_shared_parameters_are_registered_once_in_native_optimizer_and_checkpoint(self):
         algorithm, _ = make_algorithm()
         self.assertIs(algorithm.actor.policy, algorithm.critic.policy)
+        self.assertIsInstance(algorithm.actor.policy.distribution, GaussianDistribution)
+        self.assertEqual(sum(isinstance(module, GaussianDistribution)
+                             for module in algorithm.actor.modules()), 1)
         self.assertEqual(list(algorithm.critic.parameters()), [])
         self.assertEqual(algorithm.critic.state_dict(), {})
         expected = list(algorithm.actor.policy.parameters())
@@ -615,7 +639,12 @@ class NativeLearningTests(unittest.TestCase):
         saved = algorithm.save()
         self.assertEqual(saved["research_metadata"]["force_torque"], {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES, "resolution": SI_200_8_RESOLUTION})
         self.assertEqual(saved["research_metadata"]["action_contract"], ACTION_CONTRACT)
+        self.assertEqual(saved["research_metadata"]["output_distribution"], {
+            "class_name": "GaussianDistribution", "std_type": "log", "init_std": .3,
+        })
         self.assertIn("policy.critic.weight", saved["actor_state_dict"])
+        self.assertIn("policy.distribution.log_std_param", saved["actor_state_dict"])
+        self.assertNotIn("policy.log_std", saved["actor_state_dict"])
         self.assertEqual(saved["critic_state_dict"], {})
 
     @staticmethod
@@ -707,7 +736,7 @@ class NativeLearningTests(unittest.TestCase):
                 self.assertEqual(result["value"], 1. if native_expected else 2.)
 
     def test_unsplit_shared_loss_matches_native_ppo_update(self):
-        extension, native = self.paired_algorithms(max_microbatch_size=None, entropy_coef=0.)
+        extension, native = self.paired_algorithms(max_microbatch_size=None, entropy_coef=.01)
         torch.manual_seed(16)
         extension_metrics = extension._update_microbatches()
         torch.manual_seed(16)
@@ -793,17 +822,51 @@ class NativeLearningTests(unittest.TestCase):
         for name, value in algorithm.actor.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
+    def test_previous_output_distributions_are_rejected_before_loading_any_state(self):
+        algorithm, _ = make_algorithm()
+        variants = []
+        missing = algorithm.save()
+        del missing["research_metadata"]["output_distribution"]
+        variants.append(missing)
+        squashed = algorithm.save()
+        squashed["research_metadata"]["output_distribution"] = {
+            "class_name": "tanh_gaussian", "init_std": .3,
+        }
+        variants.append(squashed)
+        scalar = algorithm.save()
+        scalar["research_metadata"]["output_distribution"]["std_type"] = "scalar"
+        variants.append(scalar)
+        before = {name: value.clone() for name, value in algorithm.actor.state_dict().items()}
+        with patch.object(algorithm.actor, "load_state_dict") as actor_load, \
+             patch.object(algorithm.critic, "load_state_dict") as critic_load, \
+             patch.object(algorithm.optimizer, "load_state_dict") as optimizer_load:
+            for checkpoint in variants:
+                with self.subTest(metadata=checkpoint["research_metadata"]), \
+                     self.assertRaisesRegex(ValueError, "[Oo]utput distribution.*Gaussian"):
+                    algorithm.load(checkpoint)
+            actor_load.assert_not_called()
+            critic_load.assert_not_called()
+            optimizer_load.assert_not_called()
+        for name, value in algorithm.actor.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
     def test_inference_policy_uses_same_observable_input(self):
         cfg = runner_config()
         env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
         with redirect_stdout(io.StringIO()):
             runner = OnPolicyRunner(env, deepcopy(cfg), device="cpu")
+        with torch.no_grad():
+            runner.alg.actor.policy.actor.bias.fill_(3.)
         policy = runner.get_inference_policy(device="cpu")
         with torch.no_grad():
-            actions = policy(env.get_observations())
+            inputs = env.get_observations()
+            actions = policy(inputs)
+            expected, _ = runner.alg.actor.policy(inputs["policy"], masks=build_policy_masks(
+                inputs["policy"], runner.alg.actor.policy.cfg))
         self.assertEqual(actions.shape, (2, 18))
         self.assertTrue(torch.isfinite(actions).all())
-        self.assertTrue((actions.abs() <= 1.).all())
+        self.assertTrue((actions > 1.).all())
+        torch.testing.assert_close(actions, expected, atol=0, rtol=0)
 
     def test_native_act_reuses_shared_encoder_under_inference_mode(self):
         algorithm, env = make_algorithm()
@@ -973,17 +1036,33 @@ class NativeLearningTests(unittest.TestCase):
         torch.testing.assert_close(chunked, full, atol=2e-7, rtol=2e-6)
         torch.testing.assert_close(chunked_values, full_values, atol=2e-7, rtol=2e-6)
 
-    def test_native_distribution_configuration_preserves_bounded_action_contract(self):
+    def test_native_distribution_configuration_preserves_gaussian_action_contract(self):
         cfg = runner_config()
-        cfg["actor"]["distribution_cfg"] = {"class_name": "tanh_gaussian", "init_std": .3}
+        cfg["actor"]["distribution_cfg"] = {
+            "class_name": "GaussianDistribution", "std_type": "log", "init_std": .3,
+        }
         cfg["actor"]["stochastic"] = False
         cfg["critic"]["distribution_cfg"] = None
         cfg["critic"]["stochastic"] = False
         algorithm, _ = make_algorithm(cfg)
-        torch.testing.assert_close(algorithm.actor.policy.log_std.exp(), torch.full((18,), .3))
-        cfg["actor"]["distribution_cfg"]["class_name"] = "GaussianDistribution"
-        with self.assertRaisesRegex(ValueError, "tanh_gaussian"):
+        torch.testing.assert_close(algorithm.actor.policy.distribution.log_std_param.exp(), torch.full((18,), .3))
+        cfg["actor"]["distribution_cfg"] = {"class_name": "tanh_gaussian", "init_std": .3}
+        with self.assertRaisesRegex(ValueError, "GaussianDistribution"):
             make_algorithm(cfg)
+
+    def test_native_actor_entropy_is_analytic_without_extra_random_draws(self):
+        algorithm, env = make_algorithm()
+        with torch.no_grad():
+            algorithm.actor.policy.actor.bias.fill_(3.)
+        obs = env.get_observations()
+        actions = algorithm.actor(obs)
+        random_state = torch.get_rng_state().clone()
+        entropy = algorithm.actor.output_entropy
+        expected = (.5 * math.log(2 * math.pi * math.e) + algorithm.actor.output_std.log()).sum(-1)
+        torch.testing.assert_close(entropy, expected)
+        torch.testing.assert_close(torch.get_rng_state(), random_state, atol=0, rtol=0)
+        torch.testing.assert_close(actions, algorithm.actor.output_mean, atol=0, rtol=0)
+        self.assertTrue((actions > 1.).all())
 
     def test_invalid_microbatch_sizes_and_unsupported_extensions_fail_explicitly(self):
         for limit in (0, -1, 2.5, True):
