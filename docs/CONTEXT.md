@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-19, Asia/Seoul**.
+최종 갱신: **2026-10-20, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-10-19
+## 최신 진입점 — 2026-10-20
 
 현재 개발·학습 대상은 **`src/contact_manipulation`**,
 `Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
@@ -28,11 +28,18 @@
   play 시 mean을 사용하며 초기 std0.3은 유지했다. 이전 tanh checkpoint는 분포 검사에서 거절한다.
 - Native reward는 Clearance 1.8·Rearrangement 0.6·Motion 4개 각각 0.15·Time·Terminal의 8개다.
   Clearance는 `q=exp(−ax)`, Rearrangement·Motion은 `q−1` penalty로 지급한다.
-  정지 시 R/M 기여는0이며, Time·Terminal과 각 비용 x·weight는 유지했다.
+  정지 시 R/M 기여는0이며 각 비용 x·weight는 유지했다. Terminal은 최근학습검토후
+  성공+200·실패−50으로 조정했다. Time·γ=.99는 유지한다.
   선반 변위 1 cm/2° 등 실패 원인 7개도 분리돼 있다.
-- 최신 본 학습 `2026-10-17_15-52-37`은 29,574회 기록, 최신 checkpoint 29550이다.
-  사용자는 초기 접촉 후 hand가 선반 반대 방향으로 이동하는 행동을 관찰했다.
-  Return 상승을 작업 성공으로 판단하지 않으며, 접촉 후 작업 진행/성공 gate 진단이 필요하다.
+  이는 기준 조합이며 **현재 working cfg는 마지막 실험 E대로 Time/Terminal이 비활성**이다.
+- 10월19일 추가 학습 `15-43-41`과 네 reward 조합 실험을 분석했다. 설정 차이는 활성 reward다.
+  공통 checkpoint750을 같은 4장면·8시작자세에서 mean/sample로 평가한320episode는
+  통로확보·성공0회, 과부하/센서범위초과278회였다. 초기 raw Clearance0.462601에서 개선이 거의 없다.
+  조합별 mean 재생 생존은65.8–324.3step으로 달라, 행동 차이가 작업 진전으로 연결되지 않는 상태다.
+- 최신 장기 checkpoint11550의 std는 회전·강성·hand에서 수천으로 커졌고 모든 tensor는finite였다.
+  평균 행동만 써도 위치목표증분 norm평균12.14m·성공0/32로 악화됐다. 실제 로봇이12m이동한뜻은아니다.
+  Reward 함수의0.5상한이 아니라 큰 명령·반복과부하·분포 및 평균정책 악화를 우선 분리해야 한다.
+  원인 확정이나 production 수정 없이 근거·한계를 **TRAINING_LOG10절**에 남겼다.
 - 초기자세는 Blocker 앞 위치와 EEF-local 회전을 randomize하고 검증된 기준 관절값을
   우선 seed로 쓴다. 같은 목표에 다른 branch를 재시도하며, 실패 행만 제한적으로 복구한다.
   최종 실패 시 같은 장면의 검증된 기준 자세로 복구하고 횟수·환경 ID·seed를 남긴다.
@@ -6399,3 +6406,13 @@ Blocker앞 기존위치영역과 anchorEEF-local 회전벡터 각성분±10°를
 보존을 확인했다. 같은실제장면의1,024행 GPU sampler는모두성공, warm-up뒤약29.5–29.8ms였다.
 이는전체reset/학습iteration시간이아니다. CUDAgraph내부host상수전송 오류도 캐시로수정했다.
 상세수식·파일·회귀검사·한계는 TRAINING_LOG8절과 README에 기록했다. 장기학습은하지 않았다.
+
+### 2026-10-19 — 최근 학습에 근거한 Terminal 스케일 조정
+
+최신본학습T06의 마지막1,000iteration은 성공snapshot0, nativeTerminal평균−12.426,
+Clearance평균19.151이었다. 성공500이 지배했다는 증거보다 반복된 실패100의 기여가 컸다.
+성공+200·실패−50을 초기조정값으로 적용했다. 현재non-terminal상한1.8/step과γ=.99의
+할인합상한180보다 성공200을 크게 두어, 성공가능상태에서 단순대기로더버는구조는 피한다.
+실패비용은절반으로낮추며 종료조건·timeout bootstrap·Time·γ·다른weight는 유지한다.
+T06는옛양의R/M·tanh정책이므로 변경후성능은새run에서확인해야한다. 학습은실행하지않았다.
+근거·할인표·집계한계는 TRAINING_LOG9절과 outputs/contact_manipulation/terminal_scale_20261019/에 둔다.

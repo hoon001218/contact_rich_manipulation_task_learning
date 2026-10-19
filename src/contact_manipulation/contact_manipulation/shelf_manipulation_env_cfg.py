@@ -70,7 +70,7 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Clearance quality, bounded exp penalties, and unchanged Time/Terminal."""
+    """Clearance quality, bounded exp penalties, Time and one-off Terminal."""
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=1.8)
     rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
@@ -85,8 +85,8 @@ class RewardsCfg:
     )
     motion_force_increase = RewardTermCfg(func=mdp.motion_force_increase, weight=0.15)
     motion_torque_increase = RewardTermCfg(func=mdp.motion_torque_increase, weight=0.15)
-    time = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
-    terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
+    # time = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
+    # terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
 @configclass

@@ -49,8 +49,10 @@ class MdpCfg:
     torque_rate_deadband: float = 0.5
     time_penalty_scale: float = 0.02
     time_penalty_growth_rate: float = 0.7
-    success_reward: float = 500.0
-    failure_penalty: float = 100.0
+    # Dense reward <= 1.8/step: at gamma=.99 its discounted bound is 180.
+    # Keep completion above that bound; halve T06's frequent failure payment.
+    success_reward: float = 200.0
+    failure_penalty: float = 50.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15

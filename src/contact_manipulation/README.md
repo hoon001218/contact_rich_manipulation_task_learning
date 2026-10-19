@@ -273,7 +273,7 @@ Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 �
 | `motion_force_increase` | 0.15 | $\exp(-a_F x_F)-1$ |
 | `motion_torque_increase` | 0.15 | $\exp(-a_T x_T)-1$ (F/T 센서 모멘트) |
 | Time | 1.0 | $-\int_t^{t+\Delta t}0.02\bigl(\exp(0.7s)-1\bigr)\,ds$ |
-| Terminal | 1.0 | 성공 +500, 실패 −100, 실패 우선·episode당 1회 |
+| Terminal | 1.0 | 성공 +200, 실패 −50, 실패 우선·episode당 1회 |
 
 **Clearance는 양의 주 보상, Rearrangement·Motion은 penalty로 지급한다.**
 품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지하며, 뒤의 두 그룹은 `q−1`을 지급한다.
@@ -339,7 +339,14 @@ Velocity 항은 빠른 움직임 자체도 감점하므로 약한 규제로 시�
 discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. Weight는 유지하며
 C의 최대 기여는1.8, R의 최소 기여는−0.6, Motion 합의 최소 기여는−0.6이다.
 Time은 위 적분값을 지급한다. Step별 지급이므로 전체 return의 제어주기 불변성을 주장하지
-않는다. Time·Terminal·γ와 관측·제어는 유지한다.
+않는다. Time·γ와 관측·제어는 유지한다.
+
+Terminal은 T06 학습로그를 검토해2026-10-19에 성공500→200·실패100→50으로 조정했다.
+현재 step당 non-terminal 보상의 상한은1.8이므로 γ=0.99에서 대기의 할인합 상한은
+$1.8/(1-0.99)=180$이다. 성공200은 이보다 크게 두고, 반복 관측된 실패100의 충격은
+절반으로 줄였다. 최적값을 로그에서 추정한 것은 아니며 새 학습의 성공·진행·실패를 비교할
+초기값이다. Timeout은 여전히 Terminal지급0이며 native timeout bootstrap은 유지한다.
+근거와 한계는 [학습 기록9절](../../docs/TRAINING_LOG.md)에 둔다.
 
 Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
 `motion_force_increase`, `motion_torque_increase`를 각각 확인한다. 기존 단일 `motion` 항은

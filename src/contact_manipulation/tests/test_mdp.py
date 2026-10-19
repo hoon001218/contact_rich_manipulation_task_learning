@@ -697,14 +697,14 @@ class RewardTests(unittest.TestCase):
 
 class TerminationTests(unittest.TestCase):
     def test_stable_success_failure_priority_and_single_terminal_payment(self):
-        cfg = settings()
+        cfg = task.MdpCfg()
         candidate = torch.tensor([True, True, True, False])
         failed = torch.tensor([False, False, True, False])
         stable = torch.tensor([4, 5, 5, 0])
         paid = torch.zeros(4, dtype=torch.bool)
         success, terminal, paid = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
         self.assertEqual(success.tolist(), [False, True, False, False])
-        self.assertEqual(terminal.tolist(), [0., 500., -100., 0.])
+        self.assertEqual(terminal.tolist(), [0., cfg.success_reward, -cfg.failure_penalty, 0.])
         _, repeated, _ = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
         torch.testing.assert_close(repeated, torch.zeros_like(repeated))
 
@@ -1365,7 +1365,7 @@ class StateTests(unittest.TestCase):
         batch.state_valid[0] = False
         state.advance(batch, 1)
         self.assertTrue(state.failure[0])
-        self.assertEqual(state.components[0, 5].item(), -100.)
+        self.assertEqual(state.components[0, 5].item(), -state.cfg.failure_penalty)
         self.assertTrue(torch.isfinite(state.components).all())
         self.assertTrue(torch.isfinite(state.history).all())
 
@@ -1413,7 +1413,7 @@ class NativeAdapterTests(unittest.TestCase):
             torch.testing.assert_close(terminations.failure(env), expected.any(-1))
             self.assertFalse(terminations.success(env).any())
             payment = rewards.terminal(env) * env.step_dt
-            torch.testing.assert_close(payment, -100. * expected.any(-1))
+            torch.testing.assert_close(payment, -env.cfg.mdp.failure_penalty * expected.any(-1))
             # Observation and all nine termination terms reuse one completed transition.
             obs.current_robot_sample(env)
             self.assertEqual(read.call_count, 1)
@@ -1787,7 +1787,7 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertTrue(env.extras["terminated"][1])
         self.assertEqual(final_observation.shape, (3, 244))
         self.assertEqual(env.extras["terminal_env_ids"].numel(), 0)
-        self.assertEqual(float(state.components[1, 5]), -100.)
+        self.assertEqual(float(state.components[1, 5]), -state.cfg.failure_penalty)
         untouched = torch.tensor([0, 2])
         snapshot = {key: value[untouched].clone() for key, value in vars(state).items()
                     if isinstance(value, torch.Tensor) and value.shape[:1] == (env.num_envs,)}
@@ -1833,7 +1833,8 @@ class NativeAdapterTests(unittest.TestCase):
         env.common_step_counter = 1
         state = task.get_task_state(env)
         torch.testing.assert_close(state.failure, torch.tensor([True, True, True, False]))
-        torch.testing.assert_close(state.components[:, 5], torch.tensor([-100., -100., -100., 0.]))
+        torch.testing.assert_close(state.components[:, 5],
+                                   -state.cfg.failure_penalty * torch.tensor([1., 1., 1., 0.]))
         self.assertTrue(torch.isfinite(env.extras["terminal_observation"]).all())
 
     def test_shelf_reference_changes_only_on_selected_reset(self):

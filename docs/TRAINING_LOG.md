@@ -1,15 +1,21 @@
 # Contact Manipulation 학습 기록과 수정 과제
 
-작성·검토: **2026-10-19, Asia/Seoul**. 현재 프로젝트는
+작성·검토: **2026-10-20, Asia/Seoul**. 현재 프로젝트는
 `src/contact_manipulation`, task는 `Isaac-Contact-Manipulation-UR5e-v0`다.
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
 [프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
 
-**현재 판단:** 본 학습으로 확인한 6개 실행에서 안정적인 작업 성공은 입증되지 않았다.
-최신 실행은 return과 생존 길이가 늘었지만 Clearance의 상대 지표는 거의 개선되지 않았다.
+**현재 판단:** 10월19일의 추가 학습·reward 조합5개를 분석하고 저장정책을 고정조건에서 재생했다.
+현재 정책들의 Clearance 개선은 거의 없으며, 조합별 생존시간 차이는 관측된다.
+공통checkpoint750의320episode는 성공·통로확보0회, 과부하/센서범위초과278회였다.
+장기실행은 Gaussian std뿐 아니라 deterministic 평균 명령도 비정상적으로 커졌다.
+상세 비교·실제평가·한계는 **10절**에 둔다. 새 학습이나 production수정은 하지 않았다.
+
+아래1–6절은 이전 본 학습6개에 대한10월19일 분석이다.
 사용자가 관찰한 **“초반에 물체를 툭 치고 hand가 선반 반대 방향으로 이동”**하는 행동을
 주요 문제로 기록한다. 최초 로그 정리의 분석·수정안은1–6절에 보존했다.
-이후 적용한 Gaussian 출력 전환은 **7절**, Reward penalty·IK복구와 검증은 **8절**이다.
+이후 적용한 Gaussian 출력 전환은 **7절**, Reward penalty·IK복구와 검증은 **8절**,
+Terminal스케일 조정은 **9절**이다.
 T01–T06은 이 변경 전 학습이며, 변경 후 새 본 학습 결과를 섞지 않는다.
 
 ## 1. 기록 범위와 로그 해석
@@ -577,6 +583,213 @@ CUDA719를 해결했다고 판단하거나 이번변경이 성공률을 개선�
   사전GPU상수cache로 수정했다. 별도 실제sampler graph회귀검사 **1 passed**로
   InferenceMode capture/replay와 template교체뒤 기준관절값·방향갱신도 확인했다.
   장기학습·다양한장면의fallback빈도는 아직측정하지 않았다.
+
+## 9. 2026-10-19 적용 — Terminal 스케일 조정
+
+최신 본 학습 T06(`2026-10-17_15-52-37`)을 다시 확인해 `MdpCfg`의 기본값을
+성공 **+500→+200**, 실패 **−100→−50**으로 조정했다. Native Terminal weight는1이다.
+성공·실패 조건, 실패 우선·episode당1회지급, timeout지급0과 bootstrap, γ=.99,
+Time·Clearance·R/M 수식과 weight는 이번 변경에서 유지한다.
+
+### 로그 근거와 선택 기준
+
+| T06 native 평균 | 첫1,000 iteration | 마지막1,000 iteration |
+|---|---:|---:|
+| `Episode_Reward/clearance` | 8.279 | 19.151 |
+| `Episode_Reward/terminal` | −12.424 | −12.426 |
+| Terminal 절댓값 / Clearance | 1.501 | 0.649 |
+| 실패벌점만 절반으로 본 같은 로그집계 | −6.212 | −6.213 |
+| 그때 Terminal 절댓값 / Clearance | 0.750 | 0.324 |
+
+이 두구간은 성공 snapshot이 모두0이며 마지막 성공 양수 로그는iteration16037이다.
+관측된 Terminal은 주로 실패−100의 기여였고 **성공500이 로그를 지배했다는 근거는 없다**.
+실패50은 반복되는 큰 실패지급을 완화하되 즉시 실패의 비용을 남기는 초기실험값이다.
+표의 평균은 native reset-call/rollout집계다. Episode빈도나 실제정책을 재실행한 return이
+아니며, penalty를 낮추면 조기실패도 더 싸진다는 tradeoff가 있다.
+
+성공값은 현재 R/M penalty형태의 보상상한과 할인을 함께 고려했다.
+Non-terminal step보상은 Clearance최대1.8에서 비양수R/M·Time을 더하므로1.8이하다.
+
+$$
+\sum_{k=0}^{\infty}\gamma^k r_{\mathrm{nonterminal},k}
+\leq \frac{1.8}{1-0.99}=180 < R_{\mathrm{success}}=200.
+$$
+
+따라서 **이미 성공할 수 있는 상태에서 단순히 dense보상을 더 받으려고 성공을 미루는 것**은
+이 상한 아래에서 즉시 성공200을 이기지 못한다. 성공100처럼180보다작은 값은 이 성질이
+없다. 이는 return수준의 비교이며, 탐색·critic오차·도달가능성·성공학습을 보장하지 않는다.
+Terminal500의 불필요하게 큰 크기를 줄이면서 이 기준은 유지했다.
+
+첫 reward를index0으로두고 terminal만 할인하면 다음과 같다.
+
+| 성공 시점 | 기존500 | 변경200 |
+|---|---:|---:|
+| 2초, index99 | 184.86 | 73.95 |
+| 4초, index199 | 67.67 | 27.07 |
+| 8초, index399 | 9.07 | 3.63 |
+
+늦은 성공은 여전히 크게 할인된다. 이 조정만으로 접근·통로확보·후퇴 문제를 해결했다고
+판단하지 않는다. T06는 양의R/M·tanh정책이므로 현재의 R/M penalty·Gaussian에 대해
+같은trajectory의 return을 정확히 재구성한 것은 아니다. 새학습에서 Clearance진행·성공·
+실패원인과 episode길이를 함께 비교한다. 기존checkpoint resume은 부모run과 스케일변화를
+구분해서 기록해야 하며, 이번에 새학습·장기평가는 실행하지 않았다.
+
+분석값·집계한계는 [analysis.json](../outputs/contact_manipulation/terminal_scale_20261019/analysis.json),
+회귀검사 로그는 [tests.log](../outputs/contact_manipulation/terminal_scale_20261019/tests.log)에 둔다.
+MDP회귀검사는 **162 passed, 13 skipped, 125 subtests passed**였다. 변경된 기본설정으로
+성공안정조건·실패우선·일회지급과 native dt상쇄, 중복실패원인의일회감점을 확인했다.
+추가 production파일·sensor조회·physics연산은 없다.
+
+## 10. 2026-10-20 — 추가 학습·reward 조합 비교와 실제 정책 평가
+
+사용자가 reward 조합을 바꿔 짧게 학습해도 Clearance가 일정 이상 증가하지 않는다고 보고했다.
+저장된설정·TensorBoard전체·checkpoint를 확인하고, 학습을 하지 않는 고정조건 재생을 추가했다.
+이 절의 짧은실행은 사용자가 명시한 **reward 조합 실험**이며 본 학습6개의 성능이력과 구분한다.
+
+### 비교 대상과 통제 조건
+
+C=Clearance, R=Rearrangement, A=action-rate, V=joint-velocity, F/T=힘/모멘트증가 penalty다.
+M은 A/V/F/T 네 항을 뜻한다. R/M은 기존 exp−1이며 활성 항의 weight는 동일하다.
+
+| ID | 10월19일 run | 활성 reward | 기록 iteration | 최신 checkpoint |
+|---|---|---|---:|---:|
+| A | `15-43-41` | C+R+M+Time+Terminal | 11,567 | 11,550 |
+| B | `22-14-38` | C+A+V+Time+Terminal | 789 | 750 |
+| C | `22-42-06` | C+A+V | 769 | 750 |
+| D | `23-08-15` | C+A+V+F+T | 754 | 750 |
+| E | `23-33-48` | C+R+A+V+F+T | 1,312 | 1,300 |
+
+`params/env.yaml`·`agent.yaml` 전체를 재귀비교하면 log_dir와활성reward외의 설정은 같다.
+모두 seed0·새학습·1,024환경·100/50Hz·8초공통장면·Gaussian초기std0.3·actionclip없음·
+rollout32·PPO4epoch/4minibatch·lr3e−4 fixed·γ=.99·entropy coefficient .01이다.
+Git snapshot은동일commit767a016이며 events.py의저장diff도 같다. 모든선택checkpoint의
+모델·행동·F/T·분포metadata가 같다. model_0은 첫PPO update후 저장본으로 무학습모델이 아니다.
+
+순수Clearance-only 실험은없다. 모든조합에 A/V가 있고, Terminal을뺀 C/D/E도 성공·실패
+**종료조건은 유지**한다. 같은seed 한 번씩이며 독립seed 반복실험이 아니므로 인과의크기와
+일반적인 조합우열을 확정하지 않는다. 750iteration은 약60회의 공통장면교체다.
+
+### 학습 로그: 공통754 iteration으로 비교
+
+다섯실행의 공통구간0–753중 마지막200회(554–753)를 비교했다.
+
+| ID | native C로그 평균 | Train 길이(step) 평균 | 길이보정proxy | Gaussian mean std | hard-load 종료snapshot |
+|---|---:|---:|---:|---:|---:|
+| A | 10.890 | 100.10 | 0.4835 | 0.6448 | 0.6943 |
+| B | 13.947 | 125.50 | 0.4939 | 0.6512 | 0.5322 |
+| C | 11.481 | 101.62 | 0.5021 | 0.5756 | 0.6685 |
+| D | 12.456 | 113.37 | 0.4883 | 0.5751 | 0.5997 |
+| E | 9.669 | 86.76 | 0.4953 | 0.5806 | 0.7377 |
+
+Native C로그는episode누적값/8초로 길이에 비례한다. 표의proxy는
+$8\,\overline{C_{\mathrm{log}}}/(1.8\,\overline{L_{\mathrm{Train}}})$다.
+서로다른모집단을 나눈 값이므로 실제step평균Clearance나 가림비율이 아니다.
+Iteration별ratio는 물리적으로 가능한품질범위마저 벗어나므로 개별값을품질로 사용하지 않는다.
+집계proxy가0.484–0.502에모이고 시간에따른변화가유사하다는것까지만 로그에서 말할수있다.
+0.5를 "가림50%"나 수식의상한으로 해석하지 않는다.
+
+![동일 학습길이 비교](../outputs/contact_manipulation/reward_ablation_20261020/matched_budget.png)
+
+방문한상태에서 A의 R평균−0.00544·F평균−0.00346은 C평균10.890보다훨씬작다.
+R/F가 현재로그의Clearance기여를 압도하지는 않는다. 다만 물체를안움직여서 비용이작을수
+있으므로, 잠재적인 성공동작에서도 이 비용이작다는결론은 아니다. 리워드값의단순합이나
+서로다른조합의 Train return크기로 정책성능을비교하지 않는다.
+
+### 실제 재생: 같은 장면·시작 자세에서 진전이 있는가
+
+모든모델의 `model_750.pt`를 새seed20261020의 동일한4개장면에서 비교했다.
+각장면8개검증된초기자세를모든정책에복제하고, 초기관절·관측·카메라의일치를assert했다.
+각모델은 deterministic mean과 stochastic sample을각각실행했다. Stochastic은 같은표준정규
+noise를공유하되 모델별std를사용했다. 각행의첫episode만집계하며 native auto-reset **이전**
+GT품질·교차면적·종료·행동·토크를기록했다. 반환reward는비교하지않아원래reward조합은재지급하지않았다.
+
+총320episode(각모델·mode32개)의초기 raw품질평균은 모두 **0.462601**이다.
+아래는 deterministic평가다. 각값은episode별집계후동일가중평균이다.
+
+| ID | 최종 raw C품질 | 초기대비최종차이 | 생존step | 과부하/범위초과 실패 | 통로확보 / 성공 |
+|---|---:|---:|---:|---:|---:|
+| A | 0.461343 | −0.001258 | 102.4 | 32/32 | 0/32 / 0/32 |
+| B | 0.462546 | −0.000055 | 324.3 | 9/32 | 0/32 / 0/32 |
+| C | 0.461353 | −0.001248 | 86.8 | 32/32 | 0/32 / 0/32 |
+| D | 0.461335 | −0.001265 | 144.4 | 28/32 | 0/32 / 0/32 |
+| E | 0.461385 | −0.001215 | 65.8 | 32/32 | 0/32 / 0/32 |
+
+Stochastic도 최종품질0.461344–0.462673으로 초기값과거의같았다. 전체320episode에서
+**통로면적gate 도달0, 실제성공0, 실패278(86.875%)**였고 실패는모두
+`hard_load_or_overrange`였다. Shelf변위·물체낙하/기울어짐·이탈·들림·invalid실패는0이었다.
+17개tactile중접촉을관측한episode는8/320(2.5%)다. 이는특정Blocker접촉계측이아니며,
+다른robot부위접촉·감지면외접촉까지 없었다는뜻은아니다.
+
+실패마지막frame을제외한 best품질증가도 A/C/D/E평균은약0.00002다. B는평균0.0012–0.0013,
+최대약0.04의드문증가가있었지만 해당사례의Target도2.84–3.07cm이동했고 과부하로실패했다.
+단순순간 q상승을 목표를보호한 통로확보로 해석하지 않는다. 이 "실패frame제외"도 Target회전과
+전체성공조건을모두검증한 안전성지표는 아니다.
+
+![고정조건 Clearance 비교](../outputs/contact_manipulation/reward_ablation_20261020/paired_evaluation/clearance_paired.png)
+
+조합에따라 행동은다르다. Deterministic 위치증분명령 norm은 평균0.205–0.463m,
+회전증분 norm은0.260–2.101rad였다. 이는20ms마다생성하는 **목표pose증분**이며 실제이동이아니다.
+예를들어 A와B는 생존102.4→324.3step, 위치명령0.463→0.273m, 회전명령2.101→0.260rad로
+달랐다. Reward가전혀영향없다는결론은맞지않고, 차이가작업진전으로연결되지않는상태다.
+현재실패항은 보정F/T 과부하와raw센서범위초과를합쳐검사하므로 그중무엇이먼저발생했는지는
+이자료만으로분리하지못한다. 큰명령·토크포화·비접촉관성과 센서보상오차 중원인을단정하지않는다.
+
+### 장기학습: plateau에 더해 정책 출력의 발산
+
+A의마지막200iteration은 mean std **5,607.49**, 길이 **7.51step(0.150초)**,
+hard-load snapshot **0.9845**, C로그 **0.7003**, Train return **−44.13**이었다.
+Mean std는iteration924에서1,2335에서10,3916에서100,6481에서1000을넘었다.
+
+`model_11550`의 실제Gaussian std평균은 위치 **0.542**, 회전 **7,677**,
+강성 **4,676**, hand **8,748**이다. 위치의std까지수천이라는뜻은아니다.
+모든actor·optimizer tensor는finite이므로 NaN검사만으로는탐지되지않는다.
+E도iteration981에서meanstd1을넘었고 `model_1300`의meanstd는1.752였다.
+
+추가로 A750/A11550/E750/E1300을같은조건에서 deterministic으로비교했다(각32episode).
+이번세트는세트내시작조건을맞췄으며 앞80env세트와시작pose까지같다고가정하지않는다.
+A11550도성공0·과부하실패32/32·생존19.28step이었다. Noise를빼도 위치목표증분norm평균
+**12.14m**, 회전목표증분norm평균 **3,042.87rad**를출력했다. 첫action부터4개장면의
+8start평균위치증분19.61–21.73m였다. **탐색std만의문제가아니라 평균정책도악화**됐다.
+E1300의최종품질은0.46623으로소폭증가했지만 통로확보·성공0, 실패30/32였다.
+
+Code상Gaussian entropy에는상한이없고 loss에 $-0.01H$가있다. Hand raw±1과stiffness
+raw×100의50–200clamp로실제명령이포화돼도raw분포entropy는증가할수있다.
+큰raw변화에서 action-rate exp penalty도−0.15에포화해차이를구별하기어렵다.
+이는관측된std증가와일치하는기전후보다. Entropy만이원인이라고증명한대조실험은아니다.
+모델은raw직전action도이력으로받으므로 큰분포가network입력규모에도영향줄수있지만,
+평균정책악화가그경로때문인지는별도분리검사가필요하다.
+
+### 실험의 해석과 다음 확인 순서
+
+1. 현재관찰은 "수식이0.5에서포화"가아니라 **현정책이물체를유효하게조작하지못하는것**이다.
+   $q_C=\exp(-\rho)$는 $\rho\in[0,1]$에서0.368–1이고0.5가상한이아니다.
+2. 고정조건에서먼저과부하/범위초과로종료되는원인과큰pose명령을분리한다.
+   보정전/후F/T·초과축·실패직전action/목표추종/torque포화·실제접촉을함께봐야한다.
+3. Rewardweight추가sweep전 Gaussian std와평균명령규모가안정된조건을잡고같은평가를반복한다.
+   Entropy항을고정/제거한대조와같은 한변수실험이원인분리에맞다. Tanh재도입을확정하지않는다.
+4. C/D의최소step보상은각각 $1.8/e-0.3\simeq0.3622$, $1.8/e-0.6\simeq0.0622$로양수다.
+   성공종료는남기고Terminal을삭제했으므로 성공완료유인도함께제거했다. 이둘의정체만으로
+   R/F/T가무관하거나Clearance학습이불가능하다고결론내리지않는다.
+5. 다음비교는실제 $\Delta q_C$, 겹침면적감소, Target보호·안정화별gate, episode별실제종료수를
+   사용한다. 같은seed·4개장면의이번결과를환경전체의성공률이나seed평균의인과효과로확대하지않는다.
+
+다섯run의reset fallback_total/fraction은전구간0, search_rounds평균1.006–1.015였다.
+이번정체가 fallback 반복이나reset실패때문이라는증거는없다. 이번검사에서CUDA719는발생하지
+않았지만 장기안정성을보장하지않는다. 현재working RewardsCfg는마지막실험E대로Time/Terminal이
+주석처리돼있다. 분석중원래설정으로복구하거나production코드를수정하지않았다.
+
+### 근거 파일과 재현
+
+자료는 [reward_ablation_20261020](../outputs/contact_manipulation/reward_ablation_20261020/)에둔다.
+`analyze.py`는5run설정·전체scalar를다시읽어 `metrics.json`, `scalars.csv`와학습추이그림을만든다.
+`checkpoints.json`은실제CPUcheckpoint audit, `gaussian_bounds.json`은분포의수학적포화확률하한이다.
+후자는실제trajectory에서측정한비율과구분한다.
+
+`evaluate.py --headless --device cuda:0`은공통checkpoint750의고정조건평가를수행하고
+`paired_evaluation/{evaluation.json,episodes.csv,trajectories.npz}`에auto-reset전데이터를저장한다.
+`latest_evaluation/`은위에명시한4checkpoint의추가평가다.
+`summarize_evaluation.py --directory <평가폴더>`로표·요약JSON·그림을재생성한다.
+전체실행log는 `analysis.log`, `evaluation.log`, `latest_evaluation.log`다.
 
 ## 부록: 본 학습 여부가 확인되지 않은 실행
 
