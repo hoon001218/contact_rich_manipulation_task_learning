@@ -24,7 +24,7 @@ from ....mdp.observations import SI_200_8_RANGES, SI_200_8_RESOLUTION
 from .model import ContactManipulationPolicy, ModelCfg, build_policy_masks
 
 
-ACTION_CONTRACT = "isaaclab_min_osc_variable_kp_joint_position_to_limits_v1"
+ACTION_CONTRACT = "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3"
 
 
 class NativeContactActor(nn.Module):
@@ -496,8 +496,9 @@ class ContactManipulationPPO(PPO):
         if not isinstance(metadata, Mapping) or metadata.get("action_contract") != ACTION_CONTRACT:
             raise ValueError(
                 "Checkpoint action contract is missing or differs from the native Isaac Lab OSC "
-                "and joint-position-to-limits actions. Previous custom-action checkpoints have "
-                "different 18D action semantics; start a new training run."
+                "in the UR5e wrist EEF task frame with gravity compensation and joint-position-to-limits actions. "
+                "Previous base-frame, palm-frame, and custom-action checkpoints have different 18D action semantics; "
+                "start a new training run."
             )
         if (not isinstance(self.checkpoint_metadata, Mapping)
                 or metadata.get("output_distribution") != self.checkpoint_metadata.get("output_distribution")):

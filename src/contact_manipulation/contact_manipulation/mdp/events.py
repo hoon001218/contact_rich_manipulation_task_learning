@@ -29,7 +29,7 @@ from .observations import (
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench,
 )
 from .rewards import corner_path_increment, reward_components
-from .terminations import task_conditions, terminal_transition
+from .terminations import FAILURE_REASON_NAMES, configured_terminations, task_conditions, terminal_transition
 
 
 @dataclass
@@ -49,8 +49,9 @@ class MdpCfg:
     torque_rate_deadband: float = 0.5
     time_penalty_scale: float = 0.02
     time_penalty_growth_rate: float = 0.7
-    # Dense reward <= 1.8/step: at gamma=.99 its discounted bound is 180.
-    # Keep completion above that bound; halve T06's frequent failure payment.
+    # Retain the T06-based terminal scales (currently disabled in RewardsCfg).
+    # With distance/contact support enabled, the dense upper bound is 2.37/step;
+    # the previous 180 discounted bound must not justify these scales again.
     success_reward: float = 200.0
     failure_penalty: float = 50.0
     success_overlap_area: float = 1.0e-5
@@ -60,9 +61,8 @@ class MdpCfg:
     stable_angular_velocity: float = 0.10
     stable_steps: int = 5
     drop_tolerance: float = 0.06
-    lift_tolerance: float = 0.04
-    workspace_tolerance: float = 0.015
-    max_tilt: float = math.radians(50.0)
+    max_tilt: float = math.radians(80.0)
+    tilt_duration: float = 0.20
     force_hard: float = 80.0
     torque_hard: float = 4.0
     joint_position_scale: float = math.pi
@@ -76,6 +76,8 @@ class MdpCfg:
             raise ValueError("The agreed observation contract reserves 10 object slots.")
         if not isinstance(self.stable_steps, int) or self.stable_steps < 1:
             raise ValueError("stable_steps must be a positive integer.")
+        if not 0 < self.max_tilt <= math.pi or self.tilt_duration <= 0:
+            raise ValueError("Fall angle must be in (0, pi] and tilt_duration must be positive.")
         for name, value in vars(self).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
@@ -280,7 +282,7 @@ def object_geometry(pose, local_center, local_corners, upright):
 class TaskState:
     """Preallocated batch buffers; geometry is vision-only, physical poses reward-only."""
 
-    def __init__(self, num_envs, device, cfg, dt, *, dtype=torch.float32, step=0):
+    def __init__(self, num_envs, device, cfg, dt, *, dtype=torch.float32, step=0, termination_cfg=None):
         cfg.__post_init__()
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("step_dt must be finite and positive.")
@@ -314,10 +316,12 @@ class TaskState:
         self.path_length = zeros(n)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
+        self.tilt_count = zeros(n, o, kind=torch.long)
         self.success = zeros(n, kind=torch.bool)
         self.failure = zeros(n, kind=torch.bool)
         self.terminal_paid = zeros(n, kind=torch.bool)
-        self.failure_reasons = zeros(n, 7, kind=torch.bool)
+        self.failure_reasons = zeros(n, len(FAILURE_REASON_NAMES), kind=torch.bool)
+        self.failure_mask, self.success_enabled = configured_terminations(termination_cfg, device=device)
         # Clearance, rearrangement, force growth, torque growth, time, terminal.
         self.components = zeros(n, 6)
         self.wrench_rate_cost = zeros(n, 2)
@@ -356,7 +360,7 @@ class TaskState:
         self.history[ids, 0, 31:37] = 0
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:72] = 0
-        for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count",
+        for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count", "tilt_count",
                      "success", "failure", "terminal_paid", "failure_reasons", "components",
                      "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
             getattr(self, name)[ids] = 0
@@ -399,22 +403,27 @@ class TaskState:
             batch.sensor_wrench, self.previous_wrench, self.dt,
             elapsed_time=self.elapsed_time,
         )
-        candidate, stable, reasons, failed = task_conditions(
+        candidate, stable, tilted, reasons, failed = task_conditions(
             self.cfg, center=batch.center, corners=batch.corners, rotation=batch.rotation,
             velocity=batch.velocity, active=self.active, target=self.target,
             initial_center=self.initial_center, initial_rotation=self.initial_rotation,
             blocker_overlap=self.blocker_overlap, sensor_wrench=batch.sensor_wrench,
-            stable_count=self.stable_count, workspace_bounds=self.workspace_bounds,
+            stable_count=self.stable_count, tilt_count=self.tilt_count, step_dt=self.dt,
+            workspace_bounds=self.workspace_bounds,
             shelf_top=self.shelf_top, ceiling=self.ceiling,
             sensor_range_exceeded=batch.sensor_range_exceeded,
             shelf_pose=batch.shelf_pose, initial_shelf_pose=self.initial_shelf_pose,
             state_valid=batch.state_valid,
+            failure_mask=self.failure_mask,
         )
-        successful, payment, paid = terminal_transition(candidate, failed, stable, self.terminal_paid, self.cfg)
+        successful, payment, paid = terminal_transition(
+            candidate, failed, stable, self.terminal_paid, self.cfg, success_enabled=self.success_enabled,
+        )
         self.components[:, :5] = components
         self.components[:, 5] = payment
         self.wrench_rate_cost.copy_(costs)
         self.stable_count.copy_(stable)
+        self.tilt_count.copy_(tilted)
         self.success.copy_(successful)
         self.failure.copy_(failed)
         self.terminal_paid.copy_(paid)
@@ -475,7 +484,8 @@ def _ensure_state(env):
         # ObservationManager probes output dimensions before startup/reset.
         # No scene ground truth is substituted for missing initial vision.
         env._contact_mdp = TaskState(env.num_envs, env.device, env.cfg.mdp, float(env.step_dt),
-                                     step=env.common_step_counter)
+                                     step=env.common_step_counter,
+                                     termination_cfg=getattr(env.cfg, "terminations", None))
     return env._contact_mdp
 
 
@@ -793,7 +803,7 @@ def get_task_state(env):
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)
         state.observation = pack_policy_observation(geometry, state.history)
         env.extras["terminal_observation"] = state.observation
-        env.extras["terminated"] = (state.success | state.failure).clone()
+        env.extras["terminated"] = ((state.success & state.success_enabled) | state.failure).clone()
         env.extras["terminal_env_ids"] = state.empty_env_ids
     # Native _reset_idx clears extras['log'] after calling reset events. Merge
     # their small diagnostics here, during the subsequent observation read.

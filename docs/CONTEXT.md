@@ -24,14 +24,35 @@
   각 환경의 초기 로봇 자세는 reset마다 새로 샘플링한다. 실제 카메라는 생성하지 않는다.
 - 공식 OSC·hand position ActionCfg와 arm IdealPD(P/D=0, 150/28 N·m)를 사용한다.
   Physics 100 Hz·policy 50 Hz·공통 장면 최대 8초다.
+- 2026-10-20 후속 교정으로 OSC 제어 body·task frame·물체 observation의 기준을
+  **UR5e 말단 `wrist_3_link`**로 통일했다. 공식 `task_frame_rel_path="Robot/wrist_3_link"`와
+  scene `ee_frame`의 같은 링크 target을 지정하며 body offset은 없다. `tool0` 가상 frame이 아니다.
+  Robot observation의 EEF pose도 같은 링크를 base에서 표현한다. Arm의 위치·회전 증분과
+  stiffness 6축은 **정책 step 시작 시 현재 wrist 축**으로 해석한다.
+  목표는 $p^*=p_t+R_t\Delta p_{\mathrm{EEF}}$, $R^*=R_t\operatorname{Exp}(\Delta r_{\mathrm{EEF}})$이며
+  physics substep 동안 유지한다. 사용자가 켠 `gravity_compensation=True`를 유지해 native OSC가
+  관절 중력 토크를 feedforward로 더한다. F/T의 sensor-frame 자중·관성 측정 보상과는 별개다.
+  Gain·scale·hand 동작·244D observation 모양은 유지하며 학습 개선은 아직 확인하지 않았다.
+  규약은 `isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3`이며 이전 base-frame(v1)·손바닥
+  EEF(v2) checkpoint는 로드 전에 거절한다. 아래 과거 기록과 10월19일 reward ablation은 base-frame
+  당시 결과다. 손바닥 기준으로 변경했던 중간 단계는 TRAINING_LOG11절, 최신 변경은 13절을 따른다.
 - 출력은 RSL-RL 공식 GaussianDistribution으로 전환했다. Tanh 없이 학습 시 Gaussian sample,
   play 시 mean을 사용하며 초기 std0.3은 유지했다. 이전 tanh checkpoint는 분포 검사에서 거절한다.
 - Native reward는 Clearance 1.8·Rearrangement 0.6·Motion 4개 각각 0.15·Time·Terminal의 8개다.
   Clearance는 `q=exp(−ax)`, Rearrangement·Motion은 `q−1` penalty로 지급한다.
   정지 시 R/M 기여는0이며 각 비용 x·weight는 유지했다. Terminal은 최근학습검토후
   성공+200·실패−50으로 조정했다. Time·γ=.99는 유지한다.
-  선반 변위 1 cm/2° 등 실패 원인 7개도 분리돼 있다.
+  선반 변위 1 cm/2° 등 실패 원인 5개도 분리돼 있다.
   이는 기준 조합이며 **현재 working cfg는 마지막 실험 E대로 Time/Terminal이 비활성**이다.
+- 2026-10-20 종료 조건을 완화했다. `workspace_exit`·`object_lift`를 제거하고,
+  `object_tilt`는 **같은 물체가 80° 이상 기울어진 상태를 0.2초 연속 유지**할 때만 작동한다.
+  50 Hz에서 물체별 10 step이며, 80° 미만이면 해당 누적값을 0으로 만든다. 해당 환경 reset에서도
+  초기화한다. 밀기·pivoting 중의 순간 기울어짐을 허용하려는 변경이며 성공 판정의 안정화·Target
+  보호·Blocker 통로 확보는 유지한다. 들림·작업 영역 이탈 자체는 실패나 성공 gate가 아니다.
+  80° 이상 기울어진 유예 구간에는 성공도 보류해, 5-step 성공이 10-step 전도 판정보다
+  먼저 확정되지 않도록 한다. 회복하면 기존 성공 안정화 카운터를 다시 시작한다.
+  `object_drop`의 지지면 아래 6 cm·F/T 과부하/범위·선반 변위·invalid state 기준은 유지한다.
+  이전 학습의 실패 원인 7개 기록은 당시 조건이며, 이번 변경 후 새 학습 성능은 아직 미확인이다.
 - 10월19일 추가 학습 `15-43-41`과 네 reward 조합 실험을 분석했다. 설정 차이는 활성 reward다.
   공통 checkpoint750을 같은 4장면·8시작자세에서 mean/sample로 평가한320episode는
   통로확보·성공0회, 과부하/센서범위초과278회였다. 초기 raw Clearance0.462601에서 개선이 거의 없다.
@@ -44,6 +65,9 @@
   우선 seed로 쓴다. 같은 목표에 다른 branch를 재시도하며, 실패 행만 제한적으로 복구한다.
   최종 실패 시 같은 장면의 검증된 기준 자세로 복구하고 횟수·환경 ID·seed를 남긴다.
   이는 해당 예외의 새 자세 randomization을 포기하는 정책이다. CUDA719의 원인 해결과 구분한다.
+  이 배치용 IK의 TCP는 손바닥 `right_plam_force_sensor`로 유지해 초기 hand가 Blocker 앞에 오게 한다.
+  제어·관측 wrist frame과 용도가 다르다. 물리 F/T는 기존 `ToolForceTorqueLink` sensor frame,
+  tactile은 기존 17개 링크를 유지하며 공유 배치·reset·reward·종료 조건은 이번 frame 변경으로 바꾸지 않는다.
 
 ## 1. 이전 프로젝트의 당시 위치와 상태 구분
 
@@ -6416,3 +6440,119 @@ Clearance평균19.151이었다. 성공500이 지배했다는 증거보다 반복
 실패비용은절반으로낮추며 종료조건·timeout bootstrap·Time·γ·다른weight는 유지한다.
 T06는옛양의R/M·tanh정책이므로 변경후성능은새run에서확인해야한다. 학습은실행하지않았다.
 근거·할인표·집계한계는 TRAINING_LOG9절과 outputs/contact_manipulation/terminal_scale_20261019/에 둔다.
+
+### 2026-10-20 — 접근 거리·Blocker 접촉 유지 보상과 비용 우선 검증
+
+사용자 승인으로17개 tactile pad의 실제 접촉면 대표점과 현재 Blocker OBB 사이의 최소 거리
+`d`에 `0.10*exp(−ln(2)/0.10*d)`를 추가했다. 대표점은 collision mesh의 노출된 local+Z
+표면에서 초기화 때만 구하고 이후 GPU 링크 pose로 변환한다. 현재 privileged 물체 pose를
+쓰며 initial-vision 관측의 pose 갱신이나 actor 입력 추가는 하지 않는다.
+
+접촉 유지는 **같은 pad가 직전·현재 모두 episode Blocker와 접촉했을 때만** 0.01씩 합산한다.
+0.01 N 초과 normal force를 binary로 만들며17개를 평균하지 않는다. 최초 접촉0, 최대0.17/step,
+다른 물체에서 Blocker로 바뀐 첫 sample은0이다. 상대 구분 없는 기존 tactile observation의
+previous bit를 사용하지 않고 reward 전용 Blocker binary를 저장한다. 50 Hz 두 sample 조건이며
+그 사이의 완전한 연속 접촉을 증명하지 않는다. 강한 힘·유지 시간에 비례하는 추가 배율은 없다.
+
+Native `BlockerContactHold(ManagerTermBase)`와 공식 RewardManager.reset으로 이력을 관리한다.
+부분 reset은 해당 행의 previous/count만 지우고, 같은 step 재조회는 이력을 다시 갱신하지 않는다.
+필터는 공식 PhysX 한 view에서 pad×물체 pool을 고정 연결하고 GPU로 Blocker 열을 선택한다.
+기존17 pad의 grouped net-force 관측과244D/18D·OSC·MDP/reset CUDA graph는 유지한다.
+새 production 파일은 없으며 Time/Terminal은 사용자 설정대로 계속 비활성이다.
+
+먼저 실제1,024환경에서 기존/거리만/거리+접촉 판별을 비교했다. 정지 명령은
+37.435/38.467/39.145 ms/step(+4.57%), 작은 접근 역순은
+36.743/37.791/38.940(+5.98%), 실제 접촉·자연 부분 reset을 포함한 접근 역순은
+47.492/48.572/48.035(+1.14%)였다. 초기 상태/reset 순서가 같았고 후반 두 비교는 최종
+상태 hash도 같았다. 앞의 두 비교는 접촉0이므로 실제 접촉 성능 근거로 사용하지 않는다.
+후반 비교는 Blocker 접촉·직전부터의 유지·다른 물체 접촉 제외를 실제 sample에서 확인했다.
+큰 새 병목이 없어 유지하며, `env.rewards.blocker_contact_hold=null`이면 필터와 유지 보상을
+끄고 기존 net-contact backend와 거리 항으로 돌아간다.
+
+실제8개 native reward를 활성화하고 임시 hook을 끈 최종1,024환경·1,008step 측정은
+38.277 ms/step,24-step 수집0.91865초였다. 첫 정지 baseline0.89843초보다 약2.25% 증가지만
+별도 단독 실행의 비교다. 초기 hash와 reset 순서는 일치했다.
+
+이 값은24-step 환경 수집 비용이며 PPO update/logging 포함 iteration 시간이 아니다.
+실제CUDA4환경16step에서 native reward/reset/관측 유지 검증을 통과했고 CPU 검사235pass/
+18skip/150subtest였다. 이전 Time/Terminal 활성 가정의 cfg 검사도 현재 비활성 설정에 맞췄다.
+두 지원 항도 접촉한 채 정지하면 양의 보상을 주므로 본 학습에서 접촉 이후 Clearance 증가와
+성공률을 비교해야 한다. Dense 상한은2.07/step, γ=.99의207이 되어 과거 Terminal200의
+180 상한 근거는 더 이상 현재값이 아니다. Terminal을 재활성화하거나 재조정하지 않았다.
+상세 근거와 artifact는 TRAINING_LOG14절·outputs/contact_manipulation/contact_reward_cost_20261020/에 둔다.
+
+### 2026-10-20 — 후속 학습 분석: 약한 접근 신호·latent hard gate·분산 증가
+
+사용자는 D/H 도입 후 Clearance·success 개선, hard-load의 잦은 종료, 거리 weight/a의
+재검토를 요청했다. **분석만 수행했고 production reward·종료 설정은 수정하지 않았다.**
+10월20일 새7run 중 앞4개는4환경 검증으로 제외했다. 비교 가능한1,024환경 실행은
+01:54:22(C/R/M,last421),02:49:46(+D.1/H.01,last755),03:16:36(같은보상,hardnativeOFF,last3250)다.
+세run의 agent/seed0/wrist/gravityTrue는같고, 첫차이는D/H추가, 다음차이는hardnative제거뿐이다.
+
+공통321–420iteration에서 C native로그11.440/13.048/24.092, episode길이112.34/125.72/
+298.71step이었다. C로그는reset그룹누적값/8초이고 Train길이는최근100episode 버퍼라
+서로 나누어품질을복원하면 이론하한도위반한다. 따라서 C로그상승을가림개선배수로해석하지않는다.
+HardOFF학습은190–2612사이86개iteration에서successsnapshot이양수였으나 마지막100은0이다.
+최대0.5524%는최근종료원인snapshot이며 누적성공률이나86회성공이아니다.
+
+최신학습최초→최종100회는 D/C지급비율2.235→0.900%, 유지로그8.29e−5→3.92e−7,
+평균episode303.52→373.23step, timeoutsnapshot85.63→99.08%였다. 접근신호는작고 유지접촉은
+거의없으며 후반계속개선중이라고보기어렵다. 유지기회가희박한원인을weight만으로단정하지않는다.
+
+중요한구현불일치: 사용자가hard_load_or_overrange를nativeTerminationsCfg에서꺼도
+task_conditions.failed에는hard가남아success/stability를차단한다. extras.terminated에도남아
+공통scene timeout의bootstrap을잘못막을수있다. 일반step의native done을바꾸는것은아니다.
+Terminal은off지만추후그대로켜면disabledhard가−50및terminal_paid잠금을일으킬수있다.
+진단용hardflag와활성failuremask를분리해native done/success/terminal/bootstrap을일치시키는
+교정이우선이다. 보상force80N·torque4Nm·rawSI축overrange를분리집계한후지속시간/허용기준을정한다.
+
+또Gaussianmeanstd최초.306→최종100회48.64였다. model3250의그룹std는위치.373m,
+회전63.26rad,rawKp54.19,rawhand74.93이다. 따라서위치std48m라고설명하지않는다.
+Kp/hand의범위clamp와큰raw분산이겹치고action-rate exp비용은포화하기쉬워,후반정책분산문제를
+weight만으로해결할수있다고보지않는다. 현재entropy_coef=.01·unboundedGaussian을유지했으며
+분산안정화/entropy대조는별도검토한다.
+
+예제거리식은선형거리의exp(−10d), reaching/mainweight2/6또는3/6이다. 예제는dt를곱하고
+우리는상쇄하므로rawweight를직접복사하지않는다. 최초대조후보는C1.8,D.4,H.01,R.6,M각.15로
+Dweight만4배, aD=ln2/.1과aC1은유지한다. 다음aD5/10을분리비교한다. 큰a는원거리신호를약화할수
+있고현재palm시작거리.12–.40m는최소pad거리와같지않으므로실제dquantile계측이필요하다.
+이것은미적용후보다. Time/Terminaloff의양의C/D/H지급은접촉정지/성공직전대기의이득을남기므로
+본학습전완료인센티브도검토해야한다. D.4후dense상한2.37/step(γ.99상한237)은그자체로terminal을
+자동결정하는수치가아니다. 상세표·그래프·설정diff·CPU판정재현·checkpoint분석은TRAINING_LOG15절과
+outputs/contact_manipulation/reward_followup_20261020/에보존했다.
+
+### 2026-10-20 — 승인 weight 적용·성공 판정 분리·PhysX fault 조사
+
+이전 절의 weight 후보를 사용자가 승인했다. 현재 C1.8/D0.4/H0.01/R0.6/Motion4항각0.15이며,
+실제 변경은 거리 weight0.1→0.4뿐이다. aD=ln2/.1, aC=1, Time/Terminal/hard-load OFF는 유지한다.
+Dense 상한2.37/step과 γ.99 상한237은 Terminal scale 자동 변경의 근거가 아니다.
+
+Success는 Target 초기 pose 대비2cm/.15rad 이내 + 지정 Blocker/A₀ 교차≤1e−5m²만
+5sample(.1초) 연속 검사한다. 전체 물체 속도, pending tilt, F/T, 선반, 다른 실패를 성공 gate에서
+제거했다. 활성 실패는 별도로 종료하며 성공과 동시에 기록될 수 있다. Terminal 활성 시 지급은
+실패 우선이다. Native 활성 실패 mask와 success 활성 여부를 초기화 때 캐시해 내부 failure,
+Terminal 지급, extras.terminated를 설정에 맞췄다. Disabled hard는 진단만 유지하며 bootstrap을
+막지 않는다. 관측244D·action18D·제어·물체 형상·PhysX buffer는 변경하지 않았다.
+
+첨부2026-10-19 19:51:55UTC 오류의 최초 표시 kernel은 artiSolveInternalTendonAndMimicJointConstraints1T다.
+같은시각·같은PID1432859의 kernel journal에서 Xid31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE가 확인됐다.
+GPU 주소 접근 오류의 증거이며 단순 계산 부하/OOM 증거는 아니다. PID와 TensorBoard 마지막3250이
+03-16-36 실행과 일치한다. 첨부626줄에는 overflow/OOM 경고가 없으나 이전경고까지 배제할 수 없다.
+
+실제 환경당 collision shape는 robot46+shelf17+pool45, 그중 Mustard32다. 과거 hand5×128 hull은
+재도입되지 않았고5개 parent각2proxy를 유지한다. 전체1,024환경은 convex91,136/box19,456/plane1,
+trimesh0이다. Native 통계를 읽은 단기 hold/접근/checkpoint3250재생과 별도 희박한 tactile접촉 검사에서
+contact sample최대92,637/8,388,608(1.10%), patch24,889/163,840(15.19%)였고719/overflow는 재현되지 않았다.
+이는 장기 peak도 조밀한 hand접촉 stress도 아니므로 충돌량 원인을 배제하지 않는다. Heap64MiB는
+초기크기이며 확장된2.50GiB를 overflow라 부르지 않는다. Stack0통계는 미확인으로 취급한다.
+버퍼 일괄증설·충돌 단순화·joint변경 없이 먼저 최초 실패kernel을 동기진단/memcheck로 좁혀야 한다.
+
+별도 Hand정확성 문제: URDF mimic6개와 달리 실제stage mimicAPI/tendon은0개다. 설치converter는
+convert_mimic_joints_to_normal_joints=False를 parse_mimic=False로 직접넘긴다. 공식 importer test도
+False이면 mimicAPI가 없음을 확인한다. Distal6관절은PD0인passive DOF이며 native mimic보존을
+가정하면 안 된다. 이번 오류kernel 이름만으로 mimic원인을 주장하지 않고 후속 교정으로 남겼다.
+CPU 검사는241pass/18skip/152subtest다. 실제GPU4환경×8step은 종료0·유한관측/reward,
+8reward/6termination/mask·부분reset neighbor보존을 통과했다. 복사입력의 별도 nativepredicate
+검사에서도 disabledhard와 높은 속도가 task success/bootstrapping을 막지 않음을 확인했다.
+상세는 TRAINING_LOG16절과
+outputs/contact_manipulation/physx_failure_20261020/에 보존한다.

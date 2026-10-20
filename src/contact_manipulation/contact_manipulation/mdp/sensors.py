@@ -209,6 +209,7 @@ class SensorReader:
 # Native classes are imported only by the scene configuration after AppLauncher.
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.managers import ManagerTermBase
 from isaaclab.utils.warp import convert_to_warp_mesh
 from pxr import Usd, UsdGeom, UsdPhysics
 
@@ -221,6 +222,81 @@ class TaskContactSensor(ContactSensor):
     without history read lazily. Keep native force acquisition/history and
     fall back for other sensor configurations.
     """
+
+    def _initialize_impl(self):
+        # A stop/play recreates native views; never retain handles from an old
+        # PhysX scene. Filtering can be enabled again after initialization.
+        self._object_filter_base_view = None
+        self._object_force_matrix_w = None
+        super()._initialize_impl()
+
+    def enable_object_filtering(self, objects, env_prim_paths):
+        """Opt into one grouped, environment-local pad/object contact matrix.
+
+        Native ContactSensor's single filter list cannot express this pairing
+        for multiple sensing bodies. PhysX accepts an explicit filter list for
+        each sensor pattern, retaining one native view and one matrix read.
+        Build paths once; episode role changes only select a different column.
+        """
+        if getattr(self, "_object_filter_base_view", None) is not None:
+            return
+        if self.cfg.filter_prim_paths_expr or self.cfg.history_length or not self._whole_batch_updates():
+            raise ValueError("Object filtering requires the grouped, history-free tactile sensor configuration.")
+        if objects.num_instances != self._num_envs or len(env_prim_paths) != self._num_envs:
+            raise ValueError("Tactile sensor, object collection and environment roots must have the same count.")
+        sensor_paths = list(self.contact_physx_view.sensor_paths)
+        object_paths = list(objects.root_physx_view.prim_paths)
+        if len(sensor_paths) != self._num_envs * self._num_bodies:
+            raise RuntimeError("Unexpected native tactile sensor path count.")
+        if len(object_paths) != self._num_envs * objects.num_objects:
+            raise RuntimeError("Unexpected native object collection path count.")
+        # Collection rows are object-major, while native grouped sensor rows
+        # are environment-major. Check both assumptions before creating a view.
+        filters = []
+        for row, sensor_path in enumerate(sensor_paths):
+            env_id = row // self._num_bodies
+            prefix = str(env_prim_paths[env_id]).rstrip("/") + "/"
+            paths = [object_paths[obj * self._num_envs + env_id]
+                     for obj in range(objects.num_objects)]
+            if not sensor_path.startswith(prefix) or any(not path.startswith(prefix) for path in paths):
+                raise RuntimeError("Native tactile/object row order does not match environment roots.")
+            filters.append(paths)
+        view = self._physics_sim_view.create_rigid_contact_view(
+            sensor_paths, filter_patterns=filters, max_contact_data_count=0,
+        )
+        if (view.sensor_count != len(sensor_paths) or view.filter_count != objects.num_objects
+                or list(view.sensor_paths) != sensor_paths):
+            raise RuntimeError("Filtered contact view changed native sensor or object-column ordering.")
+        self._object_filter_base_view = self._contact_physx_view
+        self._contact_physx_view = view
+        self._object_force_matrix_w = torch.zeros(
+            (self._num_envs, self._num_bodies, objects.num_objects, 3), device=self._device,
+        )
+        self._task_outdated = True
+
+    def disable_object_filtering(self):
+        """Restore the original grouped net-contact backend for cost comparisons."""
+        base = getattr(self, "_object_filter_base_view", None)
+        if base is not None:
+            self._contact_physx_view = base
+            self._object_filter_base_view = None
+            self._object_force_matrix_w = None
+            self._task_outdated = True
+
+    @property
+    def object_force_matrix_w(self):
+        """Cached [environment, native pad, collection object, xyz] pair forces."""
+        if getattr(self, "_object_filter_base_view", None) is None:
+            raise RuntimeError("Object-filtered tactile contact has not been enabled.")
+        self._update_outdated_buffers()
+        return self._object_force_matrix_w
+
+    def _update_buffers_impl(self, env_ids):
+        super()._update_buffers_impl(env_ids)
+        if getattr(self, "_object_filter_base_view", None) is not None:
+            matrix = self.contact_physx_view.get_contact_force_matrix(dt=self._sim_physics_dt)
+            rows = slice(None) if len(env_ids) == self._num_envs else env_ids
+            self._object_force_matrix_w[rows] = matrix.view_as(self._object_force_matrix_w)[rows]
 
     def _whole_batch_updates(self):
         return (self.cfg.update_period == 0.0 and not self.cfg.track_air_time
@@ -248,6 +324,62 @@ class TaskContactSensor(ContactSensor):
         # histories. Do not read stale PhysX contacts back into reset rows.
         self._update_outdated_buffers()
         super().reset(env_ids)
+        matrix = getattr(self, "_object_force_matrix_w", None)
+        if matrix is not None:
+            matrix[slice(None) if env_ids is None else env_ids] = 0
+
+
+class BlockerContactHold(ManagerTermBase):
+    """Native reward term: same pad touches the Blocker in consecutive samples.
+
+    RewardManager owns episode-history resets. Observation remains the original
+    any-object binary contact; only this privileged reward reads pair forces.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        from ..config.ur5e.scene import TACTILE_BODY_NAMES
+
+        self.sensor = env.scene["tactile_contact"]
+        ids, names = self.sensor.find_bodies(list(TACTILE_BODY_NAMES), preserve_order=True)
+        if tuple(names) != TACTILE_BODY_NAMES:
+            raise RuntimeError("Blocker contact reward requires all 17 canonical tactile pads.")
+        with torch.inference_mode(False):
+            self.pad_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
+            self.previous_contact = torch.zeros((env.num_envs, 17), device=env.device, dtype=torch.bool)
+            self.held_count = torch.zeros(env.num_envs, device=env.device)
+        self.last_step = env.common_step_counter
+        # Weight zero must also avoid registering the filtered native view.
+        if cfg.weight != 0:
+            self.sensor.enable_object_filtering(env.scene["object_collection"], env.scene.env_prim_paths)
+
+    def reset(self, env_ids=None):
+        rows = slice(None) if env_ids is None else env_ids
+        self.previous_contact[rows] = False
+        self.held_count[rows] = 0
+        # Keep the global timestamp: resetting one row cannot advance another
+        # row's contact history or re-read the previous episode's last sample.
+
+    def __call__(self, env, threshold=0.01):
+        from .events import get_task_state
+        from .rewards import blocker_contact_hold
+
+        get_task_state(env)
+        if self.last_step != env.common_step_counter:
+            self.sensor.enable_object_filtering(env.scene["object_collection"], env.scene.env_prim_paths)
+            # Select the object before reordering pads: avoid copying all ten
+            # object columns just to retain one Blocker column.
+            force = self.sensor.object_force_matrix_w.gather(
+                2, env.task_scene_data.blocker_id[:, None, None, None].expand(-1, 17, 1, 3),
+            ).squeeze(2).index_select(1, self.pad_ids)
+            held, current = blocker_contact_hold(
+                force, self.previous_contact, threshold=threshold,
+                valid=env.task_sensor_reader().tactile_valid,
+            )
+            self.held_count.copy_(held)
+            self.previous_contact.copy_(current)
+            self.last_step = env.common_step_counter
+        return self.held_count / env.step_dt
 
 
 def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:

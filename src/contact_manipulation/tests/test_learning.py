@@ -798,6 +798,7 @@ class NativeLearningTests(unittest.TestCase):
 
     def test_previous_action_checkpoints_are_rejected_before_loading_weights(self):
         algorithm, _ = make_algorithm()
+        self.assertEqual(ACTION_CONTRACT, "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3")
         variants = []
         unversioned = algorithm.save()
         del unversioned["research_metadata"]
@@ -808,6 +809,12 @@ class NativeLearningTests(unittest.TestCase):
         custom = algorithm.save()
         custom["research_metadata"]["action_contract"] = "custom_osc_and_bounded_hand_v1"
         variants.append(custom)
+        base_frame = algorithm.save()
+        base_frame["research_metadata"]["action_contract"] = "isaaclab_min_osc_variable_kp_joint_position_to_limits_v1"
+        variants.append(base_frame)
+        palm_frame = algorithm.save()
+        palm_frame["research_metadata"]["action_contract"] = "isaaclab_eef_osc_variable_kp_joint_position_to_limits_v2"
+        variants.append(palm_frame)
         before = {name: value.clone() for name, value in algorithm.actor.state_dict().items()}
         with patch.object(algorithm.actor, "load_state_dict") as actor_load, \
              patch.object(algorithm.critic, "load_state_dict") as critic_load, \

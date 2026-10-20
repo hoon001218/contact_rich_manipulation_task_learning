@@ -272,8 +272,8 @@ def settings():
         success_reward=500.0, failure_penalty=100.0, target_translation_tolerance=0.02,
         target_rotation_tolerance=0.15, stable_linear_velocity=0.015,
         stable_angular_velocity=0.10, success_overlap_area=1.e-5,
-        workspace_tolerance=0.015, drop_tolerance=0.06, lift_tolerance=0.04,
-        max_tilt=math.radians(50), force_hard=80.0, torque_hard=4.0,
+        drop_tolerance=0.06, max_tilt=math.radians(80), tilt_duration=.2,
+        force_hard=80.0, torque_hard=4.0,
         shelf_translation_tolerance=.01, shelf_rotation_tolerance=math.radians(2),
     )
 
@@ -332,8 +332,128 @@ def physical_inputs(n=1, objects=3):
                 blocker_overlap=torch.zeros(n, dtype=center.dtype),
                 sensor_wrench=torch.zeros(n, 6, dtype=center.dtype),
                 stable_count=torch.zeros(n, dtype=torch.long),
+                tilt_count=torch.zeros(n, objects, dtype=torch.long), step_dt=.02,
                 workspace_bounds=torch.tensor([-1., 1., -1., 1.], dtype=center.dtype),
                 shelf_top=0.0, ceiling=0.8)
+
+
+class ContactRewardTests(unittest.TestCase):
+    def test_distance_adapter_reads_current_collection_pose_with_upright_origin_correction(self):
+        dtype = torch.float64
+        lower = torch.tensor([[.1, -.1, .05]] * 4, dtype=dtype)
+        upper = torch.tensor([[.5, .1, .15]] * 4, dtype=dtype)
+        upright_rotations = Rotation.from_euler('x', [0., math.pi / 2, 0., -math.pi / 2])
+        upright = torch.tensor(upright_rotations.as_quat()[:, [3, 0, 1, 2]], dtype=dtype)
+        blocker = torch.tensor([3, 1])  # Actual collection IDs, distinct from the role slot 1.
+        canonical = Rotation.from_euler('z', [math.pi / 2, -math.pi / 4])
+        native_rotation = canonical * upright_rotations[[3, 1]]
+        poses = torch.zeros((2, 4, 7), dtype=dtype)
+        poses[..., 3] = 1.
+        poses[torch.arange(2), blocker, :3] = torch.tensor([[1., 2., 3.], [-1., .5, 2.]], dtype=dtype)
+        poses[torch.arange(2), blocker, 3:] = torch.tensor(
+            native_rotation.as_quat()[:, [3, 0, 1, 2]], dtype=dtype)
+        centers = poses[torch.arange(2), blocker, :3].numpy() + canonical.apply(
+            ((lower[blocker] + upper[blocker]) * .5).numpy())
+        points = torch.full((2, 17, 3), 99., dtype=dtype)
+        points[torch.arange(2), [2, 14]] = torch.tensor(
+            centers + canonical.apply([[.3, 0., 0.], [.4, 0., 0.]]), dtype=dtype)
+        env = SimpleNamespace(
+            step_dt=.02,
+            task_scene_data=SimpleNamespace(blocker_id=blocker, lower=lower, upper=upper, upright=upright),
+            scene={'object_collection': SimpleNamespace(data=SimpleNamespace(object_link_pose_w=poses))},
+        )
+        with patch.object(task, 'get_task_state', return_value=None) as state, \
+             patch.object(rewards, 'tactile_pad_points', return_value=points):
+            score = rewards.blocker_distance(env) * env.step_dt
+            torch.testing.assert_close(score, torch.tensor([.5, .25], dtype=dtype))
+            state.assert_called_once_with(env)
+            # The native pose moves during the episode, even though initial
+            # vision stays frozen. Distance must track this actual new pose.
+            poses[torch.arange(2), blocker, :3] += torch.tensor(
+                canonical.apply([[.05, 0., 0.], [.05, 0., 0.]]), dtype=dtype)
+            score = rewards.blocker_distance(env) * env.step_dt
+            torch.testing.assert_close(score, torch.exp(
+                -math.log(2.) / .1 * torch.tensor([.05, .15], dtype=dtype)))
+
+    def test_distance_uses_nearest_point_and_rotated_blocker_surface(self):
+        # An asymmetric box checks that its orientation, not an axis-aligned
+        # bound, determines the nearest surface. All 17 pads start far away.
+        points = torch.full((4, 17, 3), 10., dtype=torch.float64)
+        center = torch.zeros((4, 3), dtype=points.dtype)
+        rotation = identity(4)
+        half = torch.tensor([[.2, .1, .05]], dtype=points.dtype).expand(4, -1)
+        points[0, 3] = points.new_tensor([.2, 0., 0.])        # On surface.
+        points[1, 8] = points.new_tensor([.3, 0., 0.])        # 10 cm beyond +X.
+        points[2, 12] = points.new_tensor([.3, .2, .05])      # 10 cm along two axes.
+        rotation[3] = points.new_tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        center[3] = points.new_tensor([1., 2., 3.])
+        points[3, 16] = points.new_tensor([1., 2.3, 3.])       # Rotated box +X is world +Y.
+        quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
+        expected = torch.tensor([0., .1, math.sqrt(.02), .1], dtype=points.dtype)
+        torch.testing.assert_close(distance, expected)
+        torch.testing.assert_close(quality, torch.exp(-math.log(2.) / .1 * expected))
+
+    def test_distance_inside_is_zero_and_invalid_geometry_cannot_receive_quality(self):
+        points = torch.ones((5, 17, 3), dtype=torch.float64)
+        center, rotation = torch.zeros((5, 3), dtype=points.dtype), identity(5)
+        half = torch.full((5, 3), .1, dtype=points.dtype)
+        points[0, 0] = 0.  # A point inside the solid OBB has distance zero.
+        points[0, 1] = math.nan  # Ignore a missing pad rather than poison valid pads.
+        points[1] = math.nan
+        center[2, 0] = math.inf
+        half[3, 2] = 0.
+        rotation[4] = 0.
+        quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
+        torch.testing.assert_close(quality, torch.tensor([1., 0., 0., 0., 0.], dtype=points.dtype))
+        self.assertEqual(float(distance[0]), 0.)
+        self.assertTrue(torch.isinf(distance[1:]).all())
+
+    def test_hold_counts_same_pad_only_and_invalid_reading_breaks_continuity(self):
+        force = torch.zeros((3, 17, 3), dtype=torch.float64)
+        previous = torch.zeros((3, 17), dtype=torch.bool)
+        previous[0, [0, 1, 2, 3, 4]] = True
+        force[0, [0, 1, 5], 0] = .02
+        force[0, 2, 0] = .01  # Strictly above threshold is required.
+        force[0, 3, 0] = math.nan
+        force[0, 4, 0] = math.inf
+        force[1, 6, 0] = .02  # First contact is unscored.
+        previous[2] = True
+        force[2, :, 1] = .5
+        valid = torch.ones_like(previous)
+        valid[2, [3, 9]] = False
+        before = previous.clone()
+        count, current = rewards.blocker_contact_hold(force, previous, valid=valid)
+        torch.testing.assert_close(count, torch.tensor([2., 0., 15.], dtype=force.dtype))
+        torch.testing.assert_close(previous, before)  # History update belongs to the caller.
+        self.assertTrue(current[0, 5])
+        self.assertFalse(current[0, 2:5].any())
+        # Retaining only pad 1 while transferring pad 0's contact to pad 7 does
+        # not count a hold at pad 7. A cleared/reset row likewise earns zero.
+        force[0] = 0.
+        force[0, [1, 7], 2] = .02
+        current[2] = False
+        next_count, _ = rewards.blocker_contact_hold(force, current, valid=valid)
+        torch.testing.assert_close(next_count, torch.tensor([1., 1., 0.], dtype=force.dtype))
+
+    def test_contact_reward_helpers_preserve_dtype_and_never_read_device_scalars(self):
+        def reject(*args, **kwargs):
+            raise AssertionError("Contact rewards must not read scalars or transfer tensors to CPU")
+
+        for dtype in (torch.float32, torch.float64):
+            points = torch.full((1024, 17, 3), .2, dtype=dtype)
+            center = torch.zeros((1024, 3), dtype=dtype)
+            rotation = identity(1024).to(dtype)
+            half = torch.full_like(center, .1)
+            previous = torch.ones((1024, 17), dtype=torch.bool)
+            with patch.object(torch.Tensor, '__bool__', reject), \
+                 patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, 'cpu', reject):
+                quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
+                count, current = rewards.blocker_contact_hold(points, previous)
+            self.assertEqual(quality.dtype, dtype)
+            self.assertEqual(distance.dtype, dtype)
+            self.assertEqual(count.dtype, dtype)
+            self.assertEqual(current.dtype, torch.bool)
+            self.assertEqual(tuple(current.shape), (1024, 17))
 
 
 class RewardTests(unittest.TestCase):
@@ -604,7 +724,7 @@ class RewardTests(unittest.TestCase):
                 faster = split_motion_penalties(env, arm_cfg, hand_cfg)
             torch.testing.assert_close(faster, actual)
 
-    def test_clearance_is_only_positive_dense_payment_and_costs_are_bounded_per_transition(self):
+    def test_core_clearance_payment_and_motion_costs_are_bounded_per_transition(self):
         cfg, data = settings(), reward_inputs(4)
         data['dt'] = .02
         data['blocked'][:] = torch.tensor([1., .75, .5, 0.])
@@ -682,61 +802,197 @@ class RewardTests(unittest.TestCase):
         for node in definition.body:
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 keywords = {item.arg: item.value for item in node.value.keywords}
-                terms[node.targets[0].id] = (keywords['func'].attr, ast.literal_eval(keywords['weight']))
-        self.assertEqual(tuple(terms), ('clearance', 'rearrangement', 'motion_action_rate', 'motion_joint_velocity',
-                                       'motion_force_increase', 'motion_torque_increase', 'time', 'terminal'))
+                function = keywords['func']
+                terms[node.targets[0].id] = (function.attr if isinstance(function, ast.Attribute) else function.id,
+                                           ast.literal_eval(keywords['weight']))
+        self.assertEqual(tuple(terms), ('clearance', 'blocker_distance', 'blocker_contact_hold', 'rearrangement',
+                                       'motion_action_rate', 'motion_joint_velocity',
+                                       'motion_force_increase', 'motion_torque_increase'))
         self.assertEqual(terms, {
             'clearance': ('clearance', 1.8), 'rearrangement': ('rearrangement', .6),
+            'blocker_distance': ('blocker_distance', .40), 'blocker_contact_hold': ('BlockerContactHold', .01),
             'motion_action_rate': ('motion_action_rate', .15),
             'motion_joint_velocity': ('motion_joint_velocity', .15),
             'motion_force_increase': ('motion_force_increase', .15),
             'motion_torque_increase': ('motion_torque_increase', .15),
-            'time': ('time_penalty', 1.), 'terminal': ('terminal', 1.),
         })
 
 
 class TerminationTests(unittest.TestCase):
-    def test_stable_success_failure_priority_and_single_terminal_payment(self):
+    def test_task_success_independent_of_failure_with_failure_payment_priority(self):
         cfg = task.MdpCfg()
         candidate = torch.tensor([True, True, True, False])
         failed = torch.tensor([False, False, True, False])
         stable = torch.tensor([4, 5, 5, 0])
         paid = torch.zeros(4, dtype=torch.bool)
         success, terminal, paid = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
-        self.assertEqual(success.tolist(), [False, True, False, False])
+        self.assertEqual(success.tolist(), [False, True, True, False])
         self.assertEqual(terminal.tolist(), [0., cfg.success_reward, -cfg.failure_penalty, 0.])
         _, repeated, _ = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
         torch.testing.assert_close(repeated, torch.zeros_like(repeated))
 
-    def test_target_protection_overlap_and_all_objects_settled(self):
+    def test_target_pose_and_blocker_overlap_are_the_only_success_conditions(self):
         data = physical_inputs(5)
         data["center"][1, 0, 0] += 0.021
         data["rotation"][2, 0] = torch.tensor([math.cos(0.08), 0., 0., math.sin(0.08)])
         data["blocker_overlap"][3] = 1.e-4
         data["velocity"][4, 2, 0] = 0.016
         data["stable_count"][:] = 2
-        candidate, stable, _, failed = terminations.task_conditions(settings(), **data)
-        self.assertEqual(candidate.tolist(), [True, False, False, False, False])
-        self.assertEqual(stable.tolist(), [3, 0, 0, 0, 0])
+        candidate, stable, _, _, failed = terminations.task_conditions(settings(), **data)
+        self.assertEqual(candidate.tolist(), [True, False, False, False, True])
+        self.assertEqual(stable.tolist(), [3, 0, 0, 0, 3])
         self.assertFalse(failed.any())
 
     def test_each_failure_reason_and_invalid_state_is_independent(self):
-        data = physical_inputs(7)
+        data = physical_inputs(5)
         data["corners"][0, 1, :, 2] -= 0.061
-        data["rotation"][1, 1] = torch.tensor([math.cos(math.pi / 6), math.sin(math.pi / 6), 0., 0.])
-        data["corners"][2, 1, :, 0] += 1.1
-        data["corners"][3, 1, :, 2] += 0.041
-        data["sensor_wrench"][4, 0] = 80.1
-        data["initial_shelf_pose"] = torch.zeros(7, 7, dtype=torch.float64)
+        data["rotation"][1, 1] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+        data["tilt_count"][1, 1] = 9
+        data["sensor_wrench"][2, 0] = 80.1
+        data["initial_shelf_pose"] = torch.zeros(5, 7, dtype=torch.float64)
         data["initial_shelf_pose"][:, 3] = 1.
         data["shelf_pose"] = data["initial_shelf_pose"].clone()
-        data["shelf_pose"][5, 0] = .011
-        data["center"][6, 1, 1] = math.nan
-        candidate, stable, reasons, failed = terminations.task_conditions(settings(), **data)
-        torch.testing.assert_close(reasons, torch.eye(7, dtype=torch.bool))
+        data["shelf_pose"][3, 0] = .011
+        data["center"][4, 1, 1] = math.nan
+        candidate, stable, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        torch.testing.assert_close(reasons, torch.eye(5, dtype=torch.bool))
         self.assertTrue(failed.all())
+        # A simultaneous failure is logged independently from task completion.
+        self.assertTrue(candidate.all())
+        torch.testing.assert_close(stable, torch.ones(5, dtype=torch.long))
+
+    def test_fallen_threshold_inclusive_and_duration_uses_control_time(self):
+        cfg, data = settings(), physical_inputs(2)
+        self.assertAlmostEqual(task.MdpCfg().max_tilt, math.radians(80))
+        self.assertEqual(task.MdpCfg().tilt_duration, .2)
+        angles = torch.tensor([80., 79.9], dtype=data['rotation'].dtype).deg2rad() / 2
+        data['rotation'][:, 1, 0] = angles.cos()
+        data['rotation'][:, 1, 1] = angles.sin()
+        for step in range(1, 11):
+            _, _, count, reasons, failed = terminations.task_conditions(cfg, **data)
+            self.assertEqual(count[:, 1].tolist(), [step, 0])
+            self.assertEqual(reasons[:, 1].tolist(), [step >= 10, False])
+            self.assertEqual(failed.tolist(), [step >= 10, False])
+            data['tilt_count'] = count
+
+        # Duration is seconds, rather than a fixed ten-step threshold.
+        data = physical_inputs(1)
+        data['step_dt'] = .03
+        data['rotation'][0, 1] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+        for step in range(1, 8):
+            _, _, data['tilt_count'], _, failed = terminations.task_conditions(cfg, **data)
+            self.assertEqual(bool(failed[0]), step >= 7)
+
+    def test_transient_tilt_recovery_restarts_continuous_duration(self):
+        cfg, data = settings(), physical_inputs(1)
+        fallen = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.], dtype=data['rotation'].dtype)
+        data['rotation'][0, 1] = fallen
+        for _ in range(9):
+            _, _, data['tilt_count'], _, failed = terminations.task_conditions(cfg, **data)
+            self.assertFalse(failed.any())
+        data['rotation'][0, 1] = torch.tensor([1., 0., 0., 0.])
+        _, _, data['tilt_count'], _, failed = terminations.task_conditions(cfg, **data)
+        self.assertFalse(data['tilt_count'].any())
+        self.assertFalse(failed.any())
+        data['rotation'][0, 1] = fallen
+        _, _, count, _, failed = terminations.task_conditions(cfg, **data)
+        self.assertEqual(count[0, 1], 1)
+        self.assertFalse(failed.any())
+
+    def test_pending_other_object_fall_does_not_gate_task_success(self):
+        cfg, data = settings(), physical_inputs(1)
+        data['stable_count'].fill_(cfg.stable_steps)
+        data['rotation'][0, 1] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+        candidate, stable, count, reasons, failed = terminations.task_conditions(cfg, **data)
+        self.assertTrue(candidate.all())
+        self.assertEqual(stable[0], cfg.stable_steps + 1)
+        self.assertEqual(count[0, 1], 1)
+        self.assertFalse(reasons.any())
+        self.assertFalse(failed.any())
+        data.update(stable_count=stable, tilt_count=count)
+        data['rotation'][0, 1] = torch.tensor([1., 0., 0., 0.])
+        candidate, stable, count, _, failed = terminations.task_conditions(cfg, **data)
+        self.assertTrue(candidate.all())
+        self.assertEqual(stable[0], cfg.stable_steps + 2)
+        self.assertFalse(count.any())
+        self.assertFalse(failed.any())
+
+    def test_nonfinite_target_pose_or_overlap_cannot_report_task_success(self):
+        data = physical_inputs(6)
+        data['center'][0, 0, 0] = math.nan
+        data['initial_center'][1, 0, 1] = math.inf
+        data['rotation'][2, 0] = 0.
+        data['initial_rotation'][3, 0] = math.nan
+        data['blocker_overlap'][4] = math.nan
+        data['blocker_overlap'][5] = -1.
+        candidate, stable, _, _, _ = terminations.task_conditions(settings(), **data)
         self.assertFalse(candidate.any())
-        torch.testing.assert_close(stable, torch.zeros(7, dtype=torch.long))
+        self.assertFalse(stable.any())
+
+    def test_disabled_hard_load_remains_diagnostic_without_failure_or_success_gating(self):
+        cfg, data = settings(), physical_inputs(2)
+        data['stable_count'].fill_(cfg.stable_steps - 1)
+        data['sensor_wrench'][0, 0] = 1000.
+        data['sensor_range_exceeded'] = torch.ones(2, 6, dtype=torch.bool)
+        data['failure_mask'] = torch.tensor([True, True, False, True, True])
+        candidate, stable, _, reasons, failed = terminations.task_conditions(cfg, **data)
+        self.assertTrue(candidate.all())
+        self.assertTrue(reasons[:, 2].all())
+        self.assertFalse(failed.any())
+        successful, payment, _ = terminations.terminal_transition(
+            candidate, failed, stable, torch.zeros(2, dtype=torch.bool), cfg)
+        self.assertTrue(successful.all())
+        torch.testing.assert_close(payment, torch.full((2,), cfg.success_reward))
+
+    def test_enabled_native_failure_configuration_handles_alias_aggregate_and_timeouts(self):
+        term = lambda fn, **params: SimpleNamespace(func=fn, params=params, time_out=False)
+        config = SimpleNamespace(
+            completion=term(terminations.success),
+            shelf=term(terminations.failure, reason='shelf_displacement'),
+            disabled=None,
+            load_as_timeout=SimpleNamespace(func=terminations.failure,
+                                           params={'reason': 'hard_load_or_overrange'}, time_out=True),
+        )
+        mask, enabled = terminations.configured_terminations(config, device='cpu')
+        self.assertEqual(mask.tolist(), [False, False, False, True, False])
+        self.assertTrue(enabled)
+        mask, enabled = terminations.configured_terminations({'all_failures': term(terminations.failure)}, device='cpu')
+        self.assertTrue(mask.all())
+        self.assertFalse(enabled)
+
+    def test_disabled_success_does_not_pay_or_mark_terminal_but_keeps_task_predicate(self):
+        cfg = task.MdpCfg()
+        successful, payment, paid = terminations.terminal_transition(
+            torch.tensor([True]), torch.tensor([False]), torch.tensor([cfg.stable_steps]),
+            torch.tensor([False]), cfg, success_enabled=False)
+        self.assertTrue(successful.all())
+        self.assertFalse(payment.any())
+        self.assertFalse(paid.any())
+
+    def test_alternating_fallen_objects_never_share_a_duration_counter(self):
+        cfg, data = settings(), physical_inputs(1)
+        for step in range(24):
+            data['rotation'].zero_()
+            data['rotation'][..., 0] = 1.
+            index = 1 + step % 2
+            data['rotation'][0, index] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+            _, _, data['tilt_count'], _, failed = terminations.task_conditions(cfg, **data)
+            self.assertFalse(failed.any())
+            self.assertEqual(data['tilt_count'][0, index], 1)
+            self.assertEqual(data['tilt_count'][0, 3 - index], 0)
+
+    def test_workspace_lift_and_ceiling_crossing_do_not_independently_fail(self):
+        data = physical_inputs(3)
+        data['center'][0, 1, 0] += 2.
+        data['corners'][0, 1, :, 0] += 2.
+        data['center'][1, 1, 2] += .05
+        data['corners'][1, 1, :, 2] += .05
+        data['center'][2, 1, 2] += 1.
+        data['corners'][2, 1, :, 2] += 1.
+        data['velocity'][:, 1, 0] = .5
+        _, _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        self.assertFalse(reasons.any())
+        self.assertFalse(failed.any())
 
     def test_nonfinite_initial_geometry_wrench_velocity_and_robot_fail(self):
         data = physical_inputs(5)
@@ -745,8 +1001,8 @@ class TerminationTests(unittest.TestCase):
         data["velocity"][2, 1, 0] = math.inf
         data["state_valid"] = torch.tensor([True, True, True, False, True])
         data["rotation"][4, 1] = 0.0  # Invalid quaternion must not count as upright.
-        _, _, reasons, failed = terminations.task_conditions(settings(), **data)
-        self.assertTrue(reasons[:, 6].all())
+        _, _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        self.assertTrue(reasons[:, 4].all())
         self.assertTrue(failed.all())
 
     def test_inactive_nan_slots_do_not_poison_conditions(self):
@@ -754,10 +1010,12 @@ class TerminationTests(unittest.TestCase):
         data["active"][:, 2] = False
         for key in ("center", "corners", "rotation", "velocity", "initial_center", "initial_rotation"):
             data[key][:, 2] = math.nan
-        candidate, stable, reasons, failed = terminations.task_conditions(settings(), **data)
+        data["tilt_count"][:, 2] = 9
+        candidate, stable, tilt, reasons, failed = terminations.task_conditions(settings(), **data)
         self.assertTrue(candidate.all())
         self.assertFalse(reasons.any())
         self.assertFalse(failed.any())
+        self.assertFalse(tilt.any())
         torch.testing.assert_close(stable, torch.ones_like(stable))
 
     def test_shelf_displacement_rotation_sign_and_invalid_pose(self):
@@ -776,18 +1034,18 @@ class TerminationTests(unittest.TestCase):
         pose[6, 0] = math.nan
         pose[7, 3:] = 0
         data.update(shelf_pose=pose, initial_shelf_pose=initial)
-        _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        _, _, _, reasons, failed = terminations.task_conditions(settings(), **data)
         self.assertEqual(failed.tolist(), [False, True, False, True, False, False, True, True])
-        self.assertEqual(reasons[:, 5].tolist(), [False, True, False, True, False, False, False, True])
-        self.assertTrue(reasons[6:, 6].all())
+        self.assertEqual(reasons[:, 3].tolist(), [False, True, False, True, False, False, False, True])
+        self.assertTrue(reasons[6:, 4].all())
 
     def test_total_sensor_overrange_fails_even_with_zero_compensated_load(self):
         data = physical_inputs(2)
         data["sensor_range_exceeded"] = torch.zeros(2, 6, dtype=torch.bool)
         data["sensor_range_exceeded"][1, 2] = True
-        _, _, reasons, failed = terminations.task_conditions(settings(), **data)
+        _, _, _, reasons, failed = terminations.task_conditions(settings(), **data)
         self.assertEqual(failed.tolist(), [False, True])
-        self.assertTrue(reasons[1, 4])
+        self.assertTrue(reasons[1, 2])
 
     def test_per_environment_workspace_and_shelf_offsets(self):
         data = physical_inputs(2)
@@ -795,7 +1053,7 @@ class TerminationTests(unittest.TestCase):
         data["shelf_top"] = torch.tensor([0.0, 2.0], dtype=torch.float64)
         data["ceiling"] = torch.tensor([0.8, 2.8], dtype=torch.float64)
         data["workspace_bounds"] = data["workspace_bounds"].repeat(2, 1)
-        candidate, _, _, failed = terminations.task_conditions(settings(), **data)
+        candidate, _, _, _, failed = terminations.task_conditions(settings(), **data)
         self.assertTrue(candidate.all())
         self.assertFalse(failed.any())
 
@@ -805,9 +1063,13 @@ class TerminationTests(unittest.TestCase):
         data["velocity"].normal_(mean=0.0, std=0.006)
         data["blocker_overlap"].uniform_(0.0, 2.e-5)
         data["stable_count"].random_(0, 8)
+        data["tilt_count"].random_(0, 12)
+        angles = torch.empty(2048, 10, dtype=torch.float64).uniform_(0., math.pi)
+        data["rotation"][..., 0] = torch.cos(angles / 2)
+        data["rotation"][..., 1] = torch.sin(angles / 2)
         data["sensor_wrench"].normal_(mean=0.0, std=1.0)
         full = terminations.task_conditions(settings(), **data)
-        chunks = [[], [], [], []]
+        chunks = [[], [], [], [], []]
         for start in range(0, 2048, 257):
             chunk = {k: v[start:start + 257] if isinstance(v, torch.Tensor) and k != "workspace_bounds" else v
                      for k, v in data.items()}
@@ -920,6 +1182,88 @@ class NativeArmEffortLimitTests(unittest.TestCase):
 
 @unittest.skipUnless("isaaclab.controllers" in sys.modules, "Requires Isaac Sim AppLauncher")
 class NativeControllerTests(unittest.TestCase):
+    def test_project_osc_task_frame_matches_the_observation_eef(self):
+        from isaaclab.envs.mdp.actions.task_space_actions import OperationalSpaceControllerAction
+        from contact_manipulation.config.ur5e.scene import TCP_BODY_NAME, TACTILE_BODY_NAMES
+        from contact_manipulation.config.ur5e.ur5e_env_cfg import UR5eContactManipulationEnvCfg
+
+        cfg = UR5eContactManipulationEnvCfg()
+        arm = cfg.actions.arm_action
+        observation_eef = cfg.scene.ee_frame.target_frames[0].prim_path
+        self.assertIs(arm.class_type, OperationalSpaceControllerAction)
+        self.assertEqual(arm.body_name, "wrist_3_link")
+        self.assertEqual(arm.task_frame_rel_path, "Robot/wrist_3_link")
+        self.assertEqual(observation_eef, "{ENV_REGEX_NS}/Robot/wrist_3_link")
+        self.assertEqual("{ENV_REGEX_NS}/" + arm.task_frame_rel_path, observation_eef)
+        self.assertEqual(arm.body_name, observation_eef.rsplit("/", 1)[-1])
+        self.assertIsNone(arm.body_offset)
+        self.assertEqual(arm.controller_cfg.target_types, ["pose_rel"])
+        self.assertEqual((arm.position_scale, arm.orientation_scale, arm.stiffness_scale), (1., 1., 100.))
+        self.assertTrue(arm.controller_cfg.gravity_compensation)
+        # Reset IK targets the palm; changing the control point must preserve
+        # both the hand's Blocker-front start and its existing tactile links.
+        self.assertEqual(TCP_BODY_NAME, "right_plam_force_sensor")
+        self.assertEqual(TACTILE_BODY_NAMES[0], TCP_BODY_NAME)
+        self.assertEqual(len(set(TACTILE_BODY_NAMES)), 17)
+
+    def test_native_eef_delta_pose_and_anisotropic_gains_rotate_into_base(self):
+        from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
+
+        controller = OperationalSpaceController(OperationalSpaceControllerCfg(
+            target_types=["pose_rel"], impedance_mode="variable_kp",
+            motion_stiffness_limits_task=(50., 200.), nullspace_control="none",
+        ), 3, "cpu")
+        half = math.sqrt(.5)
+        pose = torch.tensor([[.3, -.1, .4, 1., 0., 0., 0.],
+                             [.5, .2, .1, half, 0., 0., half],
+                             [-.2, .4, .3, half, 0., half, 0.]])
+        delta = torch.tensor([[.01, -.02, .03, .2, -.12, .08]]).expand(3, -1)
+        gains = torch.tensor([[50., 100., 200., 60., 120., 180.]]).expand(3, -1)
+        controller.set_command(torch.cat((delta, gains), -1),
+                               current_ee_pose_b=pose, current_task_frame_pose_b=pose)
+
+        # An independent SciPy oracle checks local translation and right-multiplied
+        # local rotation; the latter differs from a base-axis rotation command.
+        eef_rotation = Rotation.from_quat(pose[:, [4, 5, 6, 3]].numpy())
+        expected_position = pose[:, :3].numpy() + eef_rotation.apply(delta[:, :3].numpy())
+        expected_rotation = eef_rotation * Rotation.from_rotvec(delta[:, 3:].numpy())
+        torch.testing.assert_close(controller.desired_ee_pose_b[:, :3],
+                                   torch.tensor(expected_position, dtype=pose.dtype))
+        torch.testing.assert_close(rotation_matrix(controller.desired_ee_pose_b[:, 3:]),
+                                   torch.tensor(expected_rotation.as_matrix(), dtype=pose.dtype))
+        expected_gains = torch.tensor([[50., 100., 200., 60., 120., 180.],
+                                       [100., 50., 200., 120., 60., 180.],
+                                       [200., 100., 50., 180., 120., 60.]])
+        torch.testing.assert_close(controller._motion_p_gains_b, torch.diag_embed(expected_gains),
+                                   atol=5.e-5, rtol=1.e-6)
+
+    def test_native_eef_target_and_axes_are_latched_until_the_next_policy_command(self):
+        from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
+
+        controller = OperationalSpaceController(OperationalSpaceControllerCfg(
+            target_types=["pose_rel"], impedance_mode="variable_kp",
+            inertial_dynamics_decoupling=True, motion_stiffness_limits_task=(50., 200.),
+            nullspace_control="none",
+        ), 1, "cpu")
+        half = math.sqrt(.5)
+        pose = torch.tensor([[.3, .2, .4, half, 0., 0., half]])
+        command = torch.tensor([[.01, 0., 0., 0., 0., 0., 50., 100., 200., 60., 120., 180.]])
+        controller.set_command(command, current_ee_pose_b=pose, current_task_frame_pose_b=pose)
+        target, gains = controller.desired_ee_pose_b.clone(), controller._motion_p_gains_b.clone()
+        torch.testing.assert_close(target[:, :3], torch.tensor([[.3, .21, .4]]))
+        changed_pose = torch.tensor([[.31, .2, .4, half, 0., half, 0.]])
+        for measured in (pose, changed_pose):
+            efforts = controller.compute(jacobian_b=torch.eye(6)[None],
+                current_ee_pose_b=measured, current_ee_vel_b=torch.zeros(1, 6),
+                mass_matrix=torch.eye(6)[None])
+            self.assertTrue(torch.isfinite(efforts).all())
+            torch.testing.assert_close(controller.desired_ee_pose_b, target)
+            torch.testing.assert_close(controller._motion_p_gains_b, gains)
+        controller.set_command(command, current_ee_pose_b=changed_pose,
+                               current_task_frame_pose_b=changed_pose)
+        torch.testing.assert_close(controller.desired_ee_pose_b[:, :3], torch.tensor([[.31, .2, .39]]))
+        self.assertFalse(torch.allclose(controller._motion_p_gains_b, gains))
+
     def test_native_hand_soft_limit_mapping_and_selected_reset(self):
         from unittest.mock import Mock
         from isaaclab.envs.mdp.actions.actions_cfg import JointPositionToLimitsActionCfg
@@ -1279,6 +1623,22 @@ class StateTests(unittest.TestCase):
         state.advance(batch, 2)
         torch.testing.assert_close(state.elapsed_time, torch.tensor([.2, .1, .2, .1], dtype=state.elapsed_time.dtype))
 
+    def test_partial_reset_clears_only_selected_object_tilt_counters(self):
+        state, batch, reset = fixture(4)
+        batch.rotation[:, 1] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+        state.advance(batch, 1)
+        self.assertEqual(state.tilt_count[:, 1].tolist(), [1, 1, 1, 1])
+        self.assertFalse(state.failure.any())
+        selected, untouched = torch.tensor([1, 3]), torch.tensor([0, 2])
+        saved = state.tilt_count[untouched].clone()
+        batch.rotation[selected, 1] = batch.rotation.new_tensor([1., 0., 0., 0.])
+        state.reset(selected, batch, **reset, step=1)
+        self.assertFalse(state.tilt_count[selected].any())
+        torch.testing.assert_close(state.tilt_count[untouched], saved)
+        state.advance(batch, 2)
+        self.assertTrue(state.failure[untouched].all())
+        self.assertFalse(state.failure[selected].any())
+
     def test_cumulative_corner_path_keeps_out_and_back_movement(self):
         state, batch, _ = fixture(1)
         before = clone_batch(batch)
@@ -1383,14 +1743,72 @@ class StateTests(unittest.TestCase):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    def test_control_body_changes_robot_and_object_frames_without_changing_sensor_wrench(self):
+        """Native body binding selects the wrist independently from the F/T link."""
+        outputs = {}
+        for selected in ("tcp", "hand"):
+            env, _, _ = native_fixture(2)
+            data = env.scene["robot"].data
+            env.cfg.actions.arm_action.body_name = selected
+            # Distinct rotated wrist and palm frames expose both reference-point
+            # and reference-axis errors; root rotation also differs from world.
+            data.root_quat_w[:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+            data.body_link_pos_w[:, 1] += torch.tensor([.2, -.1, .1])
+            data.body_link_quat_w[:, 1] = torch.tensor([math.sqrt(.5), 0., math.sqrt(.5), 0.])
+            data.body_link_pos_w[:, 3] += torch.tensor([.3, .1, -.1])
+            data.body_link_quat_w[:, 3] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+            task.reset_task(env)
+            expected_body = env.scene["robot"].body_names.index(selected)
+            self.assertEqual(env._contact_mdp.bindings.tcp_id, expected_body)
+            self.assertEqual(env._contact_mdp.bindings.sensor_id, 2)
+
+            # Exercise reset and the first live sensor transition with the same
+            # independent SciPy frame oracle, not the production math helpers.
+            for step in (0, 1):
+                env.common_step_counter = step
+                packed = obs.policy_observation(env)
+                state = env._contact_mdp
+                root_rotation = Rotation.from_quat(data.root_quat_w[:, [1, 2, 3, 0]].numpy())
+                body_rotation = Rotation.from_quat(data.body_link_quat_w[:, expected_body][:, [1, 2, 3, 0]].numpy())
+                expected_rotation = root_rotation.inv() * body_rotation
+                expected_position = root_rotation.inv().apply(
+                    (data.body_link_pos_w[:, expected_body] - data.root_pos_w).numpy())
+                torch.testing.assert_close(packed[:, 124:127], torch.tensor(expected_position, dtype=packed.dtype))
+                torch.testing.assert_close(rotation_matrix(packed[:, 127:131]),
+                                           torch.tensor(expected_rotation.as_matrix(), dtype=packed.dtype))
+
+                valid = state.geometry_valid
+                frozen = state.geometry_b
+                expected_geometry = torch.zeros_like(frozen)
+                for row in range(env.num_envs):
+                    rotation = expected_rotation[row].inv()
+                    expected_geometry[row, valid[row], :3] = torch.tensor(rotation.apply(
+                        frozen[row, valid[row], :3].numpy() - expected_position[row]), dtype=packed.dtype)
+                    object_rotation = Rotation.from_quat(frozen[row, valid[row], 3:7][:, [1, 2, 3, 0]].numpy())
+                    relative = torch.tensor((rotation * object_rotation).as_quat()[:, [3, 0, 1, 2]], dtype=packed.dtype)
+                    relative = torch.where(relative[:, :1] < 0, -relative, relative)
+                    expected_geometry[row, valid[row], 3:7] = relative
+                    expected_geometry[row, valid[row], 7:] = frozen[row, valid[row], 7:]
+                torch.testing.assert_close(packed[:, :100].reshape_as(frozen), expected_geometry, atol=1.e-6, rtol=1.e-5)
+            outputs[selected] = packed.clone()
+
+        self.assertFalse(torch.allclose(outputs["tcp"][:, :100], outputs["hand"][:, :100]))
+        self.assertFalse(torch.allclose(outputs["tcp"][:, 124:131], outputs["hand"][:, 124:131]))
+        # Identical physical sensor pose/distal loads keep SI-200-8 compensated
+        # sensor-frame force/torque identical despite the changed EEF frame.
+        torch.testing.assert_close(outputs["tcp"][:, 131:137], outputs["hand"][:, 131:137], rtol=0, atol=0)
+
     @staticmethod
-    def failure_fixture():
-        """Seven isolated failures, one safe row, and one simultaneous failure."""
+    def failure_fixture(termination_cfg=None):
+        """Five isolated failures, three safe rows, and one simultaneous failure."""
         env, action, _ = native_fixture(9)
+        if termination_cfg is not None:
+            env.cfg.terminations = termination_cfg
         task.reset_task(env)
         poses = env.scene['object_collection'].data.object_link_pose_w
         poses[0, 0, 2] = -.02
-        poses[1, 0, 3:] = torch.tensor([math.cos(math.pi / 6), math.sin(math.pi / 6), 0., 0.])
+        poses[1, 0, 3:] = torch.tensor([math.sqrt(.5), math.sqrt(.5), 0., 0.])
+        env._contact_mdp.tilt_count[1, 1] = 1  # Native fixture has a .1 s control period.
         poses[2, 0, 0] = 2.
         poses[[3, 8], 0, 2] = .1
         env.sensors.ideal_wrench[[4, 8], 0] = 201.
@@ -1401,11 +1819,10 @@ class NativeAdapterTests(unittest.TestCase):
 
     def test_named_failures_are_cached_independent_and_pay_once_when_causes_overlap(self):
         env = self.failure_fixture()
-        names = ('object_drop', 'object_tilt', 'workspace_exit', 'object_lift',
-                 'hard_load_or_overrange', 'shelf_displacement', 'invalid_state')
-        expected = torch.zeros(9, 7, dtype=torch.bool)
-        expected[:7] = torch.eye(7, dtype=torch.bool)
-        expected[8, [3, 4, 5]] = True
+        names = ('object_drop', 'object_tilt', 'hard_load_or_overrange', 'shelf_displacement', 'invalid_state')
+        expected = torch.zeros(9, 5, dtype=torch.bool)
+        expected[[0, 1, 4, 5, 6]] = torch.eye(5, dtype=torch.bool)
+        expected[8, [2, 3]] = True
         with patch.object(task, '_read_transition', wraps=task._read_transition) as read, \
              patch.object(task, 'task_conditions', wraps=task.task_conditions) as conditions:
             actual = torch.stack([terminations.failure(env, reason=name) for name in names], -1)
@@ -1414,7 +1831,7 @@ class NativeAdapterTests(unittest.TestCase):
             self.assertFalse(terminations.success(env).any())
             payment = rewards.terminal(env) * env.step_dt
             torch.testing.assert_close(payment, -env.cfg.mdp.failure_penalty * expected.any(-1))
-            # Observation and all nine termination terms reuse one completed transition.
+            # Observation and all seven termination terms reuse one completed transition.
             obs.current_robot_sample(env)
             self.assertEqual(read.call_count, 1)
             self.assertEqual(conditions.call_count, 1)
@@ -1425,6 +1842,48 @@ class NativeAdapterTests(unittest.TestCase):
     def test_unknown_failure_name_rejects_configuration_before_accessing_environment(self):
         with self.assertRaisesRegex(ValueError, 'reason|failure'):
             terminations.failure(None, reason='shelf_contact_typo')
+
+    def test_disabled_hard_term_preserves_diagnostics_without_false_terminal_bootstrap_mask(self):
+        env, _, _ = native_fixture(2)
+        env.cfg.terminations = SimpleNamespace(
+            success=SimpleNamespace(func=terminations.success, params={}, time_out=False),
+            invalid=SimpleNamespace(func=terminations.failure, params={'reason': 'invalid_state'}, time_out=False),
+            hard=None,
+        )
+        task.reset_task(env)
+        env.sensors.ideal_wrench[:, 0] = 201.
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        self.assertTrue(state.failure_reasons[:, 2].all())
+        self.assertFalse(state.failure.any())
+        self.assertFalse(state.success.any())  # Blocker still overlaps the access region.
+        self.assertFalse(env.extras['terminated'].any())
+        self.assertFalse(state.components[:, 5].any())
+        torch.testing.assert_close(terminations.failure(env, reason='hard_load_or_overrange'),
+                                   torch.ones(2, dtype=torch.bool))
+
+        # Clearing the Blocker can succeed despite that same diagnostic load.
+        env.scene['object_collection'].data.object_link_pose_w[:, 0, 0] = .8
+        for step in range(2, env.cfg.mdp.stable_steps + 2):
+            env.common_step_counter = step
+            state = task.get_task_state(env)
+        self.assertTrue(state.success.all())
+        self.assertTrue(env.extras['terminated'].all())
+        self.assertFalse(state.failure.any())
+        torch.testing.assert_close(state.components[:, 5], torch.full((2,), env.cfg.mdp.success_reward))
+
+    def test_disabled_success_term_does_not_mark_geometric_completion_as_native_termination(self):
+        env, _, _ = native_fixture(1)
+        env.cfg.terminations = {}
+        task.reset_task(env)
+        env.scene['object_collection'].data.object_link_pose_w[:, 0, 0] = .8
+        for step in range(1, env.cfg.mdp.stable_steps + 1):
+            env.common_step_counter = step
+            state = task.get_task_state(env)
+        self.assertTrue(state.success.all())
+        self.assertFalse(env.extras['terminated'].any())
+        self.assertFalse(state.components[:, 5].any())
+        self.assertFalse(state.terminal_paid.any())
 
     def test_native_termination_manager_logs_every_cause_and_retains_last_episode_after_partial_reset(self):
         # Run the checkout's real compute/reset methods and our real term config,
@@ -1456,10 +1915,10 @@ class NativeAdapterTests(unittest.TestCase):
             exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
         cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
                if isinstance(value, TermCfg)}
-        names = ['time_out', 'success', 'object_drop', 'object_tilt', 'workspace_exit', 'object_lift',
-                 'hard_load_or_overrange', 'shelf_displacement', 'invalid_state']
+        names = ['time_out', 'success', 'object_drop', 'object_tilt',
+                 'shelf_displacement', 'invalid_state']
         self.assertEqual(list(cfg), names)
-        env = self.failure_fixture()
+        env = self.failure_fixture(termination_cfg=cfg)
         env.episode_length_buf = torch.zeros(env.num_envs, dtype=torch.long)
         env.max_episode_length = 400
         manager = namespace['TerminationManager'](cfg, env)
@@ -1468,9 +1927,9 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
         torch.testing.assert_close(dones, env._contact_mdp.failure)
         self.assertFalse(manager.time_outs.any())
-        expected = torch.zeros(9, 9, dtype=torch.bool)
-        expected[:7, 2:] = torch.eye(7, dtype=torch.bool)
-        expected[8, [5, 6, 7]] = True
+        expected = torch.zeros(9, 6, dtype=torch.bool)
+        expected[[0, 1, 5, 6], 2:] = torch.eye(4, dtype=torch.bool)
+        expected[8, 4] = True
         for column, name in enumerate(names):
             torch.testing.assert_close(manager.get_term(name), expected[:, column])
         logged = manager.reset(torch.tensor([0, 8]))
@@ -3057,6 +3516,150 @@ class PartialResetBatchTests(unittest.TestCase):
                 torch.testing.assert_close(getattr(state, name)[other_ids], expected)
         torch.testing.assert_close(env.extras['terminal_observation'], final_observation)
         self.assertIsNot(env.extras['terminal_observation'], state.observation)
+
+
+class BlockerContactManagerTests(unittest.TestCase):
+    """Run the native term's code without importing Kit-dependent sensors."""
+
+    @classmethod
+    def setUpClass(cls):
+        class ManagerTermBase:
+            def __init__(self, cfg, env):
+                self.cfg, self._env = cfg, env
+
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation/mdp/sensors.py'
+        node = next(n for n in ast.parse(path.read_text()).body
+                    if isinstance(n, ast.ClassDef) and n.name == 'BlockerContactHold')
+        namespace = dict(torch=torch, ManagerTermBase=ManagerTermBase,
+                         __name__='contact_manipulation.mdp.sensors', __package__='contact_manipulation.mdp')
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
+        cls.term_type = namespace['BlockerContactHold']
+        cls.names = tuple(f'pad_{i}' for i in range(17))
+
+    def fixture(self, weight=.01):
+        canonical_names = self.names
+
+        class Sensor:
+            def __init__(self):
+                self.matrix = torch.zeros((3, 17, 4, 3))
+                self.reads, self.enables = 0, 0
+
+            def find_bodies(self, names, preserve_order=False):
+                assert preserve_order and tuple(names) == canonical_names
+                # The native sensor rows deliberately have reverse order.
+                return list(reversed(range(17))), list(names)
+
+            def enable_object_filtering(self, objects, paths):
+                self.enables += 1
+
+            @property
+            def object_force_matrix_w(self):
+                self.reads += 1
+                return self.matrix
+
+            def contact(self, row, canonical_pad, object_id, force=.02):
+                self.matrix[row, 16 - canonical_pad, object_id, 0] = force
+
+        class Scene(dict):
+            env_prim_paths = ['/World/envs/env_0', '/World/envs/env_1', '/World/envs/env_2']
+
+        sensor = Sensor()
+        sensor_values = SimpleNamespace(tactile_valid=torch.ones((3, 17), dtype=torch.bool))
+        env = SimpleNamespace(num_envs=3, device='cpu', step_dt=.02, common_step_counter=0,
+                              task_scene_data=SimpleNamespace(blocker_id=torch.tensor([3, 1, 2])),
+                              task_sensor_reader=lambda: sensor_values,
+                              scene=Scene(tactile_contact=sensor, object_collection=object()))
+        fake_scene = types.ModuleType('contact_manipulation.config.ur5e.scene')
+        fake_scene.TACTILE_BODY_NAMES = canonical_names
+        with patch.dict(sys.modules, {fake_scene.__name__: fake_scene}):
+            term = self.term_type(SimpleNamespace(weight=weight), env)
+        return env, sensor, sensor_values, term
+
+    @staticmethod
+    def seed_contacts(sensor):
+        sensor.contact(0, 0, 3)
+        sensor.contact(0, 4, 3)
+        sensor.contact(0, 9, 1)  # Wrong object: role slot 1 is not collection Blocker 3.
+        sensor.contact(1, 16, 1)
+        sensor.contact(2, 8, 2)
+
+    def test_actual_collection_column_and_native_pad_order_and_step_cache(self):
+        env, sensor, _, term = self.fixture()
+        self.seed_contacts(sensor)
+        expected = torch.zeros((3, 17), dtype=torch.bool)
+        expected[0, [0, 4]], expected[1, 16], expected[2, 8] = True, True, True
+        with patch.object(task, 'get_task_state', return_value=None):
+            torch.testing.assert_close(term(env), torch.zeros(3))
+            self.assertEqual(sensor.reads, 0)
+            env.common_step_counter = 1
+            torch.testing.assert_close(term(env), torch.zeros(3))  # First contact.
+            torch.testing.assert_close(term.previous_contact, expected)
+            env.common_step_counter = 2
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([2., 1., 1.]))
+            sensor.matrix.zero_()
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([2., 1., 1.]))
+            torch.testing.assert_close(term.previous_contact, expected)
+            self.assertEqual(sensor.reads, 2)  # Repeated reward access never advances history.
+            env.common_step_counter = 3
+            torch.testing.assert_close(term(env), torch.zeros(3))
+            self.assertFalse(term.previous_contact.any())
+
+    def test_partial_reset_preserves_neighbors_and_role_change_cannot_keep_old_contact(self):
+        env, sensor, _, term = self.fixture()
+        self.seed_contacts(sensor)
+        with patch.object(task, 'get_task_state', return_value=None):
+            for step in (1, 2):
+                env.common_step_counter = step
+                term(env)
+            neighbors = term.previous_contact[[0, 2]].clone()
+            term.reset(torch.tensor([1]))
+            env.task_scene_data.blocker_id[1] = 3
+            sensor.contact(1, 7, 3)
+            torch.testing.assert_close(term.previous_contact[[0, 2]], neighbors)
+            self.assertFalse(term.previous_contact[1].any())
+            self.assertEqual(term.last_step, 2)
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([2., 0., 1.]))
+            self.assertEqual(sensor.reads, 2)
+            env.common_step_counter = 3
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([2., 0., 1.]))
+            self.assertTrue(term.previous_contact[1, 7])
+            self.assertFalse(term.previous_contact[1, 16])  # Old Blocker remains physically contacted.
+            env.common_step_counter = 4
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([2., 1., 1.]))
+            term.reset()
+            torch.testing.assert_close(term(env), torch.zeros(3))
+            self.assertFalse(term.previous_contact.any())
+
+    def test_canonical_sensor_validity_and_nonfinite_pair_forces_break_continuity(self):
+        env, sensor, values, term = self.fixture()
+        sensor.contact(0, 2, 3)
+        sensor.contact(1, 14, 1, force=math.inf)
+        sensor.contact(2, 8, 2, force=math.nan)
+        values.tactile_valid[0, 2] = False
+        with patch.object(task, 'get_task_state', return_value=None):
+            env.common_step_counter = 1
+            torch.testing.assert_close(term(env), torch.zeros(3))
+            self.assertFalse(term.previous_contact.any())
+            values.tactile_valid[0, 2] = True
+            sensor.contact(1, 14, 1)
+            sensor.contact(2, 8, 2)
+            env.common_step_counter = 2
+            torch.testing.assert_close(term(env), torch.zeros(3))
+            env.common_step_counter = 3
+            torch.testing.assert_close(term(env) * env.step_dt, torch.ones(3))
+            values.tactile_valid[0, 2] = False
+            env.common_step_counter = 4
+            torch.testing.assert_close(term(env) * env.step_dt, torch.tensor([0., 1., 1.]))
+            self.assertFalse(term.previous_contact[0, 2])
+
+    def test_zero_weight_does_not_enable_filtering_and_buffers_survive_inference_mode_changes(self):
+        with torch.inference_mode():
+            _, sensor, _, term = self.fixture(weight=0.)
+        self.assertEqual(sensor.enables, 0)
+        self.assertFalse(torch.is_inference(term.previous_contact))
+        self.assertFalse(torch.is_inference(term.held_count))
+        term.reset(torch.tensor([1]))
+        self.assertEqual(sensor.enables, 0)
 
 
 class ContactBatchUpdateTests(unittest.TestCase):

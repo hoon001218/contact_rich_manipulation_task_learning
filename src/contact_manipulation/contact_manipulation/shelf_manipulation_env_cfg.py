@@ -12,7 +12,7 @@ from isaaclab.utils import configclass
 
 from . import mdp
 from .mdp.events import MdpCfg, SpawnRules, RobotStartRules
-from .mdp.sensors import InitialVisionCfg
+from .mdp.sensors import BlockerContactHold, InitialVisionCfg
 
 
 @configclass
@@ -70,9 +70,11 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Clearance quality, bounded exp penalties, Time and one-off Terminal."""
+    """Clearance with approach/contact support and bounded exp penalties."""
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=1.8)
+    blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=0.40)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.01)
     rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
     # Four independently logged penalties retain the previous total weight 0.6.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
@@ -97,9 +99,7 @@ class TerminationsCfg:
     success = TerminationTermCfg(func=mdp.success)
     object_drop = TerminationTermCfg(func=mdp.failure, params={"reason": "object_drop"})
     object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
-    workspace_exit = TerminationTermCfg(func=mdp.failure, params={"reason": "workspace_exit"})
-    object_lift = TerminationTermCfg(func=mdp.failure, params={"reason": "object_lift"})
-    hard_load_or_overrange = TerminationTermCfg(func=mdp.failure, params={"reason": "hard_load_or_overrange"})
+    # hard_load_or_overrange = TerminationTermCfg(func=mdp.failure, params={"reason": "hard_load_or_overrange"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
 

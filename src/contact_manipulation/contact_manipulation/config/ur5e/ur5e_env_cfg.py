@@ -37,7 +37,7 @@ class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
     ee_frame = FrameTransformerCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_link", debug_vis=False,
         target_frames=[FrameTransformerCfg.FrameCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/ROASRightHand/right_plam_force_sensor", name="end_effector",
+            prim_path="{ENV_REGEX_NS}/Robot/wrist_3_link", name="end_effector",
         )],
     )
     tactile_contact = make_tactile_contact_cfg(TACTILE_BODY_NAMES)
@@ -65,7 +65,9 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
                 "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                 "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
             ],
-            body_name="right_plam_force_sensor",
+            body_name="wrist_3_link",
+            # Use the UR5e terminal link, before the sensor/hand, for action and observation.
+            task_frame_rel_path="Robot/wrist_3_link",
             position_scale=1.0,
             orientation_scale=1.0,
             stiffness_scale=100.0,
@@ -76,7 +78,7 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
                 contact_wrench_control_axes_task=(0, 0, 0, 0, 0, 0),
                 inertial_dynamics_decoupling=True,
                 partial_inertial_dynamics_decoupling=False,
-                gravity_compensation=False,
+                gravity_compensation=True,
                 motion_stiffness_task=100.0,
                 motion_damping_ratio_task=1.0,
                 motion_stiffness_limits_task=(50.0, 200.0),

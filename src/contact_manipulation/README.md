@@ -221,12 +221,12 @@ multi-GPU 및 JIT/ONNX export는 구현하지 않았다.
 | 영역 | 구현 |
 |---|---|
 | Observation | 초기 vision 기하 10×10 + 현재·직전 sample 2×72 = **244D** |
-| 물체 정보 | 현재 EEF 기준 위치·quaternion·OBB extent. 초기 추정값은 episode 내내 고정 |
+| 물체 정보 | 현재 UR5e 말단 `wrist_3_link` 기준 위치·quaternion·OBB extent. 초기 추정값은 episode 내내 고정 |
 | 슬롯 | Target 0, Blocker 1, 나머지 관측 물체와 zero padding. Role ID·mask 채널 없음 |
-| 72D sample | 12관절 q/dq 24 + base 기준 EEF pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
+| 72D sample | 12관절 q/dq 24 + base에서 표현한 `wrist_3_link` pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
 | F/T | SI-200-8 축별 clipping·양자화 → distal 링크 자중·병진/회전 관성 보상 → full scale 정규화 |
 | Tactile | 마지막 physics sample의 normal force norm > 0.01 N이면 1, 미접촉 0, 결측 −1 |
-| Action | Base 축 TCP 증분 6 + stiffness 6 + hand 독립 관절 위치 6 = **18D** |
+| Action | 현재 EEF 축 TCP 증분 6 + EEF 축 stiffness 6 + hand 독립 관절 위치 6 = **18D** |
 
 제어는 [UR5e 환경 cfg](contact_manipulation/config/ur5e/ur5e_env_cfg.py)의 `__post_init__`에서
 공식 `OperationalSpaceControllerActionCfg`와 `JointPositionToLimitsActionCfg`로 설정한다.
@@ -234,24 +234,40 @@ multi-GPU 및 JIT/ONNX export는 구현하지 않았다.
 `ActionManager.process_action → native process_actions/set_command → physics substep의
 native apply_actions/compute → scene.write_data_to_sim` 순서로 실행한다.
 
-OSC 설정은 원격 `min` branch의
+OSC gain·scale 설정은 원격 `min` branch의
 [`UR5eSweepKpOSCRelativeObsEnvCfg`](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py)를 따른다.
-제어 body는 우리 hand의 `right_plam_force_sensor`이며 Robotiq 전용 offset은 사용하지 않는다.
+2026-10-20 사용자 교정에 따라 제어 body는 UR5e의 실제 말단 rigid body인
+`wrist_3_link`로 정한다. `body_offset`은 사용하지 않으며 `tool0` 가상 frame과 구분한다.
+Action 좌표계와 물체 observation의 기준도 **현재 `wrist_3_link` frame**으로 통일한다.
+`task_frame_rel_path="Robot/wrist_3_link"`와 scene `ee_frame`의 같은 링크 target을 지정해
+공식 ActionCfg·FrameTransformer가 좌표 변환을 수행한다. 확인한 min 커밋 `baa3740`은
+task frame을 지정하지 않아 base 축 증분을 사용한다는 점에서 다르다.
 
 | 입력/설정 | 현재 native 동작 |
 |---|---|
-| Arm 앞 6D | Base 축 `pose_rel`; position/orientation scale 모두 1.0 (m, rad) |
-| Arm 뒤 6D | `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
+| Arm 앞 6D | 현재 EEF 축 `pose_rel`; position/orientation scale 모두 1.0 (m, rad) |
+| Arm 뒤 6D | EEF 축별 `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
 | 현재 Gaussian 정책의 Kp 범위 | raw 출력에 ±1 상한이 없어 native 범위 50–200을 사용 가능 |
-| OSC | Full inertia decoupling, damping ratio 1, gravity compensation=False, nullspace 없음 |
+| OSC | Full inertia decoupling, damping ratio 1, gravity compensation=True, nullspace 없음 |
 | Hand 6D | raw action을 native에서 [−1,1]로 clamp한 뒤 live soft limit 범위에 매핑 |
 
 Scale 1.0은 위치 action 0.01이 1 cm, 회전 action 0.01이 0.01 rad라는 뜻이다.
+정책 step 시작 시 측정한 EEF pose를 task frame으로 사용한다. Base 기준 EEF pose가
+$(p_t,R_t)$이면 목표는 $p^*=p_t+R_t\Delta p_{\mathrm{EEF}}$,
+$R^*=R_t\operatorname{Exp}(\Delta r_{\mathrm{EEF}})$다. 회전 입력은 Euler가 아닌 회전벡터다.
+공식 OSC는 EEF 축 stiffness/damping도 base로 변환하며, 생성된 목표는 해당 정책 step의
+physics substep 동안 유지한다. 이전 목표에 증분을 계속 누적하지 않는다.
 이전의 ±15 mm/±0.08 rad 제한과 축별 gain 매핑, workspace 목표 clipping,
 COM→TCP Jacobian/속도 보정, hand 측정 위치 기준 lead 제한, custom effort clipping은 제거했다.
-Native 예제의 frame 처리와 기존 관절별 물리 제한을 사용한다.
-F/T 자중·관성 보상은 센서 처리이므로 유지한다. Action/적용 torque의 nonfinite는 MDP에서 검사한다.
+Native task-frame 변환과 기존 관절별 물리 제한을 사용한다.
+OSC의 gravity compensation은 관절 중력 토크를 feedforward로 더해 제어 출력을 만드는 기능이다.
+F/T 자중·관성 보상은 측정값에서 distal 링크의 하중을 제거하는 별도 센서 처리로 유지한다.
+둘은 서로 다른 경로이며 중복 보상을 뜻하지 않는다. 이 설정만으로 정책 학습 개선을 보장하지 않는다.
+Action/적용 torque의 nonfinite는 MDP에서 검사한다.
 Arm actuator PD gain은 0이고 mimic 관절에는 별도 action을 주지 않는다.
+2026-10-20 실제 stage 조사에서는 native mimic/tendon 제약이0개였다. 설치된 importer가
+현재 cfg의False를 `parse_mimic=False`로 넘겨 distal6관절이 passive인 상태이며,
+URDF의 mimic 관계가 물리적으로 유지된다고 보장하지 않는다. 후속 교정 항목으로 기록했다.
 예제처럼 OSC 환경의 `__post_init__`에서도 arm stiffness/damping=0을 명시한다.
 팔은 `IdealPDActuatorCfg`를 사용해 OSC가 계산한 토크를 PhysX에 전달하기 전에 제한한다.
 `effort_limit`과 `effort_limit_sim`은 모두 shoulder/elbow 150·wrist 28 N·m이며,
@@ -262,28 +278,57 @@ position PD를 유지한다. 별도 custom controller나 torque clamp는 추가�
 속도 초과 자체에 대한 episode 종료는 연구 MDP에 추가하지 않는다.
 
 Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
-이전 custom controller checkpoint는 새 action-contract metadata 검사에서 거절하며 새 학습을 시작한다.
+이전 base-frame·손바닥 EEF·custom controller checkpoint는 action-contract metadata 검사에서 거절한다.
+현재 규약은 `isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3`이며 새 학습을 시작한다.
+244D 모양은 같지만 물체 기준점·관측 EEF pose·action의 의미와 중력 보상이 달라졌다.
 
 | Reward | Weight | Weight 적용 전 discrete step 값 |
 |---|---:|---|
 | Clearance | 1.8 | $\exp(-a_C x_C)$, $x_C=A_{\mathrm{blocked}}/A_{\mathrm{blocker}}$ |
+| `blocker_distance` | 0.40 | $\exp(-a_d d)$, 17개 pad 표면 대표점에서 현재 Blocker OBB까지의 최소 거리 |
+| `blocker_contact_hold` | 0.01 | $\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$, 같은 pad의 직전·현재 Blocker 접촉 |
 | Rearrangement | 0.6 | $\exp(-a_R x_R)-1$, $x_R=\Delta L_{\mathrm{OBB}}$ (이번 step의 이동량, m) |
 | `motion_action_rate` | 0.15 | $\exp(-a_A x_A)-1$ |
 | `motion_joint_velocity` | 0.15 | $\exp(-a_V x_V)-1$ |
 | `motion_force_increase` | 0.15 | $\exp(-a_F x_F)-1$ |
 | `motion_torque_increase` | 0.15 | $\exp(-a_T x_T)-1$ (F/T 센서 모멘트) |
-| Time | 1.0 | $-\int_t^{t+\Delta t}0.02\bigl(\exp(0.7s)-1\bigr)\,ds$ |
-| Terminal | 1.0 | 성공 +200, 실패 −50, 실패 우선·episode당 1회 |
+| Time (현재 비활성) | — | $-\int_t^{t+\Delta t}0.02\bigl(\exp(0.7s)-1\bigr)\,ds$ |
+| Terminal (현재 비활성) | — | 성공 +200, 실패 −50, 실패 우선·episode당 1회 |
 
 **Clearance는 양의 주 보상, Rearrangement·Motion은 penalty로 지급한다.**
 품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지하며, 뒤의 두 그룹은 `q−1`을 지급한다.
 비용이 0이면 penalty도 0이고, 비용이 커지면 −1에 가까워진다. 품질 캐시는 0~1을 유지한다.
 이전의 R/M 정지 보상 1.2/step을 제거한 변경이며, 작은 Clearance 개선이 항상 모든 비용을
-이기도록 보장하는 우선순위 제약은 아니다. Clearance 증가량 보상이나 접촉 gate는 추가하지 않았다.
+이기도록 보장하는 우선순위 제약은 아니다. 접근·접촉 유지 보상은 별도 지원 항이며,
+Clearance 증가량 보상이나 접촉 gate는 추가하지 않았다.
 
 Clearance의 분모는 **현재 Blocker의 XY 투영 footprint 전체 면적**이다. x_C는 초기 접근영역
 A₀와 Blocker의 교차 면적을 이 분모로 나눈 0~1 값이다. Target·주변 물체의 overlap은 제외한다.
 GPU 다각형 clipping도 Blocker에 대해서만 수행한다.
+
+거리 보상은 실제 tactile collision mesh의 노출된 local +Z 표면에서 대표점 하나씩을
+초기화 때 선택하고, 이후 native 링크 pose로 GPU에서 변환한다. Wrist 원점이나 초기 vision의
+고정 Blocker pose를 거리 기준으로 쓰지 않는다. $a_d=\ln(2)/(0.10\,\mathrm{m})$이므로
+10 cm에서 품질 0.5, 20 cm에서 0.25이며, OBB 내부·표면은 거리 0이다. OBB는 컵의 빈 공간 등
+실제 메시와 다를 수 있으므로 실제 접촉은 별도의 filtered force로 판정한다.
+
+접촉 유지의 $b^B_{i,k}$는 해당 pad와 **현재 episode의 Blocker 사이 normal force norm이
+0.01 N을 초과했는지**이다. 17개를 평균하지 않고 합산하므로 최대 기여는 0.17/step이다.
+최초 접촉은 0, 같은 pad가 다음 policy sample에서도 접촉하면 지급한다. 다른 물체에서 Blocker로
+바뀌거나 다른 pad로 접촉을 넘긴 첫 sample은 유지로 세지 않는다. 20 ms 간격의 두 sample을
+확인하며 그 사이의 완전한 연속 접촉까지 증명하지는 않는다. 힘을 더 크게 가해도 추가 점수는 없다.
+
+`mdp/sensors.py`의 native `BlockerContactHold(ManagerTermBase)`가 이력을 관리하며,
+**공식 RewardManager가 부분 reset된 행만 초기화**한다. 같은 control step을 재조회해도
+이력은 한 번만 갱신한다. 하나의 PhysX contact view에서 pad×전체 물체 pool을 읽고,
+collection의 실제 `blocker_id` 열을 GPU에서 선택한다. 매 episode 센서를 재생성하지 않는다.
+Actor는 기존 **상대 구분 없는 binary tactile 17개와 244D observation**을 유지하며,
+Blocker 구분·현재 pose는 reward의 privileged 정보로만 사용한다.
+
+두 항의 weight는 초기 실험값이며, 접촉한 채 정지하는 행동도 양의 점수를 받는다.
+따라서 접촉률과 함께 **접촉 이후 Clearance 증가·성공률**을 비교해야 한다.
+접촉 판별을 제외하려면 `env.rewards.blocker_contact_hold=null`로 실행한다. 이 경우
+기존 grouped net-contact backend와 거리 항이 유지되며 다른 물체 접촉으로 보상을 대체하지 않는다.
 
 Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개의 변위 norm을 평균한 뒤
 물체끼리 합산한 이번 step의 이동량이다. 회전·pivot·왕복 이동, Target·Blocker·초기 vision에
@@ -292,7 +337,7 @@ Rearrangement의 x_R는 모든 active 물체 각각의 대응 OBB 꼭짓점 8개
 지수 점수이므로 누적 비용이 전체 이동거리와 정확히 선형 비례하지는 않는다.
 
 Motion은 다음 네 비용을 **각각 exp에 넣고 1을 뺀 독립 term**으로 기록한다. 각 weight0.15의
-합은 `0.6 × 네 penalty의 평균`과 같다. 가속도 항과 tactile 보상은 넣지 않는다.
+합은 `0.6 × 네 penalty의 평균`과 같다. 가속도 항은 없으며 tactile 유지 보상은 별도 항이다.
 
 $$
 \begin{aligned}
@@ -313,7 +358,7 @@ substep의 값이며 policy 구간 적분이 아니다. 기존 GPU 버퍼를 사
 F/T는 자중·관성 보상 후 **현재 센서 중심**에서 비교한다. 축 회전은 norm을 바꾸지 않으므로
 world 축으로 돌릴 필요가 없고, 초기 센서 원점으로의 `r×F` 이동도 하지 않는다. 일정 하중·하중
 감소·norm이 같은 방향 변화는 F/T 점수1이다. `wrench_rate_cost`는 `(num_envs, 2)`로 힘·토크의
-초과 증가율 제곱을 각각 저장한다. Tactile observation은 유지하되 접촉 보상/gate는 추가하지 않았다.
+초과 증가율 제곱을 각각 저장한다. Tactile 유지 보상은 이 네 Motion 항에 합치지 않는다.
 
 | 계수 | 설정값 | 의미 |
 |---|---:|---|
@@ -333,19 +378,21 @@ Action·velocity의 계수는 Motion 하위 weight0.15와 함께 작은 비용�
 Velocity 항은 빠른 움직임 자체도 감점하므로 약한 규제로 시작한다. 감속하면 이 비용은
 줄지만 action-rate는 필요한 제동 명령도 감점한다. Raw Kp가 clamp되는 구간의 action 변화도
 계산에 포함되므로 action-rate를 실제 가속도나 stiffness 변화의 정확한 측정으로 해석하지 않는다.
-정지 시 Motion 기여는 0이며 실제 조작은 Clearance·성공·Time이 유도해야 한다.
+정지 시 Motion 기여는 0이며 현재는 Clearance와 접근·접촉 지원 항이 조작을 유도한다.
 
-`RewardsCfg`는 Clearance/Rearrangement/Motion4항/Time/Terminal의 **8개 term**이다. 함수가
-discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. Weight는 유지하며
+현재 `RewardsCfg`는 Clearance/거리/접촉 유지/Rearrangement/Motion4항의 **8개 활성 term**이다.
+사용자가 비활성화한 Time·Terminal은 그대로 비활성이다. 함수가
+discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다. 거리 weight만0.10→0.40으로 조정했으며
 C의 최대 기여는1.8, R의 최소 기여는−0.6, Motion 합의 최소 기여는−0.6이다.
-Time은 위 적분값을 지급한다. Step별 지급이므로 전체 return의 제어주기 불변성을 주장하지
-않는다. Time·γ와 관측·제어는 유지한다.
+Time을 활성화하면 위 적분값을 지급한다. Step별 지급이므로 전체 return의 제어주기 불변성을
+주장하지 않는다. γ와 관측·제어는 유지한다.
 
 Terminal은 T06 학습로그를 검토해2026-10-19에 성공500→200·실패100→50으로 조정했다.
-현재 step당 non-terminal 보상의 상한은1.8이므로 γ=0.99에서 대기의 할인합 상한은
-$1.8/(1-0.99)=180$이다. 성공200은 이보다 크게 두고, 반복 관측된 실패100의 충격은
-절반으로 줄였다. 최적값을 로그에서 추정한 것은 아니며 새 학습의 성공·진행·실패를 비교할
-초기값이다. Timeout은 여전히 Terminal지급0이며 native timeout bootstrap은 유지한다.
+당시 step당 non-terminal 상한1.8과 γ=0.99의 할인합 상한180을 기준으로 성공200을 두고,
+반복 관측된 실패100의 충격을 절반으로 줄였다. **거리·접촉 항 추가 후 상한은
+2.37/step, 할인합 상한은237**이므로 이전180을 현재 정당화 근거로 사용하면 안 된다.
+이번에는 Terminal을 활성화하거나 scale을 재조정하지 않았다. 재활성화 시 다시 검토한다.
+Timeout은 Terminal지급0이며 native timeout bootstrap은 유지한다.
 근거와 한계는 [학습 기록9절](../../docs/TRAINING_LOG.md)에 둔다.
 
 Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
@@ -353,36 +400,52 @@ Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_
 중복 지급하지 않는다. R/M 로그는 이제 0 이하이며 이전 양의 점수 로그와 직접 비교하지 않는다.
 이 값은 native manager가 **weight 적용 후 episode 누적값을 최대 episode 시간8초로 나눈 값**이다.
 0~1의 순간 점수나 실제 episode 길이로 정규화한 평균이 아니므로 episode 길이도 함께 확인한다.
+`Episode_Reward/blocker_distance`와 `Episode_Reward/blocker_contact_hold`도 같은 공식
+로깅 방식으로 각각 기록한다. 적용 후1,024환경에서24-step 환경 수집은 약0.919초였으며,
+이는 policy 추론·PPO update를 포함한 iteration 시간이 아니다. GPU 성능 비교와 판정 근거는
+[학습 기록14절](../../docs/TRAINING_LOG.md#14-2026-10-20--접근접촉-보상과-1024환경-비용-검증)에 둔다.
 F/T 두 점수는 state 갱신 때 각각 한 번 계산해 캐시한다. 보상 계산에는 추가 센서·PhysX 조회나
 명시적인 CPU 변환을 넣지 않고, 로그 집계는 native manager에 맡긴다.
 
-성공은 **지정 Blocker의** A₀ 교차 면적 ≤ 1e−5 m², Target 이동 ≤ 2 cm·회전 ≤
-0.15 rad, 물체 선속도 ≤ 0.015 m/s·각속도 ≤ 0.1 rad/s를 5 step 연속 만족할 때다.
-다른 물체의 overlap은 성공 gate에 넣지 않으며, 모든 active 물체의 안정화·안전 조건은 유지한다.
-낙하 6 cm, lift 4 cm, tilt 50°, workspace 이탈, 보상 F/T 80 N·4 N·m 초과,
-raw F/T 측정 범위 초과, 선반의 초기 위치 대비 **1 cm 초과 이동** 또는 초기 회전 대비
-**2° 초과 회전**, 유효하지 않은 물리·제어 상태는 실패다. 선반은 `RigidObject`로 관리하며
+성공은 **지정 Blocker의 A₀ 교차 면적 ≤ 1e−5 m², Target 초기 pose 대비 이동 ≤ 2 cm·회전 ≤
+0.15 rad**를 5 step(0.1초) 연속 만족할 때다. 두 조건의 지속만 확인하며, 물체 속도·다른 물체의
+상태·F/T·선반 상태를 성공 gate에 넣지 않는다. 초기 Target이 정확히 하나 있어야 하며
+유효하지 않은 Target pose나 교차 면적으로는 성공할 수 없다.
+낙하 6 cm, **같은 물체가 80° 이상 기울어진 상태를 0.2초 연속 유지**, 선반의 초기 위치 대비
+**1 cm 초과 이동** 또는 초기 회전 대비 **2° 초과 회전**, 유효하지 않은 물리·제어 상태는
+별도의 활성 실패 조건이다. `hard_load_or_overrange`는 현재 비활성이므로 보상 F/T 80 N·4 N·m 초과와
+raw 측정 범위 초과는 내부 진단에만 남으며, 성공·실패 지급·PPO 종료 mask에 반영하지 않는다.
+선반은 `RigidObject`로 관리하며
 Sweeping-Policy 예제와 같은 100 kg dynamic body다. 관성은 PhysX가 충돌 형상에서 계산한다.
 선반 pose는 종료 조건에만 사용하며 observation에 추가하지 않는다.
 부분 reset 시 해당 환경의 선반 pose·속도를 복원하고 초기 pose 기준도 해당 행만 갱신한다.
 Timeout은 native truncation 항으로 유지한다.
 
+Tilt는 모든 활성 물체에 대해 개별적으로 누적하며, 50 Hz policy에서 같은 물체가 10 step
+연속 기준을 만족해야 종료한다. 80° 미만으로 돌아오면 그 물체의 누적값을 0으로 만들고,
+부분 reset 시 해당 환경의 누적값만 초기화한다. 순간적인 기울어짐이나 서로 다른 물체의
+교대 기울어짐을 하나의 넘어짐으로 합치지 않는다. 평면 yaw 회전은 tilt에 해당하지 않는다.
+2026-10-20부터 `workspace_exit`·`object_lift`는 제거했다. 영역 이탈·들림 자체는 실패나
+성공 제한 조건이 아니다. 낙하·전도 실패와 통로 확보·Target 보호의 성공 판정은 분리한다.
+
 실패 원인은 공식 `TerminationManager`의 개별 term으로 기록한다. Console과 TensorBoard의
 `Episode_Termination/<원인>`에서 확인할 수 있으며, 기존 통합 `failure` 로그는 아래 항목으로
 대체했다. 모든 term은 같은 step의 캐시된 판정 결과를 읽으며 물리·센서 조회를 반복하지 않는다.
 
-| 원인 이름 | 기존 실패 조건 |
+| 원인 이름 | 현재 실패 조건 |
 |---|---|
-| `object_drop` | 활성 물체 낙하 |
-| `object_tilt` | 활성 물체 기울어짐 |
-| `workspace_exit` | 활성 물체의 허용 영역 이탈 |
-| `object_lift` | 활성 물체 들림 |
-| `hard_load_or_overrange` | 보상 F/T 과부하 또는 raw 센서 측정 범위 초과 |
+| `object_drop` | 활성 물체 OBB 최저점이 지지면보다 6 cm 초과 내려감 |
+| `object_tilt` | 같은 활성 물체의 기울기 ≥80°가 0.2초 연속 지속 |
+| `hard_load_or_overrange` (현재 비활성) | 보상 F/T 과부하 또는 raw 센서 측정 범위 초과; 진단값만 유지 |
 | `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
 | `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
-않다. 종료는 원인들의 OR이고 terminal 실패 보상은 기존대로 한 번만 지급한다.
+않다. 현재 활성 실패 4개와 성공·timeout을 합쳐 native 종료 term은 6개다.
+성공과 활성 실패가 같은 step에 충족되면 각각 기록하며, 종료는 활성 원인들의 OR이다.
+Terminal reward를 활성화할 경우에는 기존대로 실패 우선으로 한 번만 지급한다.
+내부 실패와 PPO `terminated` mask도 초기화 때 읽은 native 활성 term 설정을 따른다.
+적용 근거와 PhysX 오류의 충돌량 검사는 [학습 기록16절](../../docs/TRAINING_LOG.md#16-2026-10-20--성공-판정-분리거리-weight-적용과-physx-중단-조사)에 둔다.
 
 ## 병렬 계산과 reset 연결
 
@@ -615,12 +678,14 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 전체 환경은 **8초(400 policy step)의 공통 scene round** 동안 같은 초기 물체 배치와
 가상 카메라 시점·vision 정보를 공유한다. 움직이기 시작한 뒤 물리 상태는 환경별로 독립적이다.
 중간 성공·실패 시 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
-**로봇은 매 reset마다 Blocker 앞 허용 영역에서 EEF 위치·회전을 연속적으로 샘플링**하며,
-GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 기준 EEF는 `right_plam_force_sensor`다.
+**로봇은 매 reset마다 Blocker 앞 허용 영역에서 hand 위치·회전을 연속적으로 샘플링**하며,
+GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 이 배치용 TCP는 손바닥
+`right_plam_force_sensor`를 유지한다. OSC·물체/robot observation의 `wrist_3_link`와
+역할이 다르며, 말단 제어 기준 변경으로 초기 hand가 Blocker에서 멀어지지 않게 한다.
 위치는 기존 Blocker 앞 12–40 cm, 좌우±8 cm, 선반 위20–28 cm와 선반 앞 여유를 유지한다.
 기준 방향 R₀의 축이 환경 축의 순열이므로 이 직사각형은 중심 p₀에 대해
-`p*=p₀+R₀δp`인 EEF-local 범위와 동등하다. 위치 범위를 임의 회전과 함께 돌리지는 않는다.
-회전은 검증된 기준 관절값의 실제 EEF 방향에 local rotation vector 각 성분±10°를 합성한다.
+`p*=p₀+R₀δp`인 손바닥 TCP-local 범위와 동등하다. 위치 범위를 임의 회전과 함께 돌리지는 않는다.
+회전은 검증된 기준 관절값의 실제 손바닥 TCP 방향에 local rotation vector 각 성분±10°를 합성한다.
 이는 Euler 각별 범위나 총 회전각10° 상한을 뜻하지 않는다. 기존 hand 장착−90°는 유지한다.
 
 같은 목표 pose마다 기준 관절값과 다른3개 branch seed를 사용하며, 총80개 IK후보를 검사한다.
@@ -637,7 +702,7 @@ Native 로그 `Reset/robot_start_fallback_count`, `fallback_fraction`, `fallback
 예외 상세는 실행 로그 폴더의 `robot_start_fallbacks.jsonl`에 환경ID·seed·reset횟수·장면번호와
 budget을 기록한다. Normal reset에는 파일 쓰기를 추가하지 않는다. Native runner의 평균 로그를
 fallback 총횟수로 합산하지 말고 누적 `fallback_total`과 JSONL을 사용한다.
-카메라 관측은 robot-base frame으로 캐시하고 각 환경의 EEF frame으로 변환한다.
+카메라 관측은 robot-base frame으로 캐시하고 각 환경의 현재 `wrist_3_link` frame으로 변환한다.
 Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세 때문에 재촬영하지 않는다.
 
 공통 round 경계는 `scene_time_out` termination term으로 전체 환경을 truncate한다.
