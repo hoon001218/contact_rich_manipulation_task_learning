@@ -18,6 +18,39 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-21 후속요청에따라Actor네트워크구조외학습은examples의random-sweep
+  `rsl_rl_ppo_cfg_02.py`로통일했다. NativePPO를직접사용하고자체microbatch/KL/timeoutbootstrap을
+  제거했다. Seed42,rollout36,90,000회,scalarstd1,8epoch/4batch,lr.001adaptive,γ.98,λ.95,
+  KL.02,value1,entropy.005,gradnorm1,normalizationFalse다. ActorGNN/attention/headReLU는
+  유지하고mean-head수동초기화는제거했다. 표준init_at_random_ep_len=True이며연구MDP의
+  reset/vision/reward/controller는유지한다. 40절의설정유지·자체PPO방침은이번변경으로대체한다.
+  구형logstdcheckpoint는원래설정으로play만지원하며새baselineresume로해석하지않는다.
+  실제1024환경2iteration과기존정책4환경8stepplay를완료했다. 상세는TRAINING_LOG41절이다.
+- 2026-10-21 사용자 동의에 따라 Actor를 공식 `MLPModel` 기반으로 정리했다. GNN/attention은
+  `ContactManipulationEncoder`에서 특징만 만들고 native head464→256→128→18·forward·
+  Gaussian·PPO 인터페이스를 상속한다. Raw mask 후 선택적history144D정규화·padding재적용을
+  지원하지만 기본Actor/Critic정규화는False다. 기존logstd.3/entropy.01/fixedLR/KL없음/value.25와
+  MDP·action·reward를유지해구조변경효과를분리한다. 동등한v1checkpoint의key와Adam순서를
+  함께변환해play/resume를지원한다. CPUlearning70개(2CUDA제외)·MDP225개(16제외),GPU2검사와
+  1024/8192배치정규화OFF/ON일치를확인했다. 실제Kit1024환경2iteration도완료했으며loss2.77/3.25,
+  두번째iteration2.006초였다. 장기발산해결이나성공률개선을입증한검사는아니다.
+  초기σ.3→1은명령noise분산11.11배이며 log/entropy/KL/value계수효과는단순배율관계가아니다.
+  구현·설정별분석·검증한계는TRAINING_LOG40절을따른다.
+- 2026-10-21 공식Actor/Critic/PPO와GNN연결구조를비교했다. 1,024환경의loss/GAE/optimizer는
+  native이고Critic도공식독립MLP로FrankaLift와동일한폭/ELU/정규화OFF다. 따라서정규화OFF나
+  raw previous action자체를공식흐름위반으로보지않는다. 우선검토할차이는logstd+entropy.01+
+  fixedLR/KL없음, Actor의normalizationAPI거부, sceneLayerNorm을우회하는history144D,
+  자체Triton/compile경로다. CPU회귀와GPU1024/8192배치의집계·Actor compile출력/gradient
+  일치검사를통과했으나실제장기학습이상입력을재현한검사는아니다. 공식CNNModel처럼
+  MLPModel의latent extractor만확장하는방향을제안했으나아직적용하지않았다. 앞서공식으로부른
+  UR10OSC torque예제는로컬IsaacLab fork추가파일이므로upstream공식권장값의근거에서제외했다.
+  비교표·근거·분리실험안은TRAINING_LOG39절을따른다.
+- 2026-10-21 후속 traceback은 PPO update 중 Gaussian sample의 `std >= 0.0` 오류다.
+  현재는exp(log_std)이므로 음수std보다NaN분포파라미터로해석한다. Critic loss의inf만으로
+  독립Actor gradient오염을확정하지않으며 GAE·공통입력·log_prob/ratio경로를분리한다.
+  제안순서는최초이상값보존/optimizer유한성검사→큰finite입력생성경로수정→공식Critic
+  관측정규화→KL/entropy별도비교다. 아직production에적용하지않았고Actor정규화나새action
+  제한도확정하지않았다. 상세와재현한CPU수치경로는TRAINING_LOG38절을따른다.
 - 2026-10-21 반복되는 `Loss/value` 폭증의 의미를 설치된 native PPO·로그·CPU checkpoint로
   검토했다. 최신 `19-59-36`은284회42.49→285회4.276e11→287회39.10으로 초기에는
   batch별 극단값이고, 후반에는 지속되며2229회inf·2230회nan이다. 첫 spike 전후250/300회

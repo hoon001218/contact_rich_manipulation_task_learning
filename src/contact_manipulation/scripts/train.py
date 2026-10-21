@@ -1,8 +1,7 @@
-"""Follow Sweeping-Policy/min's native RSL-RL flow with the research episode clock.
+"""Follow the example's AppLauncher/Hydra/env/wrapper/native runner flow.
 
-Keep the example's AppLauncher/Hydra/env/wrapper/runner order. A direct runpy
-launcher would use the stock randomized initial episode counters; this task's
-initial vision, history and elapsed-time reward must all begin at actual reset.
+Use its randomized initial episode counters; scene reset still initializes the
+research task's vision and sensor history.
 """
 
 import argparse
@@ -59,6 +58,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import contact_manipulation  # Register the local task after AppLauncher.
+from contact_manipulation.config.ur5e.agents.ppo import load_checkpoint
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -108,13 +108,11 @@ def main(env_cfg, agent_cfg):
         runner.add_git_repo_to_log(__file__)
         if resume_path is not None:
             print(f"[INFO]: Loading model checkpoint from: {resume_path}", flush=True)
-            runner.load(resume_path, map_location=agent_cfg.device)
+            load_checkpoint(runner, resume_path)
         dump_yaml(str(log_dir / "params/env.yaml"), env_cfg)
         dump_yaml(str(log_dir / "params/agent.yaml"), agent_cfg)
         started = time.time()
-        # Initial vision, previous-sample padding, and exponential time penalty
-        # all begin at reset. Randomizing only native timeout counters breaks this.
-        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
         print(f"Training time: {time.time() - started:.2f} seconds", flush=True)
     finally:
         if runner is not None and runner.logger.writer is not None:

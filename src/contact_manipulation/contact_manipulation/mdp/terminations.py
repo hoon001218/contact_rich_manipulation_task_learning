@@ -23,19 +23,10 @@ def scene_time_out(env):
 
     Early reset counters remain episode-local. Scene expiry truncates every row,
     including recently restarted rows, so PPO bootstraps instead of marking failure.
-    A native shared round starts with every episode counter at zero. Until its
-    deadline, no episode can reach the equally long episode limit. Publish that
-    host-side fact so PPO can skip final-state inference without a CUDA scalar
-    read. Unrecognized/external environments retain the generic bootstrap path.
     """
     expired = env.episode_length_buf >= env.max_episode_length
     runtime = getattr(env, "_episode_reset", None)
     deadline = getattr(runtime, "next_scene_step", math.inf)
-    start = getattr(runtime, "scene_start_step", None)
-    bounded_round = (start is not None and hasattr(runtime, "shared_template")
-                     and 0 <= env.common_step_counter - start < deadline - start <= env.max_episode_length)
-    if hasattr(env, "extras"):
-        env.extras["time_outs_possible"] = not bounded_round
     if runtime is not None and env.common_step_counter >= deadline:
         return torch.ones_like(expired)
     return expired

@@ -1,4 +1,4 @@
-"""Native RSL-RL settings for the GNN/attention actor and independent MLP critic."""
+"""Sweeping-Policy random-task PPO settings with the research actor encoder."""
 
 from dataclasses import asdict
 
@@ -9,45 +9,28 @@ from .model import ModelCfg
 
 
 @configclass
-class ContactActorCfg:
-    class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactActor"
+class ContactActorCfg(RslRlMLPModelCfg):
+    class_name: str = "contact_manipulation.config.ur5e.agents.model:NativeContactActor"
     model_cfg: dict = asdict(ModelCfg())
+    hidden_dims = [256, 128]
+    activation = "relu"
     max_forward_batch_size: int = 8192
     # Inductor fuses the unchanged FP32 model/mask math; no CUDA graph replay.
     compile_model: bool = True
     obs_normalization: bool = False
     distribution_cfg: dict = {
-        "class_name": "GaussianDistribution", "std_type": "log", "init_std": ModelCfg().initial_std,
+        "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.0,
     }
     # Compatibility with Isaac Lab's native RSL-RL configuration migration.
     stochastic: bool = False
 
 
 @configclass
-class ContactPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    class_name = "contact_manipulation.config.ur5e.agents.ppo:ContactManipulationPPO"
-    max_microbatch_size: int = 8192
-    num_learning_epochs = 4
-    num_mini_batches = 4
-    learning_rate = 3.0e-4
-    schedule = "fixed"
-    gamma = 0.99
-    lam = 0.95
-    clip_param = 0.2
-    entropy_coef = 0.01
-    value_loss_coef = 0.25
-    use_clipped_value_loss = True
-    max_grad_norm = 0.5
-    desired_kl = None
-
-
-@configclass
 class ContactManipulationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """Keep native rollout/GAE/logging; bound graph activations in the models/PPO."""
+    """Match examples/Sweeping-Policy's registered random-task rsl_rl_ppo_cfg_02."""
 
-    seed = 0
-    num_steps_per_env = 32
-    max_iterations = 1000
+    num_steps_per_env = 36
+    max_iterations = 90000
     save_interval = 50
     experiment_name = "contact_manipulation"
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
@@ -59,4 +42,18 @@ class ContactManipulationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         obs_normalization=False,
         distribution_cfg=None,
     )
-    algorithm = ContactPpoAlgorithmCfg()
+    algorithm = RslRlPpoAlgorithmCfg(
+        class_name="PPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        num_learning_epochs=8,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.98,
+        lam=0.95,
+        desired_kl=0.02,
+        max_grad_norm=1.0,
+    )

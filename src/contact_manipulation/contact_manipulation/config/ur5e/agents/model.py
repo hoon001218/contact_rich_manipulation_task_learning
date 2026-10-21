@@ -11,14 +11,19 @@ The independent native MLP critic is configured in the runner settings.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from rsl_rl.modules import GaussianDistribution
+from rsl_rl.models import MLPModel
 import triton
 import triton.language as tl
+
+
+ACTION_CONTRACT = "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3"
 
 
 @triton.jit
@@ -102,7 +107,6 @@ class ModelCfg:
     node_dim: int = 64
     graph_layers: int = 2
     latent_dim: int = 128
-    initial_std: float = 0.3
 
     def __post_init__(self):
         if self.activation != "relu":
@@ -123,8 +127,6 @@ class ModelCfg:
             raise ValueError("Initial geometry must contain position(3), quaternion(4), and size(3).")
         if self.step_features != 72:
             raise ValueError("A history sample must contain 72 physical observation values; mask channels are not observations.")
-        if not math.isfinite(self.initial_std) or self.initial_std <= 0:
-            raise ValueError("initial_std must be finite and positive.")
 
     @property
     def observation_dim(self) -> int:
@@ -248,24 +250,13 @@ class SceneGraphEncoder(nn.Module):
         return torch.cat((target, blocker, contextual, _masked_mean(hidden, valid)), dim=-1)
 
 
-class ContactManipulationPolicy(nn.Module):
-    """Gaussian 18D actor with the scene encoder and final MLP."""
+class ContactManipulationEncoder(nn.Module):
+    """Scene features concatenated with the current and previous robot sample."""
 
     def __init__(self, cfg: ModelCfg | None = None):
         super().__init__()
         self.cfg = cfg or ModelCfg()
         self.scene_encoder = SceneGraphEncoder(self.cfg)
-        # Final feed-forward MLP after concat; Sequential only orders its layers.
-        self.fusion = nn.Sequential(
-            nn.Linear(5 * self.cfg.node_dim + self.cfg.history_steps * self.cfg.step_features, 2 * self.cfg.latent_dim), nn.ReLU(),
-            nn.Linear(2 * self.cfg.latent_dim, self.cfg.latent_dim), nn.ReLU(),
-        )
-        self.actor = nn.Linear(self.cfg.latent_dim, self.cfg.action_dim)
-        self.distribution = GaussianDistribution(
-            self.cfg.action_dim, init_std=self.cfg.initial_std, std_type="log",
-        )
-        nn.init.orthogonal_(self.actor.weight, gain=0.01)
-        nn.init.zeros_(self.actor.bias)
 
     def _split(self, observation: Tensor) -> tuple[Tensor, Tensor]:
         geometry, history = _split_observation(observation, self.cfg)
@@ -274,9 +265,28 @@ class ContactManipulationPolicy(nn.Module):
             history.reshape(-1, self.cfg.history_steps, self.cfg.step_features),
         )
 
-    def encode(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
+    def history_input(
+        self, observation: Tensor, *, masks: PolicyMasks, history: Tensor | None = None,
+    ) -> Tensor:
+        """Mask raw history before statistics, and mask normalized padding again."""
         leading = observation.shape[:-1]
-        geometry, history = self._split(observation)
+        _, values = self._split(observation)
+        if history is not None:
+            if history.shape != (*leading, self.cfg.history_steps * self.cfg.step_features):
+                raise ValueError("Normalized history must preserve the two 72D samples.")
+            values = history.reshape(-1, self.cfg.history_steps, self.cfg.step_features)
+        tactile_valid = masks.tactile_valid.reshape(-1, self.cfg.history_steps, 17)
+        values = torch.cat((values[..., :37],
+                            torch.where(tactile_valid, values[..., 37:54], 0),
+                            values[..., 54:]), dim=-1)
+        values = torch.where(masks.history_valid.reshape(-1, self.cfg.history_steps, 1), values, 0)
+        return values.reshape(*leading, self.cfg.history_steps * self.cfg.step_features)
+
+    def forward(
+        self, observation: Tensor, *, masks: PolicyMasks, history: Tensor | None = None,
+    ) -> Tensor:
+        leading = observation.shape[:-1]
+        geometry, _ = self._split(observation)
         expected_shapes = (
             (*leading, self.cfg.max_objects), (*leading, self.cfg.max_objects, 2),
             (*leading, self.cfg.history_steps), (*leading, self.cfg.history_steps, 17),
@@ -287,30 +297,121 @@ class ContactManipulationPolicy(nn.Module):
                 raise ValueError(f"Policy masks must be Boolean tensors on the observation device with shape {shape}.")
         scene = self.scene_encoder(geometry, masks.object_valid.reshape(-1, self.cfg.max_objects),
                                    masks.roles.reshape(-1, self.cfg.max_objects, 2))
-        # No learned history encoder: preserve current/previous order and all
-        # 144 physical features for the final MLP. Masks only remove invalid data.
-        tactile_valid = masks.tactile_valid.reshape(-1, self.cfg.history_steps, 17)
-        history = torch.cat((history[..., :37],
-                             torch.where(tactile_valid, history[..., 37:54], 0),
-                             history[..., 54:]), dim=-1)
-        history = torch.where(masks.history_valid.reshape(-1, self.cfg.history_steps, 1), history, 0)
-        return self.fusion(torch.cat((scene, history.flatten(1)), dim=-1)).reshape(*leading, self.cfg.latent_dim)
+        # Keep both 72D samples in order; there is no learned history encoder.
+        values = self.history_input(observation, masks=masks, history=history).reshape(scene.shape[0], -1)
+        return torch.cat((scene, values), dim=-1).reshape(*leading, 5 * self.cfg.node_dim + values.shape[-1])
 
-    def forward(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
-        return self.actor(self.encode(observation, masks=masks))
 
-    def act(self, observation: Tensor, deterministic: bool = False, *, masks: PolicyMasks) -> tuple[Tensor, Tensor]:
-        mean = self.forward(observation, masks=masks)
-        self.distribution.update(mean)
-        actions = self.distribution.deterministic_output(mean) if deterministic else self.distribution.sample()
-        return actions, self.distribution.log_prob(actions)
+class NativeContactActor(MLPModel):
+    """Extend the native feature extractor; inherit the MLP head and PPO interface.
 
-    def evaluate_actions(
-        self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks,
-    ) -> tuple[Tensor, Tensor]:
-        mean = self.forward(observation, masks=masks)
-        if actions.shape != mean.shape:
-            raise ValueError(f"Actions must have shape {tuple(mean.shape)}, got {tuple(actions.shape)}.")
-        self.distribution.update(mean)
-        return self.distribution.log_prob(actions), self.distribution.entropy
+    As in RSL-RL's CNNModel, geometry is encoded separately from normalized 1D
+    features. Masks use the raw public observation. Optional native running
+    normalization applies to the 144D robot history, never to graph geometry
+    or role/padding selection. The default keeps normalization disabled.
+    """
+
+    def __init__(
+        self, obs: Mapping[str, Tensor], obs_groups: dict[str, list[str]], obs_set: str,
+        output_dim: int, model_cfg: dict | ModelCfg | None = None,
+        max_forward_batch_size: int = 512, compile_model: bool = False,
+        obs_normalization: bool = False, distribution_cfg: dict | None = None,
+        stochastic: bool = False, hidden_dims: list[int] | tuple[int, ...] | None = None,
+        activation: str | None = None,
+    ):
+        self.cfg = model_cfg if isinstance(model_cfg, ModelCfg) else ModelCfg(**(model_cfg or {}))
+        if output_dim != self.cfg.action_dim:
+            raise ValueError(f"Actor output must contain {self.cfg.action_dim} research actions.")
+        if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
+            raise ValueError("max_forward_batch_size must be a positive integer.")
+        if type(compile_model) is not bool:
+            raise ValueError("compile_model must be a Boolean.")
+        self.max_forward_batch_size = max_forward_batch_size
+        self.compile_model = compile_model
+        hidden_dims = list(hidden_dims) if hidden_dims is not None else [2 * self.cfg.latent_dim, self.cfg.latent_dim]
+        activation = activation or self.cfg.activation
+        distribution_cfg = deepcopy(distribution_cfg) if distribution_cfg is not None else {
+            "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.0,
+        }
+        self.native_model_cfg = {
+            "hidden_dims": hidden_dims, "activation": activation,
+            "obs_normalization": obs_normalization, "distribution_cfg": deepcopy(distribution_cfg),
+        }
+        # Follow CNNModel: construct encoders locally, then register after the
+        # native MLPModel initializes its modules and default head weights.
+        encoder = ContactManipulationEncoder(self.cfg)
+        super().__init__(
+            obs, obs_groups, obs_set, output_dim, hidden_dims=hidden_dims,
+            activation=activation, obs_normalization=obs_normalization,
+            distribution_cfg=distribution_cfg,
+        )
+        self.encoder = encoder
+        self._compiled_features = None
+
+    def get_extra_state(self):
+        """Store the research input/action contract through native state_dict."""
+        return {
+            "architecture": "native_graph_actor_v3", "action_contract": ACTION_CONTRACT,
+            "model_cfg": asdict(self.cfg), "actor_model": deepcopy(self.native_model_cfg),
+        }
+
+    def set_extra_state(self, state):
+        if state != self.get_extra_state():
+            raise ValueError("Checkpoint Actor input/action/model configuration differs from this policy.")
+
+    def _get_obs_dim(self, obs, obs_groups, obs_set):
+        groups, width = super()._get_obs_dim(obs, obs_groups, obs_set)
+        if groups != ["policy"] or width != self.cfg.observation_dim:
+            raise ValueError(f"Expected the single public policy observation with width {self.cfg.observation_dim}.")
+        return groups, self.cfg.history_steps * self.cfg.step_features
+
+    def _get_latent_dim(self) -> int:
+        return 5 * self.cfg.node_dim + self.cfg.history_steps * self.cfg.step_features
+
+    def get_policy_observation(self, obs: Mapping[str, Tensor]) -> Tensor:
+        value = obs["policy"]
+        if value.ndim < 1 or value.shape[-1] != self.cfg.observation_dim:
+            raise ValueError(f"Expected a policy observation with width {self.cfg.observation_dim}.")
+        return value
+
+    def _feature_chunk(self, observation: Tensor, history: Tensor) -> Tensor:
+        return self.encoder(observation, masks=build_policy_masks(observation, self.cfg), history=history)
+
+    def get_latent(self, obs, masks=None, hidden_state=None):
+        observation = self.get_policy_observation(obs)
+        selectors = build_policy_masks(observation, self.cfg)
+        history = self.encoder.history_input(observation, masks=selectors)
+        history = super().get_latent({"policy": history})
+        leading = observation.shape[:-1]
+        raw = observation.reshape(-1, self.cfg.observation_dim)
+        values = history.reshape(-1, self.cfg.history_steps * self.cfg.step_features)
+        if not raw.shape[0]:
+            raise ValueError("The research model requires a nonempty observation batch.")
+        forward = self._feature_chunk
+        if self.compile_model and raw.is_cuda:
+            if self._compiled_features is None:
+                # Keep CUDA graphs disabled across inference rollout/PPO modes.
+                self._compiled_features = torch.compile(
+                    self._feature_chunk, fullgraph=True, dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+            forward = self._compiled_features
+        if raw.shape[0] <= self.max_forward_batch_size:
+            return forward(raw, values).reshape(*leading, self._get_latent_dim())
+        features = [forward(part, samples) for part, samples in zip(
+            raw.split(self.max_forward_batch_size), values.split(self.max_forward_batch_size),
+        )]
+        return torch.cat(features).reshape(*leading, self._get_latent_dim())
+
+    def update_normalization(self, obs) -> None:
+        if self.obs_normalization:
+            raw = self.get_policy_observation(obs)
+            history = self.encoder.history_input(raw, masks=build_policy_masks(raw, self.cfg))
+            super().update_normalization({"policy": history})
+
+    def as_jit(self):
+        raise NotImplementedError("Graph/history policy export is not implemented.")
+
+    def as_onnx(self, verbose: bool = False):
+        raise NotImplementedError("Graph/history policy export is not implemented.")
 

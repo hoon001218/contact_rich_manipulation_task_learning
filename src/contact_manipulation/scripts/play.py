@@ -55,6 +55,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import contact_manipulation  # Register the local task after AppLauncher.
+from contact_manipulation.config.ur5e.agents.ppo import load_checkpoint, prepare_inference_checkpoint
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -83,6 +84,7 @@ def main(env_cfg, agent_cfg):
         checkpoint = Path(get_checkpoint_path(str(log_root), agent_cfg.load_run, agent_cfg.load_checkpoint))
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    saved_checkpoint = prepare_inference_checkpoint(agent_cfg, checkpoint)
     print(f"[INFO] Loading model checkpoint from: {checkpoint}", flush=True)
     env_cfg.log_dir = str(checkpoint.parent)
 
@@ -98,10 +100,7 @@ def main(env_cfg, agent_cfg):
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         # Preserve strict model/F/T checks, but inference needs no optimizer state.
-        runner.load(
-            str(checkpoint), map_location=agent_cfg.device,
-            load_cfg={"actor": True, "critic": True, "iteration": True, "optimizer": False, "rnd": False},
-        )
+        load_checkpoint(runner, checkpoint, inference=True, checkpoint=saved_checkpoint)
         policy = runner.get_inference_policy(device=env.unwrapped.device)
         obs = env.get_observations()
         if args_cli.video:

@@ -34,7 +34,7 @@ contact_manipulation/
     │           ├── __init__.py
     │           ├── rsl_rl_ppo_cfg.py # native runner 및 연구 PPO 설정
     │           ├── model.py         # Actor 설정·mask·GNN·attention·history·action head
-    │           └── ppo.py           # native actor/critic 연결·PPO microbatch
+    │           └── ppo.py           # 기존 checkpoint play 호환·native loader 연결
     └── mdp/
         ├── __init__.py
         ├── events.py               # reset, 배치 상태, 공통 기하 계산
@@ -80,7 +80,7 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
 | EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
 | 물체 주차 | `RigidObjectCollection.permanent_wrench_composer` | parked mask와 중력 상쇄 force 계산; transient force는 instantaneous composer 사용 |
-| PPO | 기본 `PPO.update()`, 독립 `MLPModel` critic, storage·GAE·logger·checkpoint | GNN/attention actor 연결, terminal 관측 bootstrap, 큰 minibatch의 gradient accumulation |
+| PPO | 공식 `PPO` 전체와 Actor/Critic의 `MLPModel`, storage·GAE·logger·checkpoint | Actor 특징 추출에 GNN/attention 연결 |
 | 초기 vision | `convert_to_warp_mesh`, Warp mesh query | 후보 pose의 object-only raycast, 두 역할의 무가림 실루엣과 가시성, 관측 표면 OBB |
 
 직접 구현을 유지한 이유:
@@ -129,16 +129,17 @@ scripts/train.py
 ```
 
 환경의 `step/reset`, runner, rollout storage, GAE, 로그와 checkpoint 파일은 표준 구현을 사용한다.
-`PPO`는 연구 actor 연결, reset 이전 관측의 timeout bootstrap, microbatch 업데이트만 확장한다.
-초기 vision·이력·경과 시간과 timeout을 일치시키기 위해 `init_at_random_ep_len=False`로 시작한다.
+학습 설정은 `examples/Sweeping-Policy-DRL-Sim-Train`의 random 태스크가 등록한
+`rsl_rl_ppo_cfg_02.py`를 따른다. 자체 PPO subclass·microbatch 업데이트·timeout bootstrap은
+사용하지 않는다. `init_at_random_ep_len=True`도 표준 학습 스크립트와 같다.
 `commands`와 `curriculum`은 Isaac Lab 기본값인 `None`으로 두었다.
 
 `min`의 실행 스크립트는 task를 등록하고 `runpy`로 Isaac Lab 스크립트를 호출한다.
 우리 스크립트는 같은 실행 순서를 직접 사용하며 다음 차이만 유지한다.
 
-- Train: 위 episode clock 규칙 때문에 stock 학습의 무작위 초기 episode counter를 사용하지 않는다.
+- Train: 공식 runner가 초기 episode counter를 무작위화한다. 실제 초기 vision·이력은 reset 시점에 생성된다.
 - Play: 현재 graph 모델에서 지원하지 않는 JIT/ONNX export를 실행하지 않고 native inference로 재생한다.
-- 모델 연결: GNN·attention actor와 native Gaussian 분포 연결·checkpoint 계약을 adapter에서 처리한다.
+- 모델 연결: `NativeContactActor(MLPModel)`의 특징 추출에 GNN·attention을 연결하고, head·분포·PPO 인터페이스는 공식 구현에 맡긴다.
   Critic은 공식 MLP 설정으로 별도 생성한다.
 
 Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 첫 함수가 물체·로봇의
@@ -156,8 +157,8 @@ Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 
                              └─ valid object mean pooling
 현재·직전 sample [N,2,72] ── 결측 masking → flatten 144D (별도 encoder 없음)
                                    ↓
-                      concat 464 → MLP 256 → latent 128
-                                   └─ Gaussian actor: 18D
+                      concat 464 → 공식 MLPModel head 256 → 128 → 18
+                                   └─ 공식 Gaussian distribution
 
 동일한 전체 observation [N,244]
         └─ 공식 MLPModel critic: 244 → 256 → 128 → 64 → value 1D
@@ -167,9 +168,10 @@ Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 
 GNN은 관측된 물체 사이의 위치·크기 차이를 사용해 두 번 message passing한다.
 Target/Blocker embedding에서 두 attention query를 만들어 다른 물체의 정보를 읽는다.
 Attention은 `SceneGraphEncoder.forward()`의 query/key/value·masked softmax에 구현되어 있다.
-GNN 및 최종 MLP의 활성화는 **ReLU**다. `fusion = nn.Sequential(...)`은 concat 이후의
-최종 MLP `Linear(464,256) → ReLU → Linear(256,128) → ReLU`를 순서대로 묶은 것이며,
-시간 이력을 처리하는 recurrent/sequential encoder를 추가한 것이 아니다.
+GNN 및 최종 MLP의 활성화는 **ReLU**다. `ContactManipulationEncoder`는 scene 특징과
+현재·직전 정보를 합치는 기능만 담당한다. `NativeContactActor`는 공식 `MLPModel`을 상속해
+`get_latent()`를 확장하며, 최종 MLP `464→256→128→18`과 forward·분포·확률·entropy·KL·
+reset 등 공통 인터페이스를 상속한다. 공식 `CNNModel`과 같은 확장 방식이다.
 현재·직전 값은 순서대로 그대로 연결하여 최종 MLP에서 처리한다. 별도 temporal encoder는
 확정된 설계가 아니므로 이번 baseline에서 제거했다.
 
@@ -178,8 +180,13 @@ Critic은 Isaac Lab Franka Lift·Cabinet 및 Sweeping 예제처럼 **독립 MLP*
 공식 RSL-RL `MLPModel`을 생성하고 scalar value를 출력한다. Actor와 동일한 공개 244D 관측을
 직접 입력받으며 privileged 관측이나 별도 GNN·attention을 추가하지 않는다.
 Actor와 critic은 파라미터·latent·value cache를 공유하지 않는다. Critic의 value loss는
-Actor의 GNN·attention·fusion에 직접 역전파되지 않으며, PPO advantage를 통한 영향은 남는다.
-현재 Actor의 GNN·attention·fusion 활성화는 ReLU이며 Critic의 hidden 활성화만 예제의 ELU다.
+Actor의 GNN·attention·MLP에 직접 역전파되지 않으며, PPO advantage를 통한 영향은 남는다.
+현재 Actor의 GNN·attention·MLP 활성화는 ReLU이며 Critic의 hidden 활성화만 예제의 ELU다.
+
+현재 baseline은 공식 PPO의 checkpoint 형식을 사용하고 Actor의 관측/action/모델 계약을
+native `state_dict`의 extra state에 기록한다. 새 baseline checkpoint의 resume는 native 방식이다.
+기존 독립 Critic·2-sample GNN의 log-std checkpoint는 play에서 저장된 Actor 설정을 복원하고
+필요한 weight key만 변환한다. 새 scalar-std baseline으로 이전 optimizer를 이어 학습하지 않는다.
 
 2026-10-21 구조 변경 전에 저장한 공유 actor–critic checkpoint는 새 독립 critic 및 optimizer 구조와 다르다.
 Architecture metadata를 검사하여 전체 resume를 거절하므로 **새 학습을 시작해야 한다**.
@@ -188,49 +195,49 @@ Architecture metadata를 검사하여 전체 resume를 거절하므로 **새 학
 Activation도 checkpoint metadata에 기록하므로 이전 SiLU checkpoint의 그대로 resume는 거절한다.
 
 Actor는 학습 시 `a=μ+σε`, 일반 재생 시 `a=μ`를 사용한다. Tanh와 별도 action clipping은 없다.
-RSL-RL `GaussianDistribution(std_type="log")`가 양수 표준편차를 학습하고 정확한 log-probability·
-entropy·KL을 계산한다. 초기 std는 **0.3을 유지**해 tanh 제거 효과를 분리한다.
-Min의 초기 std1.0까지 맞춘 변경은 아니다. Scale1.0의 pose action에는 이제 ±1 상한도 없다.
+예제와 동일한 RSL-RL `GaussianDistribution(std_type="scalar", init_std=1.0)`를 사용한다.
+Sampling·log-probability·entropy·KL과 MLP의 기본 초기화는 공식 구현에 맡긴다.
+기존 mean-head gain.01/bias0 재초기화는 제거했다. Scale1.0의 pose action에는 ±1 상한이 없다.
 현재/직전 observation의 action 값도 ±1로 자르지 않고 실제 raw 값을 보존한다.
 Hand 관절 한계와 OSC Kp·actuator 토크 제한은 각 native 클래스에서 적용한다.
 
-출력 분포는 checkpoint의 `output_distribution`에 기록한다. 이전 tanh checkpoint는
+출력 분포는 Actor checkpoint의 `actor_model.distribution_cfg`에 기록한다. 이전 tanh checkpoint는
 새 Gaussian으로 resume/play하지 않도록 weights·optimizer 로드 전에 명시적으로 거절한다.
 변경된 분포는 새 학습으로 평가해야 한다.
 
 `build_policy_masks()`가 observation의 extent·quaternion·센서 유효값과 고정 슬롯에서
 mask를 만든 다음 모델에 별도로 전달한다. Mask·role ID를 observation이나 학습 feature에
 붙이지 않는다. 물체 padding, reset 시 직전 step 이력의 결측, tactile 결측은 해당 mask로 제외한다.
-Mask 판정에 필요한 원래 값을 유지하므로 Actor는 추가 running observation normalization을
-사용하지 않는다. Critic도 비교 예제와 동일하게 `obs_normalization=False`다.
+Mask는 항상 raw 관측에서 판정한다. Actor의 `obs_normalization=True`를 선택하면 공식 running
+normalizer를 robot/sensor/action history 144D에만 적용하고 결측 mask를 다시 적용한다.
+Scene 기하와 role/padding 판정은 raw 값을 유지한다. 현재 기본값은 Actor/Critic 모두
+`obs_normalization=False`이며, 예제의 값을 따른다.
 
 설정은 `config/ur5e/agents/rsl_rl_ppo_cfg.py` 한 곳에서 조합한다.
 
 | 항목 | 기본값 |
 |---|---|
-| Rollout / PPO epochs / minibatches | 32 step / 4 / 4 |
-| Learning rate / schedule | 3e−4 / fixed |
-| γ / GAE λ / PPO clip | 0.99 / 0.95 / 0.2 |
-| Value loss / entropy coefficient | 0.25 / 0.01 |
-| Max gradient norm / 초기 Gaussian std | 0.5 / 0.3 (학습 가능한 log std) |
-| 추론 chunk / 학습 microbatch | 최대 8,192 / 8,192 sample |
+| Seed | 42, native runner 기본값 |
+| Rollout / PPO epochs / minibatches | 36 step / 8 / 4 |
+| Learning rate / schedule / desired KL | 1e−3 / adaptive / 0.02 |
+| γ / GAE λ / PPO clip | 0.98 / 0.95 / 0.2 |
+| Value loss / entropy coefficient | 1.0 / 0.005 |
+| Max gradient norm / 초기 Gaussian std | 1.0 / 1.0, scalar 직접 학습 |
+| Actor feature chunk | 최대 8,192 sample; PPO gradient accumulation 없음 |
 | Critic hidden layers / activation / observation normalization | [256,128,64] / ELU / False |
-| 학습 iteration / checkpoint 주기 | 1,000 / 50 |
+| 학습 iteration / checkpoint 주기 | 90,000 / 50 |
 | Physics / policy 주파수 / timeout | 100 Hz / 100 Hz / 8 s |
 | 기본 환경 수 / 환경 간격 | 1 / 2.5 m |
 
-환경 수는 CLI로 늘릴 수 있다. 모델 추론 chunk와 PPO microbatch는 전체 환경 수와 별개다.
-Minibatch가 `max_microbatch_size` 이하이거나 제한이 `None`이면 **native `PPO.update()`**를 호출한다.
-현재 기본 설정에서는 1,024환경 × rollout 32 ÷ minibatches 4 = 8,192이므로 native 경로다.
-상한을 초과할 때만 Actor와 Critic의 각 microbatch loss에 표본 비율을 곱해 gradient를 누적한다.
-Gradient clipping은 native PPO와 동일하게 Actor·Critic에
-각각 적용하고 optimizer step은 원래 minibatch당 한 번 수행한다.
+환경 수는 CLI로 늘릴 수 있다. 현재 1,024환경 × rollout36 ÷ minibatches4 = 9,216이며,
+batch 크기와 관계없이 공식 `PPO.update()`를 실행한다. Actor의 feature chunking은 특징 추출의
+메모리 제한이며 PPO의 minibatch·loss·optimizer step을 바꾸지 않는다.
 하나의 native optimizer에 서로 겹치지 않는 두 네트워크의 파라미터를 등록하며,
 rollout과 update 모두 Actor의 action과 독립 Critic의 value를 별도로 계산한다.
 
 RSL-RL 5.x의 모델 API를 사용한다. 콘솔·TensorBoard 출력은 native logger를 그대로 사용하고
-기본 경로는 native value/surrogate/entropy loss를 기록하고, microbatch 경로만 추가 진단값을 기록한다. 현재 single-GPU 학습을 지원하며 RND·symmetry·
-multi-GPU 및 JIT/ONNX export는 구현하지 않았다.
+native value/surrogate/entropy loss를 기록한다. 현재 검증 범위는 single-GPU이며,
+graph Actor의 JIT/ONNX export는 구현하지 않았다.
 
 ## MDP
 
@@ -819,9 +826,9 @@ CUDA FP32에서는 ReLU·edge mask·합산을 Triton kernel 하나로 처리하�
 `[B,10,10,64]` pair activation을 저장하지 않는다. Backward에서도 node별 입력으로
 ReLU의 부호를 재계산해 receiver/sender gradient를 구하며, 큰 pair gradient도 만들지 않는다.
 CPU 및 다른 dtype은 같은 PyTorch 식을 사용한다. 파라미터 이름·shape와 checkpoint는 유지한다.
-Forward batch 상한과 PPO microbatch는 8,192다. 기본 PPO minibatch를 다시 1,024개씩
-나누지 않으며, 1,024환경 rollout은 실제 입력 1,024개를 한 번에 처리한다.
-Rollout·epoch·minibatch 수와 optimizer 갱신 횟수는 그대로다.
+Actor feature forward의 chunk 상한은 8,192다. PPO는 공식 update를 그대로 사용하며
+자체 microbatch나 gradient accumulation은 없다. 1,024환경 rollout은 실제 입력
+1,024개를 한 번에 처리한다. Rollout36·8epochs·4minibatches는 예제 설정을 따른다.
 기본 PPO 경로는 native의 gradient clipping과 loss 전송 방식을 따른다.
 따라서 native update 내부의 minibatch별 `.item()`까지 제거한 구현은 아니다.
 
@@ -952,13 +959,10 @@ Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 
 한 장면에 대해서만 수행하며, IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
 질량/관성은 고정 asset 값으로 캐시하므로 향후 dynamics randomization을 추가하면 이 캐시도 갱신해야 한다.
 
-Auto-reset 전 마지막 관측은 `extras["terminal_observation"]`에 보존한다.
-`ppo.py`가 이 관측으로 timeout value를 계산하며 같은 step의 물리적 성공·실패는 bootstrap에서 제외한다.
-Native reset의 `terminal_env_ids`를 재사용해 종료 환경이 없는 step의 추가 critic 추론을 생략한다.
-공통 round 경계 전에는 timeout이 불가능하다는 host metadata로 실패 종료 때의 불필요한
-terminal critic 추론도 생략한다. 이는 `init_at_random_ep_len=False`와 native episode counter
-증가·reset 규칙을 전제로 한다. 외부 코드에서 episode counter를 임의로 채우는 방식은 지원하지 않는다.
-Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않는다.
+Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에 보존한다.
+학습은 예제와 같은 native PPO timeout bootstrap·GAE를 사용한다. Timeout 시 저장된
+해당 step의 V를 reward에 가산하며, 이 진단 관측으로 별도 critic 추론을 하지 않는다.
+`init_at_random_ep_len=True`이며 공통 장면 교체와 부분 reset은 연구 MDP에서 관리한다.
 
 ## 검증과 남은 구현
 
@@ -1056,8 +1060,8 @@ GPU kernel 단독 시간은 아니다. 후반의 대규모 timeout reset과 장�
 
 1,024환경×rollout 32에서 90,000 iteration은 **2,949,120,000 transition**이다.
 30초/iteration이면 31.25일, 16–17초면 약 16.7–17.7일이다. Iteration 수를 다른 실험과
-비교할 때 환경 수·rollout 길이·총 transition도 함께 비교한다. 메모리 여유가 작은 경우에는
-`agent.algorithm.max_microbatch_size=512`로 낮출 수 있다.
+비교할 때 환경 수·rollout 길이·총 transition도 함께 비교한다. 위 수치는 과거 설정의 기록이며,
+현재는 자체 PPO microbatch 설정을 제공하지 않는다.
 
 2026-10-13, 실제 USD에서 측정한 40개 물체의 geometry로 reset 준비 연산을 별도 측정했다.
 아래 CPU 배치는 독립적인 seed를 사용하며, 생성된 모든 결과를 기존 scalar 검사로 다시 확인했다.
@@ -1142,7 +1146,8 @@ CPU sampler의 4·8개 스레드 실행은 동일한 작업에서 단일 스레�
 초기 환경 생성은 제외한 수치이며, **1–2초/iteration 목표에는 아직 도달하지 못했다.**
 위 계측 당시에는 rollout 32·PPO 4 epochs×4 minibatches·물리 120 Hz·정책 30 Hz를 사용했다.
 현재 기본값은 사용자 요청에 따라 물리100Hz·정책100Hz(`dt=0.01`, `decimation=1`)다.
-Rollout32는 환경별0.32초, 최대8초 episode는800step이다. 위 성능 수치는 새 주기로 측정한 결과가 아니다.
+현재 rollout36은 환경별0.36초, 최대8초 episode는800step이다.
+위 성능 수치는 현재 PPO 설정과 주기로 측정한 결과가 아니다.
 GPU 난수 생성·수치 연산 순서 변경으로 reset/학습 궤적이 달라질 수 있어 장기 처리량 보장은 아니다.
 주요 잔여 비용은 물리 step과 CPU reset 준비·큐 처리다. 자세한 계측과 검증은
 [개발 맥락](../../docs/CONTEXT.md)에 기록했다.

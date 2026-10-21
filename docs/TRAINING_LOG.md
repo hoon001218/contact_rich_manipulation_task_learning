@@ -3274,6 +3274,406 @@ Native Episode_Reward는 누적 기여/고정8초, Train/mean_reward는 최근 �
 수치 근거는 `timeline.json`, `derived_findings.json`, `checkpoint_diagnostics.json`,
 `older_native_critic_comparison.json`이다. 학습 성능이나 최초 실패 장면의 실제 재현을 수행한 분석은 아니다.
 
+## 38. 2026-10-21 — Gaussian std 오류와 학습 안정화 수정 방향
+
+사용자가 후속 traceback을 제공했다. Native PPO update 중 Actor의 stochastic forward가
+`torch.normal`에서 `normal expects all elements of std >= 0.0`으로 중단됐다. 이번에도 원인
+검토와 수정안 정리만 수행하며 production 설정·코드·reward를 변경하지 않았다.
+
+### 이번 traceback이 추가로 확인하는 것
+
+현재 Actor는 공식 GaussianDistribution의 log parameterization으로 `std=exp(log_std_param)`을
+사용한다. 유한한 log_std에서 음수 std는 나올 수 없다. CPU 재현에서 std=NaN은 정확히 같은
+오류를 냈고 std=+inf는 inf를 샘플링했으며 std=0은 허용됐다. 따라서 현재 설정에서 이 오류는
+**Actor의 std/log_std가 NaN이 됐다는 강한 근거**다. 단순히 음수 파라미터를 양수로 바꾸는
+문제로 해석하지 않는다.
+
+Native PPO는 update에서 distribution을 다시 구성하려고 stochastic Actor를 호출한다.
+이때 새로 뽑은 action은 surrogate에 사용하지 않으며 저장된 action의 log_prob를 계산한다.
+따라서 sample 호출은 이미 손상된 분포를 발견한 지점이다. 샘플링을 생략하는 것만으로 분포나
+log_prob를 복구할 수 없다. 직전 minibatch optimizer update가 최초 오염 지점일 가능성은
+있지만 당시 gradient와 분포 파라미터가 없어 확정하지 않는다.
+
+Critic과 Actor가 독립이므로 Critic의 inf loss가 같은 scalar objective에 합쳐졌다는 이유만으로
+Actor gradient가 자동으로 NaN이 되는 것은 아니다. CPU의 분리 파라미터 예제에서도
+Critic 제곱 오차는 inf인 반면 Actor gradient는 정상으로 남았다. 가능한 연결은 잘못된 GAE/
+advantage, 공통 관측 이상치, Actor log_prob/ratio overflow 등이다. 별도 합성 예제에서는
+매우 큰 유한 action의 log_prob가−inf가 되고, PPO ratio에서−inf−(−inf)가NaN이 되어
+log_std gradient까지 오염됐다. 이 역시 실제 run의 최초 transition을 재현한 증거는 아니다.
+
+Native full-minibatch PPO는 `clip_grad_norm_`에 `error_if_nonfinite=True`를 지정하지 않는다.
+CPU에서 inf gradient에 기본 clipping을 적용하면 inf×0으로NaN이 된다. 현재1,024환경의
+native경로는 이 예외 검사가 없고 custom microbatch경로에는 있으므로 양 경로 보호가 다르다.
+
+### 아직 적용하지 않은 수정 우선순위
+
+1. **최초 이상값 확보와 optimizer 오염 방지.** 관측 group별 크기, V/return/timeout bootstrap,
+   원시 advantage, action mean/std/log_prob, clip 전 gradient의 유한성을 함께 검사한다.
+   비유한 gradient를 optimizer에 반영하기 전에 자료를 보존한다. 정상 시에는 GPU reduction과
+   작은 통계만 기록하고 상세 CPU 복사는 최초 이상 때로 한정하는 방향이다. 오류를0으로 덮거나
+   해당 update를 무기록으로 건너뛰며 계속 학습하는 것을 해결책으로 삼지 않는다.
+2. **큰 유한 입력의 생성 경로 수정.** 현재 finite 검사만으로는 매우 큰 qdot/raw action을
+   거절하지 않는다. 실제 이상 row의 물리 상태와 정책 출력을 구분하고, 물리 상태가 정상 범위를
+   벗어난 경우에는 원인과 invalid 처리를 정한다. 범위는 URDF/actuator 설정과 실제 자료로
+   결정하며 이번 검토에서 임의의 새 action 제한을 확정하지 않는다.
+3. **공식 Critic 관측 정규화.** `RslRlMLPModelCfg(obs_normalization=True)`로 native
+   EmpiricalNormalization을 사용한다. GPU tensor 연산이며 통계는 native checkpoint에 저장된다.
+   평균/표준편차 정규화일 뿐 outlier clipping이나NaN 거절 기능은 없어1·2를 대체하지 못한다.
+   현재 Actor의 flag는 명시적으로 거절되며 물리값으로 mask를 생성하므로 같이 켜지 않는다.
+4. **PPO 분포 안정화의 분리 비교.** 공식 예제처럼 `schedule="adaptive"`, `desired_kl=.01`,
+   entropy.01→.005를 비교할 수 있다. Adaptive는 KL에 따른LR조절이며 hard KL 종료나NaN
+   보호가 아니다. 낮은 KL에서는LR을최대.01까지올리므로 항상보수적이라고 표현하지 않는다.
+   Entropy 축소나0대조는 후반std증가의기여를분리하는 실험이며 최초Critic spike원인으로
+   확정하지 않는다. value_loss_coef.25나 reward weight 증폭은 입력/target 오염의 해결책이 아니다.
+
+우선 reward·MDP·Actor 구조를 유지하고1–3을 확인한 뒤4를 비교하는 방향이다. 정규화 추가는
+Critic state_dict와 metadata를 바꾸므로 기존 불안정 checkpoint를 그대로 resume하지 않고
+새 학습을 기준으로 한다. 정상 resume의 통계 복구는 native 기능을 사용하며 strict=False로
+버퍼 불일치를 숨기지 않는다. 장기 학습 재개 전에는 기존 첫 spike285회와 붕괴2230회를 넘겨
+V/target·분산·실제 접촉/성공이 함께 안정적인지 검토해야 한다. 이번에 그 검증을 실행한 것은 아니다.
+
+근거는 설치본 RSL-RL5.0.1 `modules/distribution.py`, `modules/normalization.py`,
+`algorithms/ppo.py`와 로컬 ShadowHand/UR10 OSC PPO 예제다. 외부 1차 자료는
+[공식 정규화](https://github.com/leggedrobotics/rsl_rl/blob/v5.0.1/rsl_rl/modules/normalization.py),
+[공식 Gaussian](https://github.com/leggedrobotics/rsl_rl/blob/v5.0.1/rsl_rl/modules/distribution.py),
+[Andrychowicz et al. 2020, §3.2–3.3](https://arxiv.org/html/2006.05990v1)이다.
+논문의 exp-std NaN 및 observation normalization 결과는 유사 위험의 근거이며 우리 run의
+동일 원인이나 해당 수정만으로 해결될 것이라는 증명은 아니다.
+
+## 39. 2026-10-21 — 공식 Actor·Critic·PPO와 GNN 연결 구조 비교
+
+사용자는 GNN·Attention 추가 과정에서 공식 구조와 멀어진 것이 반복되는 학습 붕괴를 만들었는지
+검토하도록 요청했다. 설치된 RSL-RL5.0.1, 최신 실행 `2026-10-21_19-59-36`의 저장 설정,
+현재 Actor/PPO, Franka Lift/Reach·ShadowHand·Allegro 예제와 Sweeping min 캐시를 비교했다.
+**이번 검토에서 production 코드·MDP·네트워크·학습 설정을 변경하지 않았다.**
+
+### 비교 대상의 출처 정정
+
+로컬 IsaacLab remote는 `7cmdehdrb/IsaacLab` fork다. UR10 OSC torque 설정은 tracked/clean이지만
+fork의 `3456fb5566958c3a5f608dd978ec6b5f04114cd1`에서 추가된 예제다. 앞선 답변에서 이를
+공식 upstream 예제로 표현한 것은 부정확했다. 이번 공식 비교는 upstream에서도 내용을 확인한
+Franka Lift·ShadowHand 및 기존 Franka Reach/Allegro를 사용한다. Sweeping min은 별도 프로젝트의
+참고 예제이며 공식 권장값으로 취급하지 않는다. 로컬 min 캐시는
+`57caa46bd3fe9f8fb00fc0160d1c31beb23b4c78` 기준이다.
+
+### 이미 native인 부분
+
+- 1,024×32÷4=8,192이므로 PPO update는 그대로 `super().update()`다. Native act,
+  RolloutStorage, Adam, GAE, advantage 정규화, clipped value/surrogate loss를 사용한다.
+  별도 microbatch loss 구현은 이 실행에서 활성화되지 않는다.
+- Critic은 공식 독립 MLP `244→256→128→64→1`, ELU다. GNN과 Attention은 Actor에만 있고
+  Critic의 forward/backward가 해당 encoder를 사용하지 않는다. 공유 latent나 value head는 없다.
+- Sampling·log_prob·entropy·KL은 공식 GaussianDistribution을 호출한다. Tanh 변환이나 그에
+  필요한 확률 보정을 별도로 혼합하지 않는다. Native PPO도 update에서 stochastic forward를
+  호출하므로 std 오류의 sample stack 자체가 custom 연결 오류의 증거는 아니다.
+- 추가 timeout bootstrap은 pre-reset final observation을 평가하고 true termination을 제외한다.
+  native time_outs 가산을 제거해 이중 적용하지 않으며 reset clone으로 최종 관측을 보존한다.
+  현재 코드와 CPU 회귀에서는 episode 경계 누출을 찾지 못했다.
+- Runner의 `check_for_nan=True`도 유지한다. 다만 공식 검사 대상은 환경 obs/reward/done의NaN이며
+  큰finite입력, 모델 내부Value/return/gradient까지 검사하는 기능은 아니다.
+
+### 설정의 실제 차이
+
+최신 저장 설정과 현재 설정은 일치한다. 아래 std는 legacy cfg를 설치본의 distribution_cfg로
+변환한 뒤의 의미다. 공식 cfg에서 생략한 noise_std_type의 기본값은scalar다.
+
+| 항목 | 현재 | Franka Lift | ShadowHand | Franka Reach |
+|---|---|---|---|---|
+| Actor | GNN2층·역할Attention·MLP | MLP256/128/64 | MLP512/512/256/128 | MLP64/64 |
+| Critic | 독립MLP256/128/64 | 독립MLP256/128/64 | 독립MLP512/512/256/128 | 독립MLP64/64 |
+| Activation | ActorReLU/CriticELU | ELU | ELU | ELU |
+| Actor/Critic 관측 정규화 | False/False | False/False | True/True | False/False |
+| 초기std / parameterization | .3/log | 1/scalar | 1/scalar | 1/scalar |
+| Entropy coefficient | .01 | .006 | .005 | .001 |
+| Value coefficient | .25 | 1 | 1 | 1 |
+| LR / schedule | 3e−4/fixed | 1e−4/adaptive | 5e−4/adaptive | 1e−3/adaptive |
+| Desired KL | None | .01 | .016 | .01 |
+| Gradient norm limit | .5 | 1 | 1 | 1 |
+| Rollout / epochs / minibatches | 32/4/4 | 24/5/4 | 16/5/4 | 24/8/4 |
+| γ / λ | .99/.95 | .98/.95 | .99/.95 | .99/.95 |
+
+**정규화 OFF 자체가 공식 구조에서 벗어난 설정은 아니다.** Franka Lift의 Critic은 층 너비와
+ELU, 정규화 OFF까지 현재와 같다. Raw previous action 관측도 Shadow/Allegro에 있다.
+Hand 예제는 실제 관절 limit으로 위치를 [-1,1]에 매핑하고 속도에 .2를 곱하지만, 현재는
+q/π와 qdot/2를 사용한다. Franka Cabinet은 action을 ±1, obs를 ±5로 clamp하지만 모든 공식
+task에 같은 clamp가 있는 것은 아니다.
+
+### 원인 후보로 우선 검토할 차이
+
+1. **log std + entropy.01 + fixed LR + KL 제어 없음의 조합.**
+   `H=Σ(logσ+C)`이고 `∂H/∂logσ=1`이므로 task advantage가 약해지면 entropy가 log_std를
+   계속 올릴 수 있다. 파라미터가 조금씩 증가해도 σ는 지수적으로 증가한다. 비교 예제의 scalar는
+   entropy를 σ로 미분하면 1/σ가 된다. 둘 다 공식 지원 방식이고 scalar에는 음수 가능성도 있어
+   단순 교체가 해결을 보장하지 않는다. 첫285회의 std는 약.5이므로 후반의 std 증가만으로 최초
+   Value 이상치를 설명하지도 않는다.
+2. **Actor의 normalization API를 막은 독자 adapter.** `obs_normalization=True`를 예외로
+   거부하고 `update_normalization()`도 no-op이다. Raw 관측으로 mask를 생성해야 한다는
+   요구가 학습 입력 정규화 전체를 금지할 이유는 아니다. Mask를 먼저 만들고 padding과
+   quaternion의 의미를 유지하면서 연속 입력을 따로 처리할 수 있다. GNN의 필수 조건이 아니라
+   연결 과정에서 선택한 구조다.
+3. **Scene LayerNorm이 history144D에는 적용되지 않는다.** Raw qdot/action 등이 scene encoder를
+   거치지 않고 concat 후 fusion MLP로 들어가며, Critic도 raw244D를 받는다. 극단 입력은 양쪽에
+   영향을 줄 수 있다. 공식에도 raw action 관측이 있으므로 그 자체를 버그로 부르지 않고 실제
+   입력 범위와 최초 loss 이상치를 함께 확인해야 한다.
+4. **직접 만든 Triton autograd와 torch.compile.** 기본 nn.Module 외에 검증해야 할 경로가 늘었다.
+   아래 CPU/GPU 검사를 통과해 보통의 수식·역전파 오류를 지지하는 증거는 찾지 못했으나,
+   장기 학습 중 실제 극단 관측에서의 동작까지 보증하는 검사는 아니다.
+5. **value coefficient.25, ReLU, 네트워크 너비.** 비교 예제와 차이가 있지만 Critic은 이미
+   일반적인 ELU MLP다. 이것만으로 10¹¹~10²⁰ loss를 설명할 근거는 없으며 계수 증가에 비례해
+   clipped Adam의 Critic 업데이트가 빨라지는 것도 아니다.
+
+### GNN 자체와 연결 방법의 분리
+
+GNN은 degree에 따른 mean aggregation과 LayerNorm을 사용하고 attention은 sqrt(64)로 scale하며
+전체 mask 행을0으로 처리한다. Dropout/BatchNorm/recurrent state는 사용하지 않는다.
+CPU learning 검사는62개 실행, CUDA 전용2개 skip, 실패 없음이다. Message factorization의
+출력·gradient, 빈 attention, native PPO 업데이트 및 checkpoint 복원 검사를 포함한다.
+
+추가로 Kit를 띄우거나 학습하지 않고 RTX3090에서 실제 배치 크기1024/8192, 물체10개,
+특징64개로 검사했다. Fused edge 집계·입력 gradient는 기본 Torch 식과 일치하며 비대칭 edge,
+빈 graph, 입력 scale1000도 통과했다. Actor eager/compile의 출력과36개 파라미터 gradient도
+두 배치에서 일치했다. 최대 출력 오차3.73e−9, gradient 오차1.16e−10이며
+inference→backward→파라미터 변경→inference 전환과 기존 출력 보존도 통과했다.
+최대 모델 메모리 할당은1024에서141MB, 8192에서611MB였다. 정상 범위의 무작위 관측과 초기
+가중치를 사용했으므로 장기 학습의 실제 이상 transition을 재현한 결과는 아니다.
+원본과 재현 스크립트는
+[gpu_actor_parity.json](../outputs/contact_manipulation/native_model_audit_20261021/gpu_actor_parity.json)에 둔다.
+
+공식 구조에 가깝게 정리하는 안은 **GNN/Attention을 feature extractor로 남기고 MLPModel의
+get_latent를 확장해 scene 특징과 현재/직전 정보를 concat하는 것**이다. 공식 CNNModel도
+MLPModel을 상속하고 encoder 외의 head/distribution/protocol을 공통 코드에 맡긴다.
+현재는 공통 protocol을 NativeContactActor에서 다시 구현한다. 기존 fusion의 층 너비와 ReLU를
+유지할 수 있어 별도 history encoder나 관측 차원 변경이 필요한 제안은 아니다. 기존 파일 안에서
+정리하며 PPO/GAE나 올바른 최종 관측 bootstrap을 제거하는 방향도 아니다.
+
+학습 원인의 분리 실험은 같은 reward·Critic·PPO·action 계약에서 Actor만 공식 MLP로 바꾼 경우,
+동일 GNN에서 compile만 OFF인 경우, 집계만 Torch CUDA 식으로 바꾼 경우다. 위 GPU 검사는
+수치 일치 검사이며 이 학습 대조군들을 실행한 것이 아니다. KL/entropy/normalization 역시 여러
+항목을 한 번에 바꾸면 효과를 구분할 수 없으므로 비교 대상을 분리한다.
+
+공식 1차 자료는
+[Franka Lift](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/lift/config/franka/agents/rsl_rl_ppo_cfg.py),
+[ShadowHand](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/shadow_hand/agents/rsl_rl_ppo_cfg.py),
+[RSL-RL5.0.1 CNNModel](https://github.com/leggedrobotics/rsl_rl/blob/v5.0.1/rsl_rl/models/cnn_model.py)이다.
+
+## 40. 2026-10-21 — 공식 MLPModel Actor 적용과 PPO 설정별 영향
+
+사용자가39절의 공식 MLPModel 기반 Actor 방향에 동의했고, 비교표의 각 설정이 어떤 영향을
+주는지 설명이 부족하다고 지적했다. Actor 공통 처리를 공식 구현으로 옮기고 설정 효과를 분리해
+검토했다. **이번에는 구조만 바꾸며 std 방식·초기값·entropy·LR schedule·KL·value 계수와
+reward·MDP·controller는 기존 값을 유지했다.**
+
+### 적용한 Actor 구조
+
+- `model.py`의 `NativeContactActor(MLPModel)`가 공식 head, forward, Gaussian 생성,
+  log_prob/entropy/KL, reset/hidden-state 인터페이스를 상속한다.
+- `ContactManipulationEncoder`는 기존 GNN2층·역할 조건부 attention과 현재/직전144D concat만
+  수행한다. Native head는464→256→128→18, ReLU이며 별도 history encoder는 없다.
+- 마지막 Linear의 gain.01/bias0과 encoder→head의 난수 초기화 순서를 보존했다. 기본 설정의
+  표현식·학습 분포를 바꾸기 위한 개편이 아니다.
+- Mask는 raw244D에서 생성한다. 선택적 공식 history normalizer는144D를 처리하며, 정규화
+  전후 결측 history/tactile mask를 적용해 padding이 비영값으로 살아나지 않도록 한다.
+  Actor/Critic의 정규화 기본값은 둘 다False다. Running statistics는 native API로 저장된다.
+- cfg도 `RslRlMLPModelCfg`를 확장해 head·activation·분포 설정을 노출한다. 현재 Gaussian의
+  log/scalar·초기std를 비교하려고 adapter를 다시 고칠 필요가 없어졌다.
+- Native forward는 stochastic_output=True에서만 분포를 갱신한다. Native PPO는 원래 이 방식이며
+  큰-batch microbatch와 KL 계산도 새 의미에 맞춰 deterministic mean으로 분포를 명시적으로
+  갱신한다. 추가 sampling으로 microbatch의 난수 소비를 바꾸지 않는다.
+- v1의 정확히 동등한 checkpoint는 encoder/head/distribution key를 변환하고 Adam ID 순서도
+  재배치해 play·resume를 지원한다. 단순히 weight 이름만 바꾸면 Adam 상태가 다른 파라미터에
+  연결되므로 충분하지 않다. Metadata·shape·moment를 먼저 검증하며 strict=False로 숨기지 않는다.
+
+### 1. log 표준편차와 직접 표준편차
+
+두 방식은 같은 μ와σ에서 같은Gaussian이지만 optimizer가 움직이는 좌표가 다르다.
+
+$$
+\sigma=\exp(s),\qquad
+\sigma_{\mathrm{new}}=\sigma_{\mathrm{old}}\exp(\Delta s)
+$$
+
+직접 방식은σ에Δσ를 더한다. Log 방식은 양수를 보장하지만 파라미터가 꾸준히 증가하면 실제σ는
+곱셈으로 커진다. 직접 방식은 설치본에서 양수 clamp가 없어 음수σ가 될 수 있으므로 무조건 더
+안전한 대안은 아니다. 둘 다 공식 지원 설정이다.
+
+18축 독립Gaussian에서entropy를H, 계수를β로 두면 다음과 같다.
+
+$$
+H=\sum_{j=1}^{18}\left(\log\sigma_j+\frac12\log(2\pi e)\right),\qquad
+\frac{\partial(-\beta H)}{\partial s_j}=-\beta,\qquad
+\frac{\partial(-\beta H)}{\partial\sigma_j}=-\frac{\beta}{\sigma_j}.
+$$
+
+Task gradient가 약하면 log parameter에는 entropy의 일정한 상승 압력이 남는다. 현재처럼
+log방식·entropy.01·fixedLR·KL없음이 결합되면 후반의 분산 확대를 검토해야 한다. 다만 첫
+Value spike285회에는std≈.5였으므로 뒤의σ>50만으로 최초이상을설명하지않는다.
+
+### 2. 초기 std.3과1.0
+
+초기 탐색 진폭은3.33배, 분산은11.11배 차이 난다. 같은 초기 평균에서 모든18축σ가같다면
+전체entropy는3.869→25.541nats다. 현재OSC position/orientation scale은1이므로 위치한축의
+평균주변noise 약95%범위는±.588m→±1.960m다. XYZ noise의RMS는.520m→1.732m다.
+이는 **명령의 통계이며 실제TCP변위가 아니다.** Controller추종·토크/목표제한·접촉이 실제운동을
+결정한다. 공식 다른task의초기std1을그대로복사하면우리pose명령의초기크기가매우커질수있다.
+작은std는탐색부족가능성이있지만 현재후반분산폭증을초기std증가로해결할근거는없다.
+
+### 3. entropy coefficient.01과.006/.005
+
+환경reward가아니라optimizer의loss에−βH로들어간다. 현재는Lift비교값의1.67배,
+ShadowHand의2배다. 현재처럼state-independentσ에서는entropy가직접미분하는대상은
+std파라미터이며Actor평균을물체쪽으로직접유도하는항이아니다. 그후수집되는행동이달라져
+평균정책학습에도간접영향을준다.
+
+계수를줄이면taskgradient대비분산확대압력을줄일수있고, 너무줄이면탐색이일찍줄어들수있다.
+그러나entropy만남은극단적상황에서Adam은gradient배율을대부분정규화하므로계수를절반으로
+했다고σ증가속도가정확히절반이되는것은아니다. 유효한task신호를회복하는것과함께봐야한다.
+
+### 4. fixed와adaptive
+
+현재는정책분포가급격히바뀌어도lr3e−4가유지된다. 공식adaptive는이전/현재정책의KL로
+학습률을조정한다. 한iteration의4epochs×4minibatches에서최대16번반응할수있다.
+Actor와Critic이하나의optimizer를쓰므로양쪽의LR이함께변한다.
+
+Adaptive는큰변화때업데이트를줄일수있지만작은변화때는오히려LR을올린다. 설치본의LR범위는
+1e−5~1e−2다. NaN거절·hardKL상한·earlystop을제공하는설정은아니며,항상fixed보다안전하다고
+표현하지않는다. 오랫동안작게누적되는std상승도KL기준만으로없어지지는않는다.
+
+### 5. desired KL None과.01/.016
+
+Adaptive와함께설정해야효과가있다. Fixed그대로두고desired_kl만바꾸면현재구현에서는
+학습률이변하지않는다. 기준κ에대해KL>2κ이면LR÷1.5, 0<KL<κ/2이면LR×1.5다.
+
+| Desired KL | LR 감소 기준 | LR 증가 기준 |
+|---:|---:|---:|
+| .01 | KL>.02 | 0<KL<.005 |
+| .016 | KL>.032 | 0<KL<.008 |
+
+.016이더큰정책변화를허용한다. KL은평균과분산모두의변화를보며초기σ에도영향받는다.
+예를들어18축평균이모두같은d만큼변하고σ가고정이면KL=18d²/(2σ²)다. KL=.01에대응하는d는
+σ=.3에서.01, σ=1에서.0333으로같지않다. 따라서초기std와KL을동시에복사하면두효과가섞인다.
+
+### 6. value-loss coefficient.25와1.0
+
+Critic의rawgradient를4배로만들지만, 현재Actor/Critic이독립이므로Actorgradient를직접줄이거나
+Critic으로gradient예산을옮기는효과는없다. Log의Loss/value도계수를곱하기전값이다.
+
+양쪽계수에서Criticgradientclip.5가발동하면같은방향이같은norm으로제한돼배율차이가
+상쇄될수있다. Adam의m/sqrt(v)도일정배율의효과를대부분상쇄한다. 따라서1.0이정확히4배빠른
+Critic학습을뜻하지않는다. Clipping상태·epsilon·기존Adammoment·학습중계수변경에따라차이는
+남을수있으므로효과가전혀없다는뜻도아니다. 극단적인입력/target이나NaN을이계수만으로
+해결할수는없다.
+
+### 다음 비교의 기준
+
+우선이번공식Actor구조에서기존설정과수치동등성을검사한다. 그다음초기std.3은유지하고
+`adaptive+desired_kl=.01`을비교하고,그다음entropy만.005로비교하는순서가적절하다.
+Scalar/log비교도초기std를같게두어야한다. Value계수1은그이후의분리비교로둔다.
+이값들은이번에적용한설정이아니며장기학습결과로검증되지않았다.
+
+### 검증 결과와 한계
+
+- CPU learning은70개 실행, CUDA 전용2개 skip, 실패 없음이다. Native 메서드 상속, 기존 특징과
+  head 수식의 출력/gradient, mask 전후 history 정규화, v1 weight·Adam·다음 업데이트 동등성,
+  새 정규화 통계 복원, scalar/log 설정, adaptive native/microbatch 일치를 포함한다.
+- CPU MDP는225개 실행,16개 skip, 실패 없음이다. 코드 변경은Actor/PPO연결에 한정했지만
+  기존 관측·reset·보상·종료 회귀가 유지됨을 확인했다.
+- GPU CUDA 전용2개 검사를 통과했다. Native Actor의1024/8192배치, 정규화OFF/ON에서
+  eager/compile 출력·확률·entropy·37개파라미터gradient가일치했다. 최대오차는출력4.66e−9,
+  log_prob4.77e−7, gradient1.26e−8이며모든gradient는finite다. 정상무작위관측과초기가중치검사다.
+- 실제과거 `2026-10-21_19-59-36/model_250.pt`의Actor37개state와Adam45개state를
+  새구조로strict로드했고출력도finite였다. CPU동등성검사에서는재개후다음업데이트까지일치했다.
+- 실제Kit/PhysX1,024환경에서native2iteration을완료했다. Run은
+  `2026-10-21_23-00-48_native_actor_refactor_smoke`이며본학습성능이력에서제외한다.
+  Value loss는2.7747/3.2507, meanstd는.30033/.30088이었다. 첫iteration27.28초에는
+  compile이포함됐고두번째는2.006초(collection1.788/learning.217)였다. 저장된Actor/Critic/
+  optimizer텐서가모두finite이며종료코드0이다. 두iteration으로장기처리량이나학습안정성을
+  입증하지않으며변경전과통제된속도비교도아니다.
+
+검증원본은
+[native_actor_refactor_20261021](../outputs/contact_manipulation/native_actor_refactor_20261021/)의
+`validation_summary.json`, `gpu_validation.json/.py`, `native_training.log`에둔다.
+이구조개편이반복되는Value이상치와NaN을해결했다는장기학습증거는아직없다.
+
+## 41. 2026-10-21 — Actor 구조 외 학습을 examples random-sweep 기준으로 통일
+
+사용자가 GNN·Attention을 포함한 Actor 네트워크 구조 외의 학습은 `examples/`를 따르도록
+명시했다. 이번 변경은40절의 하이퍼파라미터 유지·자체 PPO adapter 방침을 대체한다.
+연구 task의 물체 배치·초기 vision·관측·reward·물리·controller를 Sweeping task로 바꾼 것은 아니다.
+
+### 기준과 적용값
+
+기준은 `examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/config/ur5e/agents/`
+`rsl_rl_ppo_cfg_02.py`다. 예제의 Random task 등록과 메인 학습 문서가 이 파일을 지정한다.
+다른 non-random cfg의 γ.95·entropy.01·30,000회와 섞지 않는다.
+
+| 학습 설정 | 적용값 |
+|---|---:|
+| Seed | 42, native 부모 기본값 |
+| Rollout / 최대 iteration / save interval | 36 / 90,000 / 50 |
+| Gaussian std parameter / 초기값 | scalar / 1.0 |
+| Actor / Critic observation normalization | False / False |
+| Critic hidden layers / activation | 256/128/64 / ELU |
+| PPO epochs / minibatches | 8 / 4 |
+| LR / schedule / desired KL | .001 / adaptive / .02 |
+| γ / λ | .98 / .95 |
+| Value coefficient / entropy coefficient | 1 / .005 |
+| Clipped value loss / clip | True / .2 |
+| Max gradient norm | 1 |
+| Optimizer / advantage normalization | Adam / 전체 rollout |
+| Wrapper action clipping / logger | None / TensorBoard |
+
+Actor의 GNN2층·역할attention·scene320D와현재/직전144D concat·head256/128/18 ReLU는
+기존 연구 구조로 유지한다. Mean-head의gain.01/bias0재초기화는학습초기화의차이이므로제거하고
+native MLP의기본초기화를사용한다. ModelCfg의중복initial_std도제거해분포설정은nativecfg에둔다.
+
+### 자체 학습 경로 제거
+
+- `algorithm.class_name="PPO"`로 공식 클래스를 직접 사용한다. 자체 `ContactManipulationPPO`,
+  `construct_algorithm`, microbatch loss/gradient accumulation, KL scheduler, optimizer 코드를 제거했다.
+- 자체 pre-reset final-observation timeout bootstrap을 제거했다. 공식 PPO가 timeout 시 저장된
+  해당 step의 V를 가산하고 GAE를 계산하는 예제 동작을 그대로 따른다. 이 차이를 숨기지 않는다.
+- rollout36에서1,024환경의PPO minibatch는9,216이다. 기존8,192상한때문에자체업데이트로
+  바뀌던분기는없다. Actor feature chunk8,192는메모리최적화로만남으며PPO수식을바꾸지않는다.
+- 학습의 `init_at_random_ep_len=True`도 표준 스크립트와 맞췄다. 첫 episode의남은길이는
+  무작위화되지만실제reset에서초기vision/current/previous를만드는동작은유지한다.
+  공통장면교체deadline과episode별부분reset은MDP의조건으로남긴다.
+- 전용 learner에서만쓰던 `time_outs_possible` hint는제거했다. TaskState의완료관측과종료진단
+  export는남지만native PPO가이것으로별도학습계산을수행하지는않는다.
+
+### Checkpoint와 이전 정책 재생
+
+새 학습의저장/복원은native `OnPolicyRunner/PPO`다. Actor의입력·action·모델설정검사는
+PyTorch의공식 `get_extra_state/set_extra_state`를사용해actor state_dict에저장한다.
+`agents/ppo.py`에는학습클래스없이checkpoint호환함수만남겼다.
+
+과거v1/v2의logstd/.3정책은play에서원래Actor/Critic설정과분포를복원하고필요한weight key만
+변환한뒤공식loader로읽는다. Scalar/log파라미터를숫자만바꿔해석하거나새baseline의Adam으로
+이전학습을이어가지않는다. 구형optimizerresume는명시적으로거절하고새학습을시작한다.
+이번baseline으로저장한checkpoint의resume는native방식으로검사했다.
+
+### 검증
+
+- CPU learning56개 실행중54개통과·CUDA전용2개skip다. 예제의runner/PPO설정일치,
+  nativePPO의실제타입과메서드, native timeout/GAE,로그·checkpoint,scalar1기본분포와
+  nativehead초기화,정규화·독립gradient,새checkpointresume와구형정책play를포함한다.
+- CPU MDP225개실행중16개skip·실패없음이다. 연구환경과종료조건의기존회귀를확인했다.
+- CUDA learning전용2개검사도통과했다. Fused GNN의출력·backward와native Actor의
+  compile추론·학습gradient·checkpoint key를검사했다.
+- 실제1,024환경에서2iteration을완료했다. Run은
+  `2026-10-21_23-18-08_example_learning_baseline_smoke`이며본학습성능비교에서제외한다.
+  저장된agent.yaml에서nativePPO·seed42·36rollout·scalar1·8epochs등실행값을확인했다.
+  최대iteration은검사용CLI로2로덮었으며기본값90,000과구분한다.
+  Value loss는2.4813/10.2161, meanstd는.99833/.99860이었다. 첫iteration27.35초에는
+  compile이포함됐고두번째는2.756초(collection2.226/learning.530)였다.
+  저장된Actor37개·Critic8개·optimizer135개텐서가모두finite이며종료코드0이다.
+- 실제이전 `2026-10-21_19-59-36/model_250.pt`를4환경·8step으로play했다. 원래logstd정책을
+  복원하고iteration250을확인했으며정상종료했다. 새로운학습성능검사가아니다.
+
+원본은
+[example_learning_baseline_20261021](../outputs/contact_manipulation/example_learning_baseline_20261021/)에둔다.
+예제일치는발산원인을해결했다는증거가아니며장기수렴·성공률은새baseline에서별도평가한다.
+Rollout과epoch가동시에늘었으므로이전iteration시간과같은연산량으로비교하지않는다.
+
 ## 부록: 본 학습 여부가 확인되지 않은 실행
 
 아래 3개는 모두 목표 90,000회·`resume=False`인 본 학습 후보지만 목적의 직접 근거가 부족해
