@@ -18,6 +18,89 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-21 반복되는 `Loss/value` 폭증의 의미를 설치된 native PPO·로그·CPU checkpoint로
+  검토했다. 최신 `19-59-36`은284회42.49→285회4.276e11→287회39.10으로 초기에는
+  batch별 극단값이고, 후반에는 지속되며2229회inf·2230회nan이다. 첫 spike 전후250/300회
+  Critic weight는정상규모이고 실제입력·V·GAE target은저장되지않아 최초원인은미확정이다.
+  Value loss는계수.25적용전 clipped제곱오차이며 실제reward가아니다. 입력정규화OFF·큰finite
+  qdot/raw action이력과bootstrap target을다음진단에서분리해야한다. Std.315→56.79와
+  return112.84→−29.15의동반변화는안정적인접촉회피수렴으로단정하지않는다.
+  Production·MDP·PPO를변경하지않았고새학습을실행하지않았다.
+  수치·한계·정확한수식은[TRAINING_LOG37절](TRAINING_LOG.md#37-2026-10-21--반복되는-value-loss-폭증의-의미와-최초-이상치-검토)을따른다.
+- 2026-10-21 reward·termination 전체를 검토해 **유한 작업판까지의 단일 지지 거리**로 물체의
+  낙하·이탈·큰 들림을 통합한다. 현재 선반 frame에서 `p=(OBB중심x,y,실제collider최저z)`와
+  작업판 위 최근접점 사이 거리 `d`를 사용한다. 가장 큰 활성 물체 거리로 `object_stability`
+  weight2 비용을 계산하며1cm까지0·2cm에서−1·3cm에서−1.875다. 같은 물체의거리≥3cm가
+  .1초 지속되면 `object_support_lost`다. 기존 `object_drop/ejected/off_support`는 제거하고
+  tilt80°/.2초는 자세 목적이 달라 유지한다. 성공의 기존 잔류·지지·저속 **.5초** 조건과 실패 우선은
+  유지하며 bonus는 **+100**으로 변경한다. F/T 두 증가 reward는 보정된 증가량 norm 하나와
+  exp 하나인 `motion_wrench_growth` weight.30으로 통합한다. 작은 비용의 기울기는 유지하지만
+  중간 영역의 곡선은 달라진다. 거리·접촉 유지·R·action-rate·joint-velocity·singularity는 목적이
+  달라 각각 유지한다. Reward는10→10개, native 종료는9→7개다. 비활성Time 계산·설정,
+  비활성hard-load종료경로와사용하지않는failure_penalty를제거하며센서범위진단은보존한다.
+  **손가락 관통의 물리 설정은 이번 범위에서 변경하지 않는다.** 세부 통합·제거 목록과검증상태는
+  [TRAINING_LOG36절](TRAINING_LOG.md#36-2026-10-21--rewardtermination-통합과-지지-위험-비용)을 따른다.
+- 2026-10-21 비산을 성공과 양의 Clearance에서 제외하는1단계 수정을 적용했다. **아래는34절
+  적용 당시 설정이며 bonus와 지지 실패 통합은 위36절 변경으로 대체됐다.** 사용자의
+  annotation을 반영해 완료 유지시간은 **0.5초**다. 통로·Target 보호에 모든 활성 물체의
+  작업판 잔류·signed 지지 gap −5~5mm·tilt<80°·선속도≤.05m/s·각속도≤.3rad/s와
+  활성 실패 없음을 추가했다. 성공과 활성 실패는 상호배타적이며 성공만+50, 그외0이다.
+  양의 Clearance는 현재 선반 frame의 지지 gap −5~10mm·중심 잔류·footprint overlap으로
+  즉시 gate하되 속도 제한은 없고, 음의 Clearance와 R/M 비용은 유지한다. XY 완전 이탈
+  2cm초과.05초·지지 gap3cm초과.1초를 물체별 native 실패로 추가했다. 기존 실패도 유지한다.
+  활성 collider의 지지 hull은 asset별 시작 시 추출해GPU에 저장하며 **물리 collision 설정 변경이 아니다.**
+  작은 지지 pivot의 OBB 하단 오판정을 줄이지만 실제 접촉력의 증명은 아니다. 다른weight·action·
+  Blocker 일반 이동R제외는 유지했다. 실제10종 초기지지gap은0, 1,024환경64holdstep후
+  −.182~1.711mm로 진행·완료 물리mask가모두정상이었고 부분reset도지역적이었다. 공통정점catalog와
+  Warp reduction·cachedCUDAgraph로 helper.414ms/step, 고정holdnative비교40.34→39.82ms/step
+  으로 뚜렷한지연증가는없었다. PPO·새scene reset제외측정이며 전체iteration성능을입증하지않는다.
+  새Task_Count/Task_Rate는완료episode의누적실제개수·비율이며기존종료snapshot과구분한다.
+  상세는 [TRAINING_LOG34절](TRAINING_LOG.md#34-2026-10-21--유효-재배치-성공과-비산-차단-1단계-적용)을 따른다.
+  33절은 구현 전 계획이며 완료 유지시간.2초 제안은 이번.5초 요청으로 대체됐다.
+- 2026-10-21 사용자가 play에서 관찰한 물체 튕겨내기·주변 물체 비산은 허용할 조작 성공으로
+  취급하지 않는 요구를 확인했다. **32절 검토 당시** 성공은 XY통로와 Target보호만.1초 검사해 공중·영역밖·
+  빠르게 움직이는 Blocker도 성공할 수 있고, success와 failure가 동시참이어도+50이다.
+  CPU production판정 반례로 공중Blocker2.245m/s·10rad/s의성공과 낙하/전도/선반실패 동시성공을
+  확인했지만 실제학습에서의오판정비율이나물리궤적재현은아니다. 기존checkpoint1350은
+  scalar상평가후보일뿐 올바른밀기정책으로검증된것이아니다. 다음검토우선순위는 최종성공에
+  실제선반지지·잔류·저속유지·활성실패없음을 추가하고, 양의Clearance만물리유효성으로gate하는것이다.
+  미는도중의일시적pivot/lift/속도를일괄종료하지않으며 Blocker의일반이동R제외는유지하는방향이다.
+  32절 검토에서는구현·weight·종료기준을바꾸지않았다. 근거·당시미적용수정안은
+  [TRAINING_LOG32절](TRAINING_LOG.md#32-2026-10-21--물체-튕겨내기와-성공-판정의-허점-검토)을 따른다.
+- 2026-10-21 후속 사용자 요청으로 Rearrangement와 singularity의 weight·곡선을 함께 조정했다.
+  R은weight.6→1.0·a_R2→20이며1mm에−.019801,1cm에−.181269다. Singularity는
+  weight.15→.30·warning.05→.07·half-deficit.025→.03으로, s=.06에서−.022238,
+  s=.04에서−.15를 지급한다. 선반1cm/2°·singularity s≤.005 종료와 C4/D.4/H.05,
+  다른 네 Motion각.15·성공+50은 유지했다. 기존 tensor 식의 상수만 조정해 추가 센서·물리 연산은 없다.
+  아래30절은 이전 설정으로 수행한 검토이며, 이번 동시 조정은 그때 제안한 분리 실험과 구분한다.
+  CPU259pass·18skip·381subtest(15.40초), 첫장면1,024환경32holdstep의 finite 보상·관측과
+  nativeweight/dt·부분reset 검사를 통과했다. 그러나 세장면의 reset시점 SDK지표 검사 중
+  한장면은 새warning36.23%(기존22.36%)·기존hard기준.1953%였으므로 초기상태 전체정상을
+  확인한 결과는 아니다. 실제자세와 SDK갱신/기준점의 영향을 추가로 구분해야 한다. 적용·근거는
+  [TRAINING_LOG31절](TRAINING_LOG.md#31-2026-10-21--rearrangementsingularity-weight와-경고-곡선-조정)에 기록한다.
+- 독립 Critic의 본 학습 `2026-10-21_13-33-02`를1843회까지 재검토했다. 선반 종료 snapshot은
+  1775–1799회7.37%→1800–1824회32.04%→1825–1843회4.30%였지만, 급증 전에 이미 return이
+  −22.52이고 singularity69.05%·std56.99였다. Std는최종73.856, value loss는403회에1.827e11로
+  커져 독립 Critic만으로 불안정이 해소되지는 않았다. 선반 penalty는 누락되지 않았지만 이번 step의
+  corner 이동량에 `0.6(exp(−2ΔL)−1)`을 적용하므로1mm에−.001199,1cm에−.011881로 작고,
+  초기 위치에서9mm 밀린 채 정지하면0이다. Weight 증폭만으로 원인이 해결된다고 판단하지 않는다.
+  미적용 실험 후보는 Rweight.6을 유지한a_R2→20, 별도 실험으로 singularityweight.15를 유지하고
+  warning.05→.07·half-deficit.025→.03으로 경고를 앞당기는 것이다. 후자는 reset 지표 검증이
+  선행돼야 하며 weight.3은 이후 조건부 후보다. 제어·reward 코드는 이번 검토에서 바꾸지 않았다.
+  로그 해석의 한계·분리 실험안은 [TRAINING_LOG30절](TRAINING_LOG.md#30-2026-10-21--독립-critic-학습의-선반-종료-급증과-reward-scale-재검토)을 따른다.
+- 2026-10-21 사용자 요청으로 Critic을 공식 RSL-RL `MLPModel`로 분리했다.
+  Actor의 GNN·역할 attention·ReLU fusion은 유지하며, Critic은 동일한 공개244D 관측에서
+  `244→256→128→64→1`을 계산하는 독립 ELU MLP다. `obs_normalization=False`이며
+  파라미터·latent·value cache를 공유하지 않는다. Value loss의 직접적인 Actor 역전파는 없어졌지만
+  Critic이 GAE·advantage를 통해 정책 학습에 주는 간접 영향은 남는다.
+  기존 공유 Critic 클래스·Actor 내부 value head를 제거하고 native 설정과 호출 방식을 사용한다.
+  Reward·MDP·controller·PPO 하이퍼파라미터는 유지했다. 기존 공유 checkpoint는 전체 resume와
+  현재 play에 호환되지 않으므로 새 학습을 시작한다.
+  CPU259pass·18skip·381subtest, Actor CUDA compile1pass와 실제1,024환경2iteration을 통과했다.
+  독립 checkpoint의 model·optimizer는 finite였고, 4환경8step play도 완료했다.
+  첫29.96초에는 compile이 포함됐고 다음1.87초(collection1.662/learning.205)였다.
+  두 iteration의 smoke 검사이므로 장기 처리량이나 정책 개선을 입증하지 않는다.
+  상세 변경·검증 근거는 [TRAINING_LOG29절](TRAINING_LOG.md#29-2026-10-21--critic을-공식-독립-mlp로-분리)을 따른다.
 - 2026-10-21 사용자가 보고한 OSC `linalg.inv` 오류는 full inertial decoupling의
   `inverse(J M⁻¹ Jᵀ)`에서 batch939가 singular로 판정돼 전체 호출이 중단된 경우다.
   현재 실패 행의 관절값·J·M은 저장되지 않아 기하학적 특이점과 상태/수치 문제를 구분하지 못했다.
@@ -31,10 +114,11 @@
   raw previous action만 되먹임한 CPU 검사에서는700은안정적이나750·950은자가증폭했다.
   이는 실제 실패장면 재현이 아닌 구조적 위험의 재현이다. Invalid는특이점/큰finite값검사가아니며,
   종료로그는현재불량률이아닌마지막episode원인의snapshot이다. 상세근거·개선방향은26절을따른다.
-- 같은 날 사용자 요청으로 `motion_singularity` penalty(weight0.15)와 `singularity` 종료를
+- 같은 날 사용자 요청으로 `motion_singularity` penalty(추가 당시weight0.15)와 `singularity` 종료를
   추가했다. 현재 wrist_3·팔6관절의 native public Jacobian을 step당한번 GPU에서 평가해
   보상·종료가 공유한다. `s=1/||inverse([Jv/.25;Jw])||F`는 최소 singular value의 보수적
-  대리지표이며 s≥.05이면0, s=.025이면−.075/step, s≤.005이면종료한다.
+  대리지표다. 추가 당시s≥.05이면0, s=.025이면−.075/step이었으며, 후속 조정은31절을 따른다.
+  종료는s≤.005를 유지한다.
   SVD의 CPU동기화를 피하도록 공식 `torch.linalg.inv_ex(check_errors=False)`를 썼다.
   OSC·action·관측·기존weight·초기IK는변경하지않았다. 현재활성reward10개,실패5개다.
   CPU256pass와실제1,024환경32step을검증했다. 근거와한계는TRAINING_LOG27절을따른다.
@@ -44,6 +128,12 @@
   std가.309→2.762로증가해정상적인안정수렴으로볼수없다. Success종료는마지막보상+50을
   정상지급하지만C/D/H의반복수입때문에성공지연이유리할수있는구조는남아있다.
   Success종료제거보다반복수입과완료return의관계를먼저검토한다. 상세는TRAINING_LOG28절이다.
+- 사용자관찰의정확한의미는학습초기정책은상호작용하지만후기정책은episode시작부터물체를
+  건드리지않는다는것이다. 한episode에서조금민뒤후퇴한다는뜻으로해석하지않는다.
+  최신1500–1574→1600–1699에서길이는57.38→56.67step인데D/H/C가지급로그상각각
+  92.53%/99.987%/99.917%감소했다. 접근·지속접촉상실을뒷받침하지만후퇴의최적성은미확정이다.
+  untouchedscene의C는0이며기존C이득유지로설명할수없다. 즉각비용/실패위험에의한접촉회피와
+  정책불안정에의한능력붕괴를구분해야한다. 같은episode길이에서action-rate비용은오히려증가했다.
 
 - 현재 observation은 **244D**(초기 물체 기하 100 + 현재/직전 각각 72)다.
   초기 기하만 사용하며 별도 temporal encoder 없이 GNN·역할 attention 결과와 concat한다.
@@ -70,12 +160,12 @@
   당시 결과다. 손바닥 기준으로 변경했던 중간 단계는 TRAINING_LOG11절, 최신 변경은 13절을 따른다.
 - 출력은 RSL-RL 공식 GaussianDistribution으로 전환했다. Tanh 없이 학습 시 Gaussian sample,
   play 시 mean을 사용하며 초기 std0.3은 유지했다. 이전 tanh checkpoint는 분포 검사에서 거절한다.
-- 현재 활성 native reward는 **Clearance4.0·거리0.4·Hold0.05·Rearrangement0.6·Motion5개 각각0.15·Terminal의10개**다.
+- 현재 활성 native reward는 **Clearance4.0·거리0.4·Hold0.05·Rearrangement1.0·기존Motion4개 각각0.15·Singularity0.30·Terminal의10개**다.
   Clearance는 `exp(−a·x(t))−exp(−a·x(0))`로 초기 가림 대비 개선을 지급한다.
   초기와 같으면0·개선양수·악화음수이며, 개선 상태를 유지하면 양의 지급이 계속된다.
   거리는 양의 exp 점수, Motion은 `exp(−ax)−1` penalty다. Clearance 기준은 부분reset행만 갱신한다.
   Rearrangement는 지정Blocker를 제외한 active물체(Target포함)와 선반의 OBB8corner
-  직전step변위 합을 `0.6(exp(−2x_R)−1)`로 지급한다. Time과 hard-load 종료는 비활성이다.
+  직전step변위 합을 `exp(−20x_R)−1`로 지급한다. Time과 hard-load 종료는 비활성이다.
   선반localOBB는공식USD API로한번측정하고기존pose로GPU변환하며부분reset복원은과금하지않는다.
   Terminal은 활성화해 성공+50·그 외0을
   episode당한번 지급하며 성공·failure 동시참도+50이다. 이전 failure 우선 감점은 제거했다.

@@ -1,7 +1,7 @@
 """Follow Sweeping-Policy/min's native RSL-RL inference flow for the graph policy.
 
 Use the example's checkpoint/runner/inference sequence. Keep this entry point
-because stock play unconditionally exports JIT/ONNX, which the shared GNN
+because stock play unconditionally exports JIT/ONNX, which the graph actor
 adapter does not implement. Playback itself uses the native inference policy.
 """
 

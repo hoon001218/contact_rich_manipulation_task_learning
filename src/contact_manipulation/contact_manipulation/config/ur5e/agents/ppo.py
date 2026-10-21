@@ -1,7 +1,7 @@
-"""Native RSL-RL interfaces for a shared GNN/attention policy.
+"""Native RSL-RL interfaces for a graph actor and independent native MLP critic.
 
 The native runner owns rollout storage, GAE, logging, and checkpoint files.
-Shared network construction and final-state timeout values extend native PPO.
+Research actor construction and final-state timeout values extend native PPO.
 Native update is used whenever the minibatch fits; larger batches use gradient
 accumulation. Rollout and update batches are bounded independently.
 """
@@ -30,10 +30,8 @@ ACTION_CONTRACT = "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3"
 class NativeContactActor(nn.Module):
     """Expose the research policy through the RSL-RL model interface.
 
-    The actor owns the complete shared policy, including its value head. The
-    companion critic keeps an unregistered reference to this same policy so
-    the native PPO optimizer sees every parameter exactly once. Observation
-    masks are derived before each research-model call, never added as features.
+    Observation masks are derived before each actor call, never added as
+    features. The value network is the independent, official RSL-RL MLPModel.
     """
 
     is_recurrent = False
@@ -80,7 +78,6 @@ class NativeContactActor(nn.Module):
         # cross those contexts in the pinned PyTorch version.
         self._compiled_forward = None
         self._distribution_ready = False
-        self._cached_values: tuple | None = None
         self.get_policy_observation(obs)
 
     def get_policy_observation(self, obs: Mapping[str, Tensor]) -> Tensor:
@@ -90,10 +87,10 @@ class NativeContactActor(nn.Module):
             raise ValueError(f"Expected a batched policy observation with width {self.obs_dim}.")
         return observation
 
-    def _forward_chunk(self, observation: Tensor) -> tuple[Tensor, Tensor]:
+    def _forward_chunk(self, observation: Tensor) -> Tensor:
         return self.policy(observation, masks=build_policy_masks(observation, self.cfg))
 
-    def _forward_policy(self, observation: Tensor) -> tuple[Tensor, Tensor]:
+    def _forward_policy(self, observation: Tensor) -> Tensor:
         leading = observation.shape[:-1]
         flattened = observation.reshape(-1, self.obs_dim)
         if not flattened.shape[0]:
@@ -108,36 +105,13 @@ class NativeContactActor(nn.Module):
             forward = self._compiled_forward
         if flattened.shape[0] <= self.max_forward_batch_size:
             # The standard 1024-environment rollout already fits one forward.
-            # Do not copy its actor/value outputs through singleton cat calls.
-            means, values = forward(flattened)
-            return means.reshape(*leading, self.output_dim), values.reshape(*leading, 1)
+            # Do not copy its actor outputs through singleton cat calls.
+            return forward(flattened).reshape(*leading, self.output_dim)
         results = [
             forward(chunk)
             for chunk in flattened.split(self.max_forward_batch_size)
         ]
-        return (
-            torch.cat([result[0] for result in results]).reshape(*leading, self.output_dim),
-            torch.cat([result[1] for result in results]).reshape(*leading, 1),
-        )
-
-    def _cache_token(self, obs: Mapping[str, Tensor], observation: Tensor) -> tuple:
-        try:
-            observation_version = observation._version
-        except RuntimeError:
-            # Native PPO calls actor then critic immediately, without changing
-            # the observation. Inference tensors omit a version counter; a
-            # one-use identity cache still avoids running the GNN twice.
-            observation_version = None
-        return id(obs), id(observation), observation_version, tuple(parameter._version for parameter in self.policy.parameters())
-
-    def consume_cached_value(self, obs: Mapping[str, Tensor]) -> Tensor | None:
-        """Consume an immediately preceding actor value at most once."""
-        cached, self._cached_values = self._cached_values, None
-        if cached is None:
-            return None
-        observation = self.get_policy_observation(obs)
-        token = self._cache_token(obs, observation)
-        return cached[1] if token == cached[0] else None
+        return torch.cat(results).reshape(*leading, self.output_dim)
 
     def forward(
         self,
@@ -149,11 +123,9 @@ class NativeContactActor(nn.Module):
         if masks is not None or hidden_state is not None:
             raise ValueError("The finite observation history does not use recurrent state or trajectory masks.")
         observation = self.get_policy_observation(obs)
-        mean, values = self._forward_policy(observation)
+        mean = self._forward_policy(observation)
         self.policy.distribution.update(mean)
         self._distribution_ready = True
-        token = self._cache_token(obs, observation)
-        self._cached_values = (token, values)
         return (self.policy.distribution.sample() if stochastic_output
                 else self.policy.distribution.deterministic_output(mean))
 
@@ -192,7 +164,7 @@ class NativeContactActor(nn.Module):
         return self.policy.distribution.kl_divergence(old_params, new_params)
 
     def reset(self, dones: Tensor | None = None, hidden_state=None) -> None:
-        self._cached_values = None
+        pass
 
     def get_hidden_state(self):
         return None
@@ -210,88 +182,8 @@ class NativeContactActor(nn.Module):
         raise NotImplementedError("Graph/history policy export is not implemented.")
 
 
-class NativeContactCritic(nn.Module):
-    """Native critic view of the value head owned by the shared actor policy."""
-
-    is_recurrent = False
-
-    def __init__(
-        self,
-        obs: Mapping[str, Tensor],
-        obs_groups: dict[str, list[str]],
-        obs_set: str,
-        output_dim: int,
-        shared_policy: ContactManipulationPolicy,
-        actor: NativeContactActor | None = None,
-        model_cfg: dict | ModelCfg | None = None,
-        max_forward_batch_size: int = 512,
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
-        stochastic: bool = False,
-    ):
-        super().__init__()
-        self.cfg = shared_policy.cfg if model_cfg is None else (
-            model_cfg if isinstance(model_cfg, ModelCfg) else ModelCfg(**model_cfg)
-        )
-        if asdict(self.cfg) != asdict(shared_policy.cfg):
-            raise ValueError("Actor and critic must use the same shared research model configuration.")
-        if output_dim != 1 or obs_normalization or distribution_cfg is not None or stochastic:
-            raise ValueError("The shared research critic requires one value output and unnormalized observations.")
-        if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
-            raise ValueError("max_forward_batch_size must be a positive integer.")
-        self.obs_groups = list(obs_groups[obs_set])
-        if self.obs_groups != ["policy"]:
-            raise ValueError("Actor and critic must use the same single public 'policy' observation group.")
-        self.obs_dim = self.cfg.observation_dim
-        self.output_dim = output_dim
-        self.max_forward_batch_size = max_forward_batch_size
-        # nn.Module registration would add these parameters to native PPO a
-        # second time. The actor owns and moves the entire shared policy.
-        object.__setattr__(self, "policy", shared_policy)
-        object.__setattr__(self, "_actor", actor)
-        if obs["policy"].shape[-1] != self.obs_dim:
-            raise ValueError(f"Expected a policy observation with width {self.obs_dim}.")
-        if actor is not None and actor.policy is not shared_policy:
-            raise ValueError("The critic must reference the same policy owned by its actor.")
-
-    def forward(self, obs: Mapping[str, Tensor], masks: Tensor | None = None, hidden_state=None) -> Tensor:
-        if masks is not None or hidden_state is not None:
-            raise ValueError("The finite observation history does not use recurrent state or trajectory masks.")
-        if self._actor is not None:
-            cached = self._actor.consume_cached_value(obs)
-            if cached is not None:
-                return cached
-        observation = obs["policy"]
-        if observation.ndim < 2 or observation.shape[-1] != self.obs_dim:
-            raise ValueError(f"Expected a batched policy observation with width {self.obs_dim}.")
-        flattened = observation.reshape(-1, self.obs_dim)
-        if not flattened.shape[0]:
-            raise ValueError("The research model requires a nonempty observation batch.")
-        if flattened.shape[0] <= self.max_forward_batch_size:
-            values = self.policy.value(flattened, masks=build_policy_masks(flattened, self.cfg))
-            return values.reshape(*observation.shape[:-1], 1)
-        values = [
-            self.policy.value(chunk, masks=build_policy_masks(chunk, self.cfg))
-            for chunk in flattened.split(self.max_forward_batch_size)
-        ]
-        return torch.cat(values).reshape(*observation.shape[:-1], 1)
-
-    def reset(self, dones: Tensor | None = None, hidden_state=None) -> None:
-        if self._actor is not None:
-            self._actor._cached_values = None
-
-    def get_hidden_state(self):
-        return None
-
-    def detach_hidden_state(self, dones: Tensor | None = None) -> None:
-        pass
-
-    def update_normalization(self, obs: Mapping[str, Tensor]) -> None:
-        pass
-
-
 class ContactManipulationPPO(PPO):
-    """Native PPO with final-state bootstrapping and shared-encoder microbatches."""
+    """Native PPO with final-state bootstrapping and bounded actor microbatches."""
 
     def __init__(
         self, actor, critic, storage, *, max_microbatch_size: int | None = 1024,
@@ -302,32 +194,30 @@ class ContactManipulationPPO(PPO):
             or max_microbatch_size <= 0
         ):
             raise ValueError("max_microbatch_size must be a positive integer or None.")
-        # These extensions have not been defined for the shared research model.
+        # These extensions have not been defined for the research actor.
         # Fail explicitly rather than silently changing their training semantics.
         for name in ("rnd_cfg", "symmetry_cfg", "multi_gpu_cfg"):
             if kwargs.get(name) is not None:
                 raise ValueError(f"{name} is not supported by the contact manipulation PPO extension.")
-        if critic.policy is not actor.policy or list(critic.parameters()):
-            raise ValueError("The critic must reference the actor-owned shared policy without duplicate parameters.")
+        if {id(p) for p in actor.parameters()} & {id(p) for p in critic.parameters()}:
+            raise ValueError("Actor and critic parameters must be independent.")
         super().__init__(actor, critic, storage, **kwargs)
         self.max_microbatch_size = max_microbatch_size
         self.checkpoint_metadata = deepcopy(checkpoint_metadata)
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env, cfg: dict, device: str):
-        """Use native model resolution/storage with one shared actor/critic core."""
+        """Resolve and construct independent models just like native PPO."""
         algorithm_cfg = deepcopy(cfg["algorithm"])
         algorithm_class = resolve_callable(algorithm_cfg.pop("class_name"))
         actor_cfg, critic_cfg = deepcopy(cfg["actor"]), deepcopy(cfg["critic"])
         actor_class = resolve_callable(actor_cfg.pop("class_name"))
         critic_class = resolve_callable(critic_cfg.pop("class_name"))
         if algorithm_cfg.pop("share_cnn_encoders", False):
-            raise ValueError("share_cnn_encoders is not applicable to the shared scene encoder and final MLP.")
+            raise ValueError("share_cnn_encoders is not applicable to the graph actor and independent MLP critic.")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic"])
         actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
-        critic = critic_class(
-            obs, cfg["obs_groups"], "critic", 1, shared_policy=actor.policy, actor=actor, **critic_cfg,
-        ).to(device)
+        critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         print(f"Actor Model: {actor}")
         print(f"Critic Model: {critic}")
         sample_count = cfg["num_steps_per_env"] * env.num_envs
@@ -340,6 +230,8 @@ class ContactManipulationPPO(PPO):
             raise ValueError("Per-minibatch advantage normalization requires at least two samples per minibatch.")
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
         metadata = {
+            "actor_critic_architecture": "separate_actor_mlp_critic_v1",
+            "critic_model": deepcopy(cfg["critic"]),
             "model_cfg": asdict(actor.policy.cfg),
             "force_torque": {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES,
                              "resolution": SI_200_8_RESOLUTION},
@@ -409,9 +301,7 @@ class ContactManipulationPPO(PPO):
             total = batch.observations.batch_size[0]
             for start in range(0, total, chunk_size):
                 stop = min(start + chunk_size, total)
-                inputs = self.actor.get_policy_observation(batch.observations[start:stop])
-                means, _ = self.actor.policy(inputs, masks=build_policy_masks(inputs, self.actor.policy.cfg))
-                self.actor.policy.distribution.update(means)
+                self.actor(batch.observations[start:stop])
                 old_params = tuple(parameter[start:stop] for parameter in batch.old_distribution_params)
                 kl_sum += self.actor.get_kl_divergence(old_params, self.actor.policy.distribution.params).sum()
             kl_mean = float(kl_sum / total)
@@ -436,7 +326,7 @@ class ContactManipulationPPO(PPO):
         sample share; native Gaussian entropy is analytic in every chunk.
         The native storage controls minibatch order and epoch count.
         """
-        names = ("value", "surrogate", "entropy", "grad_norm", "approximate_kl", "clip_fraction")
+        names = ("value", "surrogate", "entropy", "grad_norm", "critic_grad_norm", "approximate_kl", "clip_fraction")
         totals = torch.zeros(len(names), device=self.device)
         updates = 0
         for batch in self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs):
@@ -449,10 +339,11 @@ class ContactManipulationPPO(PPO):
             metrics = torch.zeros_like(totals)
             for start in range(0, count, chunk_size):
                 stop = min(start + chunk_size, count)
-                inputs = self.actor.get_policy_observation(batch.observations[start:stop])
-                log_prob, entropy, values = self.actor.policy.evaluate_actions(
-                    inputs, batch.actions[start:stop], masks=build_policy_masks(inputs, self.actor.policy.cfg),
-                )
+                observations = batch.observations[start:stop]
+                self.actor(observations)
+                log_prob = self.actor.get_output_log_prob(batch.actions[start:stop])
+                entropy = self.actor.output_entropy
+                values = self.critic(observations).squeeze(-1)
                 old_log_prob = batch.old_actions_log_prob[start:stop].squeeze(-1)
                 advantage = batch.advantages[start:stop].squeeze(-1)
                 ratio = (log_prob - old_log_prob).exp()
@@ -472,13 +363,18 @@ class ContactManipulationPPO(PPO):
                 (loss * share).backward()
                 log_ratio = log_prob - old_log_prob
                 metrics += torch.stack((value_loss, surrogate_loss, entropy_mean,
-                                        torch.zeros_like(value_loss), (ratio - 1.0 - log_ratio).mean(),
+                                        torch.zeros_like(value_loss), torch.zeros_like(value_loss),
+                                        (ratio - 1.0 - log_ratio).mean(),
                                         ((ratio - 1.0).abs() > self.clip_param).float().mean())).detach() * share
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.actor.policy.parameters(), self.max_grad_norm, error_if_nonfinite=True,
+                self.actor.parameters(), self.max_grad_norm, error_if_nonfinite=True,
+            )
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.critic.parameters(), self.max_grad_norm, error_if_nonfinite=True,
             )
             self.optimizer.step()
             metrics[3] = grad_norm
+            metrics[4] = critic_grad_norm
             totals += metrics
             updates += 1
         self.storage.clear()
@@ -505,6 +401,12 @@ class ContactManipulationPPO(PPO):
             raise ValueError(
                 "Checkpoint output distribution is missing or differs from this Gaussian policy. "
                 "Previous tanh-Gaussian checkpoints cannot be loaded as Gaussian actions; start a new training run."
+            )
+        if (metadata.get("actor_critic_architecture") != "separate_actor_mlp_critic_v1"
+                or metadata.get("critic_model") != self.checkpoint_metadata.get("critic_model")):
+            raise ValueError(
+                "Critic architecture differs from the independent native MLP critic. "
+                "Shared-critic checkpoints cannot resume with this architecture; start a new training run."
             )
         if metadata != self.checkpoint_metadata:
             raise ValueError(

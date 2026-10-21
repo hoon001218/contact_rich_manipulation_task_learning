@@ -75,8 +75,8 @@ class RewardsCfg:
     clearance = RewardTermCfg(func=mdp.clearance, weight=4.0)
     blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=0.40)
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.05)
-    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
-    # Independent penalties; existing four weights stay unchanged.
+    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=1.0)
+    # Command variation and actual speed are different control objectives.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
     motion_joint_velocity = RewardTermCfg(
         func=mdp.motion_joint_velocity, weight=0.15,
@@ -85,10 +85,9 @@ class RewardsCfg:
             "hand_cfg": SceneEntityCfg("robot", joint_names=MISSING),
         },
     )
-    motion_force_increase = RewardTermCfg(func=mdp.motion_force_increase, weight=0.15)
-    motion_torque_increase = RewardTermCfg(func=mdp.motion_torque_increase, weight=0.15)
-    motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.15)
-    # time = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
+    motion_wrench_growth = RewardTermCfg(func=mdp.motion_wrench_growth, weight=0.30)
+    motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
+    object_stability = RewardTermCfg(func=mdp.object_stability, weight=2.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
@@ -98,9 +97,8 @@ class TerminationsCfg:
 
     time_out = TerminationTermCfg(func=mdp.scene_time_out, time_out=True)
     success = TerminationTermCfg(func=mdp.success)
-    object_drop = TerminationTermCfg(func=mdp.failure, params={"reason": "object_drop"})
+    object_support_lost = TerminationTermCfg(func=mdp.failure, params={"reason": "object_support_lost"})
     object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
-    # hard_load_or_overrange = TerminationTermCfg(func=mdp.failure, params={"reason": "hard_load_or_overrange"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})

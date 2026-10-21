@@ -33,7 +33,7 @@ contact_manipulation/
     │       └── agents/
     │           ├── __init__.py
     │           ├── rsl_rl_ppo_cfg.py # native runner 및 연구 PPO 설정
-    │           ├── model.py         # 모델 설정·mask·GNN·attention·history·heads
+    │           ├── model.py         # Actor 설정·mask·GNN·attention·history·action head
     │           └── ppo.py           # native actor/critic 연결·PPO microbatch
     └── mdp/
         ├── __init__.py
@@ -80,7 +80,7 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
 | EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
 | 물체 주차 | `RigidObjectCollection.permanent_wrench_composer` | parked mask와 중력 상쇄 force 계산; transient force는 instantaneous composer 사용 |
-| PPO | 기본 `PPO.update()`, storage·GAE·logger·checkpoint | 공유 GNN/attention actor–critic, terminal 관측 bootstrap, 큰 minibatch의 gradient accumulation |
+| PPO | 기본 `PPO.update()`, 독립 `MLPModel` critic, storage·GAE·logger·checkpoint | GNN/attention actor 연결, terminal 관측 bootstrap, 큰 minibatch의 gradient accumulation |
 | 초기 vision | `convert_to_warp_mesh`, Warp mesh query | 후보 pose의 object-only raycast, 두 역할의 무가림 실루엣과 가시성, 관측 표면 OBB |
 
 직접 구현을 유지한 이유:
@@ -103,7 +103,8 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
   SI-200-8 양자화·범위와 hand 링크의
   자중/운동 관성 보상, OBB 조작량·clearance 등은 연구 수식이다.
 - 출력 분포는 RSL-RL의 `GaussianDistribution`을 사용한다. Sampling·log-probability·
-  analytic entropy·KL은 native 구현에 맡기고 GNN/attention과 공유 actor–critic 연결을 유지한다.
+  analytic entropy·KL은 native 구현에 맡긴다. Actor는 GNN/attention을 사용하며 critic은
+  독립적인 공식 `MLPModel`을 사용한다.
 
 비교한 공식 구현은 [OSC 예제](../../IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/config/franka/osc_env_cfg.py),
 [관절 범위 매핑 예제](../../IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/inhand/inhand_env_cfg.py),
@@ -128,7 +129,7 @@ scripts/train.py
 ```
 
 환경의 `step/reset`, runner, rollout storage, GAE, 로그와 checkpoint 파일은 표준 구현을 사용한다.
-`PPO`는 공유 네트워크 연결, reset 이전 관측의 timeout bootstrap, microbatch 업데이트만 확장한다.
+`PPO`는 연구 actor 연결, reset 이전 관측의 timeout bootstrap, microbatch 업데이트만 확장한다.
 초기 vision·이력·경과 시간과 timeout을 일치시키기 위해 `init_at_random_ep_len=False`로 시작한다.
 `commands`와 `curriculum`은 Isaac Lab 기본값인 `None`으로 두었다.
 
@@ -137,7 +138,8 @@ scripts/train.py
 
 - Train: 위 episode clock 규칙 때문에 stock 학습의 무작위 초기 episode counter를 사용하지 않는다.
 - Play: 현재 graph 모델에서 지원하지 않는 JIT/ONNX export를 실행하지 않고 native inference로 재생한다.
-- 모델 연결: 공유 GNN·attention, native Gaussian 분포 연결과 checkpoint 계약을 adapter에서 처리한다.
+- 모델 연결: GNN·attention actor와 native Gaussian 분포 연결·checkpoint 계약을 adapter에서 처리한다.
+  Critic은 공식 MLP 설정으로 별도 생성한다.
 
 Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 첫 함수가 물체·로봇의
 초기 상태와 vision을 준비하고, 두 번째가 초기 snapshot·이력·누적량을 초기화한다.
@@ -155,8 +157,11 @@ Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 
 현재·직전 sample [N,2,72] ── 결측 masking → flatten 144D (별도 encoder 없음)
                                    ↓
                       concat 464 → MLP 256 → latent 128
-                                   ├─ Gaussian actor: 18D
-                                   └─ critic: 1D
+                                   └─ Gaussian actor: 18D
+
+동일한 전체 observation [N,244]
+        └─ 공식 MLPModel critic: 244 → 256 → 128 → 64 → value 1D
+                                   (hidden activation: ELU)
 ```
 
 GNN은 관측된 물체 사이의 위치·크기 차이를 사용해 두 번 message passing한다.
@@ -166,8 +171,19 @@ GNN 및 최종 MLP의 활성화는 **ReLU**다. `fusion = nn.Sequential(...)`은
 최종 MLP `Linear(464,256) → ReLU → Linear(256,128) → ReLU`를 순서대로 묶은 것이며,
 시간 이력을 처리하는 recurrent/sequential encoder를 추가한 것이 아니다.
 현재·직전 값은 순서대로 그대로 연결하여 최종 MLP에서 처리한다. 별도 temporal encoder는
-확정된 설계가 아니므로 이번 baseline에서 제거했다. 두 head는 scene encoder와 최종 MLP를
-공유하며 critic에도 동일한 observation만 제공한다. 기본 모델은 **234,789개 파라미터**다.
+확정된 설계가 아니므로 이번 baseline에서 제거했다.
+
+Critic은 Isaac Lab Franka Lift·Cabinet 및 Sweeping 예제처럼 **독립 MLP**를 사용한다.
+`RslRlMLPModelCfg(hidden_dims=[256,128,64], activation="elu", obs_normalization=False)`로
+공식 RSL-RL `MLPModel`을 생성하고 scalar value를 출력한다. Actor와 동일한 공개 244D 관측을
+직접 입력받으며 privileged 관측이나 별도 GNN·attention을 추가하지 않는다.
+Actor와 critic은 파라미터·latent·value cache를 공유하지 않는다. Critic의 value loss는
+Actor의 GNN·attention·fusion에 직접 역전파되지 않으며, PPO advantage를 통한 영향은 남는다.
+현재 Actor의 GNN·attention·fusion 활성화는 ReLU이며 Critic의 hidden 활성화만 예제의 ELU다.
+
+2026-10-21 구조 변경 전에 저장한 공유 actor–critic checkpoint는 새 독립 critic 및 optimizer 구조와 다르다.
+Architecture metadata를 검사하여 전체 resume를 거절하므로 **새 학습을 시작해야 한다**.
+이전 공유 모델을 현재 play에서 호환 로드하는 기능도 구현하지 않았다.
 이전 temporal encoder 모델의 checkpoint는 구조가 달라 resume할 수 없다.
 Activation도 checkpoint metadata에 기록하므로 이전 SiLU checkpoint의 그대로 resume는 거절한다.
 
@@ -185,7 +201,8 @@ Hand 관절 한계와 OSC Kp·actuator 토크 제한은 각 native 클래스에�
 `build_policy_masks()`가 observation의 extent·quaternion·센서 유효값과 고정 슬롯에서
 mask를 만든 다음 모델에 별도로 전달한다. Mask·role ID를 observation이나 학습 feature에
 붙이지 않는다. 물체 padding, reset 시 직전 step 이력의 결측, tactile 결측은 해당 mask로 제외한다.
-Mask 판정에 필요한 원래 값을 유지하므로 추가 running observation normalization은 사용하지 않는다.
+Mask 판정에 필요한 원래 값을 유지하므로 Actor는 추가 running observation normalization을
+사용하지 않는다. Critic도 비교 예제와 동일하게 `obs_normalization=False`다.
 
 설정은 `config/ur5e/agents/rsl_rl_ppo_cfg.py` 한 곳에서 조합한다.
 
@@ -197,6 +214,7 @@ Mask 판정에 필요한 원래 값을 유지하므로 추가 running observatio
 | Value loss / entropy coefficient | 0.25 / 0.01 |
 | Max gradient norm / 초기 Gaussian std | 0.5 / 0.3 (학습 가능한 log std) |
 | 추론 chunk / 학습 microbatch | 최대 8,192 / 8,192 sample |
+| Critic hidden layers / activation / observation normalization | [256,128,64] / ELU / False |
 | 학습 iteration / checkpoint 주기 | 1,000 / 50 |
 | Physics / policy 주파수 / timeout | 100 Hz / 100 Hz / 8 s |
 | 기본 환경 수 / 환경 간격 | 1 / 2.5 m |
@@ -204,9 +222,11 @@ Mask 판정에 필요한 원래 값을 유지하므로 추가 running observatio
 환경 수는 CLI로 늘릴 수 있다. 모델 추론 chunk와 PPO microbatch는 전체 환경 수와 별개다.
 Minibatch가 `max_microbatch_size` 이하이거나 제한이 `None`이면 **native `PPO.update()`**를 호출한다.
 현재 기본 설정에서는 1,024환경 × rollout 32 ÷ minibatches 4 = 8,192이므로 native 경로다.
-상한을 초과할 때만 각 microbatch loss에 표본 비율을 곱해 gradient를 누적하고,
-gradient clipping과 optimizer step은 원래 minibatch당 한 번 수행한다.
-Actor와 critic이 같은 파라미터를 optimizer에 두 번 등록하지 않으며 rollout의 공통 encoder 계산도 재사용한다.
+상한을 초과할 때만 Actor와 Critic의 각 microbatch loss에 표본 비율을 곱해 gradient를 누적한다.
+Gradient clipping은 native PPO와 동일하게 Actor·Critic에
+각각 적용하고 optimizer step은 원래 minibatch당 한 번 수행한다.
+하나의 native optimizer에 서로 겹치지 않는 두 네트워크의 파라미터를 등록하며,
+rollout과 update 모두 Actor의 action과 독립 Critic의 value를 별도로 계산한다.
 
 RSL-RL 5.x의 모델 API를 사용한다. 콘솔·TensorBoard 출력은 native logger를 그대로 사용하고
 기본 경로는 native value/surrogate/entropy loss를 기록하고, microbatch 경로만 추가 진단값을 기록한다. 현재 single-GPU 학습을 지원하며 RND·symmetry·
@@ -304,28 +324,30 @@ Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 �
 
 | Reward | Weight | Weight 적용 전 discrete step 값 |
 |---|---:|---|
-| Clearance | 4.0 | $q_C(t)-q_C(0)$, $q_C(t)=\exp(-a_C x_C(t))$, $x_C=A_{\mathrm{blocked}}/A_{\mathrm{blocker}}$ |
+| Clearance | 4.0 | $\min(d,0)+V_p\max(d,0)$, $d=q_C(t)-q_C(0)$, $q_C=\exp(-a_C x_C)$, $x_C=A_{\mathrm{blocked}}/A_{\mathrm{blocker}}$ |
 | `blocker_distance` | 0.40 | $\exp(-a_d d)$, 17개 pad 표면 대표점에서 현재 Blocker OBB까지의 최소 거리 |
 | `blocker_contact_hold` | 0.05 | $\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$, 같은 pad의 직전·현재 Blocker 접촉 |
-| Rearrangement | 0.6 | $\exp(-a_R x_R)-1$, $x_R=$ Blocker를 제외한 물체와 선반의 이번 step OBB 이동량(m) |
+| Rearrangement | 1.0 | $\exp(-a_R x_R)-1$, $x_R=$ Blocker를 제외한 물체와 선반의 이번 step OBB 이동량(m) |
 | `motion_action_rate` | 0.15 | $\exp(-a_A x_A)-1$ |
 | `motion_joint_velocity` | 0.15 | $\exp(-a_V x_V)-1$ |
-| `motion_force_increase` | 0.15 | $\exp(-a_F x_F)-1$ |
-| `motion_torque_increase` | 0.15 | $\exp(-a_T x_T)-1$ (F/T 센서 모멘트) |
-| `motion_singularity` | 0.15 | $\exp(-a_S[0.05-s]_+^2)-1$ (현재 팔 자세의 특이점 접근) |
-| Time (현재 비활성) | — | $-\int_t^{t+\Delta t}0.02\bigl(\exp(0.7s)-1\bigr)\,ds$ |
-| Terminal | 1.0 | 성공 +50, 그 외0·episode당 1회 |
+| `motion_wrench_growth` | 0.30 | $\exp[-(a_F x_F+a_T x_T)/2]-1$, 하나의 보정된 wrench 증가량 |
+| `motion_singularity` | 0.30 | $\exp(-a_S[0.07-s]_+^2)-1$ (현재 팔 자세의 특이점 접근) |
+| `object_stability` | 2.0 | $\exp[-a_P\max(d_{\max}-0.01,0)^2]-1$, 유한 작업판까지의 지지점 거리 |
+| Terminal | 1.0 | 성공 +100, 그 외0·episode당 1회 |
 
 **Clearance는 초기 상태 대비 개선 보상, Rearrangement·Motion은 penalty로 지급한다.**
-품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지하며, Clearance는 `q(t)−q(0)`,
-뒤의 두 그룹은 `q−1`을 지급한다.
+품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지한다. Clearance는 초기 대비 차이
+`d=q(t)−q(0)`의 양의 부분만 진행 유효성 `V_p`로 gate하고, 뒤의 두 그룹은 `q−1`을 지급한다.
 비용이 0이면 penalty도 0이고, 비용이 커지면 −1에 가까워진다. 품질 캐시는 0~1을 유지한다.
 이전의 R/M 정지 보상 1.2/step을 제거한 변경이며, 작은 Clearance 개선이 항상 모든 비용을
 이기도록 보장하는 우선순위 제약은 아니다. 접근·접촉 유지 보상은 별도 지원 항이다.
-Clearance는 처음과 같으면0, 처음보다 개선되면양수, 악화되면음수다.
-직전 step 대비 증가량이 아니라 **episode 초기 상태와의 차이**이므로 개선된 상태를
+Clearance는 처음과 같으면0, 물리적으로 유효한 조작으로 개선되면양수, 악화되면음수다.
+직전 step 대비 증가량이 아니라 **episode 초기 상태와의 차이**이므로 유효하게 개선된 상태를
 유지하면 같은 양의 보상이 계속 지급되고, 초기 배치로 돌아오면0이 된다.
-접촉 gate는 사용하지 않는다.
+공중·영역 밖·전도·활성 실패 상태에서는 양의 부분만0이며, 음의 Clearance와 다른 비용은 유지한다.
+진행 gate에는 속도 제한이나 tactile 접촉 조건을 넣지 않아 정상적으로 미는 중에도 보상한다.
+아래 성공 판정과 같은 현재 선반 frame의 지지 기하를 사용하되, 진행은 signed gap −5~10 mm,
+OBB 중심의 작업판 XY 내부·footprint overlap을 요구한다. 최종 성공의 정지 조건은 적용하지 않는다.
 
 Clearance의 분모는 **현재 Blocker의 XY 투영 footprint 전체 면적**이다. x_C는 초기 접근영역
 A₀와 Blocker의 교차 면적을 이 분모로 나눈 0~1 값이다. Target·주변 물체의 overlap은 제외한다.
@@ -380,13 +402,18 @@ x_R(t)=\sum_{i\in\mathcal O_{\mathrm{active}}\setminus\{B\}}
 +\frac18\sum_{k=1}^{8}\|p_{\mathrm{shelf},k}^{t}-p_{\mathrm{shelf},k}^{t-1}\|_2.
 $$
 
-Weight0.6·`a_R=2 m⁻¹`을 유지한다. 누적 `path_length`는 진단용이며 보상에 넣지 않는다.
+2026-10-21 사용자 요청으로 weight를0.6→1.0, `a_R`을2→20m⁻¹로 조정했다.
+이번 step의 x_R가1mm이면약−.019801,1cm이면약−.181269를 지급한다.
+지정 Blocker는 제외하지만 Target·주변 물체·선반의 이동 비용이 함께 커지는 변경이다.
+누적 `path_length`는 진단용이며 보상에 넣지 않는다.
 **멈춘 step에는 x_R=0, penalty=0**이므로 과거 이동량에 반복 감점을 주지 않는다.
 회전·pivot·왕복 이동을 포함하고, 선반의1cm/2° 변위 종료 조건도 유지한다.
 지수 점수이므로 누적 비용이 전체 이동거리와 정확히 선형 비례하지는 않는다.
 
-Motion은 기존 네 비용과 singularity 비용을 **각각 exp에 넣고 1을 뺀 독립 term**으로 기록한다.
-각 weight는0.15이며 기존 네 항은 바꾸지 않았다. 가속도 항은 없고 tactile 유지 보상은 별도다.
+Motion은 action-rate·joint-velocity·wrench 증가·singularity의 네 term이다.
+F/T의 두 증가 비용은 하나의 보정된 norm으로 결합한 뒤 **하나의 exp**에 넣는다.
+Action-rate·joint-velocity는 각각0.15, 결합 wrench와 singularity는 각각0.30이다.
+가속도 항은 없고 tactile 유지 보상과 물체 지지 비용은 별도다.
 
 $$
 \begin{aligned}
@@ -395,7 +422,9 @@ x_V &= \sum_{j=1}^{12}\dot q_{j,k}^{\,2}, \\
 g_F &= \frac{\max(\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2,\,0)}{\Delta t}, \\
 g_T &= \frac{\max(\lVert \tau_k\rVert_2-\lVert \tau_{k-1}\rVert_2,\,0)}{\Delta t}, \\
 x_F &= \max(g_F-10,\,0)^2, \\
-x_T &= \max(g_T-0.5,\,0)^2.
+x_T &= \max(g_T-0.5,\,0)^2, \\
+x_W &= \tfrac12(a_Fx_F+a_Tx_T), \\
+r_W &= 0.30\bigl(\exp(-x_W)-1\bigr).
 \end{aligned}
 $$
 
@@ -407,17 +436,22 @@ substep의 값이며 policy 구간 적분이 아니다. 기존 GPU 버퍼를 사
 F/T는 자중·관성 보상 후 **현재 센서 중심**에서 비교한다. 축 회전은 norm을 바꾸지 않으므로
 world 축으로 돌릴 필요가 없고, 초기 센서 원점으로의 `r×F` 이동도 하지 않는다. 일정 하중·하중
 감소·norm이 같은 방향 변화는 F/T 점수1이다. `wrench_rate_cost`는 `(num_envs, 2)`로 힘·토크의
-초과 증가율 제곱을 각각 저장한다. Tactile 유지 보상은 이 네 Motion 항에 합치지 않는다.
+초과 증가율 제곱을 각각 저장하되 보상은 하나의 $x_W$에서 계산한다. 힘 증가와 토크 감소가
+상쇄되지 않는다. 기존 두 reward를 단순히 더하는 것과 다르며, 작은 비용에서의 기울기
+`0.30/2=0.15`와 총 비용 하한−0.30은 유지하지만 중간 영역의 곡선은 달라진다.
+한 채널만 기존 half-score 지점에 도달하면 결합 비용은약−0.087868이며 기존−0.075와 같다거나
+개별 채널의 half-score가 유지된다고 주장하지 않는다. 두 채널이 모두 그 지점이면−0.15다.
+Tactile 유지 보상은 Motion에 합치지 않는다.
 
 | 계수 | 설정값 | 의미 |
 |---|---:|---|
-| `a_C`, `a_R` | 1, 2 | 기존 Clearance·Rearrangement 지수 유지 |
+| `a_C`, `a_R` | 1, 20 | Clearance 유지·Rearrangement의 cm 단위 민감도 확대 |
 | `motion_action_rate_decay` | 0.004 | Raw action 변화 제곱합의 민감도 |
 | `motion_joint_velocity_decay` | 0.004 | 관절 속도 제곱합의 민감도 |
 | `force_rate_deadband` | 10 N/s | 작은 힘 증가율의 무감점 구간 |
 | `torque_rate_deadband` | 0.5 N·m/s | 작은 토크 증가율의 무감점 구간 |
-| `motion_force_rate_decay` | `ln(2)/90²` ≈ 8.55737e−5 | 힘 증가율100 N/s에서 해당 점수0.5 |
-| `motion_torque_rate_decay` | `ln(2)/4.5²` ≈ 0.0342295 | 토크 증가율5 N·m/s에서 해당 점수0.5 |
+| `motion_force_rate_decay` | `ln(2)/90²` ≈ 8.55737e−5 | 힘 증가율100 N/s에서 보정 좌표 제곱값 `ln(2)` |
+| `motion_torque_rate_decay` | `ln(2)/4.5²` ≈ 0.0342295 | 토크 증가율5 N·m/s에서 보정 좌표 제곱값 `ln(2)` |
 
 Action·velocity의 계수는 Motion 하위 weight0.15와 함께 작은 비용에서의 감점 기울기
 `0.15×0.004=0.0006`을 만든다. 이는 `min`의 native penalty weight0.03×dt0.02와 같지만,
@@ -449,34 +483,42 @@ $$
 Singular/비유한 Jacobian·역산 실패 행은0으로 처리하고 다른 행은 유지한다. Controller의
 역산·토크에는 개입하지 않으며 native OSC 코드는 변경하지 않았다.
 
-`motion_singularity_threshold=0.05`, `a_S=ln(2)/0.025²`가 초기 실험값이다.
-s≥0.05이면0, s=0.025이면−0.075/step, s=0이면−0.140625/step이다(weight포함).
+2026-10-21 weight0.15→0.30, `motion_singularity_threshold=.05→.07`,
+half-deficit`.025→.03`으로 조정해 `a_S=ln(2)/.03²`를 사용한다.
+s≥.07이면0, s=.06이면약−.022238, s=.04이면−.15,
+s=.005이면약−.288413/step이다(weight포함). s=0의 기여는약−.293111이다.
 별도의 `singularity` 종료는 s≤0.005에서 작동한다. Action 방향을 평가하는 항은 아직 없다.
 부분reset행은 첫 완료된physics sample까지penalty0으로초기화하며 이후 새Jacobian을읽는다.
 지표는관측에추가하지않고기존관절상태로추론가능한자세의privileged 보상·종료정보로만쓴다.
 
-현재 `RewardsCfg`는 Clearance/거리/접촉 유지/Rearrangement/Motion5항/Terminal의 **10개 활성 term**이다.
-Time은 비활성이다. 함수가
+현재 `RewardsCfg`는 Clearance/거리/접촉 유지/Rearrangement/Motion4항/물체 지지/Terminal의
+**10개 활성 term**이다. 비활성 Time 항과 매 step의 시간 지수 계산은 제거했다. 함수가
 discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다.
 C·거리·Hold의 최대 기여는 기본 `a_C=1`에서 각각약2.528·0.4·0.85이고,
-Clearance의 장면별 최대값은 초기 가림비율에 따라 더 작다. 기본 설정에서 Motion 합의 최소 기여는−0.740625,
-Rearrangement의 최소 기여는−0.6이다.
-Time을 활성화하면 위 적분값을 지급한다. Step별 지급이므로 전체 return의 제어주기 불변성을
+Clearance의 장면별 최대값은 초기 가림비율에 따라 더 작다. 기본 설정에서 Motion 합의 최소 기여는약−.893111,
+Rearrangement의 하한은−1, 물체 지지 비용의 하한은−2다.
+Step별 지급이므로 전체 return의 제어주기 불변성을
 주장하지 않는다. 100Hz에서는 같은8초 동안 지급 횟수가50Hz의 두 배다. γ=.99·rollout32를
 유지했으므로 rollout의 simulation 시간은0.32초이며, 같은 물리 시간에 대한 할인도 달라진다.
-이번 변경에서 다른 weight·γ·action scale은 자동 조정하지 않았다.
+γ·action scale과 나머지 weight는 유지한다. 새 지지 비용과 종료는 기존 GPU 기하·cached CUDA
+graph를 공유하며 센서·물리 step을 추가하지 않는다.
+초기 자세의 warning 구간 여부와 조정 후 검증 결과는 [학습 기록31절](../../docs/TRAINING_LOG.md)에 기록한다.
+세장면의 reset시점 SDK 지표 검사 중 한장면은 새warning36.23%(기존22.36%)였고,
+1,024행 중2행은 기존 종료 기준에도 걸렸다. 실제 초기 자세와 SDK갱신·기준점의 영향을
+추가로 구분해야 하므로 모든 초기 상태가 정상임을 확인한 결과는 아니다.
+새 수치가 학습 퇴행이나 std·value 폭증을 해결한다고 보장하지 않는다.
 
-Terminal은 사용자 요청으로 성공+50·그 외0을 episode당 한 번 지급한다.
-성공 없이 실패나 timeout만 발생하면0이다. 성공과 failure를 독립 판정하는 현재 구조에서
-두 flag가 동시에 참이면 success 기준으로+50을 지급한다. 이전 failure 우선 감점은 제거했다.
-Native weight1.0과 `/step_dt` 어댑터를 유지해100Hz에서도 실제 보너스는+50이다.
+Terminal은 사용자 요청으로 성공+100·그 외0을 episode당 한 번 지급한다.
+성공 없이 실패나 timeout만 발생하면0이다. **활성 실패가 우선**하므로 같은 step에 원래의
+통로·Target 조건과 실패가 겹쳐도 성공은false이고+100을 지급하지 않는다. 별도 실패 벌점은 없다.
+Native weight1.0과 `/step_dt` 어댑터를 유지해100Hz에서도 실제 보너스는+100이다.
 현재 non-terminal 상한은약3.778/step, γ=.99 할인합 상한은약377.8이며,
 이 느슨한 상한만으로 완료를 서두르는 정책이 학습된다고 판단하지 않는다.
-Native timeout bootstrap과 성공·실패 판정 조건은 유지한다.
+Native timeout bootstrap은 유지하며, 아래의 유효 재배치 성공 판정을 사용한다.
 변경 근거와 최신 로그의 수치 이상은 [학습 기록23절](../../docs/TRAINING_LOG.md)에 둔다.
 
 Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
-`motion_force_increase`, `motion_torque_increase`, `motion_singularity`를 각각 확인한다. 기존 단일 `motion` 항은
+`motion_wrench_growth`, `motion_singularity`와 `Episode_Reward/object_stability`를 각각 확인한다. 기존 단일 `motion` 항은
 중복 지급하지 않는다. R/M 로그는 이제 0 이하이며 이전 양의 점수 로그와 직접 비교하지 않는다.
 이 값은 native manager가 **weight 적용 후 episode 누적값을 최대 episode 시간8초로 나눈 값**이다.
 0~1의 순간 점수나 실제 episode 길이로 정규화한 평균이 아니므로 episode 길이도 함께 확인한다.
@@ -484,29 +526,74 @@ Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_
 로깅 방식으로 각각 기록한다. 적용 후1,024환경에서24-step 환경 수집은 약0.919초였으며,
 이는 policy 추론·PPO update를 포함한 iteration 시간이 아니다. GPU 성능 비교와 판정 근거는
 [학습 기록14절](../../docs/TRAINING_LOG.md#14-2026-10-20--접근접촉-보상과-1024환경-비용-검증)에 둔다.
-F/T 두 점수는 state 갱신 때 각각 한 번 계산해 캐시한다. 보상 계산에는 추가 센서·PhysX 조회나
+결합 F/T 점수는 state 갱신 때 한 번 계산해 캐시한다. 보상 계산에는 추가 센서·PhysX 조회나
 명시적인 CPU 변환을 넣지 않고, 로그 집계는 native manager에 맡긴다.
 
 성공은 **지정 Blocker의 A₀ 교차 면적 ≤ 1e−5 m², Target 초기 pose 대비 이동 ≤ 2 cm·회전 ≤
-0.15 rad**를 10 step(0.1초) 연속 만족할 때다. 두 조건의 지속만 확인하며, 물체 속도·다른 물체의
-상태·F/T·선반 상태를 성공 gate에 넣지 않는다. 초기 Target이 정확히 하나 있어야 하며
-유효하지 않은 Target pose나 교차 면적으로는 성공할 수 없다.
-낙하 6 cm, **같은 물체가 80° 이상 기울어진 상태를 0.2초 연속 유지**, 선반의 초기 위치 대비
-**1 cm 초과 이동** 또는 초기 회전 대비 **2° 초과 회전**, 유효하지 않은 물리·제어 상태는
-별도의 활성 실패 조건이다. `hard_load_or_overrange`는 현재 비활성이므로 보상 F/T 80 N·4 N·m 초과와
-raw 측정 범위 초과는 내부 진단에만 남으며, 성공·실패 지급·PPO 종료 mask에 반영하지 않는다.
-선반은 `RigidObject`로 관리하며
-Sweeping-Policy 예제와 같은 100 kg dynamic body다. 관성은 PhysX가 충돌 형상에서 계산한다.
-선반 pose는 종료 조건에만 사용하며 observation에 추가하지 않는다.
-부분 reset 시 해당 환경의 선반 pose·속도를 복원하고 초기 pose 기준도 해당 행만 갱신한다.
-Timeout은 native truncation 항으로 유지한다.
+0.15 rad**에 더해 다음을 **0.5초** 연속 만족할 때다. 현재100Hz에서는50 sample이며
+`success_duration / step_dt`를 올림해 주기가 바뀌어도 같은 시간을 유지한다.
 
-Tilt는 모든 활성 물체에 대해 개별적으로 누적하며, 100 Hz policy에서 같은 물체가 20 step
-연속 기준을 만족해야 종료한다. 80° 미만으로 돌아오면 그 물체의 누적값을 0으로 만들고,
-부분 reset 시 해당 환경의 누적값만 초기화한다. 순간적인 기울어짐이나 서로 다른 물체의
-교대 기울어짐을 하나의 넘어짐으로 합치지 않는다. 평면 yaw 회전은 tilt에 해당하지 않는다.
-2026-10-20부터 `workspace_exit`·`object_lift`는 제거했다. 영역 이탈·들림 자체는 실패나
-성공 제한 조건이 아니다. 낙하·전도 실패와 통로 확보·Target 보호의 성공 판정은 분리한다.
+- 모든 활성 물체의 XY OBB가 작업판 경계 안에 있음(경계5 mm 허용).
+- 현재 선반 frame에서 물체 collision 기하의 최저점과 지지면의 signed gap이 **−5~5 mm**.
+- 현재80° 이상 넘어진 물체가 없고, 모든 활성 물체의 선속도 ≤ **0.05 m/s**, 각속도 ≤ **0.3 rad/s**.
+- 활성 실패가 없고, 물체·센서·제어 상태가 유효함.
+
+Blocker뿐 아니라 주변 물체의 잔류·안정도 검사한다. 속도 기준은 **완료 판정에만** 쓰며,
+미는 중의 진행 Clearance를 막는 조건이 아니다. 비활성 padding은 모두 제외한다.
+원래 통로·Target 조건인 `raw_goal`과 유효 성공을 분리해 진단하며, 활성 실패와 성공은 상호배타적이다.
+
+지지면은 선반 전체 OBB가 아니라 실제 작업판과 기둥에서 측정한 사용 영역이다.
+물체의 활성 collider 정점을 시작 시 asset별로 한 번 읽고 convex hull의 지지점을 GPU에 저장한다.
+최저 높이는 현재 선반 frame의 평면 방향에 대한 정점 내적으로 구해, 기울어진 OBB의 빈 모서리가
+지지면 아래로 내려갔다는 이유만으로 정상 pivot을 거절하는 일을 줄인다. Mesh hull의 평면 극값은
+원래 정점과 같고, 곡면 primitive는 촘촘한 근사와 오차 상한을 사용한다. 이 cache는 **물리 collision
+형상을 바꾸지 않으며 실제 접촉력의 증명도 아니다.** 정점을 환경별로 복제하지 않고 약3.39MB의
+공통 catalog를 Warp block reduction으로 처리한다. 작은 tensor연산은 cached CUDA graph로 묶는다.
+실제10종의 초기 gap은0, 1,024환경64holdstep후 −.182~1.711mm로 진행·완료 물리mask는 모두
+정상이었다. Support helper는.414ms/step, 같은 고정hold의 native step비교는40.34→39.82ms로
+뚜렷한 지연 증가는 없었다. PPO·새scene reset을 제외한 결과이므로 전체iteration 성능의 증명은 아니다.
+상세 측정과 한계는 [학습 기록34절](../../docs/TRAINING_LOG.md#34-2026-10-21--유효-재배치-성공과-비산-차단-1단계-적용)을 따른다.
+
+물체의 지지 실패는 낙하·XY 이탈·큰 들림의 세 term을 하나의 **유한 작업판까지의 거리**로 대체했다.
+현재 선반 frame에서 물체 OBB 중심의XY와 실제 collider 최저 높이로 대표점
+$p_i=(c_{ix},c_{iy},z_{i,\min})$를 만들고, 실제 작업판 위 최근접점 $\Pi_S(p_i)$까지의 거리를 쓴다.
+
+$$
+S=[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]\times\{z_{\mathrm{panel}}\},\qquad
+d_i=\|p_i-\Pi_S(p_i)\|_2,\qquad
+d_{\max}=\max_{i\in\mathcal O_{\mathrm{active}}}d_i.
+$$
+
+작업판 내부의 지지된 평면 밀기·yaw pivot은 $d_i=0$이다. 위/아래 이탈과 수평 이탈은 같은
+유클리드 거리로 평가한다. 전체 OBB가 경계를 완전히 벗어나야 하던 이전 기준과 달리 중심의
+수평 이탈부터 반영하므로 의미가 동일하지 않다. 대표점은 실제 무게중심·접촉 지지다각형의
+안정성을 증명하지 않는다. 지지된 옆넘어짐도 거리0일 수 있어 tilt는 별도로 유지한다.
+
+$$
+r_{\mathrm{stability}}=2\left[\exp\left(-\frac{\ln2}{0.01^2}
+\max(d_{\max}-0.01,0)^2\right)-1\right].
+$$
+
+거리1cm까지0,2cm에서−1,3cm에서−1.875다. Blocker도 포함하고 물체 수로 비용이 배가되지
+않도록 가장 위험한 활성 물체의 거리만 사용한다. **같은 물체**의 $d_i\ge3$cm가0.1초 지속되면
+`object_support_lost`로 종료한다. 각 물체 카운터는 회복·비활성화 시0이며 부분reset은 선택 환경만
+초기화한다. 진행 Clearance gate와 완료 조건은 기존의 더 엄격한 기하를 유지하고, 실패의 유예
+중에도 진행 유효성을 잃으면 양의 Clearance를 즉시 차단한다.
+
+같은 물체의80° 이상 기울어짐0.2초 지속, 선반의 초기 pose 대비1cm/2° 초과,
+invalid·singularity는 유지한다. 손가락 관통의 물리 설정 수정은 사용자의 요청대로 보류했다.
+지원 거리 비용은 충돌 누락 방지나 종료 전 감속을 보장하지 않는다.
+
+비활성 `hard_load_or_overrange`의 종료 경로와80N/4N·m hard threshold는 제거했다. SI-200-8의
+raw 범위 초과·보정 진단은 유지하되 성공의 숨은 gate로 적용하지 않는다. 선반은 공식 `RigidObject`로 관리하는
+100 kg dynamic body이며, 관성은 PhysX가 collision 형상에서 계산한다. 선반 pose는 observation에
+추가하지 않는다. 부분 reset은 해당 환경의 pose·속도·초기 기준과 지속시간 카운터만 초기화한다.
+Timeout은 native truncation으로 유지한다.
+
+Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 같은 물체가20 sample 연속
+기준을 만족해야 종료한다. 80° 미만 회복·비활성화 시 해당 카운터를0으로 만들고, 서로 다른 물체의
+교대 기울어짐을 합치지 않는다. 평면 yaw는 tilt가 아니다. 예전 `workspace_exit`·`object_lift`를
+복구하지 않고, 위의 단일 지지 거리와 지속시간 조건을 사용한다.
 
 실패 원인은 공식 `TerminationManager`의 개별 term으로 기록한다. Console과 TensorBoard의
 `Episode_Termination/<원인>`에서 확인할 수 있으며, 기존 통합 `failure` 로그는 아래 항목으로
@@ -514,18 +601,24 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며, 100 Hz poli
 
 | 원인 이름 | 현재 실패 조건 |
 |---|---|
-| `object_drop` | 활성 물체 OBB 최저점이 지지면보다 6 cm 초과 내려감 |
+| `object_support_lost` | 같은 활성 물체의 유한 작업판까지의 지지점 거리 ≥3cm가0.1초 연속 지속 |
 | `object_tilt` | 같은 활성 물체의 기울기 ≥80°가 0.2초 연속 지속 |
-| `hard_load_or_overrange` (현재 비활성) | 보상 F/T 과부하 또는 raw 센서 측정 범위 초과; 진단값만 유지 |
 | `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
 | `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
 | `singularity` | 현재 팔 자세의 보수적 이동능력 지표 s≤0.005 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
-않다. 현재 활성 실패 5개와 성공·timeout을 합쳐 native 종료 term은 7개다.
-성공과 활성 실패가 같은 step에 충족되면 각각 기록하며, 종료는 활성 원인들의 OR이다.
-Terminal은 현재 성공 기준으로+50을 한 번 지급하며 실패만 발생하면0이다.
+않다. 현재 활성 실패5개와 성공·timeout을 합쳐 native 종료 term은7개다.
+활성 실패끼리는 동시에 기록될 수 있지만 성공은 활성 실패가 없을 때만 성립한다.
+Terminal은 유효 성공에만+100을 한 번 지급하며 실패·timeout은0이다.
 내부 실패와 PPO `terminated` mask도 초기화 때 읽은 native 활성 term 설정을 따른다.
+
+새로 완료된 episode의 실제 누적 집계도 기존 native logger로 제공한다. `Task_Count/completed`,
+`valid_success`, `raw_goal_seen`, `unsupported_goal_seen`, `goal_and_failure`는 종료된episode를
+reset 전GPU에서 한 번씩 세는 누적 개수다. `Task_Rate/valid_success`는 누적 유효성공/완료episode다.
+`raw_goal_seen`은 episode 도중 통로·Target조건을 한 번이라도 충족했는지, `unsupported_goal_seen`은
+그때 진행유효성이 없었는지, `goal_and_failure`는 raw목표와 활성실패가 겹쳤는지 센다. 서로배타적인
+실패 원인 비율은 아니다. 기존 `Episode_Termination/*`의 마지막episode snapshot 평균과 구분한다.
 Singularity는 MDP step당한번계산한같은지표를보상과공유하며native로그
 `Episode_Termination/singularity`로분리한다. 임계값은초기실험기준이다.
 Native실행순서가OSC→physics→termination이므로현재OSC호출에서발생하는역행렬예외까지
@@ -720,7 +813,8 @@ Blocker/다른 물체의 filtered force 구분,접촉 유지 이력,부분reset�
 GNN edge MLP의 첫 선형 연산을 node별 projection으로 분해해 `[N,10,10,134]`
 concatenation과 반복 projection을 제거했다. 두 번째 선형 연산은 message 평균 이후로 옮겨
 edge마다가 아닌 node마다 한 번 계산한다. 이웃이 없는 node에는 선형 bias가 유입되지 않게
-처리한다. 기존 dense 식과 출력·gradient가 일치하며 모델 파라미터와 checkpoint 구조도 동일하다.
+처리한다. 이 기하 연산 최적화 자체는 기존 dense 식과 출력·gradient가 일치하며
+Actor 파라미터와 checkpoint 구조를 바꾸지 않는다.
 CUDA FP32에서는 ReLU·edge mask·합산을 Triton kernel 하나로 처리하여
 `[B,10,10,64]` pair activation을 저장하지 않는다. Backward에서도 node별 입력으로
 ReLU의 부호를 재계산해 receiver/sender gradient를 구하며, 큰 pair gradient도 만들지 않는다.
@@ -731,12 +825,14 @@ Rollout·epoch·minibatch 수와 optimizer 갱신 횟수는 그대로다.
 기본 PPO 경로는 native의 gradient clipping과 loss 전송 방식을 따른다.
 따라서 native update 내부의 minibatch별 `.item()`까지 제거한 구현은 아니다.
 
-CUDA에서는 `agent.actor.compile_model=true`가 기본이며, GNN·attention·mask·마지막 MLP의
-순수 tensor forward를 Inductor로 compile한다. 모델 구조와 checkpoint key는 유지한다.
+CUDA에서는 `agent.actor.compile_model=true`가 기본이며, Actor의 GNN·attention·mask·마지막 MLP의
+순수 tensor forward를 Inductor로 compile한다. Compile 자체는 모델 구조나 checkpoint key를 바꾸지 않는다.
 최초 추론/학습 compile 시간이 추가된다. CUDA graph를 쓰는 `reduce-overhead`는 native 학습의
 InferenceMode 전환에서 오류가 재현되어 사용하지 않는다. CPU는 eager이며,
 `agent.actor.compile_model=false`로 CUDA에서도 eager 실행을 비교할 수 있다.
 
+아래 성능 수치는 독립 Critic으로 분리하기 전 공유 모델의 개발 이력이며,
+새 Actor·Critic 구성의 처리량을 측정한 결과가 아니다.
 2026-10-15 RTX 3090·1,024환경·10물체·30 iteration 측정에서 forward 분할 상한만
 1,024→8,192로 늘렸을 때 collection+learning 평균은 **2.961→2.280초**였다
 (최초 iteration 제외, 공통 scene 교체와 부분 reset 포함). PPO update는 **0.926→0.313초**다.
@@ -865,6 +961,9 @@ terminal critic 추론도 생략한다. 이는 `init_at_random_ep_len=False`와 
 Reset 후의 새 episode 관측을 이전 episode의 value로 사용하지 않는다.
 
 ## 검증과 남은 구현
+
+이 절의 과거 학습·checkpoint 검증은 2026-10-21 독립 Critic 전환 이전 구성의 기록이다.
+새 구성의 검증 결과는 [학습 기록](../../docs/TRAINING_LOG.md)에 별도로 기록한다.
 
 2026-10-19 R/M penalty·IK복구 적용 후 실제GPU4환경·32step·부분reset2회를 검증했다.
 Native보상 수식의 최대오차는1.19e−7이며 다른환경 상태·공유template이 보존됐다.
@@ -1059,14 +1158,14 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 `CONTACT_MANIPULATION_UR5E_USD_PATH`, `CONTACT_MANIPULATION_HAND_URDF_PATH`로 지정한다.
 
 ```bash
-./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless --run_name gaussian
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless --run_name independent_critic
 ```
 
 1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비로
 첫 학습 로그까지 수 분이 걸릴 수 있다. 한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
 
 ```bash
-./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name gaussian
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name independent_critic
 ```
 
 기하 관측과 IK의 임시 메모리는 native Hydra 설정으로 조절할 수 있다. 다음 예시는
@@ -1082,17 +1181,18 @@ Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
 다른 checkout을 사용하면 `ISAACLAB_PATH`를 지정한다.
 
 저장된 정책을 GUI에서 재생하려면 저장소 루트에서 다음과 같이 실행한다.
-아래는 위 명령으로 학습한 Gaussian run의 마지막 checkpoint를 선택한다.
-`--checkpoint`로 특정 Gaussian checkpoint 파일을 직접 지정할 수도 있다.
+아래는 위 명령으로 새로 학습한 독립 Critic run의 마지막 checkpoint를 선택한다.
+`--checkpoint`로 같은 구조의 특정 checkpoint 파일을 직접 지정할 수도 있다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/play.py \
-  --load_run '.*_gaussian' \
+  --load_run '.*_independent_critic' \
   --num_envs 4 --real-time
 ```
 
 `--checkpoint`를 생략하면 native `get_checkpoint_path()`로 최신 run의 마지막 checkpoint를
-선택한다. 이전 tanh run은 분포 계약 검사에서 거절되므로 새 Gaussian run을 지정한다. 기본 환경 수는 1이고,
+선택한다. 이전 tanh 및 공유 actor–critic run은 계약 검사에서 거절되므로
+독립 Critic 구조로 새로 학습한 run을 지정한다. 기본 환경 수는 1이고,
 중간 episode 종료 시 공유 배치를 복원하고 로봇 자세를 다시 샘플링한다.
 공통 round 경계에서는 학습과 동일하게 새 배치·초기 관측으로 교체한다.
 `--real-time`은 실행이 빠를 때 환경의 정책 주기(기본100Hz)에 맞춰 기다리며 느린 reset을 가속하지 않는다.
@@ -1104,10 +1204,11 @@ export는 수행하지 않는다. 모델 구조와 action 계약이 모두 같�
 현재 환경 설정을 사용하므로 과거의 배치·관측 모델까지 복원하는 기능은 아니다.
 필요한 설정 변경은 학습과 같은 Hydra `env.*`, `agent.*` 인자로 전달한다.
 
-기존50Hz checkpoint를 당시 주기로 재생하려면 `env.decimation=2 env.mdp.stable_steps=5`를
-추가한다. GUI 렌더링 주기도 맞추려면 `env.sim.render_interval=2`를 추가한다.
-Play는 checkpoint의 env.yaml에서 주기를 자동 복원하지 않는다. 새100Hz 학습에는
-이 인자를 붙이지 않는다. 마찰은 현재값(정지·동마찰0.5, 반발0)을 유지하며, 추후 물성 조정은
+동일한 독립 Critic 구조로50Hz에서 학습한 checkpoint의 정책 주기를 맞추려면
+`env.decimation=2 env.mdp.success_duration=0.5`를 추가한다. 성공 유지시간은50Hz에서도
+0.5초(25 sample)다. GUI 렌더링 주기는 `env.sim.render_interval=2`로 맞춘다. 과거 성공 판정까지
+그대로 복원하는 것은 아니며, Play는 checkpoint의 env.yaml에서 주기를 자동 복원하지 않는다.
+새100Hz 학습에는 이 인자를 붙이지 않는다. 마찰은 현재값(정지·동마찰0.5, 반발0)을 유지하며, 추후 물성 조정은
 Hold weight·정책 주기 변경과 분리해 비교한다.
 
 GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`을 사용한다.

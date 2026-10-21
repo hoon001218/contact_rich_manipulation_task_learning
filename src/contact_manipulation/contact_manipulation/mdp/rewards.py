@@ -6,8 +6,7 @@ Python loops or device-to-host reads. Native RewardTermCfg weights remain the
 only reward weights. Clearance pays its exp(-a*x) quality relative to episode
 start; rearrangement and motion use exp(-a*x) - 1 penalties. Cached components
 retain the original qualities for task-state diagnostics. The adapters divide discrete payments by
-dt to cancel the native RewardManager's dt factor; Time retains its exact
-elapsed-time integral.
+dt to cancel the native RewardManager's dt factor.
 """
 
 from __future__ import annotations
@@ -19,9 +18,9 @@ import torch
 __all__ = [
     "corner_path_increment", "clearance_quality", "reward_components", "clearance", "rearrangement",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
-    "motion_action_rate", "motion_joint_velocity", "motion_force_increase", "motion_torque_increase",
+    "motion_action_rate", "motion_joint_velocity", "motion_wrench_growth", "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
-    "time_penalty", "terminal",
+    "terminal",
 ]
 
 
@@ -179,9 +178,8 @@ def clearance_quality(cfg, blocked, blocker_area):
     return torch.exp(-cfg.clearance_decay * ratio)
 
 
-def reward_components(cfg, blocked, blocker_area, path_increment,
-                      wrench, previous_wrench, dt, *, elapsed_time):
-    """Return unweighted (clearance, rearrangement, force quality, torque quality, time).
+def reward_components(cfg, blocked, blocker_area, path_increment, wrench, previous_wrench, dt):
+    """Return unweighted clearance, rearrangement and coupled F/T growth quality.
 
     Clearance evaluates only the designated Blocker; its manager adapter
     subtracts the episode's initial quality. The caller supplies non-Blocker
@@ -190,28 +188,25 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
     Its quality returns to one when objects stop; the manager adapter subtracts
     one so stopped objects have zero penalty and past motion is not charged again.
 
-    Motion combines native action-rate and joint-velocity qualities with two
-    independent force/torque growth qualities. Cache the two scores separately
-    for native per-term logging; each exponent uses squared positive growth above a
-    small dead band. Constant load, release and direction-only changes have
+    F/T uses one calibrated norm of positive load growth, followed by one
+    exponential. The factor 1/2 and native weight .30 preserve the previous
+    .15-per-channel small-cost slopes and total -.30 bound; the finite-cost
+    curve intentionally differs from adding two separate rewards. Keep both
+    excess-rate squared values for diagnostics. Constant load, release and direction-only changes have
     quality one, which maps to zero penalty in the manager adapters. Wrenches
     are self-load compensated at the current sensor center:
     rotations of their axes preserve norms, but translating the torque origin
     would change the measured load. Return the two excess-rate squared costs
     separately for diagnostics, in (N/s)^2 and (N*m/s)^2.
 
-    Time is the exact integral of scale * (exp(growth * t) - 1) over
-    [elapsed_time, elapsed_time + dt]. It has no T_ref and starts at zero rate.
-    Accumulating this term is independent of control frequency. Nonfinite
-    numerical results are replaced by zero; termination separately marks invalid
+    Nonfinite numerical results are replaced by zero; termination separately marks invalid
     active physical state as failure so a failed simulation cannot poison PPO.
     """
     if not math.isfinite(dt) or dt <= 0.0:
         raise ValueError("Control dt must be finite and positive.")
     batch_shape = blocked.shape
-    if (blocker_area.shape != batch_shape
-            or path_increment.shape != batch_shape or elapsed_time.shape != batch_shape):
-        raise ValueError("Areas, path length, and elapsed time must contain one value per environment.")
+    if blocker_area.shape != batch_shape or path_increment.shape != batch_shape:
+        raise ValueError("Areas and path length must contain one value per environment.")
     if wrench.shape != (*batch_shape, 6) or previous_wrench.shape != wrench.shape:
         raise ValueError("Current and previous wrench must contain six components per environment.")
 
@@ -225,21 +220,10 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
     force_cost = (force_increase / dt - cfg.force_rate_deadband).clamp_min(0.0).square()
     torque_cost = (torque_increase / dt - cfg.torque_rate_deadband).clamp_min(0.0).square()
     rate_cost = torch.stack((force_cost, torque_cost), -1)
-    force_score = torch.exp(-cfg.motion_force_rate_decay * force_cost)
-    torque_score = torch.exp(-cfg.motion_torque_rate_decay * torque_cost)
+    wrench_cost = .5 * (cfg.motion_force_rate_decay * force_cost + cfg.motion_torque_rate_decay * torque_cost)
+    wrench_score = torch.exp(-wrench_cost)
 
-    if cfg.time_penalty_scale == 0.0:
-        time_score = torch.zeros_like(clear)
-    else:
-        growth_dt = cfg.time_penalty_growth_rate * dt
-        exponential_dt = math.expm1(growth_dt)
-        # Stable expm1(x) - x avoids cancellation at the first/smallest step.
-        excess = (growth_dt ** 2 * (0.5 + growth_dt * (1 / 6 + growth_dt * (1 / 24 + growth_dt / 120)))
-                  if growth_dt < 1.0e-4 else exponential_dt - growth_dt)
-        integral = torch.expm1(cfg.time_penalty_growth_rate * elapsed_time) * exponential_dt + excess
-        time_score = (-cfg.time_penalty_scale * integral / cfg.time_penalty_growth_rate).to(clear)
-
-    components = torch.stack((clear, rearr, force_score, torque_score, time_score), -1)
+    components = torch.stack((clear, rearr, wrench_score), -1)
     return (torch.nan_to_num(components, nan=0.0, posinf=0.0, neginf=0.0),
             torch.nan_to_num(rate_cost, nan=0.0, posinf=0.0, neginf=0.0))
 
@@ -255,11 +239,12 @@ def _reward_rate(env, index, *, baseline=0.0):
 
 
 def clearance(env):
-    """Improvement over episode start; an unchanged scene pays zero."""
+    """Initial-relative quality; invalid placement suppresses only positive progress."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    return (state.components[:, 0] - state.initial_clearance_quality) / env.step_dt
+    delta = state.components[:, 0] - state.initial_clearance_quality
+    return torch.where(state.clearance_progress_valid, delta, delta.clamp_max(0.0)) / env.step_dt
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
@@ -307,14 +292,26 @@ def motion_joint_velocity(env, arm_cfg, hand_cfg):
     return (torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) - 1.0) / env.step_dt
 
 
-def motion_force_increase(env):
-    """Cached exp-minus-one penalty of positive compensated force growth."""
+def motion_wrench_growth(env):
+    """One calibrated positive F/T growth norm; unloading does not cancel loading."""
     return _reward_rate(env, 2, baseline=1.0)
 
 
-def motion_torque_increase(env):
-    """Cached exp-minus-one penalty of F/T sensor-moment growth, not joint torque."""
-    return _reward_rate(env, 3, baseline=1.0)
+def object_stability(env):
+    """Worst active object's distance to the finite support surface, beyond slack.
+
+    This is a state-risk cost, separate from non-Blocker path disturbance.
+    It uses the same geometric distance as object_support_lost, not a sum of
+    the previous lift/drop/ejection penalties. No per-object loop or state query.
+    """
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    distance = torch.where(state.active, state.support_distance, 0.0)
+    distance = torch.nan_to_num(distance, nan=math.inf, posinf=math.inf, neginf=math.inf)
+    excess = (distance - state.cfg.support_warning_distance).clamp_min(0.0)
+    worst = excess.square().amax(-1)
+    return torch.expm1(-state.cfg.support_stability_decay * worst) / env.step_dt
 
 
 def singularity_margin(jacobian, *, characteristic_length=0.25):
@@ -341,7 +338,7 @@ def singularity_margin(jacobian, *, characteristic_length=0.25):
     return torch.where(valid, norm.reciprocal(), 0.0)
 
 
-def singularity_penalty(margin, *, threshold=0.05, decay=math.log(2.0) / 0.025**2):
+def singularity_penalty(margin, *, threshold=0.07, decay=math.log(2.0) / 0.03**2):
     """Zero above the warning margin; bounded exp-minus-one cost below it."""
     safe = torch.where(torch.isfinite(margin), margin.clamp_min(0.0), 0.0)
     cost = (threshold - safe).clamp_min(0.0).square()
@@ -359,11 +356,6 @@ def motion_singularity(env):
     ) / env.step_dt
 
 
-def time_penalty(env):
-    """Integrated elapsed-time penalty converted to a native reward rate."""
-    return _reward_rate(env, 4)
-
-
 def terminal(env):
     """One-time success bonus converted to a native reward rate."""
-    return _reward_rate(env, 5)
+    return _reward_rate(env, 3)

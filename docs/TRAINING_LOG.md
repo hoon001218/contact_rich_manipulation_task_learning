@@ -1,11 +1,16 @@
 # Contact Manipulation 학습 기록과 수정 과제
 
-작성·검토: **2026-10-20, Asia/Seoul**. 현재 프로젝트는
+작성·검토: **2026-10-21, Asia/Seoul**. 현재 프로젝트는
 `src/contact_manipulation`, task는 `Isaac-Contact-Manipulation-UR5e-v0`다.
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
 [프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
 
-**현재 판단:** 10월19일의 추가 학습·reward 조합5개를 분석하고 저장정책을 고정조건에서 재생했다.
+**최신 판단:** `2026-10-21_19-59-36`은 value loss의 일시적 극단값이 후반의 지속적 붕괴로
+이어진다. 첫 spike285회 전후 저장 Critic 가중치는 정상 규모이며, 실제 입력·Value·GAE target은
+저장되지 않아 최초 원인은 미확정이다. 보상 감소를 접촉 회피의 합리적 수렴으로 단정하지 않고
+가치 추정·입력 이상치를 먼저 분리한다. 정확한 loss 의미와 수치는 **37절**을 따른다.
+
+**초기 분석:** 10월19일의 추가 학습·reward 조합5개를 분석하고 저장정책을 고정조건에서 재생했다.
 현재 정책들의 Clearance 개선은 거의 없으며, 조합별 생존시간 차이는 관측된다.
 공통checkpoint750의320episode는 성공·통로확보0회, 과부하/센서범위초과278회였다.
 장기실행은 Gaussian std뿐 아니라 deterministic 평균 명령도 비정상적으로 커졌다.
@@ -2283,6 +2288,991 @@ C/D/H지급gate는아니다. 실제정책이이유인을이용했는지는별도
 지급과D/H지원항의지급단계·조건을검토해미완료유지수입을줄이는것이우선검토할수정안이다.
 이번에는production설정이나수식을변경하지않았다. 상세scalar·재현코드는
 [terminal_incentive_20261021](../outputs/contact_manipulation/terminal_incentive_20261021/)에보존했다.
+
+### 사용자 후속 명확화 — 학습 후반에는 처음부터 접촉하지 않음
+
+사용자는한episode안에서민뒤후퇴한다는뜻이아니라,학습초기정책은물체와상호작용하고
+후기정책은처음부터물체를건드리지않는다고명확히했다. 따라서후기회피를기존Clearance
+개선수익의유지로설명하지않는다. Untouchedscene의Clearance는정확히0이다.
+
+1500–1574→1600–1699회에서episode길이는57.38→56.67step(−1.25%)인데,
+Clearance로그4.6872→.00388(−99.917%),Distance1.9994→.1493(−92.53%),
+Hold.13728→.0000178(−99.987%)로하락했다. Action-rate비용절댓값은.531→.578로증가했고,
+return은47.59→−13.60,success snapshot13.22%→.00275%,singularity3.38%→77.02%였다.
+단순한episode길이감소로설명하기어려운접근·조작관여의상실이다.
+Hold는연속접촉지표이므로단발접촉까지전혀없었음을scalar만으로증명하지는못한다.
+
+가능한기전은접촉시즉각비용·실패가자주발생해첫접촉을회피하는국소정책이다.
+정상자세에서거리20cm정지시D=.1/step,R/M대부분0인데,초기접촉에는F/T증가·action-rate·
+jointvelocity·부수물체이동비용이먼저발생할수있다. 실제Blockeroverlap이개선돼야C가생기며
+goal50도할인된다. 다만안전하고안정적인근접/접촉은같은C의먼거리정지보다D/H가높으므로,
+후퇴를무조건최적해라고판정하지않는다. 정책분산·value loss증가와조작능력붕괴도함께검토한다.
+원인분리는동일초기장면에서초기/후기checkpoint의첫접촉전누적보상·행동·종료원인을
+비교해야한다. 이번에는code나weight를변경하지않았다. 추가집계근거는
+[retreat_20261021](../outputs/contact_manipulation/retreat_20261021/)에보존했다.
+
+## 29. 2026-10-21 — Critic을 공식 독립 MLP로 분리
+
+사용자는 학습 후반의 return·접근·접촉 감소가 안정적인 회피 정책의 수렴이 아니라
+정책의 퇴행일 수 있다고 지적했고, 공유 Critic의 영향을 분리하기 위해 일반적인 Isaac Lab
+예제와 같은 Critic을 요청했다. 기존 공유 구조가 최초 붕괴 원인이었다고 확정한 변경은 아니다.
+
+### 모델과 native API 변경
+
+Critic은 `RslRlMLPModelCfg(hidden_dims=[256,128,64], activation="elu",
+obs_normalization=False, distribution_cfg=None)`로 공식 RSL-RL `MLPModel`을 생성한다.
+이는 로컬 Sweeping 예제와 Isaac Lab Franka Lift·Cabinet 예제의 Critic hidden 크기·활성화·
+관측 정규화 설정을 따른다. 설치된 RSL-RL5.0.1의 분리 모델 API에서
+`critic_class(obs, obs_groups, "critic", 1, **critic_cfg)`로 구성한다.
+
+| 항목 | 기존 | 변경 후 |
+|---|---|---|
+| Actor | GNN·역할 attention·ReLU fusion→18D Gaussian | 동일한 계산과 출력 분포 유지 |
+| Critic | Actor의 scene encoder·fusion을 공유하는 value head | 공식 독립 MLP `244→256→128→64→1` |
+| Critic hidden activation | 공유 ReLU 표현 | 예제의 ELU |
+| 입력 | 공개244D 관측 | 동일한 공개244D 관측, privileged 채널 추가 없음 |
+| Critic observation normalization | 사용 안 함 | 사용 안 함 |
+| 파라미터·latent·value cache 공유 | 공유 | 공유 없음 |
+
+Actor 안의 value head·`value()`와 별도 `NativeContactCritic` 클래스를 제거했다.
+Actor는 action mean만 계산하며 Critic은 관측을 직접 받아 scalar value를 계산한다.
+공유 모델에서 Actor 직후 값을 재사용하던 cache도 제거했다. Observation 기반 mask는
+기존처럼 Actor GNN의 padding·역할·결측 처리에 사용하며 Critic 입력 채널로 추가하지 않는다.
+
+Native optimizer는 서로 겹치지 않는 Actor·Critic 파라미터를 모두 관리한다.
+기본 `PPO.update()`를 유지하고 큰 minibatch의 기존 microbatch 경로도 양쪽 loss를 누적한다.
+Gradient clipping은 native PPO와 같이 Actor와 Critic에 각각 적용한다.
+이제 value loss가 Actor의 GNN·attention·fusion에 직접 gradient를 주지는 않는다.
+다만 Critic의 값이 GAE·advantage에 사용되므로 Actor 학습에 대한 간접 영향까지 사라진 것은 아니다.
+
+PPO 하이퍼파라미터·loss 수식·timeout 최종 관측 bootstrap, reward와 weight·scale,
+controller·action 계약·244D observation·18D action·MDP·physics/policy 주기는 유지했다.
+새로운 학습 성능이나 수치 안정성 개선이 확인됐다는 의미는 아니다.
+
+### Checkpoint와 실행 기준
+
+기존 공유 checkpoint는 Actor 내부 value head, 비어 있는 별도 Critic state dict,
+공유 optimizer 상태를 저장하므로 새 독립 구조의 전체 resume와 호환되지 않는다.
+Architecture metadata로 이를 구분하고 **새 학습을 시작한다**.
+이전 공유 checkpoint를 현재 play에서 호환 로드하는 기능도 이번 변경에 포함하지 않았다.
+학습·재생 예제 run 이름은 `independent_critic`으로 구분한다.
+
+### 검증과 범위
+
+- CPU 전체 검사: **259pass·18skip·381subtest pass**.
+- Actor의 CUDA compile 검사 **1pass**. Actor GNN·attention 계산을 유지한 상태로 검사했다.
+- 실제 native **1,024환경×2iteration** 학습을 exit0으로 완료했다. 공식 독립 `MLPModel`
+  구조가 콘솔에 출력되고 rollout·PPO update·로그·checkpoint 저장까지 진행됐다.
+- 저장된 checkpoint의 Actor234,660개·Critic103,937개 파라미터와 독립 architecture metadata를
+  확인했다. Model·optimizer tensor 및 TensorBoard scalar는 모두 finite였다.
+  같은 checkpoint를 공식 runner로 로드해 **4환경×8control step** play도 exit0으로 완료했다.
+- 첫 iteration은 collection19.360초·learning10.603초, 합계29.96초로 최초 compile을 포함한다.
+  다음 iteration은 collection1.662초·learning.205초, 합계1.87초였다.
+  **두 iteration의 실행 확인이며 장기 평균 처리량, 공통 scene 교체 비용이나 정책 성공을
+  입증하는 benchmark는 아니다.**
+
+재현 로그는
+[native_train.log](../outputs/contact_manipulation/independent_critic_20261021/native_train.log),
+실행은 [2026-10-21_13-27-47_independent_critic_smoke](../logs/rsl_rl/contact_manipulation/2026-10-21_13-27-47_independent_critic_smoke/)에 보존한다.
+Checkpoint·play 확인 결과는 [native_result.json](../outputs/contact_manipulation/independent_critic_20261021/native_result.json)에 기록했다.
+이번 smoke는 기능 검증이므로 본 학습의 reward·success 경향 분석에 포함하지 않는다.
+
+## 30. 2026-10-21 — 독립 Critic 학습의 선반 종료 급증과 reward scale 재검토
+
+분석 snapshot은 독립 Critic 본 학습 `2026-10-21_13-33-02`의iteration1843까지다.
+사용자의 선반 이동 종료 증가와 reward weight·scale 가설을 기존 코드·저장 설정·scalar로 검토했다.
+**이번에는 production 코드·reward 수식·weight·종료 기준을 변경하지 않았다.**
+
+### 선반 종료 급증 전후의 상태
+
+| Iteration 구간 | Mean return | Distance 로그 | Hold 로그 | Shelf 종료 snapshot | Singularity 종료 snapshot | Mean std |
+|---|---:|---:|---:|---:|---:|---:|
+| 1775–1799 | −22.52 | 0.437 | 0.000636 | 7.37% | 69.05% | 56.99 |
+| 1800–1824 | −14.64 | 0.479 | 0.000550 | 32.04% | 47.10% | 63.97 |
+| 1825–1843 | −14.72 | 0.433 | 0.001021 | 4.30% | 76.39% | 70.90 |
+
+선반 종료가 급증하기 전부터 접근·지속접촉 보상이 작고 return이 음수이며 singularity 종료가
+많았다. 따라서 선반 종료 증가만을 최초 붕괴 원인으로 볼 수 없다. 평균 std는 초기.300에서
+최종73.856으로 커졌고, value loss는403회에 이미1.827e11로 처음1e6을 넘었다.
+독립 Critic은 value loss의 직접적인 공유 encoder 역전파를 제거했지만 학습 불안정을
+단독으로 막지는 못했다. 이 결과가 공유 Critic의 영향이 전혀 없었다는 증명도 아니다.
+
+`Episode_Termination/*`는 각 환경의 마지막으로 끝난 episode 원인 snapshot이며,
+해당 iteration에 새로 발생한 실패율이나 현재 물리 상태의 불량률이 아니다.
+여러 원인이 동시에 참일 수 있다. `Episode_Reward/*`는 weighted episode 누적값을 고정8초로
+나눈 로그이며 순간 보상이나 실제 생존시간으로 나눈 평균이 아니다. `Train/mean_reward`도
+최근 종료 episode 집계여서 동일한 cohort라고 단정하지 않는다.
+공통 배치는800policy step, 즉 rollout32에서25iteration마다 바뀐다. 1800·1825 경계의
+가파른 변화에는 장면 교체와 snapshot 갱신이 함께 작용할 수 있다.
+현재 scalar에는 실제 선반 pose 궤적·생성된 실패 사건 수·warning 구간 체류시간이 없어
+충돌 시점과 보상 간의 인과관계를 확정할 수 없다.
+
+### 선반 penalty는 존재하지만 cm 단위 민감도가 작음
+
+현재 Rearrangement는 지정 Blocker를 제외한 active 물체와 선반의 **이번 step** 대응 OBB
+corner8개 변위 norm 평균을 합쳐 `0.6(exp(−2ΔL)−1)`을 지급한다. Target과 관측되지 않은
+주변 물체도 포함한다. 선반의 초기 pose 대비 순변위를 직접 입력하는 항이 아니다.
+
+| 선반의 이번 step 순수 병진 이동 | 선반만 움직였을 때 R 지급 |
+|---|---:|
+| 0.1 mm | −0.000120 |
+| 1 mm | −0.001199 |
+| 5 mm | −0.005970 |
+| 10 mm | −0.011881 |
+
+1cm를100step에 나눠 움직여도 할인 전 누적은 약−.012다. 초기 위치에서9mm 밀린 채
+멈추면 이후 이동량은0이므로 이 penalty도0이다. 그러나 종료는 초기 위치 대비1cm 또는
+회전2° 초과에서 즉시 발생한다. `a_R=2m⁻¹`의 half-quality 이동량은약34.7cm로,
+종료 전 cm 단위 이동에 대한 감점 기울기가 작다. 정상 범위에서 지수항이 포화해서
+정보를 잃는 상황은 아니다. OBB는 실제 선반 전체0.4085×1.01×1.8m를 사용한다.
+
+비교하면 Distance는최대+.4/step, Hold는최대+.85/step이고, 가림비율.50→.49만 개선해도
+Clearance가약+.02438/step 반복 지급된다. 성공은+50이며 failure만 발생하면 terminal은0이다.
+성공과 선반 failure가 동시에 참일 때도 기존 사용자 결정대로+50을 지급한다.
+이러한 크기 비교는 선반 이동 비용이 약할 가능성을 뒷받침하지만, 실제 정책의 행동 원인이나
+바람직한 최종 weight를 계산한 것은 아니다.
+
+선반 corner는 reset 행의 초기 pose와 같은 frame으로 이력을 초기화하며,
+native 실행은 종료 판정→마지막 reward 계산→reset 순서여서 마지막 이동 비용이 누락되지 않는다.
+정상적인 finite 선반 이동에서 reset 이력·reward 지급의 구현 오류는 찾지 못했다.
+NaN/Inf 이동량을0으로 치환하는 경로는 있지만 별도 invalid 종료가 처리하며, 일반적인
+finite 선반 이동 급증을 설명하는 근거는 없다.
+
+### Singularity 로그의 크기와 경고 시점
+
+현재 penalty는 `0.15(exp(−a_S[max(0,.05−s)]²)−1)`,
+`a_S=ln(2)/.025²`이며 `s≤.005`에서 종료한다.
+
+| 현재 지표s | Weighted penalty |
+|---|---:|
+| .05 이상 | 0 |
+| .04 | −.01575 |
+| .025 | −.075 |
+| .005 | −.13412 |
+
+Reward와 종료는 같은 post-physics 지표를 공유하므로 사전 경고 구간은 존재한다.
+다만 평균 episode 로그가 작다는 이유만으로 곡선이 잘못됐다고 판단하지 않는다.
+대부분 정상 구간에 있었거나 warning 구간을 짧게 통과한 뒤 종료해도 평균은 작을 수 있다.
+경고 진입 이후 몇step 안에 종료되는지 확인해야 경고 시점과 크기 중 무엇이 부족한지 구분된다.
+
+### 미적용 분리 실험 후보
+
+기준 비교에서는 Clearance4·Distance.4·Hold.05·Terminal성공+50과 나머지 네 Motion의
+weight각.15를 유지한다. 여러 penalty를 한꺼번에 키워 접촉 회피를 악화시키지 않도록
+다음 후보를 **각각 별도 실험**으로 비교한다.
+
+- **Rearrangement:** 우선 weight.6을 유지하고 `a_R=2→20m⁻¹`로 cm 단위 기울기를 비교한다.
+  1mm는−.01188,1cm는−.10876이고 최대 비용은−.6으로 같다. 전체 R weight를 올리는 것과 달리
+  상한을 그대로 두지만 Target·주변 물체 이동 비용도 커지므로 접근·접촉 상실을 함께 감시해야 한다.
+- **Singularity:** 먼저 weight.15를 유지하고 warning threshold`.05→.07`, half-deficit`.025→.03`
+  (`a_S=ln(2)/.03²`)으로 경고를 앞당기는 후보를 검토한다. 예를 들어s=.06에서약−.01112,
+  s=.04에서−.075가 된다. 적용 전 새 장면·로봇 reset의 지표 분포를 검사해 초기 자세를
+  무차별 감점하지 않는지 확인해야 한다. 종료 기준`.005`는 우선 유지한다.
+  Weight`.15→.3`은 적절한 warning 구간이 확보돼도 비용 크기가 부족한 경우의 **후속 조건부 후보**이며,
+  처음부터 함께 적용하는 기본 제안이 아니다.
+- **선반 별도 조기 경고:** 초기 pose 대비 변위·회전에 warning 구간을 두면,9mm 이동 후 정지한
+  상태의 위험도도 표현할 수 있다. 기존 shelf pose를 재사용하는 소량의 tensor 계산으로 가능하지만
+  별도 수식·term 설계가 필요하며 아직 구현하지 않았다.
+
+어느 후보도 std·value 폭증이나 기존 raw action 이력의 되먹임 문제를 해결한다고 주장하지 않는다.
+보상 감도를 실험하는 동안 같은 장면에서 평균 행동과 sampling 행동의 차이, raw action·std·value,
+선반 변위와 warning 체류시간을 분리해 확인해야 한다.
+
+설정·구간 집계·분석 snapshot은
+[scalar_analysis.json](../outputs/contact_manipulation/reward_scale_20261021/scalar_analysis.json)에 보존했다.
+현재·후보 곡선의 수치 비교는 [sensitivity.json](../outputs/contact_manipulation/reward_scale_20261021/sensitivity.json),
+그림은 [reward_curves.png](../outputs/contact_manipulation/reward_scale_20261021/reward_curves.png)와
+[latest_training.png](../outputs/contact_manipulation/reward_scale_20261021/latest_training.png)에 보존했다.
+후보 곡선은 계산상 비교이며 변경한 설정으로 학습한 결과가 아니다.
+
+## 31. 2026-10-21 — Rearrangement·Singularity weight와 경고 곡선 조정
+
+30절의 검토 후 사용자가 조정을 요청해 두 항의 weight와 곡선을 함께 변경했다.
+30절은 이전 설정을 평가한 기록으로 유지하며, 이번 변경은 각 효과를 나누어 측정한
+분리 실험과 구분한다. 학습 퇴행이나 std·value 폭증의 원인이 해결됐다는 판단은 아니다.
+
+| 설정 | 이전 | 적용 |
+|---|---:|---:|
+| Rearrangement weight | .6 | 1.0 |
+| `rearrangement_decay` | 2m⁻¹ | 20m⁻¹ |
+| Singularity weight | .15 | .30 |
+| `motion_singularity_threshold` | .05 | .07 |
+| Singularity half-deficit | .025 | .03 |
+| `motion_singularity_decay` | `ln(2)/.025²` | `ln(2)/.03²` |
+
+### 지급되는 값과 유지한 조건
+
+Rearrangement는 지정 Blocker를 제외한 active 물체와 선반의 직전step OBB corner 이동량을
+합친 x_R에 대해 `exp(−20x_R)−1`을 지급한다. 비용 정의·회전 반영·선택 행 reset 이력은 유지한다.
+Target·다른 물체 이동 비용도 함께 커지므로 접촉 회피 재발 여부를 함께 확인해야 한다.
+
+| 이번 step x_R | 이전 지급 | 조정 후 지급 |
+|---|---:|---:|
+| 1mm | −.001199 | −.0198013 |
+| 1cm | −.011881 | −.181269 |
+
+이는 이번 step의 이동 비용이며 초기 pose 대비 순변위 penalty로 바꾼 것은 아니다.
+선반이9mm 이동한 채 멈추면 이후 이동 비용은 여전히0이다. 선반 pose의 별도 조기 경고
+term은 추가하지 않았다.
+
+Singularity는 다음을 지급한다.
+
+$$
+r_S=0.30\left\{\exp\left(-\frac{\ln2}{.03^2}[\max(0,.07-s)]^2\right)-1\right\}.
+$$
+
+| 현재 지표s | 조정 후 지급 |
+|---|---:|
+| .07 이상 | 0 |
+| .06 | −.0222376 |
+| .04 | −.15 |
+| .005 | −.288413 |
+| 0 | −.293111 |
+
+이전보다 큰 지표에서 경고가 시작되며, penalty 크기도 확대했다. 지표 정의와 계산 공유는
+유지하며 종료는기존`s≤.005`다. 초기 reset 행은 첫 완료physics sample 전까지 warning 기준값으로
+초기화해 penalty0을 유지한다. 새 warning 기준에 대한 실제 초기 자세 검증은 아래에 따로 기록한다.
+
+Clearance4·Distance.4·Hold.05(17pad 합산), 나머지 네 Motion각.15,
+Terminal성공+50·그외0, 선반1cm/2°와 singularity.005 종료 조건은 유지했다.
+Controller·action·관측·물리 주기·PPO 하이퍼파라미터·독립 Critic 구조도 바꾸지 않았다.
+현재10개 reward term의 구성은 같고, Motion 합의 하한은약−.893111,
+Rearrangement의 하한은−1이다.
+
+기존 tensor 식의 설정 상수만 변경했다. 센서 조회·physics step·추가 kernel 연산이나
+새 production 파일을 추가하지 않는다. 기존 로그 키를 그대로 사용한다.
+
+### 검증 상태
+
+CPU 전체 검사는 **259pass·18skip·381subtest pass**, 소요15.40초였다.
+실제 native 검사에서는 첫장면 **1,024환경×32holdstep(32,768transition)**의 관측·보상이
+finite였고, 새 Rearrangement·Singularity의 native manager weight와 dt 적용 및
+부분reset의 다른 행 보존을 확인했다. 결과의 `reward_and_reset_checks_passed`는true다.
+
+이와 별도로 새 장면3개에서 reset시점의 native SDK Jacobian 지표를 조회했다.
+**3개 장면 각각32physics step을 실행한 결과는 아니다.** Hold 실행은 첫장면에만 수행했다.
+
+| 장면 | SDK 지표s 최솟값 | 기존 warning s<.05 | 새 warning s<.07 | 기존 hard s≤.005 |
+|---|---:|---:|---:|---:|
+| 0 | .0824477 | 0/1,024 | 0/1,024 | 0/1,024 |
+| 1 | .000110765 | 229/1,024(22.36%) | 371/1,024(36.23%) | 2/1,024(.1953%) |
+| 2 | .0588610 | 0/1,024 | 3/1,024(.2930%) | 0/1,024 |
+
+**초기 SDK 지표에서 기존 종료 기준도 걸리는 행이 확인됐다.**
+따라서 결과의 `all_initial_starts_above_termination`은false이며, 전체 초기 자세가 정상이라는
+검증으로 해석하지 않는다. 특히 장면1에서는 warning 확대가 초기 감점 대상 행을22.36%에서
+36.23%로 늘린다. 첫장면의 정상 분포를 모든 장면의 초기 상태로 일반화할 수 없다.
+
+기존 초기 IK는 이 singularity 지표를 직접 검사하지 않는다. 다만 reset시점 SDK 읽기의
+frame/기준점·갱신 시점 영향과 실제 자세를 아직 구분하지 못했다.
+추가 analytic Jacobian 대조도 native 값과 최대약.0229m 차이가 남아 기준점·SDK refresh를
+완전히 설명한 검증이 아니었다. 이 차이만으로 실제 초기 자세가 원인이라고 단정하지 않는다.
+현재 범위에서는 production IK·초기 sampling 조건을 변경하지 않았으며, 해당 구분은 후속 과제다.
+
+확정 결과는 [native_result.json](../outputs/contact_manipulation/reward_adjustment_20261021/native_result.json),
+실행 로그는 [native_validation.log](../outputs/contact_manipulation/reward_adjustment_20261021/native_validation.log)에 보존했다.
+이 검사는 수식·연동·일부 reset과 초기 SDK 분포의 확인이며, 조정 후 학습 성능이나
+장기 안정성·모든 초기 자세의 건전성은 아직 확인하지 않았다.
+
+## 32. 2026-10-21 — 물체 튕겨내기와 성공 판정의 허점 검토
+
+사용자는 play에서 Blocker와 주변 물체를 정상적으로 밀어 재배치하기보다 튕겨내는 행동을
+관찰했고, 이런 동작이 성공으로 집계될 가능성을 지적했다. 허용할 결과는 Target 접근 공간을
+만들면서 물체가 선반에 남는 조작이다. 이번에는 기존 판정의 반례와 수정 우선순위를 검토했으며,
+**production 코드·reward·weight·성공·종료 조건은 변경하지 않았다.**
+
+### 현재 성공 조건이 보장하지 않는 것
+
+현재 성공은 지정 Blocker의 XY접근영역 교차면적≤1e−5m²와 Target초기pose대비
+이동≤2cm·회전≤.15rad를10step(.1초) 연속 만족하는 것이다. Blocker의 높이·작업영역 잔류·
+선반 지지·선속도·각속도, 주변 물체의 비산 여부는 성공 gate가 아니다.
+`stable_linear_velocity=.015m/s`, `stable_angular_velocity=.1rad/s`가 설정에 남아 있지만
+현재 성공 판정에서는 사용하지 않는다. 현재의 stable count는 정지 확인이 아닌
+통로 확보·Target 보호 조건의 지속 횟수다.
+
+낙하는 물체 OBB최저점이 선반 지지면보다6cm 넘게 낮아졌을 때 검사하며, 높이 들림과
+작업영역 이탈 자체는 종료하지 않는다. 전도는80° 이상이.2초 지속돼야 종료한다.
+따라서 공중에 있거나 막 넘어지기 시작한 물체가 낙하·전도 실패보다 먼저 성공할 수 있다.
+단순 자유낙하 예에서 초기 수직속도0이면.1초 낙하량은약4.905cm,
+6cm까지는약.1106초다. 이는 시간차를 설명하는 계산이며 실제 PhysX 재생 결과는 아니다.
+
+성공과 활성 failure는 독립 판정하며 같은step에둘다참이어도 Terminal은+50을 지급한다.
+기존 사용자 결정대로 구현된 동작이지만, 물체를 잃거나 선반을 움직인 완료를 배제하려는
+이번 요구와 충돌한다. 실패 원인만으로 음수 terminal이 지급되는 구조도 아니다.
+
+### Production 판정 함수의 CPU 반례
+
+현재 `task_conditions()`와 `terminal_transition()`을 합성 tensor 상태에 직접 호출했다.
+정책·physics 재생이 아니며 해당 checkpoint에서 실제로 발생한 궤적을 복원한 검사는 아니다.
+
+| 입력 상태 | 현재 성공 | 현재 failure | 최초 terminal 지급 |
+|---|---|---|---:|
+| 지지된 정지 Blocker가 통로를 확보한 대조군 | 참 | 거짓 | +50 |
+| 공중의 Blocker가2.245m/s·10rad/s로 이동하며.1초 통로 확보 | 참 | 거짓 | +50 |
+| Blocker가 작업 XY영역 밖에 있으나 통로·Target 조건 충족 | 참 | 거짓 | +50 |
+| 선반 밖 자유낙하.1초로 최저점이 지지면보다4.905cm 낮음 | 참 | 거짓(6cm미만) | +50 |
+| 새로90° 기울어진 상태가.1초 지속 | 참 | 거짓(.2초유예중) | +50 |
+| 성공 조건과 `object_drop`이 같은step에 처음 충족 | 참 | 참 | +50 |
+| 성공 조건과 `object_tilt`가 같은step에 처음 충족 | 참 | 참 | +50 |
+| 성공 조건과 `shelf_displacement`가 같은step에 처음 충족 | 참 | 참 | +50 |
+
+전도 반례를 성공 reset 없이.2초까지 계속 계산하면 전도 failure도 발생한다.
+하지만 native 환경은.1초 성공에서 이미 reset하므로 이후 실패가 잘못된 완료를
+사후 취소하지는 못한다. 실제 episode에서 성공은 한 번만 지급한다.
+반례와 재현방법은
+[predicate_counterexamples.json](../outputs/contact_manipulation/flinging_review_20261021/predicate_counterexamples.json)에 보존했다.
+
+### Reward·action 구조와 학습 로그의 해석
+
+Clearance는 XY투영만 보므로 실제 지지 여부를 구분하지 않는다. **순수 수직 이동만으로
+XY가림이 줄어드는 것은 아니다.** 다만 수평으로 튕겨나가거나 회전해 투영면적·교차면적이
+바뀌면, 여전히 공중·고속인 상태에서도 Clearance가 증가할 수 있다.
+지정 Blocker는 Rearrangement에서 제외된다. 이는 정상적인 밀기·pivot을 허용하려는 규칙이며
+비산 방지의 물리 유효성까지 검사하는 규칙은 아니다.
+
+다른 active 물체의 이동은 R에 들어가지만 현재 R은 이번step 조작량의 합에 지수를 적용한다.
+동일한 총이동량.1m를 한 번에 만들면 `exp(−20×.1)−1≈−.8647`,10step으로 균등 분할하면
+누적약−1.8127,100step이면약−1.9801이다(weight1,할인전).
+큰 순간 이동이 step당 비용 포화로 상대적으로 싸지는 구조가 있어, 별도 유효성 판정 없이
+R weight만 키운다고 비산을 배제할 수 없다. 동일한 측정 경로길이를 가정한 수식 비교이며,
+실제로 튕긴 물체는 reset까지 계속 이동 비용이 누적될 수 있다. 한 번 충돌하면 비용이
+한 번만 발생한다는 의미나 실제 비산 행동의 원인을 입증한 것은 아니다.
+
+Checkpoint1350의 위치 Gaussian std는[3.6202,4.0207,3.7551], 회전은[6.5975,6.7027,7.2941]이었다.
+Pose scale1.0·unclipped Gaussian이므로 학습 sampling의 위치 명령 std는약3.6–4.0m,
+회전 명령 std는약6.6–7.3rad다. 실제 EEF이동이나 action 궤적을 측정한 값은 아니다.
+Play 기본값은평균μ를 사용하므로 이 std만으로 deterministic play의 특정 비산을 설명할 수도 없다.
+Task 유효성과 별도로 action scale·탐색분산·entropy·제어기 제한의 영향을 진단할 필요가 있으나,
+이번 검토에서 OSC 수정이나 controller 교체를 적용하지 않았다. 수식·checkpoint 근거는
+[reward_bias.json](../outputs/contact_manipulation/flinging_review_20261021/reward_bias.json)에 보존했다.
+
+`2026-10-21_15-33-47`을1804회까지 포착한 scalar에서 checkpoint1350직전50회
+(1301–1350)의 success snapshot은44.76%,drop36.11%,tilt7.63%였다.
+이 값은 각 원인의 주변집계이며 동일episode에서 성공과 실패가 겹쳤다는 뜻은 아니다.
+기존에 선택한 상위 checkpoint는 scalar 기준의 평가 후보일 뿐 올바른 밀기 동작을 검증한
+정책이 아니다. 사용자의 play 관찰은 허용 조작 여부를 판단하는 직접 증거이며,
+현재 scalar만으로 잘못된 성공의 비율을 계산할 수는 없다.
+근거는 [metrics.json](../outputs/contact_manipulation/flinging_review_20261021/metrics.json)에 둔다.
+
+### 미적용 수정 우선순위
+
+1. **최종 성공의 물리적 유효성부터 정의한다.** 기존 통로·Target보호에 더해 Blocker가
+   실제 작업 선반의 지지영역에 남고, 완전히 넘어진 자세가 아니며,
+   낮은 선속도·각속도로.1–.2초 유지되며,
+   활성 failure가 없는 완료를 성공으로 삼는 방향이다. 주변 물체를 잃거나 튕겨낸 상태도
+   유효한 완료에서 제외한다. 허용 속도·지지 tolerance·최종 유지시간의 수치는 후속 확정이 필요하다.
+   조작 중 전도의.2초 종료 유예는 유지할 수 있지만, 유예 중인 완전 전도 자세가 먼저
+   최종 성공을 통과하지 않도록 완료의 자세 조건과 실패 debounce를 구분해야 한다.
+2. **Success와 failure를 동시에 참으로 완료 처리하지 않는다.** 유효하지 않은 완료에는
+   +50을 지급하지 않도록 판정과 terminal 지급을 일치시킨다. 별도 음의 failure weight를
+   추가할지는 아직 결정하지 않았다.
+3. **양의 dense Clearance에 물리 유효성 gate를 검토한다.** 지지·잔류를 잃어 통로를
+   확보한 경우 양의 보상을 지급하지 않되 음의 Clearance와 R/M 비용은 유지한다.
+   미는 도중의 속도까지 최종 정지 기준으로 gate하면 필요한 조작을 막으므로,
+   settled 속도는 완료 조건에 두고 진행 보상의 gate는 물리적인 지지·잔류 위주로 구분한다.
+4. **Blocker의 정상 이동 R제외는 유지한다.** 대신 비산·이탈의 유효성 검사는 Blocker도
+   포함한다. 모든 일시적 lift·pivot을 즉시 종료하거나 처음부터 정지를 요구하는 방식은 피한다.
+   R의 물체별/step별 비용 포화·분할 편향은 이와 별도의 후속 수식 검토 대상으로 남긴다.
+
+이미 보유한 물체 pose·OBB corner·속도·선반 pose와 실제 작업판의 지지 metadata를 활용하면
+GPU tensor 계산으로 구성할 수 있다. 추가 contact sensor·환경별 Python 반복문·매step CPU
+logging이 필요한 수정은 아니다. 다만 OBB의 지지 판정은 실제 비볼록 mesh 접촉의 근사이며,
+**선반 전체1.8m높이 OBB를 작업판 지지영역으로 쓰면 안 된다.** 실제 작업 선반의 XY·지지면
+높이와 움직인 선반 기준 변환을 사용해야 한다.
+
+검증에는 raw success와 failure·공중·영역밖·고속 상태가 같은 종료에서 겹쳤는지 확인하는
+최소 GPU episode counter를 추가하는 방향을 검토한다. 전체 step을 CPU로 기록하는 디버그
+구조는 필요하지 않다. 합법적인 밀기·pivot·회복과 비산 반례를 나누어 검사한 뒤
+이전 checkpoint의 성공률도 새 판정으로 재평가해야 한다.
+
+## 33. 2026-10-21 — 비산을 성공과 보상에서 분리하는 구체 수정안
+
+사용자가32절의 검토를 구체적인 수정안으로 정리하도록 요청했다.
+**아래는 작성 당시의 구현 전 계획이다. 이후 적용 내용은34절을 따르며, 완료 유지시간.2초 제안은 사용자 요청으로.5초로 대체됐다.**
+첫단계는 성공·진행보상의 물리적 의미를 바로잡는 범위로 한정하고,
+Rearrangement 수식과 action·탐색 설정은 이후 별도 실험으로 구분한다.
+
+### 기준 기하와 높이 gap
+
+실제 작업판과 기둥에서 측정한 usable XY영역·지지면을 현재 선반 frame으로 저장한다.
+물체의 기존 OBB corner를 현재 선반 pose의 역변환으로 같은 frame에 표현해 선반이
+움직여도 지지 판정의 기준이 함께 움직이도록 한다. 선반 전체1.8m높이 OBB는 쓰지 않는다.
+
+물체i의 위쪽 들림 gap은 다음처럼 한쪽 방향으로 계산한다.
+
+$$
+g_i=\max\left(z_{i,\min}^{\mathrm{shelf}}-z_{\mathrm{panel}}
+-b_{i,\mathrm{rest}},\;0\right).
+$$
+
+`abs(z_min−z_panel)`을 쓰지 않아 작은 침투·solver 오차를 공중 들림과 혼동하지 않는다.
+선택적인 rest bias는 **검증된 정지 지지 자세의 asset별 고정 보정값**으로만 얻는다.
+임의의 reset높이를 기준으로 삼으면 잘못 생성된 공중 상태를 정상화하므로 그렇게 하지 않는다.
+기존 bounds가 지지면과 맞으면 bias는0이다. 구현 전에 resting asset·정상밀기·pivot의
+gap을 먼저 측정해 아래 mm후보가 실제 기하·contact offset과 맞는지 확인한다.
+OBB는 실제 비볼록 mesh 접촉의 근사여서 이 판정을 접촉의 증명으로 해석하지 않는다.
+특히 위 식만으로는 판 아래로 침투한 상태도 gap=0이 된다. 따라서 최종 지지 유효성은
+이 gap 상한만으로 확정하지 않고, signed gap과 실제 collision 형상을 대조해 얻은 정상
+지지 자세의 허용 하단 범위도 함께 검사한다. 이 하단 범위는 asset·허용 자세의 검증된
+지지 기하를 기준으로 정하고 현재 reset 높이로 학습하지 않는다. 보수적인 OBB 범위가
+합법적 pivot을 거절하는지도 calibration에 포함한다. 아래 높이 값은 이 지지 일관성 검사를
+통과한 상태에서 허용할 **위쪽 들림의 후보 상한**이다.
+
+### 진행 유효성·최종 완료·실패를 별도 판정
+
+| 목적 | 초기 후보 조건 | 시간·처리 |
+|---|---|---|
+| 진행 유효성 Vp | 모든active물체 OBB중심이 작업판XY내부, XYbbox가 판과겹침, gap≤10mm, 현재80°이상전도·invalid없음 | 매step즉시판정, 속도제한없음 |
+| 최종 완료 | 모든active물체 XYbbox가 작업판내부(+5mm허용), 검증된 하단 범위·gap≤5mm, 현재tilt<80°, 선속도≤.05m/s·각속도≤.3rad/s | 기존통로·Target조건과함께.2초유지 |
+| `object_ejected` 실패 | 같은active물체의 XYbbox가 작업판과 완전히 분리되고 경계 gap>2cm | .05초연속 |
+| `object_off_support` 실패 | 같은active물체의 gap>3cm | .1초연속 |
+
+값은 확정된 물리 안전 한계가 아니라 **calibration후 검증할 초기 후보**다.
+최종 bbox완전포함(+5mm)은 단순하고 보수적인 초기 완료 기준이므로 정상적인5mm초과
+overhang도 거절할 수 있다. 실제 mesh지지·손잡이 bounds와 정상조작을 대조한 뒤 강제해야 한다.
+진행조건은 더 느슨하게 두어 미는 중의 부분 overhang·작은 bounce·pivot 회복을 허용한다.
+정상적인 조작의 속도가 빠르다는 이유로 진행 Clearance를 막거나 즉시 종료하지 않는다.
+
+기존 통로면적≤1e−5m²와 Target이동≤2cm·회전≤.15rad는 유지한다.
+최종 속도 검사는 Blocker만이 아니라 모든active물체에 적용해 주변 물체가 비산 중인
+장면을 완료로 세지 않는다. .05m/s·.3rad/s는 **완료 판정 전용**이며 연속 Motion penalty를
+추가하는 설정이 아니다. 완료 유지시간.2초는 seconds로 두고현재step_dt에서ceil해
+100Hz에서는20sample이 되도록 한다. XY이탈은5sample, off-support는10sample이다.
+
+기존 drop6cm, tilt80°·.2초, 선반1cm/2°, singularity·invalid 실패는 유지한다.
+새 실패의 누적은 물체별로 수행하며 회복·비활성화하면 해당 물체의 counter를0으로 만든다.
+다른 물체의 번갈아 발생한 들림·이탈을 한 물체의 지속으로 합치지 않는다.
+Gate는 유예 없이 즉시 닫고 **실패만 debounce**하므로 유예기간에 비산 성공을 지급하지 않는다.
+Hard failure가 한번 성립하면 native 종료로 episode를 끝내 이후 착지로 완료를 세탁하지 못하게 한다.
+
+최종 valid success는 raw goal·위 완료조건·`~enabled_failure`를 함께 만족해야 한다.
+기존 native enabled failure mask만 사용해, 비활성화한 F/T hard-load를 숨은 gate로 부활시키지 않는다.
+Raw goal은 진단값으로 남기고 valid success와 failure는 상호배타적으로 만든다.
+Terminal은 **valid success에만+50**, 그외0을 유지하며 별도 음의 failure weight는 아직 정하지 않는다.
+
+### 진행 Clearance의 지급 방식
+
+초기대비 품질차이 d와 현재진행유효성 Vp로 다음을 제안한다.
+
+$$
+d=q_C(t)-q_C(0),\qquad
+r_C=4\left[\min(d,0)+V_p\max(d,0)\right].
+$$
+
+기존 exp품질·초기baseline·weight4를 유지하고 **양의 부분만** 진행 유효성으로 gate한다.
+음의 Clearance와 R/M 비용은 그대로 지급하며 다른 reward까지 전체0으로 만들지 않는다.
+공중·영역밖에서 보류된 양의 보상을 나중에 정산하지 않는다.
+최종 정지 조건을 이 gate에 넣지 않으므로 물체를 움직이며 통로를 개선하는 중에도
+진행 유효성이 유지되면 양의 Clearance를 받을 수 있다.
+
+첫단계에서는 다른 weight와 Blocker의 일반 병진·회전 R제외를 유지한다.
+Blocker도 지지·잔류·비산 유효성 검사에서는 제외하지 않는다.
+
+### 코드·병렬화 계획
+
+- `mdp/events.py`: 기존 `MdpCfg`에 threshold·seconds를, `TaskState`에 cached진행/완료/failure
+  bool과 두개`(N,O)`정수counter를 추가한다. 기존 post-physics갱신에 현재corner·속도·선반pose를
+  재사용하고 native manager가 호출하는 순서와 무관하게 step당한번 계산한다.
+- 기존 `scene.py`의 실제작업판·기둥 metadata를 재사용/확장해 최초준비후 GPU에 저장한다.
+  환경별 Pythonloop나 추가 sensor·SDK pose조회가 필요한 설계로 만들지 않는다.
+- `mdp/terminations.py`: cached조건을 읽는 두 failure term과 valid success를 연결하고,
+  `shelf_manipulation_env_cfg.py`에서 공식 TerminationTermCfg로 선언한다.
+- `mdp/rewards.py`: cachedVp를 양의 Clearance에만 적용하고 valid success로 terminal지급을 일치시킨다.
+  새production파일은 만들지 않는다. 부분reset은선택env_ids의counter·cache만초기화한다.
+  Inactivepadding은기하·속도·counter검사에서모두mask한다.
+
+이 계획은 기존 GPU tensor계산에 작은 reduction·bool·counter갱신을 추가하는 방식이다.
+실제 overhead는 측정해야 하며0이라고 주장하지 않는다.
+
+### 후속 단계의 분리 실험
+
+**Rearrangement:** 현재 exp-per-step 비용의 .1m총경로를1/10/100step으로 나누는 독립 검사를
+유지해 분할 편향을 정량화한다. 과거 누적이동량을 매step 반복 감점하는 수식으로 돌아가지 않는다.
+exp품질을 유지한다는 조건에서 최종 지급방식을 별도로 결정해야 하며, 조용히 선형비용으로
+교체하지 않는다. 이 수식 실험은 첫단계 성공·진행gate수정과 섞지 않는다.
+
+**Action·탐색:** 공식 ActionCfg의 `position_scale`후보.02/.05와 `orientation_scale`후보.05/.10을
+고정 명령으로 비교해 실제EEF추종·접촉·토크포화를 측정한다. 아직 선택한action상한은 아니며
+Gaussian출력자체의상한도 아니다. Kp50–200·stiffness_scale100과 공식OSC core는 유지한다.
+초기std.3에서 native entropy coefficient`.01→.001`, adaptive schedule·desiredKL`.01`도
+각각 분리해서 비교할 수 있으나 이들이 std의 hard cap을 보장하지는 않는다.
+설치RSL-RL5.0.1에 없는 `max_std`config를 있다고 가정하지 않는다.
+전체action을±1로 자르면 Kp최대가100으로 줄어200까지 쓰지 못하므로 그런globalclip을 넣지 않는다.
+Actionscale을 바꾸는 실험은 metadata계약을 버전으로 구분하고 새학습으로 평가한다.
+
+### 구현 후 통과 기준
+
+- 합법적밀기에서 움직이는동안 양의Clearance가 지급되고, 낮은속도로.2초유지하기전 성공은false다.
+- 작은lift·pivot·bounce가회복되면 object별counter가초기화되고 과한일괄종료가발생하지않는다.
+- 공중·영역밖·전도·주변물체비산 반례는성공false·+50지급0이며 success와failure가동시참이되지않는다.
+- 음의Clearance·R/M이gate로사라지지않고, 비활성F/T종료가새gate에포함되지않는다.
+- 물체별counter·inactivepadding·선택행reset·움직인선반frame을 CPU독립예제와CUDA1,024행에서검사한다.
+- Native실행에서 rawgoal대비invalidcompletion의동시counter를집계하고 **수정된valid success**로
+  checkpoint를재평가한다. 이전success snapshot을새유효성공률처럼사용하지않는다.
+- 최소GPUepisode집계만사용하고매stepCPU로그는추가하지않는다. 같은조건baseline과비교해
+  iteration overhead5%미만을목표로측정하되 통과를미리주장하지않는다.
+
+초기height·XY·속도후보는 정지asset·정상밀기 calibration이 끝난 후 강제할 값으로 확정한다.
+이 계획 작성 시점에는 구현·성능검증·새성공률측정을 수행하지 않았다.
+
+## 34. 2026-10-21 — 유효 재배치 성공과 비산 차단 1단계 적용
+
+사용자가33절 수정안의 완료 유지시간을0.2초에서 **0.5초**로 바꾸어 적용하도록 요청했다.
+이번 범위는 성공·진행 Clearance·명백한 비산 실패의 정합성이다. 다른 reward weight,
+Blocker의 일반 이동 Rearrangement 제외, action scale·OSC·탐색 설정은 유지한다.
+
+### 적용한 판정
+
+| 항목 | 적용 조건 |
+|---|---|
+| 기존 목표 | 지정 Blocker의 접근영역 교차 면적≤1e−5m², Target 초기 대비 이동≤2cm·회전≤.15rad |
+| 최종 완료 | 모든 활성 물체가 작업판 XY 안에 잔류(+5mm), collision 지지 signed gap −5~5mm, tilt<80°, 선속도≤.05m/s·각속도≤.3rad/s |
+| 유지시간 | 목표·최종완료·활성실패없음을 **.5초 연속**;100Hz50sample, 주기 변경 시 seconds에서 올림 |
+| 진행 유효성 | 모든 활성 물체의 작업판 내 OBB중심·XY footprint overlap, signed gap −5~10mm, 현재전도·invalid·활성실패없음; 속도 제한 없음 |
+| `object_ejected` | 같은 활성 물체 XYbbox가 작업판과 완전히 분리되고 경계 간격>2cm인 상태가.05초 지속 |
+| `object_off_support` | 같은 활성 물체의 지지 gap>3cm인 상태가.1초 지속 |
+
+새 실패의 지속시간은 `(N,O)` GPU정수 counter로 관리한다. 회복·비활성화하면 해당 물체만0이 되고,
+부분reset은 선택 환경의 counter만 초기화한다. 서로 다른 물체의 교대 들림·이탈을 합치지 않는다.
+진행 gate는 즉시 닫으며 실패 종료만 짧게 유예한다. 기존 drop6cm·tilt80°/.2초·선반1cm/2°·
+invalid·singularity 실패는 유지했다. 공식 `TerminationTermCfg`를 사용해 새 두 원인을 개별 기록한다.
+
+기존 통로·Target 조건은 `raw_goal` 진단과 분리하고 **활성 실패가 성공보다 우선**하도록 했다.
+같은 step에 실패가 성립하면 성공false·terminal0이며, 유효 성공에만+50을 한 번 지급한다.
+비활성화한 F/T hard-load는 숨은 성공 gate로 복구하지 않는다. 속도는 완료에만 적용하므로
+지지된 상태의 빠른 밀기·pivot을 그 이유만으로 진행 보상에서 제외하지 않는다.
+
+### Clearance와 지지 기하
+
+기존 초기 품질 기준과exp형태·weight4를 유지하고 양의 부분만 gate한다.
+
+$$
+d=q_C(t)-q_C(0),\qquad
+r_C=4\left[\min(d,0)+V_p\max(d,0)\right].
+$$
+
+음의 Clearance와 Rearrangement·Motion 비용은 유지하며, gate가 닫힌 동안 지급되지 않은
+양의 보상을 나중에 정산하지 않는다. Distance·접촉 유지 보상은 이번 변경에서 바꾸지 않았다.
+
+실제 작업판·기둥에서 측정한 영역과 현재 선반 frame을 사용한다. 높이는 보수적인 OBB 최저점만
+쓰면 작은 pivot에서 빈 corner가 판 아래로 내려가므로, 활성 collider Mesh/Cube 등의 실제 지지
+정점을 asset별 시작 시 한 번 추출하고 CPU convex hull로 내부 정점을 제거한다. **이 hull은
+높이 계산용 cache이며 PhysX collision 형상이나 hull 분해 설정을 변경하지 않는다.**
+GPU에서는 평면 법선 방향 정점 내적의 최솟값으로 collision 하단 높이를 구한다. Mesh의 선형
+평면 극값은 원래 정점과 같고, 곡면 primitive는 촘촘한 근사와 scale을 반영한 미터 단위 오차 상한을
+함께 저장한다. 이는 authored collider의 기하 근사이며 cooked PhysX 접촉력의 증명이 아니다.
+Signed gap의하한−5mm로 판 아래 침투를 정상 지지로 오인하는 것도 차단한다. 작은 pivot은
+회복 가능한 범위에서 허용하되 현재80° 이상 전도는 완료와 양의 진행 보상에서 제외한다.
+
+기존 `scene.py`·`events.py`·`terminations.py`·`rewards.py`와 환경cfg 안에서 구현했다.
+새 production 파일·카메라·접촉 센서를 추가하지 않았고, 매step CPU기하 조회·환경별Pythonloop 없이
+기존 pose·OBB·속도와 cached GPU기하를 재사용한다. 기존 native manager 실행 흐름과dt 어댑터를 유지한다.
+
+### GPU 비용과 native 로깅
+
+실제 collision catalog는 asset별 hull 정점이8~28,209개였다. 초기의 환경별 padded정점 복제는
+약3.47GB와support helper20.08ms/step을 요구해 제거했다. 최종 구현은 약3.39MB의 공통 catalog를
+그대로 공유하고, Warp block reduction이 물체별 실제 정점 수만 처리한다. 정점 수를 줄여 근사를
+늘린 최적화가 아니며, 결과는 full정점 torch계산과float32오차 범위에서 일치했다. 작은 tensor연산은
+cached CUDA graph로 묶어 반복적인 CPU kernel launch비용을 줄였다.
+
+실제 완료된 episode를 reset 전에GPU에서 집계해 기존 native logger로 내보낸다.
+`Task_Count/completed`, `valid_success`, `raw_goal_seen`, `unsupported_goal_seen`, `goal_and_failure`는
+프로세스 시작 후 누적 개수다. `Task_Rate/valid_success`는 누적 유효 성공/완료episode 비율이다.
+`raw_goal_seen` 등은 episode 도중 한 번이라도 조건을 보였는지 집계하며 서로 배타적이지 않다.
+`unsupported_goal_seen`은 raw목표와 진행유효성 위반의 동시 발생, `goal_and_failure`는 raw목표와
+활성 실패의 동시 발생이다. 기존 `Episode_Termination/*`의 마지막episode snapshot 평균과
+새로 완료된 episode의 실제 누적 비율을 혼동하지 않는다. 매step CPU출력은 추가하지 않았다.
+
+### 검증 결과와 범위
+
+- CPU MDP227 tests(16 CUDA skip), learning62 tests(2 CUDA skip)를 통과했다. CUDA4개 회귀검사도
+  통과했으며 cache입력변경·물체별counter·부분reset·inference mode교대를 포함한다. 공중·영역밖·
+  주변물체비산·음의Clearance유지·실패우선·비활성F/T·padding을 tensor반례로 검사했다.
+  Kit의 실제 USD지원기하 fixture1개도 통과했고 app종료exit0을 확인했다.
+- 실제10종asset의 최초 collision signed gap은 모두0이었다. 1,024환경에서64holdstep 후 최소
+  **−0.182mm**, 최대 **1.711mm**였고 진행·완료의 물리유효성 mask는 모두true였다. 이는
+  정지 장면의 기하 판정 결과이며 목표가 달성됐거나 유효 성공률100%라는 뜻이 아니다.
+  선택 환경의 부분reset도 나머지 환경의 상태를 바꾸지 않았다.
+- 최종 native support helper는 **.414ms/step**이었다. 같은1,024환경·물리·고정hold명령에서
+  MDP갱신만 저장된이전구현과 교체한 비교는 baseline평균 **40.34ms/step**, 새구현 **39.82ms/step**
+  (−1.27%)였다. 이 차이는 측정잡음 수준이며 뚜렷한 step지연 증가는 관찰하지 않았다.
+- 위 비교에는 **PPO update와 새scene생성 경계reset이 포함되지 않는다.** 따라서 전체iteration
+  overhead5%미만의 통과나90000iteration 학습시간을 입증한 측정으로 사용하지 않는다.
+  장기학습·동적밀기/pivot·새checkpoint의 유효성공률 평가는 별도로 남아 있다.
+
+근거와 재현 스크립트는
+[valid_rearrangement_20261021](../outputs/contact_manipulation/valid_rearrangement_20261021/VALIDATION.md)에 둔다.
+새 성공 판정으로 기존 checkpoint를 재평가하기 전까지 과거 scalar success를 유효 성공률로
+해석하지 않는다. Rearrangement의 시간 분할 편향과action·entropy 조정은 후속 분리 실험이다.
+
+## 35. 2026-10-21 — 손가락 관통·종료 전 위험 비용·성공 보상 재검토
+
+사용자는 빠른 손 동작에서 물체/선반 관통, 비산 종료 경계 전 penalty 부재,
+강화된 성공 조건 대비 +50 bonus 부족을 보고했다. 추가 답변에서 관통은 **주로 손가락**이라고 했다.
+이 절은 코드·공식 API·로그를 대조한 **검토와 제안**이며 production 설정을 변경하지 않았다.
+
+### 손가락 충돌
+
+현재 물리/정책은100Hz(dt=.01, decimation1)이고, 손의 부모 collider5개는 contact offset .5mm,
+손 rigid body의 max_depenetration_velocity는 .1m/s이다. 후자는 실제 손 속도 상한이 아니다.
+OSC는 목표 pose 증분을 torque로 제어하므로 position_scale1이 매step1m teleport를 뜻하지 않는다.
+1m/s인 실제 link는10ms동안1cm를 이동할 수 있어 얇은 collider를 검사 사이에 지나갈 가능성이 있다.
+저속/고속의 동일 경로 대조와 collision overlay로 시간 이산화와 형상/필터 누락을 구분해야 한다.
+
+설치된 Isaac Sim5.1의 SimulationManager.enable_ccd는 CUDA에서 활성화 요청을 무시한다.
+[공식 OmniPhysics107.3 문서](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/rigid_bodies_articulations/rigid_bodies.html#configure-continuous-collision-detection-on-a-rigid-body)도
+Direct GPU API에서 두 CCD 모드가 작동하지 않음을 명시한다. 따라서 단순 CCDon을 해결책으로 적용하지 않는다.
+공식 cfg의 solve_articulation_contact_last=True, 부모 contact offset의 점진적 확대를 단독 비교하고
+17개 tactile 접촉 시점·self contact·실행 비용도 검사할 후보로 둔다. 지속 침투 해소와 이미 놓친
+충돌은 다른 문제다. 여전히 관통하면 물리200Hz(dt=.005)/정책100Hz(decimation2)를 비교하되
+물리 호출 증가를 측정한다. depenetration 상한을 무작정 올리면 비산을 악화할 수 있다.
+
+### 위험 비용 후보
+
+현재 support helper에는 gate·지속시간 counter만 있고 경계 전 연속 비용은 없다.
+기존 계산의 gap·XY bounds·upright_z를 재사용해 exp(-a*x)-1 비용을 별도 항으로 캐시할 수 있다.
+정상 선반 위 밀기/yaw pivot은0이며 Blocker도 위험 검사에서는 제외하지 않는다.
+각 위험 비용을0~1로 계산하고 활성 물체/위험 중 최댓값에 총 weight2를 적용하는 것은 초기 후보다.
+이는 물체 수에 따른 penalty배율을 피하는 결합이며, 종류별 크기는 별도로 기록한다.
+온셋과 weight는 아직 확정/검증하지 않았다.
+
+- 들림: gap10mm까지0,20mm에서 절반,30mm에서약.9375.
+- 경계: footprint 전체 이탈 거리만 쓰면 늦을 수 있으므로, 최종 잔류 허용과 맞춘
+  XY overhang5mm초과를 경고 후보로 삼는다. 과도한 pivot 억제 여부를 함께 측정한다.
+- 낙하·전도도 soft warning을 검토한다. 단, 현재 hard drop은 world OBB 하단이고
+  support gap은 현재 shelf-frame collision 하단이므로 기하 기준 차이를 먼저 정리한다.
+
+기존 positive Clearance gate가 닫혀도 Distance최대.4와17pad Hold최대.85가 남는다.
+따라서 작은 위험 weight만 추가하면 비산 경계에서조차 양의 보상이 남을 수 있다.
+위험 비용은 물리적 충돌 방지나 종료 전 감속 보장이 아니며 한step에 경고 구간을 뛰어넘을 수 있다.
+
+### 로그와 성공 bonus
+
+2026-10-21_18-20-44는1,024환경 본 학습으로 iteration0–1396을 분석했다.
+새 누적카운터의 rollout-평균 snapshot에서 추정한 완료episode 대비 비율은
+유효 성공약.767%, raw goal경험16.127%, unsupported goal경험12.054%다.
+동일episode에서 중복되는 지표이므로 서로 배타적인 분류가 아니며 정수 원시 횟수도 아니다.
+마지막50iteration 유효 성공 추정은1.813%, raw goal27.033%, unsupported goal19.920%였다.
+4환경/16iteration인18-18-47은 bonus 결정의 주 근거로 삼지 않았다.
+
+성공 bonus의 첫 비교값은 **50→100**을 제안한다. gamma=.99/100Hz에서0.5초 뒤의
++50은 현재 시점30.25, +75는45.38, +100은60.50이다. 과거0.1초 뒤+50의45.22를
+유지시간 변경만으로 보상하려면 약74.74면 된다. +100은 추가 완료 우대 실험이며 최적값은 아니다.
+현재 std가.300→7.621, value loss peak약2.75e17까지 증가했으므로 bonus만으로 모든 현상을
+설명하거나 해결했다고 보지 않는다. 실제 명령·관절 속도·접촉 침투를 함께 확인해야 한다.
+
+수치 원본: [training_reward_metrics.json](../outputs/contact_manipulation/reward_safety_review_20261021/training_reward_metrics.json).
+이 검토에서는 관통 재현 실험·새 penalty 구현·bonus 변경을 수행하지 않았다.
+
+## 36. 2026-10-21 — Reward·Termination 통합과 지지 위험 비용
+
+사용자는35절의 손가락 관통 수정은 재발 시 다루고, **종료 전 위험 비용과 성공 bonus 증가**를
+진행하도록 요청했다. 동시에 전체 reward·termination을 검토해 목적이 겹치는 것은 단순 OR·합산이
+아닌 하나의 기준으로 통합하고, 불필요해진 항목을 제거하도록 했다. 이번 변경에서는 물리 주기,
+collision 형상·offset·solver·controller·action scale을 수정하지 않는다.
+
+### 전체 term 검토와 유지·통합 결정
+
+| 기존 항목 | 결정 | 이유 |
+|---|---|---|
+| Clearance | 유지 | 통로 개선이라는 주목표 |
+| Blocker distance / contact hold | 각각 유지 | 접촉 전 접근과 동일pad의Blocker접촉 지속은 서로 다른 신호 |
+| Rearrangement | 유지 | 비Blocker 물체·선반의 step간 조작 경로 비용; 지지 상태 위험과 다름 |
+| Action rate / joint velocity | 각각 유지 | 명령 변화와 실제 속도 비용은 중복이 아니며 기존 사용자 선택을 유지 |
+| Force 증가 / torque 증가 | 하나의 wrench 증가 비용으로 통합 | 보정된 결합 norm을 한 exp로 평가 |
+| Singularity reward / termination | 유지 | 동일 margin의 연속 비용과 위험 경계 종료는 상호 보완적 |
+| Terminal | 유효 성공+50→+100 | .5초 안정된 완료를 더 우대; 실패·timeout0 유지 |
+| Drop / ejected / off-support | 단일 지지 거리 조건으로 교체 | 같은 지지 작업영역에서의 이탈을 서로 다른 frame·기하로 검사하던 중복 해소 |
+| Object tilt | 유지 | 옆으로 누운 물체는 지지 거리0일 수 있어 지지와 자세는 별도 조건 |
+| Shelf displacement | 유지 | 선반 자체의 작업 기반 보호; R의 경로 비용만으로 대체하지 않음 |
+| Invalid state | 유지 | 비유한 물리·센서·제어 상태의 실행 안전성 |
+| Success / timeout | 유지 | 완료와 native truncation의 구별 |
+
+활성 reward는 **10→10개**다. F/T2항을1항으로 줄이고 물체 지지 비용1항을 추가한다.
+활성 종료는 **9→7개**이며 실패 원인5개+success+timeout이다. 목적이 다른 항을 한 함수에
+넣어 term 개수만 줄이지 않는다. Joint velocity를 없애려면 빠른 속도 자체의 약한 규제를 없애는
+별도 설계 변경이며, 이번 중복 정리에서는 제거하지 않는다.
+
+### 지지 위험의 단일 연속 기준
+
+현재 선반 frame의 실제 작업판 영역을 유한 직사각형 $S$로 사용한다. 활성 물체마다 기존
+OBB 중심XY와 실제 collider 최저 높이를 결합한 대표점 $p_i$를 만들고, 작업판 위 최근접점까지
+**하나의 유클리드 거리**를 계산한다.
+
+$$
+\begin{aligned}
+S&=[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]\times\{z_{\mathrm{panel}}\},\\
+p_i&=(c_{ix},c_{iy},z_{i,\min}),\\
+d_i&=\|p_i-\Pi_S(p_i)\|_2,\qquad
+d_{\max}=\max_{i\in\mathcal O_{\mathrm{active}}}d_i.
+\end{aligned}
+$$
+
+`clamp`로 얻은 수평 최근접점과 지지면 높이를 사용하므로 위·아래·수평 방향 이탈을 같은 단위와
+기하로 평가한다. 예를 들어 수평24mm·높이18mm 이탈은 거리30mm다. 예전 세 bool의 OR가
+아니며 기존의 world OBB6cm낙하·완전XY분리2cm/.05초·양의높이3cm/.1초와 의미가 달라진다.
+중심이 판 안에 있고 collider가 지지된 정상 평면 밀기·yaw pivot은0이며, Blocker도 제외하지 않는다.
+대표점은 실제 질량중심이나 접촉 지지다각형이 아니므로 역학적 안정성·실제 접촉력의 증명으로
+해석하지 않는다. 판 위에 누운 물체도 거리0일 수 있어80°/.2초 tilt조건은 유지한다.
+
+보상은 가장 큰 활성 물체 거리에서 다음 하나의 exp비용을 만든다.
+
+$$
+r_{\mathrm{object\_stability}}
+=2\left[\exp\left(-\frac{\ln2}{(0.01\,\mathrm m)^2}
+\max(d_{\max}-0.01\,\mathrm m,0)^2\right)-1\right].
+$$
+
+| 거리 | weight 포함 step 비용 |
+|---|---:|
+| 0–1cm | 0 |
+| 1.5cm | −0.318207 |
+| 2cm | −1 |
+| 3cm | −1.875 |
+
+거리≥3cm가 **같은 물체에서.1초 연속** 지속되면 `object_support_lost`다. `>=` 경계를 포함하며
+100Hz에서는10sample이다. 물체별 GPU카운터는 회복·비활성화 시0으로 만들고, 부분reset은 선택
+환경만 초기화한다. 서로 다른 물체의 교대 들림을 누적하지 않는다. inactive padding은 제외한다.
+현재 지지점·pose·지원 catalog와cachedCUDAgraph를 재사용하며 센서나 매step CPU조회는 추가하지 않는다.
+
+완료의 작업판XY잔류·signed gap−5~5mm·모든활성물체저속·.5초유지는 유지한다. 진행 Clearance도
+기존의더엄격한즉시gate를 유지하므로 실패 유예 중 양의 Clearance를 계속 지급하지 않는다.
+음의 Clearance와 다른 비용은 gate하지 않는다. Distance와 Hold의최대합1.25는 남지만 지지거리
+3cm에서 새비용−1.875가 발생한다. 이것이 모든 조작의 총return 우선순위나 경고 구간을 건너뛰는
+동작의 충돌 방지를 보장하지는 않는다. 위험 비용의 초기 weight2는 이후 실제 조작으로 검토한다.
+
+### F/T reward의 실제 통합
+
+기존 센서중심frame·자중/관성보상·양의norm증가·10N/s와.5N·m/s deadband를 유지한다.
+하중 감소나 norm이 같은 축방향 변화에는 새 비용을 주지 않는다. 기존 단위별 계수도 재사용한다.
+
+$$
+\begin{aligned}
+x_F&=\left[\frac{[\|F_t\|_2-\|F_{t-1}\|_2]_+}{\Delta t}-10\right]_+^2,\\
+x_T&=\left[\frac{[\|\tau_t\|_2-\|\tau_{t-1}\|_2]_+}{\Delta t}-0.5\right]_+^2,\\
+a_F&=\frac{\ln2}{90^2},\qquad a_T=\frac{\ln2}{4.5^2},\\
+x_W&=\left\|\begin{bmatrix}\sqrt{a_F/2}\sqrt{x_F}\\
+\sqrt{a_T/2}\sqrt{x_T}\end{bmatrix}\right\|_2^2
+=\frac{a_Fx_F+a_Tx_T}{2},\\
+r_W&=0.30\bigl(\exp(-x_W)-1\bigr).
+\end{aligned}
+$$
+
+이는 두 기존 reward를 합치는 것이 아니라 **보정된 증가량norm 하나의 exp**다. 힘 증가와 토크
+감소가 상쇄되지 않고, 단위가 다른 값을 보정 없이 더하지 않는다. 작은 비용의기울기는
+`0.30/2=.15`로 기존각.15를유지하며 총 비용하한−.30도 같지만, 중간영역의 곡선은 다르다.
+한채널만 기존 half점이면 이전−.075→새−.087868, 두채널모두half점이면−.15로 같다.
+하나의 채널만 매우 커도 결합 비용은−.30까지 접근해 기존 해당채널 하한−.15와 다르다.
+`Episode_Reward/motion_wrench_growth`로 기록하고 힘·토크 증가량 자체는 진단으로 유지한다.
+
+### 실제 제거 목록
+
+| 제거 항목 | 대체 또는 남기는 정보 |
+|---|---|
+| `object_drop`, `object_ejected`, `object_off_support` 종료term·reason | `object_support_lost` 단일 거리 조건 |
+| 별도 ejection/off-support 카운터 | 하나의 물체별 support-loss 카운터 |
+| `motion_force_increase`, `motion_torque_increase` reward adapter | `motion_wrench_growth` 단일norm·단일exp |
+| 비활성 `time_penalty` reward·매step 시간exp 계산 | timeout은 native truncation으로 유지; 새시간비용 없음 |
+| 비활성 `hard_load_or_overrange` 종료reason·hard하중비교 | SI-200-8 raw범위초과·보정센서진단 유지; 숨은 성공gate 없음 |
+| `failure_penalty` legacy field | 실패bonus0은 그대로 유지 |
+
+제거할 불필요한 cfg10개는 `ejection_gap`, `ejection_duration`, `off_support_gap`,
+`off_support_duration`, `drop_tolerance`, `force_hard`, `torque_hard`, `time_penalty_scale`,
+`time_penalty_growth_rate`, `failure_penalty`다. 새 지지 거리·duration·soft 곡선 설정으로 필요한
+값만 선언한다. 기존 물체·선반R, action-rate·velocity, singularity는 제거하지 않는다.
+
+### 구현·검증 범위
+
+기존 `mdp/events.py`, `rewards.py`, `terminations.py`와 native환경cfg에서 연결하고 새production
+파일·물리센서·환경subclass를 추가하지 않는다. RewardManager의weight/dt어댑터, 실패우선·
+성공+100한번·부분reset·rawgoal진단을유지한다. Reward/termination 이름이 바뀌므로 새run의
+항목별 곡선과 과거 force/torque·세support실패 로그를 같은정의로직접비교하지않는다.
+네트워크·action계약은바뀌지않지만 이전checkpoint를이어학습하면MDP보상/종료변경실험으로기록한다.
+
+### 검증 결과와 한계
+
+- CPU MDP는 225개 중 16개 제외, learning은 62개 중 2개 제외로 실패가 없었다. 검사 범위는 거리의
+  수평·상하·대각선·경계 포함, 작은 lift/pivot·물체별 timer·inactive padding·선택행 reset,
+  실패우선·.5초성공·+100한번·F/T exp의국소기울기를포함한다. 수평24mm와높이24mm가
+  **각각3cm미만이어도 결합거리33.94mm로실패하는 반례**를 통과해 기존개별조건의OR가아님을확인했다.
+- RTX3090 CUDA에서1,024환경×10물체×6transition의 CPU/GPU판정일치·hotpath host read부재,
+  변경입력에대한CUDAgraph재생·2cm비용−1·inactiveNaN제외를통과했다. 기존CUDA회귀4개도
+  실패·skip없이통과했다. 이는tensor·state검사이며 Kit/PhysX/PPO검사는아니다.
+- 실제Kit/PhysX1,024환경에서64holdstep의관측·보상finite,성공/실패상호배타성, native reward10개·
+  termination7개를확인했다. 지지거리2cm의weight포함비용−1, 결합wrench수식의native dt/weight,
+  success설정.5초/+100, 선택행0·1023의부분reset지역성을확인했다. 이hold실행에서완료episode는0으로
+  **실제성공조작을재현한검사가아니며 성공률을측정하지않았다.** +100의조건부1회지급은tensor회귀로검사했다.
+- 초기10종asset의signed지지gap은모두0,hold후범위−.182~1.711mm였으며 진행·완료의물리유효성
+  mask는모두true였다. 이는정지장면오판정검사이며목표달성이나성공률100%를뜻하지않는다.
+- 지지helper평균은**.4226ms/step**,고정hold의전체환경step은**38.889ms**,32step환산은
+  **1.244초**였다. policy추론·PPO update·새scene경계reset을제외한측정이며,이번변경전과의
+  통제된baseline비교는수행하지않았다. 따라서이수치로속도개선율이나전체iteration시간을주장하지않는다.
+
+F/T quality의reset초기값은1로두어센서의첫완료sample전에는결합비용0을유지한다.
+새장기학습의성공률개선·동적밀기/전도성능·관통해소를입증한변경으로표현하지않는다.
+검사원본과재현스크립트는
+[unified_mdp_20261021](../outputs/contact_manipulation/unified_mdp_20261021/VALIDATION.md)에둔다.
+
+## 37. 2026-10-21 — 반복되는 Value loss 폭증의 의미와 최초 이상치 검토
+
+사용자는 학습 초반의 상호작용이 후반에는 사라지고 보상도 감소하는 현상을 반복해서 관찰했다.
+이번 범위는 `Loss/value`의 정확한 의미와 최신 로그·저장 checkpoint를 통한 원인 범위 축소다.
+**Production 코드·reward·termination·모델·PPO 설정을 변경하거나 새 학습을 실행하지 않았다.**
+TensorBoard 분석은2026-10-21 13:07 UTC에 확보한 scalar까지이며, 최신 실행은
+`2026-10-21_19-59-36`, 마지막 scalar는2230회다. Checkpoint 검토는2200회까지다.
+
+### 로그의 Value loss가 계산하는 것
+
+1,024환경×32step÷4minibatch=8,192이므로 현재 `ContactManipulationPPO.update()`는
+설정한 microbatch 한도8,192 이내에서 설치된 RSL-RL5.0.1의 native `PPO.update()`를 호출한다.
+Critic은 공개244D 관측을 받는 독립 공식 MLP `244→256→128→64→1`이고, ELU·입력 정규화OFF·
+선형 출력이다. Actor와 파라미터를 공유하지 않는다.
+
+Critic의 예측 V는 그 관측에서 앞으로 받을 할인 누적 보상의 추정이다. Loss는 보상의 크기 자체가
+아니라 추정 V와 학습 목표 return 사이의 제곱 오차다. 실제 clipped value loss는 다음과 같다.
+
+$$
+\begin{aligned}
+\bar V_\theta(o)&=V_{\mathrm{old}}(o)+
+\operatorname{clip}\bigl(V_\theta(o)-V_{\mathrm{old}}(o),-0.2,0.2\bigr),\\
+L_V&=\mathbb E\left[\max\left\{
+\bigl(V_\theta(o)-\hat R^\lambda\bigr)^2,
+\bigl(\bar V_\theta(o)-\hat R^\lambda\bigr)^2\right\}\right].
+\end{aligned}
+$$
+
+`Loss/value`는 이 값을4epochs×4minibatch에 걸쳐 평균한 것으로 **value_loss_coef=.25를
+곱하기 전**이다. 최종 objective는 surrogate+.25×value−.01×entropy다. `.2 clipping`은
+이전 V에서의 변화에 대한 loss branch를 만드는 것이며 V의 절댓값이나 loss의 상한이 아니다.
+Actor와 Critic에 각각 적용하는 gradient norm.5도 forward 값·target·loss의 크기를 제한하지
+않는다. Native clipping은 nonfinite gradient에 즉시 예외를 내도록 설정돼 있지 않다.
+
+목표는 완전히 관측된 미래 reward의 단순 합이 아니라 Critic을 재사용한 GAE return이다.
+
+$$
+\begin{aligned}
+\delta_t&=r_t+\gamma(1-d_t)V_{\mathrm{old}}(o_{t+1})-V_{\mathrm{old}}(o_t),\\
+\hat A_t&=\delta_t+\gamma\lambda(1-d_t)\hat A_{t+1},\\
+\hat R_t^\lambda&=\hat A_t+V_{\mathrm{old}}(o_t).
+\end{aligned}
+$$
+
+γ=.99, λ=.95, rollout은32step이며 마지막 관측의 Critic V를 bootstrap에 사용한다.
+Timeout에서는 reset 전 관측의γV를 stored reward에 추가한 뒤 done으로 재귀를 끊는다.
+진짜 termination과 timeout이 동시에면 termination을 우선하며 native timeout의 이중 가산은
+제거한다. 현재 코드 읽기에서는 reset 관측을 최종 관측으로 잘못 사용하는 alias 오류는 찾지
+못했다. Advantage만 표준화하고 reward·return·Value는 표준화하지 않는다.
+
+따라서 reward가 정상 범위라도 잘못된 V가 bootstrap target으로 들어가면 target도 비정상적으로
+커질 수 있다. 현재 수식의 정상 finite 상태에서 dense reward의 느슨한 범위는
+약−6.43~3.78/step이고 성공+100은1회다. 800step·γ=.99에서 실제 환경 할인 return의 느슨한
+범위는 약−642.65~477.73이다. 이 범위는 **정상 task reward의 return**에 대한 것이며,
+오류가 있는 Critic으로 계산한 GAE target을 제한하지 않는다.
+
+### 최신 실행의 시간 순서
+
+| Iteration | Loss/value |
+|---:|---:|
+| 284 | 42.49 |
+| 285 | 4.276×10¹¹ |
+| 286 | 9.899×10¹¹ |
+| 287 | 39.10 |
+| 631 | 189.21 |
+| 632 | 1.231×10¹⁴ |
+| 633 | 180.22 |
+| 2228 | 6.855×10²⁸ |
+| 2229 | inf |
+| 2230 | nan |
+
+첫285회의 제곱 오차를 RMS로 환산하면 약653,932지만, 모든 환경의 V가 이 크기라는 뜻은 아니다.
+특정 환경·transition의 큰 오차 몇 개도 평균 제곱 오차를 지배할 수 있다. 처음부터 Critic 전체가
+지속해서 거대한 출력을 내는 형태보다는 **일부 batch의 극단값이 간헐적으로 나타나는 형태**다.
+
+| 구간 | Loss 중앙값 | Loss>10⁶인 iteration 수 |
+|---|---:|---:|
+| 0–284 | 73.68 | 0/285 |
+| 285–499 | 86.18 | 2/215 |
+| 500–999 | 124.25 | 30/500 |
+| 1000–1499 | 187.05 | 136/500 |
+| 1500–1999 | 1.427×10¹⁴ | 460/500 |
+| 2000–2228 | 3.013×10¹⁷ | 227/229 |
+
+285회 당시 평균 episode return은6.42, Gaussian 평균std는.496이다. 당시 이미 거대한 reward나
+폭증한std가 확인된 것은 아니다. Mean reward는 최근 완료episode 통계라 단일 outlier reward를
+배제하는 증거는 아니지만, 위의 수식상 bounded reward와 함께 보면 정상 보상 scale만으로
+이 loss를 설명할 수 없다. Value loss의 첫 nonfinite는2229회이고 invalid_state snapshot의
+첫 nonzero는2230회다. Invalid 종료가 finite한 큰 값의 선행 검출을 보장하지 않음을 보여준다.
+
+| 지표의 구간 평균 | 0–49회 | 2000–2199회 |
+|---|---:|---:|
+| Train/mean_reward | 112.84 | −29.15 |
+| Episode_Reward/clearance | 11.06 | .328 |
+| Episode_Reward/blocker_contact_hold | .0231 | .000085 |
+| Policy/mean_std | .315 | 56.79 |
+
+최종2230회의std는82.55다. 이는 학습 Gaussian의 분산 지표이며 deterministic play의 출력이나
+EEF 속도가 아니다. 보상·접촉 감소와 함께 탐색 분산이 매우 커져 있으므로 조용한 비접촉 정책으로
+안정 수렴했다고 해석하지 않는다. 로그상의 선후관계만으로 loss가 행동 붕괴를 일방적으로
+일으켰다고 확정하지도 않는다.
+
+다른 독립 Critic 실행에서도 첫 Loss>10⁶는 `11-09-26`221회2.028×10¹⁰,
+`13-33-02`403회1.827×10¹¹, `15-33-47`222회1.520×10¹⁶,
+`18-20-44`257회2.154×10¹⁵로 반복됐다. 실행 간 reward/종료 설정은 다르므로 재발성의
+증거이며 하나의 원인을 분리한 통제 실험은 아니다.
+
+### Checkpoint로 확인한 것과 확인하지 못한 것
+
+최신250→300회 저장 Critic의 최대 절댓값 weight는.211→.215, 첫 layer norm은11.41→11.44,
+출력 layer norm은.821→.794다. 검토한2200회까지의 Actor·Critic·Adam state는 모두finite다.
+따라서 첫285회 spike를 저장 가중치 자체의 거대한 폭발로 설명하는 근거는 없다. 50회 간격의
+저장값이므로 그 사이의 일시적 상태까지 정상이라고 증명하는 것은 아니다.
+
+실제 rollout이 아닌 합성 정상 범위 입력1,024개에 대한 최대|V|는250회45.49, 300회34.19,
+1500회41.40, 2000회2,926, 2200회9,125다. 후반의 critic drift는 이 probe에서도 보이지만
+합성 관측을 실제 학습 분포나 당시 target의 재현으로 취급하지 않는다.
+
+확인한 입력 경로는 joint_vel/2와 raw previous_action18에 큰 finite 값을 제한하거나
+통계적으로 정규화하는 처리가 없다는 점이다. Current·previous 두 sample 모두에 들어간다.
+F/T는SI범위로 나눈 뒤±5 clamp하지만, 다른 모든 입력도 같은 범위로 제한되는 것은 아니다.
+model250에서 합성 joint velocity 열만10⁶배 키우면 최대|V|≈2.27×10⁶, action 이력 열만
+키우면≈1.09×10⁶가 된다. 정상 규모 weights로도 입력 이상치가 큰 V를 만드는 기작의 확인이지
+당시 그런 입력이 있었다는 증거는 아니다.
+
+반대로 정상 물리 입력을 고정하고 raw action 이력만500step 되먹임한 합성 검사에서는 최신
+checkpoint들의 자가 지수 폭발을 재현하지 못했다. 따라서 action history만을 단독 원인으로
+확정하지 않는다. Checkpoint에 실제 obs·V·return target·rollout buffer가 없어 최초 이상치가
+관절 상태, raw action, 다른 관측, bootstrap target 중 어디서 시작됐는지는 미확정이다.
+
+### Actor와의 연결과 다음 진단 기준
+
+Actor와 Critic은 독립 파라미터·각각의 gradient clipping을 사용한다. 큰 value loss가 Actor의
+gradient에 직접 더해지거나 Actor의 clipping 한도를 빼앗는 구조는 아니다. 다만 위 GAE의
+잘못된 V가 advantage에 섞여 **실제 return이 감소해도 잘못된 행동을 강화**할 수 있다.
+큰 outlier가 advantage 표준편차를 지배하면 대부분 정상 transition의 학습 신호가 약해질 수도
+있다. 단순한 일정 offset·scale 오류는 차분/정규화로 일부 상쇄되므로 모든 큰 loss가 반드시
+이 결과를 일으킨다고 단정하지 않는다. Advantage 신호가 약해지면 entropy.01의 분산 증가
+유도가 상대적으로 남을 가능성도 있으나, 현재 자료만으로 실제 기여 비율은 정할 수 없다.
+
+관측 aliasing과 초기 vision만의 부분관측은 return 예측 난도를 높이지만, bounded reward의
+10²⁰ loss를 그 이유만으로 정당화하지 않는다. 우선 최초 spike에서 다음을 함께 보존해야 한다.
+
+1. 환경 reward와 timeout bootstrap 추가 후 stored reward를 구분한 범위.
+2. V_old, V_new, 마지막/timeout V, GAE target, raw advantage/TD error의 p99·최댓값·상위 환경.
+3. 해당 환경의 관측 group별 크기, action mean/std/sample, q/qdot, 종료·reset 여부.
+4. Actor/Critic별 clip 전 gradient norm, nonfinite 여부, KL과 advantage 정규화 표준편차.
+
+이는 다음 구현의 진단 기준이며 이번 분석에서 추가한 runtime logging은 아니다. Reward weight나
+모델 크기를 바꾸기 전에 reward scale 효과와 입력/target 수치 이상을 구분한다.
+Native Episode_Reward는 누적 기여/고정8초, Train/mean_reward는 최근 완료episode 통계다.
+종료 snapshot은 신규episode 실패 비율이 아니며 Task_Count도 logger의32step 평균으로 기록돼
+차분을 정확한 정수 episode 수로 표현하지 않는다.
+
+원본·재현 스크립트는
+[value_loss_review_20261021](../outputs/contact_manipulation/value_loss_review_20261021/)에 둔다.
+주요 그림은 [value_loss_timeline.png](../outputs/contact_manipulation/value_loss_review_20261021/value_loss_timeline.png),
+수치 근거는 `timeline.json`, `derived_findings.json`, `checkpoint_diagnostics.json`,
+`older_native_critic_comparison.json`이다. 학습 성능이나 최초 실패 장면의 실제 재현을 수행한 분석은 아니다.
 
 ## 부록: 본 학습 여부가 확인되지 않은 실행
 

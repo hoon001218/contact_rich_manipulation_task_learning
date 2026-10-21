@@ -1,11 +1,11 @@
-"""Jointly trained initial-scene graph and finite sensor-history policy.
+"""Initial-scene graph and finite sensor-history actor.
 
 This module deliberately has no Isaac Sim imports. The observation contains
 initial camera geometry, with target and blocker in reserved slots 0 and 1,
 and the current/previous robot and sensor samples. Callers derive masks from
 that observation before passing observation and masks separately to the model.
 Masks control padding, sensor filtering, and role selection; they are not learned features.
-Both actor and critic use the same observable information.
+The independent native MLP critic is configured in the runner settings.
 """
 
 from __future__ import annotations
@@ -249,7 +249,7 @@ class SceneGraphEncoder(nn.Module):
 
 
 class ContactManipulationPolicy(nn.Module):
-    """Gaussian 18D actor and a critic sharing the scene encoder and final MLP."""
+    """Gaussian 18D actor with the scene encoder and final MLP."""
 
     def __init__(self, cfg: ModelCfg | None = None):
         super().__init__()
@@ -261,7 +261,6 @@ class ContactManipulationPolicy(nn.Module):
             nn.Linear(2 * self.cfg.latent_dim, self.cfg.latent_dim), nn.ReLU(),
         )
         self.actor = nn.Linear(self.cfg.latent_dim, self.cfg.action_dim)
-        self.critic = nn.Linear(self.cfg.latent_dim, 1)
         self.distribution = GaussianDistribution(
             self.cfg.action_dim, init_std=self.cfg.initial_std, std_type="log",
         )
@@ -297,26 +296,21 @@ class ContactManipulationPolicy(nn.Module):
         history = torch.where(masks.history_valid.reshape(-1, self.cfg.history_steps, 1), history, 0)
         return self.fusion(torch.cat((scene, history.flatten(1)), dim=-1)).reshape(*leading, self.cfg.latent_dim)
 
-    def forward(self, observation: Tensor, *, masks: PolicyMasks) -> tuple[Tensor, Tensor]:
-        latent = self.encode(observation, masks=masks)
-        return self.actor(latent), self.critic(latent).squeeze(-1)
+    def forward(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
+        return self.actor(self.encode(observation, masks=masks))
 
-    def value(self, observation: Tensor, *, masks: PolicyMasks) -> Tensor:
-        # Standalone final-state/bootstrap queries only need the critic head.
-        return self.critic(self.encode(observation, masks=masks)).squeeze(-1)
-
-    def act(self, observation: Tensor, deterministic: bool = False, *, masks: PolicyMasks) -> tuple[Tensor, Tensor, Tensor]:
-        mean, value = self.forward(observation, masks=masks)
+    def act(self, observation: Tensor, deterministic: bool = False, *, masks: PolicyMasks) -> tuple[Tensor, Tensor]:
+        mean = self.forward(observation, masks=masks)
         self.distribution.update(mean)
         actions = self.distribution.deterministic_output(mean) if deterministic else self.distribution.sample()
-        return actions, self.distribution.log_prob(actions), value
+        return actions, self.distribution.log_prob(actions)
 
     def evaluate_actions(
         self, observation: Tensor, actions: Tensor, *, masks: PolicyMasks,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        mean, value = self.forward(observation, masks=masks)
+    ) -> tuple[Tensor, Tensor]:
+        mean = self.forward(observation, masks=masks)
         if actions.shape != mean.shape:
             raise ValueError(f"Actions must have shape {tuple(mean.shape)}, got {tuple(actions.shape)}.")
         self.distribution.update(mean)
-        return self.distribution.log_prob(actions), self.distribution.entropy, value
+        return self.distribution.log_prob(actions), self.distribution.entropy
 

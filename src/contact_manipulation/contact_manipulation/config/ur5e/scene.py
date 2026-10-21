@@ -1726,6 +1726,81 @@ def _shelf_rules(cache: UsdGeom.BBoxCache, shelf: Usd.Prim, origin: Point3, rule
     )
 
 
+def _object_support_vertices(body, colliders, upright):
+    """Cache authored collider support points in the canonical upright frame.
+
+    Minima of a linear plane-distance function occur on the convex hull, so
+    discarding interior mesh vertices is exact even for concave authored
+    meshes. This inspects authored shapes, not PhysX's cooked contacts. Curved
+    native primitives are tessellated with a conservative metric error bound.
+    Every operation here runs once per asset at scene initialization.
+    """
+    from scipy.spatial import ConvexHull, QhullError
+    import trimesh
+
+    xforms = UsdGeom.XformCache(Usd.TimeCode.Default())
+    world = _gf_column(xforms.GetLocalToWorldTransform(body))
+    rigid = np.eye(4)
+    rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
+    world_to_body = np.linalg.inv(rigid)
+    canonical = _rotation_wxyz(upright)
+    shapes = {}
+    shape_types = (UsdGeom.Mesh, UsdGeom.Cube, UsdGeom.Sphere, UsdGeom.Cylinder, UsdGeom.Capsule)
+    for collider in colliders:
+        for prim in Usd.PrimRange(collider, Usd.TraverseInstanceProxies()):
+            if (any(prim.IsA(kind) for kind in shape_types)
+                    and not (prim.HasAPI(UsdPhysics.CollisionAPI)
+                             and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is False)):
+                shapes[str(prim.GetPath())] = prim
+    vertices, error = [], 0.0
+    for prim in shapes.values():
+        approximation = 0.0
+        if prim.IsA(UsdGeom.Mesh):
+            points = np.asarray(UsdGeom.Mesh(prim).GetPointsAttr().Get(), dtype=np.float64)
+        elif prim.IsA(UsdGeom.Cube):
+            half = .5 * float(UsdGeom.Cube(prim).GetSizeAttr().Get())
+            points = np.asarray(list(product((-half, half), repeat=3)))
+        elif prim.IsA(UsdGeom.Sphere):
+            radius = float(UsdGeom.Sphere(prim).GetRadiusAttr().Get())
+            sphere = trimesh.creation.icosphere(subdivisions=3, radius=radius)
+            points = np.asarray(sphere.vertices)
+            # The inscribed polyhedron contains this concentric inner sphere.
+            face_distance = np.abs((sphere.face_normals * sphere.triangles[:, 0]).sum(-1))
+            approximation = max(0.0, radius - float(face_distance.min()))
+        else:
+            capsule = prim.IsA(UsdGeom.Capsule)
+            cfg = UsdGeom.Capsule(prim) if capsule else UsdGeom.Cylinder(prim)
+            radius, height = float(cfg.GetRadiusAttr().Get()), float(cfg.GetHeightAttr().Get())
+            shape = (trimesh.creation.capsule(radius=radius, height=height, count=[32, 64]) if capsule
+                     else trimesh.creation.cylinder(radius=radius, height=height, sections=64))
+            points = np.asarray(shape.vertices)
+            axis = cfg.GetAxisAttr().Get()
+            if axis == "X":
+                points = points[:, [2, 1, 0]]
+            elif axis == "Y":
+                points = points[:, [0, 2, 1]]
+            # Capsule's polar grid has at least 16 segments per semicircle;
+            # this deliberately bounds both polar and azimuthal chord errors.
+            approximation = radius * (1.0 - math.cos(math.pi / (16 if capsule else 64)))
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points) or not np.isfinite(points).all():
+            raise ValueError(f"Collider has missing/nonfinite support vertices: {prim.GetPath()}")
+        transform = world_to_body @ _gf_column(xforms.GetLocalToWorldTransform(prim))
+        points = points @ transform[:3, :3].T + transform[:3, 3]
+        vertices.append(points @ canonical.T)
+        error = max(error, approximation * float(np.linalg.norm(transform[:3, :3], ord=2)))
+    if not vertices:
+        raise ValueError(f"No supported collider geometry under {body.GetPath()}")
+    points = np.unique(np.concatenate(vertices), axis=0)
+    if len(points) >= 4:
+        try:
+            points = points[ConvexHull(points).vertices]
+        except QhullError:
+            # Flat/linear shapes still have well-defined plane support; retain
+            # their finite unique points instead of perturbing the geometry.
+            pass
+    return tuple(map(tuple, points.tolist())), error
+
+
 def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRules]:
     """Inspect env_0 body bounds and shelf collisions after the scene has spawned.
 
@@ -1777,10 +1852,13 @@ def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRule
         try:
             bounds = _range_bounds(cache.ComputeUntransformedBound(body))
             lower, upper = _upright_bounds(bounds, spec.upright_quat, _body_stretch(body))
+            support_vertices, support_error = _object_support_vertices(body, colliders, spec.upright_quat)
         except ValueError as error:
             raise RuntimeError(f"Cannot inspect object geometry for {spec.name}: {error}") from error
-        measured[spec.asset_name] = (lower, upper)
-    geometries = tuple(ObjectGeometry(spec.name, *measured[spec.asset_name], asset_name=spec.asset_name)
+        measured[spec.asset_name] = (lower, upper, support_vertices, support_error)
+    geometries = tuple(ObjectGeometry(spec.name, *measured[spec.asset_name][:2], asset_name=spec.asset_name,
+                                     support_vertices=measured[spec.asset_name][2],
+                                     support_error=measured[spec.asset_name][3])
                        for spec in OBJECT_SPECS)
 
     shelf_path = _environment_zero_path(env, env.scene.cfg.shelf.prim_path)

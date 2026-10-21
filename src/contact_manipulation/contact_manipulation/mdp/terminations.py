@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 
-__all__ = ["FAILURE_REASON_NAMES", "task_conditions", "terminal_transition", "scene_time_out", "success", "failure"]
+__all__ = ["FAILURE_REASON_NAMES", "ObjectSupportValidity", "object_support_validity", "task_conditions",
+           "terminal_transition", "scene_time_out", "success", "failure"]
 
 
 # Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
 FAILURE_REASON_NAMES = (
-    "object_drop", "object_tilt", "hard_load_or_overrange", "shelf_displacement", "invalid_state", "singularity",
+    "object_support_lost", "object_tilt", "shelf_displacement", "invalid_state", "singularity",
 )
 _FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
 
@@ -39,13 +41,103 @@ def scene_time_out(env):
     return expired
 
 
-def terminal_transition(success_candidate, failure, stable_count, paid, cfg, *, success_enabled=True):
-    """Report success independently and pay its bonus once; all other cases pay zero."""
-    successful = success_candidate & (stable_count >= cfg.stable_steps)
+def terminal_transition(success_candidate, failure, stable_count, paid, cfg, *, success_enabled=True, step_dt=0.01):
+    """Confirm a settled success for the configured duration; enabled failure wins."""
+    if not math.isfinite(step_dt) or step_dt <= 0:
+        raise ValueError("step_dt must be finite and positive.")
+    stable_steps = max(1, math.ceil(cfg.success_duration / step_dt - 1.e-9))
+    successful = success_candidate & (stable_count >= stable_steps) & ~failure
     completed = successful & success_enabled
     payment = torch.where(completed, cfg.success_reward, 0.0)
     payment = torch.where(paid, 0.0, payment)
     return successful, payment, paid | completed | failure
+
+
+class ObjectSupportValidity(NamedTuple):
+    """Shared geometric gates and debounced per-object failure state, all on device."""
+
+    progress_valid: torch.Tensor
+    completion_valid: torch.Tensor
+    support_loss_count: torch.Tensor
+    lost: torch.Tensor
+    support_distance: torch.Tensor
+
+
+def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, active, upright_z,
+                            support_bounds, support_height, support_loss_count,
+                            step_dt, support_bottom=None):
+    """Evaluate shelf retention without imposing a velocity gate on progress.
+
+    Geometry is already expressed in the *current* shelf link frame. Bounds are
+    the measured work panel's [xmin,xmax,ymin,ymax], not the full shelf OBB.
+    ``support_bottom`` may provide the exact collision geometry minimum in that
+    frame; the conservative OBB minimum is the fallback. A signed lower bound
+    rejects below-panel penetration rather than treating every negative gap as
+    supported. None of these geometric checks proves a contact force exists.
+
+    The support representative is (OBB center x/y, collision geometry bottom).
+    Its Euclidean distance to the finite panel rectangle provides ONE support
+    loss measure for lifting, falling, and leaving the panel. These events are
+    not separately thresholded and OR-ed. Tipping remains an independent check:
+    a tipped object can still touch the panel at zero support distance.
+
+    All object predicates, including finite checks and timers, ignore inactive
+    slots. Only final completion requires settled objects. Failure timers belong
+    to individual objects, so alternating transients do not accumulate together.
+    """
+    if (center_shelf.ndim != 3 or center_shelf.shape[-1] != 3
+            or corners_shelf.shape != (*center_shelf.shape[:-1], 8, 3)
+            or velocity.shape != (*center_shelf.shape[:-1], 6)
+            or active.shape != center_shelf.shape[:-1] or upright_z.shape != active.shape):
+        raise ValueError("Shelf-frame object geometry, velocity, and masks must have matching dimensions.")
+    if support_loss_count.shape != active.shape or support_loss_count.dtype != torch.long:
+        raise ValueError("Support failure counts must have one int64 entry per environment/object.")
+    if not math.isfinite(step_dt) or step_dt <= 0:
+        raise ValueError("step_dt must be finite and positive.")
+    bounds = torch.as_tensor(support_bounds, device=center_shelf.device, dtype=center_shelf.dtype)
+    height = torch.as_tensor(support_height, device=center_shelf.device, dtype=center_shelf.dtype)
+    if bounds.shape not in ((4,), (center_shelf.shape[0], 4)):
+        raise ValueError("Support bounds must have shape (4,) or (environments, 4).")
+    if height.ndim > 1 or (height.ndim == 1 and height.shape[0] != center_shelf.shape[0]):
+        raise ValueError("Support height must be a scalar or one value per environment.")
+    lower = corners_shelf.amin(-2)
+    upper = corners_shelf.amax(-2)
+    bottom = lower[..., 2] if support_bottom is None else support_bottom
+    if bottom.shape != active.shape:
+        raise ValueError("Support bottom must contain one value per environment/object.")
+    floor = height[..., None] if height.ndim else height
+    signed_gap = bottom - floor
+    # Strided views avoid an implicit CPU index tensor/copy under CUDA capture.
+    bound_lo, bound_hi = bounds[..., 0::2].unsqueeze(-2), bounds[..., 1::2].unsqueeze(-2)
+    valid_metadata = (torch.isfinite(bounds).all(-1) & (bounds[..., 1] > bounds[..., 0])
+                      & (bounds[..., 3] > bounds[..., 2]) & torch.isfinite(height))
+    finite = (torch.isfinite(center_shelf).all(-1) & torch.isfinite(corners_shelf).all((-2, -1))
+              & torch.isfinite(velocity).all(-1) & torch.isfinite(upright_z) & torch.isfinite(bottom))
+    xy_lo, xy_hi = lower[..., :2], upper[..., :2]
+    centered = ((center_shelf[..., :2] >= bound_lo) & (center_shelf[..., :2] <= bound_hi)).all(-1)
+    overlaps = ((xy_hi >= bound_lo) & (xy_lo <= bound_hi)).all(-1)
+    upright = upright_z > math.cos(cfg.max_tilt) + 4 * torch.finfo(center_shelf.dtype).eps
+    above_lower_limit = signed_gap >= -cfg.support_penetration_tolerance
+    progress_object = (finite & centered & overlaps & upright & above_lower_limit
+                       & (signed_gap <= cfg.progress_support_gap))
+    contained = ((xy_lo >= bound_lo - cfg.success_xy_tolerance)
+                 & (xy_hi <= bound_hi + cfg.success_xy_tolerance)).all(-1)
+    settled = ((velocity[..., :3].square().sum(-1) <= cfg.stable_linear_velocity ** 2)
+               & (velocity[..., 3:].square().sum(-1) <= cfg.stable_angular_velocity ** 2))
+    complete_object = (finite & contained & upright & above_lower_limit & settled
+                       & (signed_gap <= cfg.success_support_gap))
+
+    closest_xy = torch.maximum(torch.minimum(center_shelf[..., :2], bound_hi), bound_lo)
+    distance = torch.sqrt((center_shelf[..., :2] - closest_xy).square().sum(-1) + signed_gap.square())
+    distance = torch.where(active, torch.where(finite, distance, math.inf), 0.)
+    unsupported = (distance >= cfg.support_loss_distance) & active & finite
+    support_steps = max(1, math.ceil(cfg.support_loss_duration / step_dt - 1.e-9))
+    next_loss = torch.where(unsupported, (support_loss_count + 1).clamp_max(support_steps), 0)
+    return ObjectSupportValidity(
+        (progress_object | ~active).all(-1) & valid_metadata,
+        (complete_object | ~active).all(-1) & valid_metadata,
+        next_loss, (next_loss >= support_steps).any(-1), distance,
+    )
 
 
 def configured_terminations(cfg, *, device):
@@ -78,26 +170,31 @@ def configured_terminations(cfg, *, device):
 def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
                     initial_center, initial_rotation, blocker_overlap, sensor_wrench,
                     stable_count, tilt_count, step_dt, workspace_bounds, shelf_top, ceiling,
-                    sensor_range_exceeded=None, shelf_pose=None, initial_shelf_pose=None, state_valid=None,
-                    failure_mask=None, singularity=None):
+                    shelf_pose=None, initial_shelf_pose=None, state_valid=None,
+                    failure_mask=None, singularity=None, support_validity=None, raw_goal_out=None):
     """Evaluate a full parallel batch without reading tensors back to Python.
 
     Object tensors have shapes (N, O, 3), (N, O, 8, 3), (N, O, 4), and
     (N, O, 6); quaternions are scalar-first relative to each object's upright
     pose. Geometry and initial geometry use the fixed environment frame.
-    Workspace/ceiling metadata is retained for callers but is not a failure gate.
+    Native callers provide cached ``support_validity`` computed in the current
+    shelf frame. Standalone callers fall back to these fixed-frame corners and
+    workspace bounds; they must supply a persistent helper result to debounce
+    support loss across samples. Ceiling is retained as reset metadata.
     Shelf height may be a scalar or (N,) tensor. ``target`` and
     ``active`` are boolean object masks. ``blocker_overlap`` is the designated
     blocker's overlap area with the target approach region, in square meters.
-    Task success requires only a protected Target and cleared Blocker, held for
-    ``stable_steps`` samples. Object velocity, other objects, and failure causes
-    do not gate that task predicate. Native enabled failures remain separate.
+    Task success requires a protected Target, cleared Blocker, supported and
+    retained settled active objects, and no enabled failure. The terminal
+    transition confirms that predicate for ``success_duration`` seconds.
 
     ``tilt_count`` tracks consecutive tipped samples separately for each object;
     recovering upright or becoming inactive clears only that object's count.
     Return success candidate, updated stability/tilt counts, failure reasons, failure.
     Reason columns follow ``FAILURE_REASON_NAMES``; ``failure_mask`` selects only
     enabled native causes for aggregate failure without erasing diagnostics.
+    ``raw_goal_out`` optionally receives the protected-target/cleared-blocker
+    predicate before completion validity, so diagnostics do not recompute poses.
     Inactive slots never trigger a failure, even
     when padded with NaN. state_valid optionally incorporates robot, tactile, or
     other integration-specific finite checks supplied by the environment.
@@ -139,19 +236,12 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     protected = ((target_active.sum(-1) == 1)
                  & (within_target_tolerance | ~target_active).all(-1))
 
-    bottom = corners[..., 2].amin(-1)
-    # Expand only tensor dimensions. Scalars naturally broadcast without a device copy.
-    floor = shelf_top[..., None] if isinstance(shelf_top, torch.Tensor) and shelf_top.ndim else shelf_top
     up_z = 1.0 - 2.0 * rotation[..., 1:3].square().sum(-1) / rotation_norm.square().clamp_min(1.0e-12)
     # Inclusive angular boundary, allowing only floating-point round-off at 80 degrees.
     tilted = (up_z <= math.cos(cfg.max_tilt) + 4 * torch.finfo(rotation.dtype).eps) & active & valid_objects
     tilt_steps = max(1, math.ceil(cfg.tilt_duration / step_dt - 1.e-9))
     next_tilt_count = torch.where(tilted, (tilt_count + 1).clamp_max(tilt_steps), 0)
-    hard = ((torch.linalg.vector_norm(sensor_wrench[..., :3], dim=-1) > cfg.force_hard)
-            | (torch.linalg.vector_norm(sensor_wrench[..., 3:], dim=-1) > cfg.torque_hard))
-    if sensor_range_exceeded is not None:
-        hard = hard | sensor_range_exceeded.any(-1) if sensor_range_exceeded.ndim == 2 else hard | sensor_range_exceeded
-    displaced = torch.zeros_like(hard)
+    displaced = torch.zeros_like(invalid)
     if shelf_pose is not None or initial_shelf_pose is not None:
         if (shelf_pose is None or initial_shelf_pose is None
                 or shelf_pose.shape != (center.shape[0], 7) or initial_shelf_pose.shape != shelf_pose.shape):
@@ -164,23 +254,34 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
         cosine = ((q * q0).sum(-1).abs() / (norm * norm0).clamp_min(1.e-12)).clamp(0., 1.)
         displaced = ((shelf_pose[:, :3] - initial_shelf_pose[:, :3]).square().sum(-1)
                      > cfg.shelf_translation_tolerance ** 2) | (cosine < math.cos(cfg.shelf_rotation_tolerance / 2))
-    singular = torch.zeros_like(hard)
+    singular = torch.zeros_like(invalid)
     if singularity is not None:
         if singularity.shape != blocker_overlap.shape:
             raise ValueError("Singularity margin must contain one value per environment.")
         singular = ~torch.isfinite(singularity) | (singularity <= cfg.singularity_termination_threshold)
-    reasons = torch.stack((((bottom < floor - cfg.drop_tolerance) & active).any(-1),
-                           (next_tilt_count >= tilt_steps).any(-1),
-                           hard, displaced, invalid, singular), -1)
+    if support_validity is None:
+        support_validity = object_support_validity(
+            cfg, center_shelf=center, corners_shelf=corners, velocity=velocity, active=active,
+            upright_z=up_z, support_bounds=workspace_bounds, support_height=shelf_top,
+            support_loss_count=torch.zeros_like(tilt_count),
+            step_dt=step_dt,
+        )
+    reasons = torch.stack((support_validity.lost, (next_tilt_count >= tilt_steps).any(-1),
+                           displaced, invalid, singular), -1)
     failed = (reasons if failure_mask is None else reasons & failure_mask).any(-1)
-    candidate = ((blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area)
-                 & protected)
+    raw_goal = (blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area) & protected
+    if raw_goal_out is not None:
+        if raw_goal_out.shape != blocker_overlap.shape or raw_goal_out.dtype != torch.bool:
+            raise ValueError("Raw-goal output must have one boolean entry per environment.")
+        raw_goal_out.copy_(raw_goal)
+    candidate = (raw_goal & support_validity.completion_valid & ~invalid & ~failed
+                 & ~tilted.any(-1))
     next_stable_count = torch.where(candidate, stable_count + 1, 0)
     return candidate, next_stable_count, next_tilt_count, reasons, failed
 
 
 def success(env):
-    """Native TerminationTerm: sustained blocker clearance with a protected target."""
+    """Native TerminationTerm: a sustained, settled valid shelf rearrangement."""
     from .events import get_task_state
 
     return get_task_state(env).success

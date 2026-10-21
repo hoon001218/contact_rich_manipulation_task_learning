@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 from rsl_rl.algorithms import PPO
+from rsl_rl.models import MLPModel
 from rsl_rl.modules import GaussianDistribution
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
@@ -196,9 +197,9 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.model.act(self.observation)
         with self.assertRaises(TypeError):
-            self.model.value(self.observation)
-        with self.assertRaises(TypeError):
             self.model.evaluate_actions(self.observation, torch.zeros(3, 18))
+        self.assertFalse(hasattr(self.model, "critic"))
+        self.assertFalse(hasattr(self.model, "value"))
         masks = self.masks()
         with self.assertRaisesRegex(ValueError, "Boolean tensors"):
             self.model(self.observation, masks=replace(masks, object_valid=masks.object_valid.float()))
@@ -221,12 +222,11 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(node_inputs[0], expected_geometry)
         torch.testing.assert_close(history_inputs[0][:, -144:], expected_history.flatten(1))
 
-    def test_distractor_slot_permutation_preserves_policy_and_value(self):
+    def test_distractor_slot_permutation_preserves_policy(self):
         perm = torch.tensor([0, 1, 4, 2, 3])
         geometry, history = self.model._split(self.observation)
         reordered = pack(geometry[:, perm], history)
-        for first, second in zip(self.forward(self.observation), self.forward(reordered)):
-            torch.testing.assert_close(first, second, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(self.forward(self.observation), self.forward(reordered), atol=1e-6, rtol=1e-5)
 
     def test_swapping_reserved_slots_changes_target_blocker_semantics(self):
         geometry, history = self.model._split(self.observation)
@@ -234,7 +234,7 @@ class ModelTests(unittest.TestCase):
         original_masks, swapped_masks = self.masks(), self.masks(swapped)
         torch.testing.assert_close(original_masks.roles, swapped_masks.roles)
         first, second = self.forward(self.observation), self.forward(swapped)
-        self.assertGreater(float((first[1] - second[1]).abs().max()), 1e-6)
+        self.assertGreater(float((first - second).abs().max()), 1e-6)
 
     def test_graph_permutation_is_invariant_when_geometry_and_selectors_move_together(self):
         geometry, _ = self.model._split(self.observation)
@@ -250,17 +250,16 @@ class ModelTests(unittest.TestCase):
         geometry = torch.where(masks.object_valid[..., None], geometry, torch.full_like(geometry, float("nan")))
         history = torch.where(masks.history_valid[..., None], history, torch.full_like(history, float("nan")))
         poisoned = pack(geometry, history)
-        for first, second in zip(self.forward(self.observation), self.forward(poisoned)):
-            torch.testing.assert_close(first, second, atol=0, rtol=0)
-            self.assertTrue(torch.isfinite(second).all())
+        actual = self.forward(poisoned)
+        torch.testing.assert_close(self.forward(self.observation), actual, atol=0, rtol=0)
+        self.assertTrue(torch.isfinite(actual).all())
 
     def test_all_padding_is_finite_without_inventing_observed_objects(self):
         padded = torch.full_like(self.observation, float("nan"))
         masks = self.masks(padded)
-        actions, log_probs, values = self.model.act(padded, masks=masks)
+        actions, log_probs = self.model.act(padded, masks=masks)
         self.assertTrue(torch.isfinite(actions).all())
         self.assertTrue(torch.isfinite(log_probs).all())
-        self.assertTrue(torch.isfinite(values).all())
         geometry, _ = self.model._split(padded)
         scene = self.model.scene_encoder(geometry, masks.object_valid, masks.roles)
         torch.testing.assert_close(scene, torch.zeros_like(scene))
@@ -271,13 +270,13 @@ class ModelTests(unittest.TestCase):
         hook = self.model.fusion[0].register_forward_pre_hook(
             lambda _module, args: captured.append(args[0]))
         try:
-            means, values = self.forward(inputs)
+            means = self.forward(inputs)
         finally:
             hook.remove()
         _, history = self.model._split(inputs)
         expected = torch.where(self.masks(inputs).history_valid[..., None], history, 0)
         torch.testing.assert_close(captured[0][:, -144:], expected.flatten(1))
-        (means.square().sum() + values.square().sum()).backward()
+        means.square().sum().backward()
         gradient = inputs.grad[:, -144:].reshape(-1, 2, 72)
         self.assertGreater(float(gradient[0, 0].abs().sum()), 0)
         self.assertGreater(float(gradient[0, 1].abs().sum()), 0)
@@ -294,11 +293,10 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(masks.history_valid[:, 1].any())
         history[:, 1] = float("nan")
         actual = self.forward(pack(geometry, history))
-        for first, second in zip(expected, actual):
-            torch.testing.assert_close(first, second, atol=0, rtol=0)
+        torch.testing.assert_close(expected, actual, atol=0, rtol=0)
         history[:, 0, :12] += 10.0
         changed = self.forward(pack(geometry, history))
-        self.assertGreater(float((expected[1] - changed[1]).abs().max()), 1e-5)
+        self.assertGreater(float((expected - changed).abs().max()), 1e-6)
 
     def test_invalid_tactile_values_are_zeroed_before_projection(self):
         geometry, history = self.model._split(self.observation)
@@ -308,15 +306,14 @@ class ModelTests(unittest.TestCase):
         actual = self.forward(pack(geometry, history))
         history[:, 0, 37] = 0
         no_contact = self.forward(pack(geometry, history))
-        for first, second, third in zip(expected, actual, no_contact):
-            torch.testing.assert_close(first, second, atol=0, rtol=0)
-            torch.testing.assert_close(first, third, atol=0, rtol=0)
+        torch.testing.assert_close(expected, actual, atol=0, rtol=0)
+        torch.testing.assert_close(expected, no_contact, atol=0, rtol=0)
 
     def test_gaussian_actions_match_analytic_log_probability_and_entropy(self):
         masks = self.masks()
-        actions, log_probs, values = self.model.act(self.observation, masks=masks)
-        evaluated, entropy, evaluated_values = self.model.evaluate_actions(self.observation, actions, masks=masks)
-        mean, _ = self.forward(self.observation)
+        actions, log_probs = self.model.act(self.observation, masks=masks)
+        evaluated, entropy = self.model.evaluate_actions(self.observation, actions, masks=masks)
+        mean = self.forward(self.observation)
         std = self.model.distribution.std
         expected_log_probability = -.5 * (
             ((actions - mean) / std).square() + 2 * std.log() + math.log(2 * math.pi)
@@ -325,19 +322,18 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(log_probs, evaluated, atol=2e-5, rtol=1e-5)
         torch.testing.assert_close(evaluated, expected_log_probability)
         torch.testing.assert_close(entropy, expected_entropy)
-        torch.testing.assert_close(values, evaluated_values)
         self.assertTrue(torch.isfinite(entropy).all())
         first = self.model.act(self.observation, deterministic=True, masks=masks)
         second = self.model.act(self.observation, deterministic=True, masks=masks)
         torch.testing.assert_close(first[0], second[0], atol=0, rtol=0)
         torch.testing.assert_close(first[0], mean, atol=0, rtol=0)
 
-    def test_scene_encoder_and_final_mlp_receive_policy_and_value_gradients(self):
+    def test_scene_encoder_attention_and_final_mlp_receive_policy_gradients(self):
         masks = self.masks()
-        actions, _, _ = self.model.act(self.observation, masks=masks)
-        logs, entropy, values = self.model.evaluate_actions(self.observation, actions.detach(), masks=masks)
-        (logs.mean() + 0.01 * entropy.mean() + values.square().mean()).backward()
-        for module in (self.model.scene_encoder, self.model.fusion, self.model.actor, self.model.critic):
+        actions, _ = self.model.act(self.observation, masks=masks)
+        logs, entropy = self.model.evaluate_actions(self.observation, actions.detach(), masks=masks)
+        (logs.mean() + 0.01 * entropy.mean()).backward()
+        for module in (self.model.scene_encoder, self.model.fusion, self.model.actor):
             gradients = [parameter.grad for parameter in module.parameters()]
             self.assertTrue(all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients))
             self.assertGreater(sum(float(gradient.abs().sum()) for gradient in gradients), 0)
@@ -359,16 +355,16 @@ class ModelTests(unittest.TestCase):
             self.model.actor.bias[::2] = 20.0
             self.model.actor.bias[1::2] = -20.0
         masks = self.masks()
-        actions, logs, _ = self.model.act(self.observation, masks=masks)
-        evaluated, entropy, values = self.model.evaluate_actions(self.observation, actions, masks=masks)
+        actions, logs = self.model.act(self.observation, masks=masks)
+        evaluated, entropy = self.model.evaluate_actions(self.observation, actions, masks=masks)
         self.assertTrue((actions[:, ::2] > 1.0).all())
         self.assertTrue((actions[:, 1::2] < -1.0).all())
         torch.testing.assert_close(logs, evaluated, atol=0, rtol=0)
         self.assertTrue(torch.isfinite(entropy).all())
-        deterministic, _, _ = self.model.act(self.observation, deterministic=True, masks=masks)
-        mean, _ = self.forward(self.observation)
+        deterministic, _ = self.model.act(self.observation, deterministic=True, masks=masks)
+        mean = self.forward(self.observation)
         torch.testing.assert_close(deterministic, mean, atol=0, rtol=0)
-        (evaluated.mean() + entropy.mean() + values.mean()).backward()
+        (evaluated.mean() + entropy.mean()).backward()
         self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
                             for parameter in self.model.parameters()))
 
@@ -380,7 +376,7 @@ class ModelTests(unittest.TestCase):
         before = parameter.detach().clone()
         optimizer = torch.optim.SGD(self.model.parameters(), lr=.01)
         actions = torch.zeros(3, self.cfg.action_dim)
-        _, entropy, _ = self.model.evaluate_actions(self.observation, actions, masks=self.masks())
+        _, entropy = self.model.evaluate_actions(self.observation, actions, masks=self.masks())
         (-entropy.mean()).backward()
         torch.testing.assert_close(parameter.grad, -torch.ones_like(parameter))
         optimizer.step()
@@ -390,18 +386,16 @@ class ModelTests(unittest.TestCase):
     def test_arbitrary_leading_batch_dimensions(self):
         repeated = self.observation[None].expand(2, -1, -1)
         masks = self.masks(repeated)
-        actions, logs, values = self.model.act(repeated, masks=masks)
+        actions, logs = self.model.act(repeated, masks=masks)
         self.assertEqual(actions.shape, (2, 3, 18))
         self.assertEqual(logs.shape, (2, 3))
-        self.assertEqual(values.shape, (2, 3))
         self.assertEqual(masks.roles.shape, (2, 3, 5, 2))
 
     def test_single_observation_without_batch_dimension(self):
         single = self.observation[0]
-        actions, log_probability, value = self.model.act(single, masks=self.masks(single))
+        actions, log_probability = self.model.act(single, masks=self.masks(single))
         self.assertEqual(actions.shape, (18,))
         self.assertEqual(log_probability.shape, ())
-        self.assertEqual(value.shape, ())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA fused edge reduction")
     def test_fused_edge_reduction_matches_dense_output_and_backward(self):
@@ -472,8 +466,8 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(scores.grad[~mask], torch.zeros_like(scores.grad[~mask]))
 
     def test_attention_and_both_message_layers_receive_nonzero_gradients(self):
-        values = self.forward(self.observation)[1]
-        values.square().sum().backward()
+        means = self.forward(self.observation)
+        means.square().sum().backward()
         graph = self.model.scene_encoder
         for module in (*graph.messages, graph.role_queries, graph.keys, graph.values):
             self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
@@ -483,11 +477,10 @@ class ModelTests(unittest.TestCase):
     def test_parallel_batch_matches_individual_observations(self):
         inputs = observation(self.cfg, batch=1024)
         with torch.no_grad():
-            actions, values = self.forward(inputs)
+            actions = self.forward(inputs)
             for index in (0, 1, 31, 32, 511, 1023):
-                single_actions, single_value = self.forward(inputs[index])
+                single_actions = self.forward(inputs[index])
                 torch.testing.assert_close(actions[index], single_actions, atol=1e-7, rtol=1e-5)
-                torch.testing.assert_close(values[index], single_value, atol=1e-7, rtol=1e-5)
 
     def test_sampling_and_evaluation_do_not_extract_tensor_scalars(self):
         def forbid(*_args, **_kwargs):
@@ -495,7 +488,7 @@ class ModelTests(unittest.TestCase):
 
         with patch.object(torch.Tensor, "__bool__", forbid), patch.object(torch.Tensor, "item", forbid):
             masks = self.masks()
-            actions, _, _ = self.model.act(self.observation, masks=masks)
+            actions, _ = self.model.act(self.observation, masks=masks)
             self.model.evaluate_actions(self.observation, actions, masks=masks)
 
     def test_research_history_and_action_contract_rejects_incompatible_config(self):
@@ -523,7 +516,8 @@ def runner_config(model_cfg=None, **algorithm_overrides):
         obs_groups={"actor": ["policy"], "critic": ["policy"]},
         actor=dict(class_name=f"{AGENTS}.ppo:NativeContactActor", model_cfg=asdict(model_cfg),
                    max_forward_batch_size=32),
-        critic=dict(class_name=f"{AGENTS}.ppo:NativeContactCritic", max_forward_batch_size=32),
+        critic=dict(class_name="MLPModel", hidden_dims=[256, 128, 64], activation="elu",
+                    obs_normalization=False, distribution_cfg=None),
         algorithm=algorithm, multi_gpu=None,
     )
 
@@ -624,15 +618,20 @@ class NativeLearningTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "model_0.pt").exists())
             self.assertTrue((Path(directory) / "model_1.pt").exists())
 
-    def test_shared_parameters_are_registered_once_in_native_optimizer_and_checkpoint(self):
+    def test_independent_native_critic_has_separate_parameters_and_checkpoint(self):
         algorithm, _ = make_algorithm()
-        self.assertIs(algorithm.actor.policy, algorithm.critic.policy)
+        self.assertIs(type(algorithm.critic), MLPModel)
+        self.assertFalse(hasattr(algorithm.actor.policy, "critic"))
+        self.assertFalse(hasattr(algorithm.actor, "consume_cached_value"))
         self.assertIsInstance(algorithm.actor.policy.distribution, GaussianDistribution)
         self.assertEqual(sum(isinstance(module, GaussianDistribution)
                              for module in algorithm.actor.modules()), 1)
-        self.assertEqual(list(algorithm.critic.parameters()), [])
-        self.assertEqual(algorithm.critic.state_dict(), {})
-        expected = list(algorithm.actor.policy.parameters())
+        actor_parameters = list(algorithm.actor.parameters())
+        critic_parameters = list(algorithm.critic.parameters())
+        self.assertTrue(critic_parameters)
+        self.assertTrue({id(value) for value in actor_parameters}.isdisjoint(
+            id(value) for value in critic_parameters))
+        expected = actor_parameters + critic_parameters
         actual = algorithm.optimizer.param_groups[0]["params"]
         self.assertEqual([id(value) for value in actual], [id(value) for value in expected])
         self.assertEqual(len(actual), len({id(value) for value in actual}))
@@ -642,10 +641,14 @@ class NativeLearningTests(unittest.TestCase):
         self.assertEqual(saved["research_metadata"]["output_distribution"], {
             "class_name": "GaussianDistribution", "std_type": "log", "init_std": .3,
         })
-        self.assertIn("policy.critic.weight", saved["actor_state_dict"])
+        self.assertFalse(any("critic" in name for name in saved["actor_state_dict"]))
         self.assertIn("policy.distribution.log_std_param", saved["actor_state_dict"])
         self.assertNotIn("policy.log_std", saved["actor_state_dict"])
-        self.assertEqual(saved["critic_state_dict"], {})
+        self.assertTrue(saved["critic_state_dict"])
+        self.assertEqual(saved["research_metadata"]["critic_model"], {
+            "class_name": "MLPModel", "hidden_dims": [256, 128, 64], "activation": "elu",
+            "obs_normalization": False, "distribution_cfg": None,
+        })
 
     @staticmethod
     def transition(algorithm, obs, values):
@@ -698,11 +701,12 @@ class NativeLearningTests(unittest.TestCase):
         first, env = make_algorithm(cfg, num_envs=3)
         second, _ = make_algorithm(cfg, num_envs=3)
         second.actor.policy.load_state_dict(first.actor.policy.state_dict())
+        second.critic.load_state_dict(first.critic.state_dict())
         collect(first, env)
         second.storage = deepcopy(first.storage)
         return first, second
 
-    def test_microbatches_preserve_original_adam_steps_losses_and_shared_gradients(self):
+    def test_microbatches_preserve_adam_steps_losses_and_actor_critic_gradients(self):
         full, split = self.paired_algorithms(max_microbatch_size=None)
         split.max_microbatch_size = 4
         torch.manual_seed(92)
@@ -710,12 +714,14 @@ class NativeLearningTests(unittest.TestCase):
             full_metrics = full._update_microbatches()
         torch.manual_seed(92)
         with patch.object(split.optimizer, "step", wraps=split.optimizer.step) as split_steps, \
-             patch.object(split.actor.policy, "evaluate_actions", wraps=split.actor.policy.evaluate_actions) as forwards:
+             patch.object(split.actor, "forward", wraps=split.actor.forward) as forwards:
             split_metrics = split.update()
         self.assertEqual(full_steps.call_count, 4)
         self.assertEqual(split_steps.call_count, 4)
-        self.assertEqual([call.args[0].shape[0] for call in forwards.call_args_list], [4, 2] * 4)
-        for first, second in zip(full.actor.policy.parameters(), split.actor.policy.parameters()):
+        self.assertEqual([call.args[0].batch_size[0] for call in forwards.call_args_list], [4, 2] * 4)
+        full_parameters = list(full.actor.parameters()) + list(full.critic.parameters())
+        split_parameters = list(split.actor.parameters()) + list(split.critic.parameters())
+        for first, second in zip(full_parameters, split_parameters):
             torch.testing.assert_close(first, second, rtol=4e-5, atol=3e-6)
             torch.testing.assert_close(first.grad, second.grad, rtol=4e-4, atol=3e-7)
         for name in full_metrics:
@@ -735,7 +741,7 @@ class NativeLearningTests(unittest.TestCase):
                 self.assertEqual(split.call_count, int(not native_expected))
                 self.assertEqual(result["value"], 1. if native_expected else 2.)
 
-    def test_unsplit_shared_loss_matches_native_ppo_update(self):
+    def test_unsplit_independent_losses_match_native_ppo_update(self):
         extension, native = self.paired_algorithms(max_microbatch_size=None, entropy_coef=.01)
         torch.manual_seed(16)
         extension_metrics = extension._update_microbatches()
@@ -743,10 +749,12 @@ class NativeLearningTests(unittest.TestCase):
         native_metrics = PPO.update(native)
         for name in ("value", "surrogate"):
             self.assertAlmostEqual(extension_metrics[name], native_metrics[name], places=5)
-        for first, second in zip(extension.actor.policy.parameters(), native.actor.policy.parameters()):
+        extension_parameters = list(extension.actor.parameters()) + list(extension.critic.parameters())
+        native_parameters = list(native.actor.parameters()) + list(native.critic.parameters())
+        for first, second in zip(extension_parameters, native_parameters):
             torch.testing.assert_close(first, second, rtol=4e-5, atol=3e-6)
 
-    def test_native_runner_checkpoint_restores_shared_policy_and_optimizer(self):
+    def test_native_runner_checkpoint_restores_actor_critic_and_optimizer(self):
         cfg = runner_config()
         env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -757,8 +765,10 @@ class NativeLearningTests(unittest.TestCase):
             restored = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
             restored.load(checkpoint, map_location="cpu")
             self.assertEqual(restored.current_learning_iteration, 1)
-            self.assertIs(restored.alg.actor.policy, restored.alg.critic.policy)
+            self.assertIs(type(restored.alg.critic), MLPModel)
             for first, second in zip(runner.alg.actor.policy.parameters(), restored.alg.actor.policy.parameters()):
+                torch.testing.assert_close(first, second, rtol=0, atol=0)
+            for first, second in zip(runner.alg.critic.parameters(), restored.alg.critic.parameters()):
                 torch.testing.assert_close(first, second, rtol=0, atol=0)
             self.assertTrue(restored.alg.optimizer.state)
             for first, second in zip(runner.alg.optimizer.state.values(), restored.alg.optimizer.state.values()):
@@ -857,6 +867,27 @@ class NativeLearningTests(unittest.TestCase):
         for name, value in algorithm.actor.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
+    def test_shared_critic_checkpoints_are_rejected_before_loading_any_state(self):
+        algorithm, _ = make_algorithm()
+        shared = algorithm.save()
+        shared["research_metadata"].pop("critic_model", None)
+        shared["research_metadata"].pop("actor_critic_architecture", None)
+        shared["critic_state_dict"] = {}
+        variants = [shared]
+        wrong_critic = algorithm.save()
+        wrong_critic["research_metadata"]["critic_model"]["hidden_dims"] = [64, 64]
+        variants.append(wrong_critic)
+        with patch.object(algorithm.actor, "load_state_dict") as actor_load, \
+             patch.object(algorithm.critic, "load_state_dict") as critic_load, \
+             patch.object(algorithm.optimizer, "load_state_dict") as optimizer_load:
+            for checkpoint in variants:
+                with self.subTest(metadata=checkpoint["research_metadata"]), \
+                     self.assertRaisesRegex(ValueError, "[Cc]ritic architecture"):
+                    algorithm.load(checkpoint)
+            actor_load.assert_not_called()
+            critic_load.assert_not_called()
+            optimizer_load.assert_not_called()
+
     def test_inference_policy_uses_same_observable_input(self):
         cfg = runner_config()
         env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
@@ -868,28 +899,56 @@ class NativeLearningTests(unittest.TestCase):
         with torch.no_grad():
             inputs = env.get_observations()
             actions = policy(inputs)
-            expected, _ = runner.alg.actor.policy(inputs["policy"], masks=build_policy_masks(
+            expected = runner.alg.actor.policy(inputs["policy"], masks=build_policy_masks(
                 inputs["policy"], runner.alg.actor.policy.cfg))
         self.assertEqual(actions.shape, (2, 18))
         self.assertTrue(torch.isfinite(actions).all())
         self.assertTrue((actions > 1.).all())
         torch.testing.assert_close(actions, expected, atol=0, rtol=0)
 
-    def test_native_act_reuses_shared_encoder_under_inference_mode(self):
+    def test_native_act_uses_actor_encoder_once_and_critic_never_calls_it(self):
         algorithm, env = make_algorithm()
         with torch.inference_mode():
             obs = env.get_observations()
-            with patch.object(algorithm.actor.policy, "forward", wraps=algorithm.actor.policy.forward) as forward:
+            with patch.object(algorithm.actor.policy, "forward", wraps=algorithm.actor.policy.forward) as forward, \
+                 patch.object(algorithm.critic, "forward", wraps=algorithm.critic.forward) as critic:
                 algorithm.act(obs)
             self.assertEqual(forward.call_count, 1)
-        # The one-use cache cannot be reused for later calls or changed input.
-        obs = env.get_observations()
-        with torch.no_grad():
-            algorithm.actor(obs)
+            self.assertEqual(critic.call_count, 1)
             obs["policy"].add_(.01)
-            with patch.object(algorithm.actor.policy, "value", wraps=algorithm.actor.policy.value) as value:
-                algorithm.critic(obs)
-            self.assertEqual(value.call_count, 1)
+            with patch.object(algorithm.actor.policy, "forward", side_effect=AssertionError("Critic called actor")):
+                values = algorithm.critic(obs)
+            self.assertEqual(values.shape, (env.num_envs, 1))
+
+    def test_critic_loss_cannot_update_actor_graph_attention_fusion_action_or_std(self):
+        algorithm, env = make_algorithm()
+        obs = env.get_observations()
+        before = {name: value.detach().clone() for name, value in algorithm.actor.named_parameters()}
+        algorithm.optimizer.zero_grad(set_to_none=True)
+        (algorithm.critic(obs) - 100.).square().mean().backward()
+        self.assertTrue(all(value.grad is None for value in algorithm.actor.parameters()))
+        critic_gradients = [value.grad for value in algorithm.critic.parameters()]
+        self.assertTrue(all(value is not None and torch.isfinite(value).all() for value in critic_gradients))
+        self.assertGreater(sum(float(value.abs().sum()) for value in critic_gradients), 0.)
+        algorithm.optimizer.step()
+        for name, value in algorithm.actor.named_parameters():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_actor_loss_cannot_update_critic(self):
+        algorithm, env = make_algorithm()
+        obs = env.get_observations()
+        before = {name: value.detach().clone() for name, value in algorithm.critic.named_parameters()}
+        algorithm.optimizer.zero_grad(set_to_none=True)
+        algorithm.actor(obs)
+        actions = algorithm.actor.output_mean.detach() + .1
+        loss = -algorithm.actor.get_output_log_prob(actions).mean() - .01 * algorithm.actor.output_entropy.mean()
+        loss.backward()
+        self.assertTrue(all(value.grad is None for value in algorithm.critic.parameters()))
+        self.assertGreater(sum(float(value.grad.abs().sum()) for value in algorithm.actor.parameters()
+                               if value.grad is not None), 0.)
+        algorithm.optimizer.step()
+        for name, value in algorithm.critic.named_parameters():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
     def test_compilation_is_optional_on_cpu_and_does_not_register_checkpoint_wrappers(self):
         cfg = runner_config()
@@ -908,23 +967,22 @@ class NativeLearningTests(unittest.TestCase):
         algorithm, env = make_algorithm(num_envs=4)
         actor = algorithm.actor.cuda()
         reference = deepcopy(actor)
+        critic = algorithm.critic.cuda()
         actor.compile_model = True
         obs = env.get_observations().to("cuda")
         keys = list(actor.state_dict())
         with torch.inference_mode():
             expected_actions = reference(obs).clone()
             actions = actor(obs).clone()
-            values = algorithm.critic(obs).clone()
+            values = critic(obs).clone()
             torch.testing.assert_close(actions, expected_actions, rtol=1e-4, atol=2e-6)
-            torch.testing.assert_close(values, reference.policy.value(
-                obs["policy"], masks=build_policy_masks(obs["policy"], actor.cfg)).unsqueeze(-1),
-                rtol=1e-4, atol=2e-6)
+            self.assertTrue(torch.isfinite(values).all())
+            self.assertEqual(values.shape, (4, 1))
         # Native runner alternates inference rollout with gradient-enabled PPO.
         for candidate in (reference, actor):
             candidate.zero_grad(set_to_none=True)
             output = candidate(obs)
-            value = candidate.consume_cached_value(obs)
-            (output.square().mean() + value.square().mean()).backward()
+            output.square().mean().backward()
         for actual, expected in zip(actor.parameters(), reference.parameters()):
             if expected.grad is not None:
                 torch.testing.assert_close(actual.grad, expected.grad, rtol=3e-3, atol=3e-6)
@@ -1050,7 +1108,6 @@ class NativeLearningTests(unittest.TestCase):
         }
         cfg["actor"]["stochastic"] = False
         cfg["critic"]["distribution_cfg"] = None
-        cfg["critic"]["stochastic"] = False
         algorithm, _ = make_algorithm(cfg)
         torch.testing.assert_close(algorithm.actor.policy.distribution.log_std_param.exp(), torch.full((18,), .3))
         cfg["actor"]["distribution_cfg"] = {"class_name": "tanh_gaussian", "init_std": .3}

@@ -1,9 +1,9 @@
-"""Native RSL-RL runner settings for the shared GNN/attention research policy."""
+"""Native RSL-RL settings for the GNN/attention actor and independent MLP critic."""
 
 from dataclasses import asdict
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 from .model import ModelCfg
 
@@ -20,15 +20,6 @@ class ContactActorCfg:
         "class_name": "GaussianDistribution", "std_type": "log", "init_std": ModelCfg().initial_std,
     }
     # Compatibility with Isaac Lab's native RSL-RL configuration migration.
-    stochastic: bool = False
-
-
-@configclass
-class ContactCriticCfg:
-    class_name: str = "contact_manipulation.config.ur5e.agents.ppo:NativeContactCritic"
-    max_forward_batch_size: int = 8192
-    obs_normalization: bool = False
-    distribution_cfg: dict | None = None
     stochastic: bool = False
 
 
@@ -62,5 +53,10 @@ class ContactManipulationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
     clip_actions = None  # Match the min baseline's Gaussian output without an extra action clip.
     actor = ContactActorCfg()
-    critic = ContactCriticCfg()
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[256, 128, 64],
+        activation="elu",
+        obs_normalization=False,
+        distribution_cfg=None,
+    )
     algorithm = ContactPpoAlgorithmCfg()

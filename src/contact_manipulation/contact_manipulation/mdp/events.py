@@ -29,14 +29,16 @@ from .observations import (
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench,
 )
 from .rewards import clearance_quality, corner_path_increment, reward_components, singularity_margin
-from .terminations import FAILURE_REASON_NAMES, configured_terminations, task_conditions, terminal_transition
+from .terminations import (
+    FAILURE_REASON_NAMES, configured_terminations, object_support_validity, task_conditions, terminal_transition,
+)
 
 
 @dataclass
 class MdpCfg:
     max_objects: int = 10
     clearance_decay: float = 1.0
-    rearrangement_decay: float = 2.0
+    rearrangement_decay: float = 20.0
     # The original four Motion scores each have weight 0.15. Near zero cost,
     # 0.15 * 0.004 matches min's native 0.03 penalty weight * 0.02 s dt.
     motion_action_rate_decay: float = 0.004
@@ -44,8 +46,8 @@ class MdpCfg:
     # Geometric warning/hard margins; initial tuning, not certified safety limits.
     # L matches the existing IK angular weighting; s is inverse-Frobenius margin.
     singularity_characteristic_length: float = 0.25
-    motion_singularity_threshold: float = 0.05
-    motion_singularity_decay: float = math.log(2.0) / 0.025**2
+    motion_singularity_threshold: float = 0.07
+    motion_singularity_decay: float = math.log(2.0) / 0.03**2
     singularity_termination_threshold: float = 0.005
     # Initial design: half quality at +100 N/s or +5 N*m/s, respectively.
     # Dead bands cover small sensor changes, not validated task impact limits.
@@ -53,25 +55,29 @@ class MdpCfg:
     motion_torque_rate_decay: float = math.log(2.0) / 4.5**2
     force_rate_deadband: float = 10.0
     torque_rate_deadband: float = 0.5
-    time_penalty_scale: float = 0.02
-    time_penalty_growth_rate: float = 0.7
     # One-time bonus for the enabled success termination.
     # With default a_C=1 and distance/contact support, the baseline-corrected
     # dense upper bound at clearance weight 4 is about 3.778/step;
     # the previous 180 discounted bound must not justify these scales again.
-    success_reward: float = 50.0
-    failure_penalty: float = 0.0  # Legacy serialized field; no failure payment.
+    success_reward: float = 100.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15
-    stable_linear_velocity: float = 0.015
-    stable_angular_velocity: float = 0.10
-    stable_steps: int = 10  # Preserve 0.1 s confirmation at the 100 Hz policy rate.
-    drop_tolerance: float = 0.06
+    stable_linear_velocity: float = 0.05
+    stable_angular_velocity: float = 0.30
+    success_duration: float = 0.50
+    # Geometric proxies, not measured contact forces. Validate with resting
+    # collider geometry; progress permits motion and small recovering pivots.
+    progress_support_gap: float = 0.010
+    success_support_gap: float = 0.005
+    support_penetration_tolerance: float = 0.005
+    success_xy_tolerance: float = 0.005
+    support_warning_distance: float = 0.010
+    support_stability_decay: float = math.log(2.0) / 0.010**2
+    support_loss_distance: float = 0.030
+    support_loss_duration: float = 0.100
     max_tilt: float = math.radians(80.0)
     tilt_duration: float = 0.20
-    force_hard: float = 80.0
-    torque_hard: float = 4.0
     joint_position_scale: float = math.pi
     joint_velocity_scale: float = 2.0
     tactile_threshold: float = 0.01
@@ -81,8 +87,12 @@ class MdpCfg:
     def __post_init__(self):
         if self.max_objects != 10:
             raise ValueError("The agreed observation contract reserves 10 object slots.")
-        if not isinstance(self.stable_steps, int) or self.stable_steps < 1:
-            raise ValueError("stable_steps must be a positive integer.")
+        if min(self.success_duration, self.support_loss_duration) <= 0:
+            raise ValueError("Success and physical-failure durations must be positive.")
+        if not (self.success_support_gap <= self.progress_support_gap < self.support_loss_distance
+                and 0 <= self.support_warning_distance < self.support_loss_distance
+                and self.support_stability_decay > 0):
+            raise ValueError("Support warning/completion ranges must precede the loss threshold.")
         if not 0 < self.max_tilt <= math.pi or self.tilt_duration <= 0:
             raise ValueError("Fall angle must be in (0, pi] and tilt_duration must be positive.")
         if not (self.singularity_characteristic_length > 0
@@ -91,9 +101,8 @@ class MdpCfg:
         for name, value in vars(self).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
-            if (name.endswith("_ref") or name.endswith("_scale") or name == "time_penalty_growth_rate"):
-                if name != "time_penalty_scale" and value <= 0:
-                    raise ValueError(f"{name} must be positive.")
+            if (name.endswith("_ref") or name.endswith("_scale")) and value <= 0:
+                raise ValueError(f"{name} must be positive.")
 
 
 @dataclass
@@ -289,6 +298,63 @@ def object_geometry(pose, local_center, local_corners, upright):
     return center, corners, rotation
 
 
+@wp.kernel(enable_backward=False)
+def _collision_support_minimum(vertices: wp.array3d(dtype=wp.float32), counts: wp.array(dtype=wp.int64),
+                               object_ids: wp.array2d(dtype=wp.int64), normals: wp.array3d(dtype=wp.float32),
+                               centers: wp.array3d(dtype=wp.float32), output: wp.array2d(dtype=wp.float32)):
+    row, obj, lane = wp.tid()
+    asset = int(object_ids[row, obj])
+    minimum = float(wp.inf)
+    if asset >= 0 and asset < counts.shape[0]:
+        normal = wp.vec3(normals[row, obj, 0], normals[row, obj, 1], normals[row, obj, 2])
+        center = wp.vec3(centers[row, obj, 0], centers[row, obj, 1], centers[row, obj, 2])
+        for vertex in range(lane, int(counts[asset]), 128):
+            point = wp.vec3(vertices[asset, vertex, 0], vertices[asset, vertex, 1], vertices[asset, vertex, 2])
+            minimum = wp.min(minimum, wp.dot(point - center, normal))
+    # The last launch dimension is exactly one CUDA block. Lanes read adjacent
+    # vertices and reduce locally; neither an expanded N*O*V tensor nor atomics
+    # are needed, even for the largest catalog collision mesh.
+    tile = wp.tile(minimum)
+    reduced = wp.tile_min(tile)
+    wp.tile_store(output[row], reduced, offset=obj)
+
+
+def collision_support_minimum(vertices_catalog, vertex_counts, object_ids, normals, local_center):
+    """Exact directional collision minima from a shared, unexpanded catalog.
+
+    The CUDA path launches one block per environment/object and skips padded
+    catalog vertices using persistent counts. Only its (N,O) result is allocated
+    per sample. The CPU implementation is an oracle for small standalone tests.
+    """
+    if (vertices_catalog.ndim != 3 or vertices_catalog.shape[-1] != 3
+            or vertex_counts.shape != vertices_catalog.shape[:1]
+            or vertex_counts.dtype != torch.long or object_ids.ndim != 2 or object_ids.dtype != torch.long
+            or normals.shape != (*object_ids.shape, 3) or local_center.shape != normals.shape):
+        raise ValueError("Supply catalog vertices/counts, int64 object IDs, and matching normals/centers.")
+    if any(value.device != normals.device for value in (vertices_catalog, vertex_counts, object_ids, local_center)):
+        raise ValueError("Collision support catalog, IDs, normals, and centers must share a device.")
+    if normals.is_cuda:
+        if (normals.dtype != torch.float32 or vertices_catalog.dtype != torch.float32
+                or local_center.dtype != torch.float32):
+            raise ValueError("The CUDA collision support kernel requires float32 geometry.")
+        wp.init()
+        output = normals.new_empty(object_ids.shape)
+        wp.launch(_collision_support_minimum, dim=(*object_ids.shape, 128), block_dim=128,
+                  inputs=[wp.from_torch(vertices_catalog), wp.from_torch(vertex_counts), wp.from_torch(object_ids),
+                          wp.from_torch(normals), wp.from_torch(local_center), wp.from_torch(output)],
+                  stream=wp.stream_from_torch(torch.cuda.current_stream(normals.device)))
+        return output
+    output = normals.new_full(object_ids.shape, math.inf)
+    for asset in range(vertices_catalog.shape[0]):
+        selected = object_ids == asset
+        count = int(vertex_counts[asset])
+        if count and selected.any():
+            directions = normals[selected]
+            output[selected] = ((vertices_catalog[asset, :count] @ directions.mT).amin(0)
+                                - (local_center[selected] * directions).sum(-1))
+    return output
+
+
 class TaskState:
     """Preallocated batch buffers; geometry is vision-only, physical poses reward-only."""
 
@@ -318,6 +384,12 @@ class TaskState:
         self.shelf_top = zeros(n)
         self.ceiling = zeros(n)
         self.initial_shelf_pose = zeros(n, 7)
+        self.env_origins = zeros(n, 3)
+        self.support_bounds = zeros(n, 4)
+        self.support_height = zeros(n)
+        self.support_vertices = None  # One immutable collision catalog, never cloned per environment.
+        self.support_vertex_counts = None
+        self.support_error = None
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
         self.initial_clearance_quality = zeros(n)
@@ -330,13 +402,24 @@ class TaskState:
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
         self.tilt_count = zeros(n, o, kind=torch.long)
+        self.support_loss_count = zeros(n, o, kind=torch.long)
+        self.support_distance = zeros(n, o)
+        self.clearance_progress_valid = zeros(n, kind=torch.bool)
+        self.completion_valid = zeros(n, kind=torch.bool)
+        self.raw_goal = zeros(n, kind=torch.bool)
+        self.raw_goal_seen = zeros(n, kind=torch.bool)
+        self.unsupported_goal_seen = zeros(n, kind=torch.bool)
+        self.goal_failure_seen = zeros(n, kind=torch.bool)
+        # Cumulative fresh native episode counts, never last-episode snapshots.
+        self.completed_totals = zeros(5, kind=torch.long)
         self.success = zeros(n, kind=torch.bool)
         self.failure = zeros(n, kind=torch.bool)
         self.terminal_paid = zeros(n, kind=torch.bool)
         self.failure_reasons = zeros(n, len(FAILURE_REASON_NAMES), kind=torch.bool)
         self.failure_mask, self.success_enabled = configured_terminations(termination_cfg, device=device)
-        # Clearance, rearrangement, force growth, torque growth, time, terminal.
-        self.components = zeros(n, 6)
+        self.invalid_reason_index = FAILURE_REASON_NAMES.index("invalid_state")
+        # Clearance, rearrangement, coupled F/T growth, terminal.
+        self.components = zeros(n, 4)
         self.wrench_rate_cost = zeros(n, 2)
         self.rearrangement_increment = zeros(n)
         self.blocker_overlap = zeros(n)
@@ -365,6 +448,20 @@ class TaskState:
                             ("shelf_top", shelf_top), ("ceiling", ceiling)):
             getattr(self, name)[ids] = value[rows]
         self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
+        # Rules describe the measured panel in environment coordinates. Store
+        # its rectangle in the shelf link frame, then follow the CURRENT shelf
+        # pose at every transition. Whole-shelf bounds include posts/other tiers.
+        bounds, height = workspace_bounds[rows], shelf_top[rows]
+        panel = torch.stack((
+            torch.stack((bounds[:, 0], bounds[:, 2], height), -1),
+            torch.stack((bounds[:, 0], bounds[:, 3], height), -1),
+            torch.stack((bounds[:, 1], bounds[:, 2], height), -1),
+            torch.stack((bounds[:, 1], bounds[:, 3], height), -1)), -2)
+        panel = quat_apply(quat_conjugate(batch.shelf_pose[rows, None, 3:]),
+                           panel - (batch.shelf_pose[rows, :3] - self.env_origins[ids])[:, None])
+        lo, hi = panel.amin(-2), panel.amax(-2)
+        self.support_bounds[ids] = torch.stack((lo[:, 0], hi[:, 0], lo[:, 1], hi[:, 1]), -1)
+        self.support_height[ids] = panel[..., 2].mean(-1)
         self.shelf_local_corners[ids] = shelf_local_corners[rows]
         # Fixed episode origin at the initial shelf position, world-oriented
         # axes: retain rotation displacement without adding large clone offsets.
@@ -382,6 +479,8 @@ class TaskState:
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:72] = 0
         for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count", "tilt_count",
+                     "support_loss_count", "support_distance", "clearance_progress_valid", "completion_valid", "raw_goal",
+                     "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
                      "success", "failure", "terminal_paid", "failure_reasons", "components",
                      "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
             getattr(self, name)[ids] = 0
@@ -394,6 +493,7 @@ class TaskState:
         self.initial_clearance_quality[ids] = initial_quality
         self.components[ids, 0] = initial_quality
         self.components[ids, 1] = 1.0  # Reset/idle rearrangement has zero penalty.
+        self.components[ids, 2] = 1.0  # No completed load-growth transition at reset.
         # No completed physics sample yet; reset rows start with zero warning cost.
         self.singularity_margin[ids] = self.cfg.motion_singularity_threshold
         self.ready = True
@@ -442,8 +542,8 @@ class TaskState:
         components, costs = reward_components(
             self.cfg, blocked, blocker_area, self.rearrangement_increment,
             batch.sensor_wrench, self.previous_wrench, self.dt,
-            elapsed_time=self.elapsed_time,
         )
+        support = self._support_validity(batch)
         candidate, stable, tilted, reasons, failed = task_conditions(
             self.cfg, center=batch.center, corners=batch.corners, rotation=batch.rotation,
             velocity=batch.velocity, active=self.active, target=self.target,
@@ -452,17 +552,26 @@ class TaskState:
             stable_count=self.stable_count, tilt_count=self.tilt_count, step_dt=self.dt,
             workspace_bounds=self.workspace_bounds,
             shelf_top=self.shelf_top, ceiling=self.ceiling,
-            sensor_range_exceeded=batch.sensor_range_exceeded,
             shelf_pose=batch.shelf_pose, initial_shelf_pose=self.initial_shelf_pose,
             state_valid=batch.state_valid,
             failure_mask=self.failure_mask,
             singularity=singularity,
+            support_validity=support,
+            raw_goal_out=self.raw_goal,
         )
         successful, payment, paid = terminal_transition(
-            candidate, failed, stable, self.terminal_paid, self.cfg, success_enabled=self.success_enabled,
+            candidate, failed, stable, self.terminal_paid, self.cfg, step_dt=self.dt,
+            success_enabled=self.success_enabled,
         )
-        self.components[:, :5] = components
-        self.components[:, 5] = payment
+        self.clearance_progress_valid.copy_(support.progress_valid & ~failed & ~reasons[:, self.invalid_reason_index])
+        self.completion_valid.copy_(support.completion_valid)
+        self.raw_goal_seen.logical_or_(self.raw_goal)
+        self.unsupported_goal_seen.logical_or_(self.raw_goal & ~support.progress_valid)
+        self.goal_failure_seen.logical_or_(self.raw_goal & failed)
+        self.support_loss_count.copy_(support.support_loss_count)
+        self.support_distance.copy_(support.support_distance)
+        self.components[:, :3] = components
+        self.components[:, 3] = payment
         self.wrench_rate_cost.copy_(costs)
         self.stable_count.copy_(stable)
         self.tilt_count.copy_(tilted)
@@ -479,6 +588,59 @@ class TaskState:
         self.elapsed_time.add_(self.dt)
         self.observation = None
         self.last_step = step
+
+    def _support_validity(self, batch):
+        """Replay the fixed geometric task check without small-op CPU dispatch."""
+        if not batch.center.is_cuda or torch.cuda.is_current_stream_capturing():
+            return self._support_tensors(batch)
+        key = (torch.is_inference_mode_enabled(), torch.backends.cuda.matmul.allow_tf32)
+        cache = getattr(self, "_support_graphs", {})
+        values = (batch.center, batch.corners, batch.rotation, batch.velocity, batch.shelf_pose)
+        if key not in cache:
+            with torch.inference_mode(False), torch.cuda.device(batch.center.device):
+                static = tuple(value.clone() for value in values)
+                sample = SimpleNamespace(**dict(zip(("center", "corners", "rotation", "velocity", "shelf_pose"), static)))
+                stream = torch.cuda.Stream(device=batch.center.device)
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(2):
+                        self._support_tensors(sample)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = self._support_tensors(sample)
+            cache[key] = (static, graph, output)
+            self._support_graphs = cache
+        static, graph, output = cache[key]
+        for destination, source in zip(static, values):
+            destination.copy_(source)
+        graph.replay()
+        return output
+
+    def _support_tensors(self, batch):
+        """Current shelf-relative geometry; collision plane minima avoid OBB pivot artifacts."""
+        inverse = quat_conjugate(batch.shelf_pose[:, None, 3:])
+        shelf_origin = batch.shelf_pose[:, :3] - self.env_origins
+        center = quat_apply(inverse, batch.center - shelf_origin[:, None])
+        corners = quat_apply(inverse[:, :, None], batch.corners - shelf_origin[:, None, None])
+        relative = quat_mul(inverse, batch.rotation)
+        normal = relative.new_zeros((*relative.shape[:-1], 3))
+        normal[..., 2] = 1
+        normal = quat_apply(quat_conjugate(relative), normal)
+        bottom = None
+        if self.support_vertices is not None:
+            # Dot cached canonical vertices with the shelf normal expressed in
+            # object axes. No mesh transforms, USD calls or CPU queries per step.
+            minimum = collision_support_minimum(
+                self.support_vertices, self.support_vertex_counts, self.bindings.object_ids,
+                normal, self.bindings.local_center)
+            bottom = center[..., 2] + minimum - self.support_error[self.bindings.object_ids]
+        return object_support_validity(
+            self.cfg, center_shelf=center, corners_shelf=corners, velocity=batch.velocity,
+            active=self.active, upright_z=normal[..., 2], support_bounds=self.support_bounds,
+            support_height=self.support_height, support_bottom=bottom,
+            support_loss_count=self.support_loss_count, step_dt=self.dt,
+        )
 
 
 @dataclass
@@ -507,6 +669,9 @@ class SceneBatch:
     shelf_local_corners: torch.Tensor    # N,8,3; full physical shelf in its link frame
     sensor_body_name: str
     distal_body_names: tuple[str, ...]    # complete hand + distal half-spacer
+    support_vertices: torch.Tensor | None = None  # catalog,V,3 canonical collision hulls
+    support_vertex_mask: torch.Tensor | None = None  # catalog,V, bool
+    support_error: torch.Tensor | None = None  # catalog; primitive approximation bound in meters
 
 
 @dataclass
@@ -558,6 +723,11 @@ def _bind_scene(env, state, scene):
     # PhysX exposes COM inertia in link axes and column-major flattened order.
     inertias = inertias.reshape(env.num_envs, len(distal), 3, 3).transpose(-1, -2).contiguous()
     n, o = env.num_envs, state.cfg.max_objects
+    state.env_origins.copy_(env.scene.env_origins)
+    if scene.support_vertices is not None:
+        state.support_vertices = scene.support_vertices
+        state.support_vertex_counts = scene.support_vertex_mask.sum(-1)
+        state.support_error = scene.support_error
     # These asset properties are fixed in this task. Native COM properties
     # otherwise fetch CPU buffers again at every physics timestamp/reset.
     body_com_local = robot.data.body_com_pos_b.index_select(1, distal_ids).clone()
@@ -615,6 +785,19 @@ def _validate_reset_data(env, scene, ids):
     if not bool(torch.isfinite(shelf_corners).all()
                 & (shelf_corners.amax(-2) > shelf_corners.amin(-2)).all()):
         raise ValueError("Shelf local OBB corners must be finite with positive extents.")
+    if scene.support_vertices is not None:
+        vertices, mask, error = scene.support_vertices, scene.support_vertex_mask, scene.support_error
+        if (vertices.ndim != 3 or vertices.shape[0] != scene.lower.shape[0] or vertices.shape[-1] != 3
+                or vertices.device != device or mask is None or mask.shape != vertices.shape[:-1]
+                or mask.dtype != torch.bool or mask.device != device or error is None
+                or error.shape != scene.lower.shape[:1] or error.device != device):
+            raise ValueError("Collision support catalog requires matching vertices, masks, and error bounds.")
+        if not bool((torch.isfinite(vertices).all(-1) | ~mask).all() & mask.any(-1).all()
+                    & torch.isfinite(error).all() & (error >= 0).all()):
+            raise ValueError("Collision support vertices/errors must be finite with a nonempty hull per asset.")
+        prefix = torch.arange(vertices.shape[1], device=device)[None] < mask.sum(-1)[:, None]
+        if not torch.equal(prefix, mask):
+            raise ValueError("Collision support catalog must pack valid vertices before padding.")
     observed, active_ids = scene.observed_ids[ids], scene.object_ids[ids]
     valid = scene.geometry_valid[ids]
     belongs = ((observed[..., None] == active_ids[:, None, :]) & (active_ids[:, None, :] >= 0)).any(-1)
@@ -828,6 +1011,22 @@ def reset_task(env, env_ids=None):
                 & (initial.tcp_pose_b[:, 3:7].norm(dim=-1) > 1.e-8).all()):
         raise ValueError("Reset robot joint/EEF measurements must be finite with a valid quaternion.")
     expand = lambda value: value.expand(ids.numel(), *value.shape[1:])
+    manager = getattr(env, "termination_manager", None)
+    if state.ready and runtime is not None and manager is not None:
+        # Native termination was evaluated before reset events. Count these
+        # selected completed episodes before their state is cleared. Export GPU
+        # snapshots via the existing pending-metrics/native logger path.
+        ended = manager.dones[ids] & (state.elapsed_time[ids] > 0)
+        state.completed_totals.add_(torch.stack((
+            ended.sum(), (ended & state.success[ids]).sum(),
+            (ended & state.raw_goal_seen[ids]).sum(),
+            (ended & state.unsupported_goal_seen[ids]).sum(),
+            (ended & state.goal_failure_seen[ids]).sum())))
+        names = ("completed", "valid_success", "raw_goal_seen", "unsupported_goal_seen", "goal_and_failure")
+        metrics = dict(getattr(runtime, "pending_reset_metrics", None) or {})
+        metrics.update({f"Task_Count/{name}": value.clone() for name, value in zip(names, state.completed_totals)})
+        metrics["Task_Rate/valid_success"] = state.completed_totals[1] / state.completed_totals[0].clamp_min(1)
+        runtime.pending_reset_metrics = metrics
     state.reset(ids, initial, geometry_b=expand(prepared.geometry), geometry_valid=expand(prepared.valid),
                 active=expand(prepared.active), target=expand(prepared.target), blocker=expand(prepared.blocker),
                 access_region=scene.access_region[ids],
@@ -894,6 +1093,8 @@ class ObjectGeometry:
     lower: tuple[float, float, float]
     upper: tuple[float, float, float]
     asset_name: str | None = None
+    support_vertices: tuple[tuple[float, float, float], ...] = field(default=(), compare=False, repr=False)
+    support_error: float = field(default=0.0, compare=False)
 
 
 @dataclass
@@ -3601,6 +3802,15 @@ def _initialize_episode_reset(env):
     lower = torch.tensor([geometry.lower for geometry in env.spawn_geometries], device=env.device)
     upper = torch.tensor([geometry.upper for geometry in env.spawn_geometries], device=env.device)
     upright = lower.new_tensor([spec.upright_quat for spec in OBJECT_SPECS])
+    vertex_count = max(len(geometry.support_vertices) for geometry in env.spawn_geometries)
+    if vertex_count == 0:
+        raise RuntimeError("Native objects require measured collision support vertices.")
+    support_vertices = lower.new_zeros((len(env.spawn_geometries), vertex_count, 3))
+    support_mask = torch.zeros(support_vertices.shape[:-1], device=env.device, dtype=torch.bool)
+    for index, geometry in enumerate(env.spawn_geometries):
+        count = len(geometry.support_vertices)
+        support_vertices[index, :count] = lower.new_tensor(geometry.support_vertices)
+        support_mask[index, :count] = True
     shelf_lower, shelf_upper = lower.new_tensor(inspect_shelf_bounds(env))
     signs = lower.new_tensor(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
                              (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
@@ -3625,6 +3835,8 @@ def _initialize_episode_reset(env):
         ceiling=lower.new_full((n,), env.spawn_rules.ceiling),
         shelf_local_corners=shelf_corners.expand(n, -1, -1),
         sensor_body_name=FORCE_TORQUE_BODY_NAME, distal_body_names=distal,
+        support_vertices=support_vertices, support_vertex_mask=support_mask,
+        support_error=lower.new_tensor([geometry.support_error for geometry in env.spawn_geometries]),
     )
     objects.parked_mask = torch.ones((n, len(OBJECT_SPECS)), dtype=torch.bool, device=env.device)
     objects.gravity = lower.new_tensor(env.cfg.sim.gravity)
