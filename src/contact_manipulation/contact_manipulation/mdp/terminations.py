@@ -11,7 +11,7 @@ __all__ = ["FAILURE_REASON_NAMES", "task_conditions", "terminal_transition", "sc
 
 # Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
 FAILURE_REASON_NAMES = (
-    "object_drop", "object_tilt", "hard_load_or_overrange", "shelf_displacement", "invalid_state",
+    "object_drop", "object_tilt", "hard_load_or_overrange", "shelf_displacement", "invalid_state", "singularity",
 )
 _FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
 
@@ -40,11 +40,10 @@ def scene_time_out(env):
 
 
 def terminal_transition(success_candidate, failure, stable_count, paid, cfg, *, success_enabled=True):
-    """Report task success independently; active failure takes payment priority."""
+    """Report success independently and pay its bonus once; all other cases pay zero."""
     successful = success_candidate & (stable_count >= cfg.stable_steps)
     completed = successful & success_enabled
-    payment = torch.where(failure, -cfg.failure_penalty,
-                          torch.where(completed, cfg.success_reward, 0.0))
+    payment = torch.where(completed, cfg.success_reward, 0.0)
     payment = torch.where(paid, 0.0, payment)
     return successful, payment, paid | completed | failure
 
@@ -80,7 +79,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
                     initial_center, initial_rotation, blocker_overlap, sensor_wrench,
                     stable_count, tilt_count, step_dt, workspace_bounds, shelf_top, ceiling,
                     sensor_range_exceeded=None, shelf_pose=None, initial_shelf_pose=None, state_valid=None,
-                    failure_mask=None):
+                    failure_mask=None, singularity=None):
     """Evaluate a full parallel batch without reading tensors back to Python.
 
     Object tensors have shapes (N, O, 3), (N, O, 8, 3), (N, O, 4), and
@@ -165,9 +164,14 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
         cosine = ((q * q0).sum(-1).abs() / (norm * norm0).clamp_min(1.e-12)).clamp(0., 1.)
         displaced = ((shelf_pose[:, :3] - initial_shelf_pose[:, :3]).square().sum(-1)
                      > cfg.shelf_translation_tolerance ** 2) | (cosine < math.cos(cfg.shelf_rotation_tolerance / 2))
+    singular = torch.zeros_like(hard)
+    if singularity is not None:
+        if singularity.shape != blocker_overlap.shape:
+            raise ValueError("Singularity margin must contain one value per environment.")
+        singular = ~torch.isfinite(singularity) | (singularity <= cfg.singularity_termination_threshold)
     reasons = torch.stack((((bottom < floor - cfg.drop_tolerance) & active).any(-1),
                            (next_tilt_count >= tilt_steps).any(-1),
-                           hard, displaced, invalid), -1)
+                           hard, displaced, invalid, singular), -1)
     failed = (reasons if failure_mask is None else reasons & failure_mask).any(-1)
     candidate = ((blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area)
                  & protected)
@@ -186,7 +190,7 @@ def failure(env, reason: str | None = None):
     """Read an aggregate failure or one cached cause for native termination logs.
 
     Several causes may be true in the same environment. The termination manager
-    combines them with OR; task state still pays the terminal penalty once.
+    combines them with OR; failure alone does not produce a terminal payment.
     """
     from .events import get_task_state
 

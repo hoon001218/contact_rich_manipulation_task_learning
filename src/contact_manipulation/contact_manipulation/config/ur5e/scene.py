@@ -203,6 +203,47 @@ def validate_hand_urdf_assets(urdf_path: str) -> None:
         )
 
 
+def hand_joint_limits(urdf_path: str) -> tuple[dict[str, tuple[float, float]], dict[str, float]]:
+    """Resolve master position/velocity bounds from the coupled URDF constraints.
+
+    Some master maxima exceed a mimic child's limit. Intersect the constraints
+    once at configuration time; PhysX enforces mimic motion during simulation.
+    """
+    joints = {joint.attrib["name"]: joint for joint in ElementTree.parse(urdf_path).findall("joint")}
+    original = {name: (float(joints[name].find("limit").attrib["lower"]),
+                       float(joints[name].find("limit").attrib["upper"])) for name in HAND_JOINT_NAMES}
+    feasible = {name: list(bounds) for name, bounds in original.items()}
+    velocities = {name: float(joint.find("limit").attrib["velocity"]) for name, joint in joints.items()
+                  if joint.attrib["type"] == "revolute"}
+    for child in joints.values():
+        current, slope, offset, seen = child, 1.0, 0.0, set()
+        while (mimic := current.find("mimic")) is not None:
+            name = current.attrib["name"]
+            if name in seen:
+                raise ValueError(f"Cyclic hand mimic relationship at {name}.")
+            seen.add(name)
+            offset += slope * float(mimic.attrib.get("offset", 0.0))
+            slope *= float(mimic.attrib.get("multiplier", 1.0))
+            current = joints[mimic.attrib["joint"]]
+        master = current.attrib["name"]
+        limit = child.find("limit")
+        if not seen or master not in feasible or limit is None:
+            continue
+        lower, upper = float(limit.attrib["lower"]), float(limit.attrib["upper"])
+        if slope == 0.0:
+            if not lower <= offset <= upper:
+                raise ValueError(f"Hand mimic constant exceeds {child.attrib['name']} limits.")
+            continue
+        velocities[master] = min(velocities[master], velocities[child.attrib["name"]] / abs(slope))
+        lower, upper = sorted(((lower - offset) / slope, (upper - offset) / slope))
+        feasible[master][0] = max(feasible[master][0], lower)
+        feasible[master][1] = min(feasible[master][1], upper)
+    for name, (lower, upper) in feasible.items():
+        if lower > upper:
+            raise ValueError(f"Hand mimic limits have no feasible interval for {name}.")
+    return {name: tuple(bounds) for name, bounds in feasible.items()}, velocities
+
+
 def _world_transform(prim: Usd.Prim) -> Gf.Matrix4d:
     return UsdGeom.XformCache(Usd.TimeCode.Default()).GetLocalToWorldTransform(prim)
 
@@ -374,118 +415,100 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
             prim.SetInstanceable(False)
 
 
-def _tactile_parent_proxies(points: np.ndarray, pads: list[np.ndarray]):
-    """Two low-vertex convexes, with the pad-side piece recessed behind the pads.
+def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> None:
+    """Preserve URDF limits and coupling through native USD/PhysX APIs.
 
-    This is template authoring, never an episode/physics-step operation. Each
-    pad's thin PCA axis defines its face; the sign points away from the parent.
-    Try the four tangent cuts around the first pad and retain the cut with the
-    smallest worst surface half-space error. Mass/inertia are not derived here.
+    This importer expands mimic limits and adds compliant coupling. Restore the
+    coupled master limits and configure native rigid mimic constraints.
+    No joint motion or dependent position targets are computed in Python.
     """
-    from scipy.spatial import ConvexHull, HalfspaceIntersection
+    from omni.physx.bindings import _physx
 
-    points = np.asarray(points, dtype=np.float64)
-    directions = np.array([d for d in product((-1., 0., 1.), repeat=3) if any(d)])
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-    envelope = np.column_stack((directions, -(points @ directions.T).max(axis=0)))
-    faces, tangents = [], None
-    for pad in pads:
-        centered = pad - pad.mean(axis=0)
-        _, axes = np.linalg.eigh(centered.T @ centered / len(pad))
-        normal = axes[:, 0]
-        if normal @ (pad.mean(axis=0) - points.mean(axis=0)) < 0:
-            normal = -normal
-        # Keep the core behind the pad, including its rounded perimeter.
-        faces.append(np.r_[normal, -(pad @ normal).max() + .0012])
-        if tangents is None:
-            tangents = axes[:, 1:].T
-    faces = np.asarray(faces)
-
-    def polyhedron(planes):
-        inside = points[(points @ planes[:, :3].T + planes[:, 3] < -1.e-8).all(axis=1)]
-        if len(inside) < 4:
-            return None
-        vertices = HalfspaceIntersection(planes, inside.mean(axis=0)).intersections
-        hull = ConvexHull(vertices)
-        if len(vertices) > 64:
-            raise RuntimeError('Hand proxy exceeds the native convex vertex budget.')
-        # Consistent outward winding for the authored mesh.
-        triangles = hull.simplices.copy()
-        a, b, c = vertices[triangles[:, 0]], vertices[triangles[:, 1]], vertices[triangles[:, 2]]
-        reverse = (np.cross(b-a, c-a) * hull.equations[:, :3]).sum(axis=1) < 0
-        triangles[reverse] = triangles[reverse][:, [0, 2, 1]]
-        return vertices, triangles
-
-    candidates = []
-    for tangent in tangents:
-        for sign in (-1., 1.):
-            normal = sign * tangent
-            boundary = (pads[0] @ normal).min() - .001
-            cut = np.r_[normal, -boundary]
-            regions = (np.vstack((envelope, cut)), np.vstack((envelope, -cut, faces)))
-            pieces = [polyhedron(region) for region in regions]
-            if any(piece is None for piece in pieces):
-                continue
-            error = np.minimum.reduce([
-                (points @ region[:, :3].T + region[:, 3]).max(axis=1) for region in regions
-            ]).clip(min=0)
-            candidates.append((float(error.max()), pieces))
-    if not candidates:
-        raise RuntimeError('Cannot construct sensor-clear hand collision proxies.')
-    return min(candidates, key=lambda candidate: candidate[0])[1]
+    joints = {prim.GetName(): UsdPhysics.RevoluteJoint(prim)
+              for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.IsA(UsdPhysics.RevoluteJoint)}
+    positions, velocities = hand_joint_limits(urdf_path)
+    for source in ElementTree.parse(urdf_path).findall("joint"):
+        if source.attrib["type"] != "revolute":
+            continue
+        joint = joints[source.attrib["name"]]
+        prim, limits = joint.GetPrim(), source.find("limit").attrib
+        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+        drive.CreateTypeAttr("force")
+        drive.CreateMaxForceAttr(float(limits["effort"]))
+        mimic = source.find("mimic")
+        if mimic is None:
+            lower, upper = positions[source.attrib["name"]]
+            joint.CreateLowerLimitAttr(math.degrees(lower))
+            joint.CreateUpperLimitAttr(math.degrees(upper))
+            PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr(math.degrees(velocities[source.attrib["name"]]))
+            continue
+        # The official importer leaves mimic velocity unconstrained: applying a
+        # second brake fights its coupling. The master cap already incorporates
+        # every dependent URDF velocity limit through hand_joint_limits().
+        # Keep its expanded native position range too: the master interval and
+        # mimic equation imply the original child range without a second stop.
+        apis = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
+        if len(apis) != 1:
+            raise RuntimeError(f"Native URDF importer must preserve one mimic constraint on {prim.GetPath()}.")
+        api = apis[0]
+        api.CreateReferenceJointRel().SetTargets([joints[mimic.attrib["joint"]].GetPath()])
+        api.CreateGearingAttr(-float(mimic.attrib.get("multiplier", 1.0)))
+        api.CreateOffsetAttr(-math.degrees(float(mimic.attrib.get("offset", 0.0))))
+        # Official PhysX constants support this installed pre-schema compliance API.
+        axis = next(schema.split(":", 1)[1] for schema in prim.GetAppliedSchemas()
+                    if schema.startswith("PhysxMimicJointAPI:")).upper()
+        # Native hard coupling matches the URDF relation. Dependent DOFs must
+        # retain the importer's unbraked velocity to avoid redundant constraints.
+        for field, value in (("NATURAL_FREQUENCY", 0.0), ("DAMPING_RATIO", 0.0)):
+            attribute = getattr(_physx, f"MIMIC_JOINT_ATTRIBUTE_NAME_{field}_{axis}")
+            prim.CreateAttribute(attribute, Sdf.ValueTypeNames.Float).Set(value)
 
 
-def _preserve_tactile_parent_slots(stage: Usd.Stage, hand_path: str) -> None:
-    """Replace only five hand parent colliders with two convex pieces each.
+def _configure_hand_collisions(stage: Usd.Stage, hand_path: str) -> None:
+    """Cook the original URDF meshes with native, bounded convex decomposition.
 
-    Keep the 17 tactile bodies, all robot joints, and authored inertial properties.
-    Existing visual meshes are untouched. Native PhysX cooks the small convexes.
+    Only five concave parent meshes need decomposition to expose the tactile
+    pads. All 17 tactile meshes and their rigid bodies remain unchanged.
     """
+    bodies = {prim.GetName(): prim for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path))
+              if prim.HasAPI(UsdPhysics.RigidBodyAPI)}
     parents = ("right_plam_1", *(f"right_{finger}_2" for finger in ("index", "middle", "ring", "little")))
-    bodies = {p.GetName(): p for p in Usd.PrimRange(stage.GetPrimAtPath(hand_path))
-              if p.HasAPI(UsdPhysics.RigidBodyAPI)}
-    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-
-    def collision_points(body, reference):
-        colliders = [p for p in Usd.PrimRange(body) if p.HasAPI(UsdPhysics.CollisionAPI)
-                     and UsdPhysics.CollisionAPI(p).GetCollisionEnabledAttr().Get() is not False]
-        meshes = {str(p.GetPath()): p for collider in colliders for p in Usd.PrimRange(collider)
-                  if p.IsA(UsdGeom.Mesh)}
-        clouds = []
-        for mesh in meshes.values():
-            transform = np.asarray(cache.GetLocalToWorldTransform(mesh) * reference)
-            local = np.asarray(UsdGeom.Mesh(mesh).GetPointsAttr().Get(), dtype=np.float64)
-            clouds.append(local @ transform[:3, :3] + transform[3, :3])
-        if not clouds:
-            raise RuntimeError(f'No collision mesh for hand body {body.GetPath()}.')
-        return np.unique(np.concatenate(clouds), axis=0), colliders
-
+    roots = tuple(f"right_{finger}_1" for finger in ("thumb", "index", "middle", "ring", "little"))
+    housings = ("right_plam_1", "right_plam_2")
+    missing = set((*parents, *roots, *housings, *TACTILE_BODY_NAMES)) - bodies.keys()
+    if missing:
+        raise RuntimeError(f"Hand URDF import is missing required bodies: {sorted(missing)}.")
+    decomposition = sim_utils.ConvexDecompositionPropertiesCfg(
+        max_convex_hulls=4, hull_vertex_limit=64, voxel_resolution=100_000, shrink_wrap=True,
+    )
     for name in parents:
-        body = bodies[name]
-        reference = cache.GetLocalToWorldTransform(body).GetInverse()
-        points, originals = collision_points(body, reference)
-        pad_names = ('right_plam_force_sensor',) if name == 'right_plam_1' else (
-            name.removesuffix('_2') + '_force_sensor_2', name.removesuffix('_2') + '_force_sensor_3')
-        pads = [collision_points(bodies[pad], reference)[0] for pad in pad_names]
-        pieces = _tactile_parent_proxies(points, pads)
-        for collider in originals:
-            if '/collisions/' not in str(collider.GetPath()):
-                raise RuntimeError('Hand proxy replacement requires separate collision and visual subtrees.')
-            collider.SetActive(False)
-        for index, (vertices, triangles) in enumerate(pieces):
-            mesh = UsdGeom.Mesh.Define(stage, body.GetPath().AppendChild(f'TactileParentProxy_{index}'))
-            mesh.CreatePointsAttr([Gf.Vec3f(*p) for p in vertices])
-            mesh.CreateFaceVertexCountsAttr([3] * len(triangles))
-            mesh.CreateFaceVertexIndicesAttr(triangles.ravel().tolist())
-            mesh.CreateSubdivisionSchemeAttr('none')
-            mesh.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
-            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim()).CreateCollisionEnabledAttr(True)
-            sim_utils.define_mesh_collision_properties(str(mesh.GetPath()),
-                sim_utils.ConvexHullPropertiesCfg(hull_vertex_limit=64), stage=stage)
-            sim_utils.modify_collision_properties(str(mesh.GetPath()),
-                sim_utils.CollisionPropertiesCfg(contact_offset=.0005, rest_offset=0.), stage=stage)
-        # Ensure final hand-only collision overrides survive instance sharing.
-        body.CreateAttribute('contactManipulation:handProxy', Sdf.ValueTypeNames.Bool, custom=True).Set(True)
+        cooking = decomposition.copy()
+        if name == "right_plam_1":
+            cooking.max_convex_hulls = 16
+            cooking.voxel_resolution = 500_000
+            cooking.error_percentage = 1.0
+        colliders = [prim for prim in Usd.PrimRange(bodies[name])
+                     if prim.HasAPI(UsdPhysics.CollisionAPI)
+                     and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is not False]
+        meshes = {str(prim.GetPath()): prim for collider in colliders for prim in Usd.PrimRange(collider)
+                  if prim.IsA(UsdGeom.Mesh)}
+        if not meshes:
+            raise RuntimeError(f"Hand URDF body {name} has no collision mesh.")
+        for collider in colliders:
+            # URDF imports author CollisionAPI/MeshCollisionAPI on the STL
+            # container, not its mesh child. Cook that actual collider.
+            sim_utils.define_mesh_collision_properties(str(collider.GetPath()), cooking, stage=stage)
+            sim_utils.modify_collision_properties(
+                str(collider.GetPath()), sim_utils.CollisionPropertiesCfg(contact_offset=.0005, rest_offset=0.), stage=stage,
+            )
+    # Palm housings are fixed siblings of the finger roots under base_link,
+    # so native direct-joint filtering does not cover their mounting overlap.
+    # Exclude only these attached root/housing pairs; other hand self contacts
+    # and every tactile pad/object contact remain enabled.
+    for name in housings:
+        filtered = UsdPhysics.FilteredPairsAPI.Apply(bodies[name]).CreateFilteredPairsRel()
+        for root in roots:
+            filtered.AddTarget(bodies[root].GetPath())
 
 
 @clone
@@ -518,15 +541,16 @@ def spawn_ur5e_hand(
         asset_path=cfg.hand_urdf_path,
         fix_base=False,
         merge_fixed_joints=False,
-        convert_mimic_joints_to_normal_joints=False,
+        # This installed converter forwards the flag to set_parse_mimic().
+        # True preserves the URDF's native PhysX mimic constraints here.
+        convert_mimic_joints_to_normal_joints=True,
         make_instanceable=False,
         self_collision=False,
         collider_type="convex_hull",
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=0.1),
         activate_contact_sensors=True,
-        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-            target_type="position",
-            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=20.0, damping=1.0),
-        ),
+        # Preserve importer mimic drive types; the native actuator sets gains.
+        joint_drive=None,
     )
     hand_cfg.func(hand_path, hand_cfg)
 
@@ -539,7 +563,8 @@ def spawn_ur5e_hand(
         )
 
     _deinstance_subtree(stage, hand_path)
-    _preserve_tactile_parent_slots(stage, hand_path)
+    _configure_hand_joints(stage, hand_path, cfg.hand_urdf_path)
+    _configure_hand_collisions(stage, hand_path)
     tool_frame = _find_named_prim(stage, prim_path, cfg.tool_frame_candidates)
     tool_body = _nearest_rigid_body_ancestor(tool_frame)
     if tool_body.IsInstance():
@@ -582,8 +607,9 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
         max_depenetration_velocity=1.0,
     )
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = sim_utils.ArticulationRootPropertiesCfg(
-        enabled_self_collisions=False,
-        solver_position_iteration_count=16,
+        enabled_self_collisions=True,
+        # Native hand mimic/contact constraints need this convergence budget.
+        solver_position_iteration_count=32,
         solver_velocity_iteration_count=2,
     )
     tool_frame_candidates: tuple[str, ...] = _UR_TOOL_FRAME_CANDIDATES
@@ -663,8 +689,9 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=[".*(thumb|index|middle|ring|little).*"],
-                effort_limit_sim=10.0,
-                velocity_limit_sim=1.0,
+                # Inherit URDF effort and the coupled master velocity bounds.
+                effort_limit_sim=None,
+                velocity_limit_sim=None,
                 stiffness={
                     "(?!(?:" + "|".join(HAND_JOINT_NAMES) + ")$).*(thumb|index|middle|ring|little).*": 0.0,
                     **{name: 20.0 for name in HAND_JOINT_NAMES},
@@ -1602,6 +1629,33 @@ def _environment_zero_path(env: object, path: str) -> str:
     return path.format(ENV_REGEX_NS=env_path).replace(env.scene.env_regex_ns, env_path, 1)
 
 
+def inspect_shelf_bounds(env) -> Bounds:
+    """Measure the complete shelf once in its native rigid-body link frame.
+
+    The native pose omits USD scale, so bake that scale into these local bounds.
+    Call during initialization, then transform cached corners with shelf poses
+    on the environment device; no USD or CPU query is needed while stepping.
+    """
+    body_path = env.scene["shelf"].root_physx_view.prim_paths[0]
+    body = env.scene.stage.GetPrimAtPath(body_path)
+    if not body.IsValid() or not body.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"Shelf rigid body is missing or invalid: {body_path}")
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=False,
+        ignoreVisibility=True,
+    )
+    try:
+        return _upright_bounds(
+            _range_bounds(cache.ComputeUntransformedBound(body)),
+            (1.0, 0.0, 0.0, 0.0),
+            _body_stretch(body),
+        )
+    except ValueError as error:
+        raise RuntimeError(f"Cannot inspect shelf geometry at {body_path}: {error}") from error
+
+
 def _shelf_rules(cache: UsdGeom.BBoxCache, shelf: Usd.Prim, origin: Point3, rules: SpawnRules) -> SpawnRules:
     """Discover support/ceiling panels and clip the support inside vertical posts."""
     collisions: list[Bounds] = []
@@ -1765,10 +1819,16 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
     layer = Sdf.Layer.CreateNew(output_path)
     library = Usd.Stage.Open(layer)
     for index, path in enumerate(bodies):
+        live = stage.GetPrimAtPath(path)
+        filtered_pairs = (UsdPhysics.FilteredPairsAPI(live).GetFilteredPairsRel().GetTargets()
+                          if live.HasAPI(UsdPhysics.FilteredPairsAPI) else [])
         expected_meshes = sum(prim.IsA(UsdGeom.Mesh) for prim in Usd.PrimRange(stage.GetPrimAtPath(path)))
         destination = Sdf.Path(f'/Body_{index}')
         Sdf.CopySpec(flattened, Sdf.Path(path), layer, destination)
         prototype = library.GetPrimAtPath(destination)
+        # Cross-body filters belong to the live articulation, outside this
+        # geometry-only reference's scope. Author them on the editable root.
+        prototype.RemoveProperty('physics:filteredPairs')
         # References cannot target materials outside their referenced subtree.
         # Copy those materials into this prototype and retarget bindings.
         bindings = [(rel, rel.GetTargets()) for prim in Usd.PrimRange(prototype)
@@ -1788,11 +1848,12 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
                 remapped.append(materials[target])
             relationship.SetTargets(remapped)
         # Root bindings/poses remain editable; only descendants form prototypes.
-        live = stage.GetPrimAtPath(path)
         # The baked subtree contains the resolved asset and our collision edits.
         # An older, stronger reference can restore its original offsets or
         # colliders once local descendant edits become instance proxies.
         live.GetReferences().SetReferences([Sdf.Reference(output_path, destination)])
+        if filtered_pairs:
+            UsdPhysics.FilteredPairsAPI.Apply(live).CreateFilteredPairsRel().SetTargets(filtered_pairs)
         live.SetInstanceable(True)
         if not live.IsInstance():
             raise RuntimeError(f'Failed to share geometry below {path}.')

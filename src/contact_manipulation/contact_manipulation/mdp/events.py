@@ -28,7 +28,7 @@ from .observations import (
     dynamic_sample, geometry_in_eef_frame, pack_policy_observation, prepare_initial_geometry,
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench,
 )
-from .rewards import corner_path_increment, reward_components
+from .rewards import clearance_quality, corner_path_increment, reward_components, singularity_margin
 from .terminations import FAILURE_REASON_NAMES, configured_terminations, task_conditions, terminal_transition
 
 
@@ -37,10 +37,16 @@ class MdpCfg:
     max_objects: int = 10
     clearance_decay: float = 1.0
     rearrangement_decay: float = 2.0
-    # With Motion weight 0.6, each score has weight 0.15. Near zero cost,
+    # The original four Motion scores each have weight 0.15. Near zero cost,
     # 0.15 * 0.004 matches min's native 0.03 penalty weight * 0.02 s dt.
     motion_action_rate_decay: float = 0.004
     motion_joint_velocity_decay: float = 0.004
+    # Geometric warning/hard margins; initial tuning, not certified safety limits.
+    # L matches the existing IK angular weighting; s is inverse-Frobenius margin.
+    singularity_characteristic_length: float = 0.25
+    motion_singularity_threshold: float = 0.05
+    motion_singularity_decay: float = math.log(2.0) / 0.025**2
+    singularity_termination_threshold: float = 0.005
     # Initial design: half quality at +100 N/s or +5 N*m/s, respectively.
     # Dead bands cover small sensor changes, not validated task impact limits.
     motion_force_rate_decay: float = math.log(2.0) / 90.0**2
@@ -49,17 +55,18 @@ class MdpCfg:
     torque_rate_deadband: float = 0.5
     time_penalty_scale: float = 0.02
     time_penalty_growth_rate: float = 0.7
-    # Retain the T06-based terminal scales (currently disabled in RewardsCfg).
-    # With distance/contact support enabled, the dense upper bound is 2.37/step;
+    # One-time bonus for the enabled success termination.
+    # With default a_C=1 and distance/contact support, the baseline-corrected
+    # dense upper bound at clearance weight 4 is about 3.778/step;
     # the previous 180 discounted bound must not justify these scales again.
-    success_reward: float = 200.0
-    failure_penalty: float = 50.0
+    success_reward: float = 50.0
+    failure_penalty: float = 0.0  # Legacy serialized field; no failure payment.
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15
     stable_linear_velocity: float = 0.015
     stable_angular_velocity: float = 0.10
-    stable_steps: int = 5
+    stable_steps: int = 10  # Preserve 0.1 s confirmation at the 100 Hz policy rate.
     drop_tolerance: float = 0.06
     max_tilt: float = math.radians(80.0)
     tilt_duration: float = 0.20
@@ -78,6 +85,9 @@ class MdpCfg:
             raise ValueError("stable_steps must be a positive integer.")
         if not 0 < self.max_tilt <= math.pi or self.tilt_duration <= 0:
             raise ValueError("Fall angle must be in (0, pi] and tilt_duration must be positive.")
+        if not (self.singularity_characteristic_length > 0
+                and 0 < self.singularity_termination_threshold < self.motion_singularity_threshold):
+            raise ValueError("Singularity requires a positive length and hard margin below the warning margin.")
         for name, value in vars(self).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
@@ -310,7 +320,10 @@ class TaskState:
         self.initial_shelf_pose = zeros(n, 7)
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
+        self.initial_clearance_quality = zeros(n)
         self.previous_corners = zeros(n, o, 8, 3)
+        self.shelf_local_corners = zeros(n, 8, 3)
+        self.previous_shelf_corners = zeros(n, 8, 3)
         self.previous_wrench = zeros(n, 6)
         self.wrench_bias = zeros(n, 6)
         self.path_length = zeros(n)
@@ -327,10 +340,12 @@ class TaskState:
         self.wrench_rate_cost = zeros(n, 2)
         self.rearrangement_increment = zeros(n)
         self.blocker_overlap = zeros(n)
+        self.singularity_margin = zeros(n)
 
     @torch.no_grad()
     def reset(self, ids, batch, *, geometry_b, geometry_valid, active, target, blocker,
-              access_region, workspace_bounds, shelf_top, ceiling, step, batch_is_selected=False):
+              access_region, workspace_bounds, shelf_top, ceiling, shelf_local_corners,
+              step, batch_is_selected=False):
         """Commit selected rows after physical reset and accepted initial vision.
 
         By default all inputs have a full-environment leading dimension. With
@@ -350,6 +365,12 @@ class TaskState:
                             ("shelf_top", shelf_top), ("ceiling", ceiling)):
             getattr(self, name)[ids] = value[rows]
         self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
+        self.shelf_local_corners[ids] = shelf_local_corners[rows]
+        # Fixed episode origin at the initial shelf position, world-oriented
+        # axes: retain rotation displacement without adding large clone offsets.
+        self.previous_shelf_corners[ids] = quat_apply(
+            batch.shelf_pose[rows, None, 3:], self.shelf_local_corners[ids],
+        )
         self.initial_center[ids] = batch.center[rows]
         self.initial_rotation[ids] = batch.rotation[rows]
         self.previous_corners[ids] = batch.corners[rows]
@@ -364,6 +385,17 @@ class TaskState:
                      "success", "failure", "terminal_paid", "failure_reasons", "components",
                      "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
             getattr(self, name)[ids] = 0
+        # One batched geometry query for reset rows only. The initial reference
+        # stays fixed until those environments start another episode.
+        areas, overlap = projected_areas(batch.corners[rows], blocker[rows] & active[rows], access_region[rows])
+        initial_quality = torch.nan_to_num(
+            clearance_quality(self.cfg, overlap.sum(-1), areas.sum(-1)), nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        self.initial_clearance_quality[ids] = initial_quality
+        self.components[ids, 0] = initial_quality
+        self.components[ids, 1] = 1.0  # Reset/idle rearrangement has zero penalty.
+        # No completed physics sample yet; reset rows start with zero warning cost.
+        self.singularity_margin[ids] = self.cfg.motion_singularity_threshold
         self.ready = True
         # Build a new tensor: extras may still reference the previous episode's
         # final observation. Unreset rows retain exactly the same measurements.
@@ -378,13 +410,19 @@ class TaskState:
         self.last_step = step
 
     @torch.no_grad()
-    def advance(self, batch, step):
+    def advance(self, batch, step, *, singularity=None):
         if step == self.last_step:
             return
         if not self.ready:
             raise RuntimeError("reset_task must run after scene/vision initialization before stepping.")
         if step != self.last_step + 1:
             raise RuntimeError("MDP must be evaluated once every completed control transition.")
+        if singularity is None:
+            self.singularity_margin.fill_(self.cfg.motion_singularity_threshold)
+        else:
+            if singularity.shape != self.singularity_margin.shape:
+                raise ValueError("Singularity margin must contain one value per environment.")
+            self.singularity_margin.copy_(singularity)
         safe_corners = torch.nan_to_num(batch.corners, nan=0.0, posinf=0.0, neginf=0.0)
         # Clearance and its success gate concern only the designated Blocker.
         # Skip polygon clipping for other objects; their path/safety checks remain.
@@ -392,7 +430,10 @@ class TaskState:
         blocked = overlap.sum(-1)
         blocker_area = areas.sum(-1)
         self.blocker_overlap.copy_(blocked)
-        increment = corner_path_increment(self.previous_corners, batch.corners, self.active)
+        shelf_corners = ((batch.shelf_pose[:, :3] - self.initial_shelf_pose[:, :3])[:, None]
+                         + quat_apply(batch.shelf_pose[:, None, 3:], self.shelf_local_corners))
+        increment = (corner_path_increment(self.previous_corners, batch.corners, self.active & ~self.blocker)
+                     + torch.linalg.vector_norm(shelf_corners - self.previous_shelf_corners, dim=-1).mean(-1))
         self.rearrangement_increment.copy_(torch.nan_to_num(increment, nan=0.0, posinf=0.0, neginf=0.0))
         self.path_length.add_(self.rearrangement_increment)
         # Force/torque norms are rotation-invariant. Keep the current sensor
@@ -415,6 +456,7 @@ class TaskState:
             shelf_pose=batch.shelf_pose, initial_shelf_pose=self.initial_shelf_pose,
             state_valid=batch.state_valid,
             failure_mask=self.failure_mask,
+            singularity=singularity,
         )
         successful, payment, paid = terminal_transition(
             candidate, failed, stable, self.terminal_paid, self.cfg, success_enabled=self.success_enabled,
@@ -432,6 +474,7 @@ class TaskState:
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
         self.tcp_pose_b.copy_(torch.nan_to_num(batch.tcp_pose_b, nan=0.0, posinf=0.0, neginf=0.0))
         self.previous_corners.copy_(batch.corners)
+        self.previous_shelf_corners.copy_(shelf_corners)
         self.previous_wrench.copy_(batch.sensor_wrench)
         self.elapsed_time.add_(self.dt)
         self.observation = None
@@ -461,6 +504,7 @@ class SceneBatch:
     workspace_bounds: torch.Tensor       # N,4
     shelf_top: torch.Tensor              # N
     ceiling: torch.Tensor                # N
+    shelf_local_corners: torch.Tensor    # N,8,3; full physical shelf in its link frame
     sensor_body_name: str
     distal_body_names: tuple[str, ...]    # complete hand + distal half-spacer
 
@@ -543,6 +587,7 @@ def _validate_reset_data(env, scene, ids):
         ("geometry_valid", (n, o), torch.bool), ("geometry_b", (n, o, 10), None),
         ("access_region", (n, 4), None), ("workspace_bounds", (n, 4), None),
         ("shelf_top", (n,), None), ("ceiling", (n,), None),
+        ("shelf_local_corners", (n, 8, 3), None),
     ):
         value = getattr(scene, name)
         if value.shape != shape or value.device != device or (dtype is not None and value.dtype != dtype):
@@ -566,6 +611,10 @@ def _validate_reset_data(env, scene, ids):
     if not bool((torch.isfinite(scene.shelf_top[ids]) & torch.isfinite(scene.ceiling[ids])
                  & (scene.shelf_top[ids] < scene.ceiling[ids])).all()):
         raise ValueError("Shelf/ceiling heights must be finite and ordered.")
+    shelf_corners = scene.shelf_local_corners[ids]
+    if not bool(torch.isfinite(shelf_corners).all()
+                & (shelf_corners.amax(-2) > shelf_corners.amin(-2)).all()):
+        raise ValueError("Shelf local OBB corners must be finite with positive extents.")
     observed, active_ids = scene.observed_ids[ids], scene.object_ids[ids]
     valid = scene.geometry_valid[ids]
     belongs = ((observed[..., None] == active_ids[:, None, :]) & (active_ids[:, None, :] >= 0)).any(-1)
@@ -783,7 +832,8 @@ def reset_task(env, env_ids=None):
                 active=expand(prepared.active), target=expand(prepared.target), blocker=expand(prepared.blocker),
                 access_region=scene.access_region[ids],
                 workspace_bounds=scene.workspace_bounds[ids], shelf_top=scene.shelf_top[ids],
-                ceiling=scene.ceiling[ids], step=env.common_step_counter, batch_is_selected=True)
+                ceiling=scene.ceiling[ids], shelf_local_corners=scene.shelf_local_corners[ids],
+                step=env.common_step_counter, batch_is_selected=True)
     if "terminal_observation" in env.extras:
         # Reuse IDs already computed by native auto-reset; the learner can skip
         # timeout value inference without a second GPU nonzero()/scalar read.
@@ -797,7 +847,12 @@ def get_task_state(env):
     if env.common_step_counter != state.last_step:
         if not state.ready:
             raise RuntimeError("reset_task must initialize the scene before stepping.")
-        state.advance(_read_transition(env, state), env.common_step_counter)
+        # The public native property reads the CURRENT post-physics wrist/arm
+        # Jacobian. OSC's private cached buffer belongs to the preceding step.
+        # Shared once here for reward and termination; no matrix is read on CPU.
+        arm = env.action_manager.get_term("arm_action")
+        margin = singularity_margin(arm.jacobian_w, characteristic_length=state.cfg.singularity_characteristic_length)
+        state.advance(_read_transition(env, state), env.common_step_counter, singularity=margin)
         # Native env resets after reward/done. Preserve the final observation
         # here for the learner's timeout bootstrap, before any reset.
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)
@@ -3531,7 +3586,7 @@ def _initialize_episode_reset(env):
     if hasattr(env, "_episode_reset"):
         return env._episode_reset
     from ..config.ur5e.scene import (
-        OBJECT_SPECS, RobotPoseModel, inspect_geometry, FORCE_TORQUE_BODY_NAME,
+        OBJECT_SPECS, RobotPoseModel, inspect_geometry, inspect_shelf_bounds, FORCE_TORQUE_BODY_NAME,
     )
     from .sensors import SensorReader, InitialVisionSensor
 
@@ -3546,6 +3601,10 @@ def _initialize_episode_reset(env):
     lower = torch.tensor([geometry.lower for geometry in env.spawn_geometries], device=env.device)
     upper = torch.tensor([geometry.upper for geometry in env.spawn_geometries], device=env.device)
     upright = lower.new_tensor([spec.upright_quat for spec in OBJECT_SPECS])
+    shelf_lower, shelf_upper = lower.new_tensor(inspect_shelf_bounds(env))
+    signs = lower.new_tensor(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+                             (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
+    shelf_corners = (shelf_lower + shelf_upper) * .5 + (shelf_upper - shelf_lower) * .5 * signs
     link_paths = robot.root_physx_view.link_paths[0]
     distal = tuple(name for name, path in zip(robot.body_names, link_paths)
                    if "/ROASRightHand/" in str(path) or name == FORCE_TORQUE_BODY_NAME)
@@ -3564,6 +3623,7 @@ def _initialize_episode_reset(env):
         workspace_bounds=lower.new_tensor((*env.spawn_rules.x_range, *env.spawn_rules.y_range)).expand(n, -1),
         shelf_top=lower.new_full((n,), env.spawn_rules.shelf_top),
         ceiling=lower.new_full((n,), env.spawn_rules.ceiling),
+        shelf_local_corners=shelf_corners.expand(n, -1, -1),
         sensor_body_name=FORCE_TORQUE_BODY_NAME, distal_body_names=distal,
     )
     objects.parked_mask = torch.ones((n, len(OBJECT_SPECS)), dtype=torch.bool, device=env.device)

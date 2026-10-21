@@ -3,9 +3,9 @@
 The numerical kernels use only PyTorch and do not read simulator state. Every
 argument carries an environment leading dimension; there are no per-environment
 Python loops or device-to-host reads. Native RewardTermCfg weights remain the
-only reward weights. Clearance keeps its exp(-a*x) quality reward; rearrangement
-and motion use exp(-a*x) - 1 penalties. Cached components retain the original
-qualities for task-state diagnostics. The adapters divide discrete payments by
+only reward weights. Clearance pays its exp(-a*x) quality relative to episode
+start; rearrangement and motion use exp(-a*x) - 1 penalties. Cached components
+retain the original qualities for task-state diagnostics. The adapters divide discrete payments by
 dt to cancel the native RewardManager's dt factor; Time retains its exact
 elapsed-time integral.
 """
@@ -17,9 +17,10 @@ import math
 import torch
 
 __all__ = [
-    "corner_path_increment", "reward_components", "clearance", "rearrangement",
+    "corner_path_increment", "clearance_quality", "reward_components", "clearance", "rearrangement",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "motion_action_rate", "motion_joint_velocity", "motion_force_increase", "motion_torque_increase",
+    "singularity_margin", "singularity_penalty", "motion_singularity",
     "time_penalty", "terminal",
 ]
 
@@ -155,7 +156,7 @@ def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, va
 
 
 def corner_path_increment(previous_corners, corners, active):
-    """Sum active objects' mean eight-corner displacement, in meters.
+    """Sum selected objects' mean eight-corner displacement, in meters.
 
     Corners have fixed object-local correspondence and shape (N, O, 8, 3),
     expressed in the fixed environment frame. Translation, rotation, pivoting,
@@ -172,12 +173,20 @@ def corner_path_increment(previous_corners, corners, active):
     return torch.linalg.vector_norm(delta, dim=-1).mean(-1).sum(-1)
 
 
+def clearance_quality(cfg, blocked, blocker_area):
+    """Absolute Blocker overlap quality, shared by reset and completed steps."""
+    ratio = (blocked / blocker_area.clamp_min(1.0e-12)).clamp(0.0, 1.0)
+    return torch.exp(-cfg.clearance_decay * ratio)
+
+
 def reward_components(cfg, blocked, blocker_area, path_increment,
                       wrench, previous_wrench, dt, *, elapsed_time):
     """Return unweighted (clearance, rearrangement, force quality, torque quality, time).
 
-    Clearance evaluates only the designated Blocker. Rearrangement uses this
-    transition's corner path in exp(-a*x), including rotation and return motion.
+    Clearance evaluates only the designated Blocker; its manager adapter
+    subtracts the episode's initial quality. The caller supplies non-Blocker
+    objects' and the shelf's corner path for this transition, including rotation
+    and return motion, to Rearrangement's exp(-a*x).
     Its quality returns to one when objects stop; the manager adapter subtracts
     one so stopped objects have zero penalty and past motion is not charged again.
 
@@ -206,8 +215,7 @@ def reward_components(cfg, blocked, blocker_area, path_increment,
     if wrench.shape != (*batch_shape, 6) or previous_wrench.shape != wrench.shape:
         raise ValueError("Current and previous wrench must contain six components per environment.")
 
-    ratio = (blocked / blocker_area.clamp_min(1.0e-12)).clamp(0.0, 1.0)
-    clear = torch.exp(-cfg.clearance_decay * ratio)
+    clear = clearance_quality(cfg, blocked, blocker_area)
     rearr = torch.exp(-cfg.rearrangement_decay * path_increment.clamp_min(0.0))
 
     force_increase = (torch.linalg.vector_norm(wrench[..., :3], dim=-1)
@@ -247,8 +255,11 @@ def _reward_rate(env, index, *, baseline=0.0):
 
 
 def clearance(env):
-    """Blocker overlap quality as a native manager reward rate."""
-    return _reward_rate(env, 0)
+    """Improvement over episode start; an unchanged scene pays zero."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    return (state.components[:, 0] - state.initial_clearance_quality) / env.step_dt
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
@@ -270,7 +281,7 @@ def blocker_distance(env, decay=math.log(2.0) / 0.10):
 
 
 def rearrangement(env):
-    """Bounded negative exp penalty of this step's object corner displacement."""
+    """This step's non-Blocker object and shelf corner-displacement penalty."""
     return _reward_rate(env, 1, baseline=1.0)
 
 
@@ -306,11 +317,53 @@ def motion_torque_increase(env):
     return _reward_rate(env, 3, baseline=1.0)
 
 
+def singularity_margin(jacobian, *, characteristic_length=0.25):
+    """Conservative weakest-direction margin for a batch of six-axis arm Jacobians.
+
+    Scale linear rows by 1/L so linear/angular entries are dimensionless.
+    L=0.25 m follows the existing IK position/orientation weighting convention.
+    For invertible J_scaled, s=1/||inverse(J_scaled)||_F lies between
+    sigma_min/sqrt(6) and sigma_min; it is NOT the exact minimum singular value.
+    Native inv_ex(check_errors=False) keeps CUDA errors/results on the device,
+    unlike svdvals' host error check. Failed/nonfinite rows conservatively get 0.
+    This diagnostic never changes the OSC Jacobian, inverse, or effort targets.
+    """
+    if jacobian.ndim != 3 or jacobian.shape[-2:] != (6, 6):
+        raise ValueError("Singularity requires six arm joints and a Jacobian shaped [N, 6, 6].")
+    if not math.isfinite(characteristic_length) or characteristic_length <= 0:
+        raise ValueError("Singularity characteristic length must be finite and positive.")
+    scaled = torch.cat((jacobian[:, :3] / characteristic_length, jacobian[:, 3:]), dim=1)
+    valid = torch.isfinite(scaled).all(dim=(-2, -1))
+    identity = torch.eye(6, dtype=jacobian.dtype, device=jacobian.device)
+    inverse, info = torch.linalg.inv_ex(torch.where(valid[:, None, None], scaled, identity), check_errors=False)
+    norm = torch.linalg.vector_norm(inverse, dim=(-2, -1))
+    valid = valid & (info == 0) & torch.isfinite(inverse).all(dim=(-2, -1)) & torch.isfinite(norm) & (norm > 0)
+    return torch.where(valid, norm.reciprocal(), 0.0)
+
+
+def singularity_penalty(margin, *, threshold=0.05, decay=math.log(2.0) / 0.025**2):
+    """Zero above the warning margin; bounded exp-minus-one cost below it."""
+    safe = torch.where(torch.isfinite(margin), margin.clamp_min(0.0), 0.0)
+    cost = (threshold - safe).clamp_min(0.0).square()
+    return torch.exp(-decay * cost) - 1.0
+
+
+def motion_singularity(env):
+    """Read the same post-physics arm margin used by the singularity termination."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    return singularity_penalty(
+        state.singularity_margin, threshold=state.cfg.motion_singularity_threshold,
+        decay=state.cfg.motion_singularity_decay,
+    ) / env.step_dt
+
+
 def time_penalty(env):
     """Integrated elapsed-time penalty converted to a native reward rate."""
     return _reward_rate(env, 4)
 
 
 def terminal(env):
-    """One-time success/failure payment converted to a native reward rate."""
+    """One-time success bonus converted to a native reward rate."""
     return _reward_rate(env, 5)

@@ -72,11 +72,11 @@ class EventCfg:
 class RewardsCfg:
     """Clearance with approach/contact support and bounded exp penalties."""
 
-    clearance = RewardTermCfg(func=mdp.clearance, weight=1.8)
+    clearance = RewardTermCfg(func=mdp.clearance, weight=4.0)
     blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=0.40)
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.01)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.05)
     rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.6)
-    # Four independently logged penalties retain the previous total weight 0.6.
+    # Independent penalties; existing four weights stay unchanged.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
     motion_joint_velocity = RewardTermCfg(
         func=mdp.motion_joint_velocity, weight=0.15,
@@ -87,8 +87,9 @@ class RewardsCfg:
     )
     motion_force_increase = RewardTermCfg(func=mdp.motion_force_increase, weight=0.15)
     motion_torque_increase = RewardTermCfg(func=mdp.motion_torque_increase, weight=0.15)
+    motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.15)
     # time = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
-    # terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
+    terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
 @configclass
@@ -102,6 +103,7 @@ class TerminationsCfg:
     # hard_load_or_overrange = TerminationTermCfg(func=mdp.failure, params={"reason": "hard_load_or_overrange"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
+    singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
 
 
 @configclass
@@ -122,11 +124,11 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     target_asset: str | None = None
     blocker_asset: str | None = None
 
-    decimation: int = 2
+    decimation: int = 1
     episode_length_s: float = 8.0
 
     def __post_init__(self):
-        # Common timing matches Sweeping-Policy: 100 Hz physics / 50 Hz policy.
+        # Policy and physics both run at 100 Hz.
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
         self.sim.physx.bounce_threshold_velocity = 0.05

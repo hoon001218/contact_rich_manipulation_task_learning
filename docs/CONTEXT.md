@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-20, Asia/Seoul**.
+최종 갱신: **2026-10-21, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-10-20
+## 최신 진입점 — 2026-10-21
 
 현재 개발·학습 대상은 **`src/contact_manipulation`**,
 `Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
@@ -18,12 +18,44 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-21 사용자가 보고한 OSC `linalg.inv` 오류는 full inertial decoupling의
+  `inverse(J M⁻¹ Jᵀ)`에서 batch939가 singular로 판정돼 전체 호출이 중단된 경우다.
+  현재 실패 행의 관절값·J·M은 저장되지 않아 기하학적 특이점과 상태/수치 문제를 구분하지 못했다.
+  과거10월17일 replay에는 실제 near-singularity와 FP32 증폭이 확인됐다. IdealPD 제한은
+  OSC 계산 이후이므로 이 예외를 막지 못한다. 최신 공식 develop에는 inertia conditioning이
+  있으나 설치본에는 없다. 제어 설정은 이번 조사에서 바꾸지 않았으며 근거·후속 방향은
+  TRAINING_LOG25절에 기록했다.
+- 같은 날 최신 `2026-10-20_23-36-51`의 invalid 급증을 조사했다. Value loss가 먼저
+  735회9.48e25→739회3.76e34로 커졌고740회Inf/invalid1.72%→741회invalid75.81%였다.
+  모든 저장 checkpoint의 parameter·Adam state는finite였다. 고정된 합성 관절·센서 입력에서
+  raw previous action만 되먹임한 CPU 검사에서는700은안정적이나750·950은자가증폭했다.
+  이는 실제 실패장면 재현이 아닌 구조적 위험의 재현이다. Invalid는특이점/큰finite값검사가아니며,
+  종료로그는현재불량률이아닌마지막episode원인의snapshot이다. 상세근거·개선방향은26절을따른다.
+- 같은 날 사용자 요청으로 `motion_singularity` penalty(weight0.15)와 `singularity` 종료를
+  추가했다. 현재 wrist_3·팔6관절의 native public Jacobian을 step당한번 GPU에서 평가해
+  보상·종료가 공유한다. `s=1/||inverse([Jv/.25;Jw])||F`는 최소 singular value의 보수적
+  대리지표이며 s≥.05이면0, s=.025이면−.075/step, s≤.005이면종료한다.
+  SVD의 CPU동기화를 피하도록 공식 `torch.linalg.inv_ex(check_errors=False)`를 썼다.
+  OSC·action·관측·기존weight·초기IK는변경하지않았다. 현재활성reward10개,실패5개다.
+  CPU256pass와실제1,024환경32step을검증했다. 근거와한계는TRAINING_LOG27절을따른다.
+- 후속학습 `2026-10-21_11-09-26`을2058회까지분석했다. 600–699회return124.0/success
+  snapshot12.63%에서800–899회return66.7/success20.23%로갈라졌고,1600–1699회는
+  return−13.6/success약0/singularity77.02%로붕괴했다. Invalid는0이나value loss가최대5.09e17,
+  std가.309→2.762로증가해정상적인안정수렴으로볼수없다. Success종료는마지막보상+50을
+  정상지급하지만C/D/H의반복수입때문에성공지연이유리할수있는구조는남아있다.
+  Success종료제거보다반복수입과완료return의관계를먼저검토한다. 상세는TRAINING_LOG28절이다.
+
 - 현재 observation은 **244D**(초기 물체 기하 100 + 현재/직전 각각 72)다.
   초기 기하만 사용하며 별도 temporal encoder 없이 GNN·역할 attention 결과와 concat한다.
 - 10개 물체의 공통 배치·초기 object-only mesh raycast 정보를 공유하고,
   각 환경의 초기 로봇 자세는 reset마다 새로 샘플링한다. 실제 카메라는 생성하지 않는다.
 - 공식 OSC·hand position ActionCfg와 arm IdealPD(P/D=0, 150/28 N·m)를 사용한다.
-  Physics 100 Hz·policy 50 Hz·공통 장면 최대 8초다.
+  Physics 100 Hz·policy 100 Hz(`dt=.01`, `decimation=1`)·공통 장면 최대8초다.
+  2026-10-20 사용자 요청으로 정책50→100Hz를 적용했다. 이전 학습 로그는50Hz 당시 결과다.
+- Hand는 URDF의 native mimic6개와 독립관절6개로 구성한다. 토크1N·m와 연동식을 반영한
+  관절 범위를 공식 API로 설정하며17개 tactile 링크·binary observation·Blocker hold를 유지한다.
+  결합 로봇 solver는position32/velocity2다. 접촉 시 종속관절의 순간 속도 초과는 남아 있다.
+  적용·검증·수치 한계는 TRAINING_LOG21절을 따른다.
 - 2026-10-20 후속 교정으로 OSC 제어 body·task frame·물체 observation의 기준을
   **UR5e 말단 `wrist_3_link`**로 통일했다. 공식 `task_frame_rel_path="Robot/wrist_3_link"`와
   scene `ee_frame`의 같은 링크 target을 지정하며 body offset은 없다. `tool0` 가상 frame이 아니다.
@@ -38,21 +70,30 @@
   당시 결과다. 손바닥 기준으로 변경했던 중간 단계는 TRAINING_LOG11절, 최신 변경은 13절을 따른다.
 - 출력은 RSL-RL 공식 GaussianDistribution으로 전환했다. Tanh 없이 학습 시 Gaussian sample,
   play 시 mean을 사용하며 초기 std0.3은 유지했다. 이전 tanh checkpoint는 분포 검사에서 거절한다.
-- Native reward는 Clearance 1.8·Rearrangement 0.6·Motion 4개 각각 0.15·Time·Terminal의 8개다.
-  Clearance는 `q=exp(−ax)`, Rearrangement·Motion은 `q−1` penalty로 지급한다.
-  정지 시 R/M 기여는0이며 각 비용 x·weight는 유지했다. Terminal은 최근학습검토후
-  성공+200·실패−50으로 조정했다. Time·γ=.99는 유지한다.
-  선반 변위 1 cm/2° 등 실패 원인 5개도 분리돼 있다.
-  이는 기준 조합이며 **현재 working cfg는 마지막 실험 E대로 Time/Terminal이 비활성**이다.
+- 현재 활성 native reward는 **Clearance4.0·거리0.4·Hold0.05·Rearrangement0.6·Motion5개 각각0.15·Terminal의10개**다.
+  Clearance는 `exp(−a·x(t))−exp(−a·x(0))`로 초기 가림 대비 개선을 지급한다.
+  초기와 같으면0·개선양수·악화음수이며, 개선 상태를 유지하면 양의 지급이 계속된다.
+  거리는 양의 exp 점수, Motion은 `exp(−ax)−1` penalty다. Clearance 기준은 부분reset행만 갱신한다.
+  Rearrangement는 지정Blocker를 제외한 active물체(Target포함)와 선반의 OBB8corner
+  직전step변위 합을 `0.6(exp(−2x_R)−1)`로 지급한다. Time과 hard-load 종료는 비활성이다.
+  선반localOBB는공식USD API로한번측정하고기존pose로GPU변환하며부분reset복원은과금하지않는다.
+  Terminal은 활성화해 성공+50·그 외0을
+  episode당한번 지급하며 성공·failure 동시참도+50이다. 이전 failure 우선 감점은 제거했다.
+  최신22-33-03의초기값차감후101–200회C/D지급비.753을근거로C1.8→4를적용했다.
+  Hold는 같은 pad의 직전·현재 Blocker 접촉을17개 합산한다. 0.01→0.05 변경으로 최대0.85/step이다.
+  γ=.99와 나머지 weight·scale은 자동 조정하지 않았다. Dense reward는 per-policy-step이므로
+  같은8초 지급 횟수가50Hz의 두 배가 되고, rollout32의 simulation 시간은0.32초다.
+  마찰은 현재 μs=.5/μd=.5를 유지하며 추후 물성 조정은 별도 실험으로 비교한다.
 - 2026-10-20 종료 조건을 완화했다. `workspace_exit`·`object_lift`를 제거하고,
   `object_tilt`는 **같은 물체가 80° 이상 기울어진 상태를 0.2초 연속 유지**할 때만 작동한다.
-  50 Hz에서 물체별 10 step이며, 80° 미만이면 해당 누적값을 0으로 만든다. 해당 환경 reset에서도
+  현재100Hz에서 물체별20step이며, 80° 미만이면 해당 누적값을0으로 만든다. 해당 환경 reset에서도
   초기화한다. 밀기·pivoting 중의 순간 기울어짐을 허용하려는 변경이며 성공 판정의 안정화·Target
   보호·Blocker 통로 확보는 유지한다. 들림·작업 영역 이탈 자체는 실패나 성공 gate가 아니다.
-  80° 이상 기울어진 유예 구간에는 성공도 보류해, 5-step 성공이 10-step 전도 판정보다
-  먼저 확정되지 않도록 한다. 회복하면 기존 성공 안정화 카운터를 다시 시작한다.
-  `object_drop`의 지지면 아래 6 cm·F/T 과부하/범위·선반 변위·invalid state 기준은 유지한다.
-  이전 학습의 실패 원인 7개 기록은 당시 조건이며, 이번 변경 후 새 학습 성능은 아직 미확인이다.
+  이후16절에서 성공은 Target 보호·지정 Blocker 통로 확보만10step(.1초) 연속 검사하도록 분리했다.
+  Tilt pending·속도·F/T·선반 상태는 성공 gate가 아니다. 활성 실패는 같은 step에 따로 기록될 수 있다.
+  `object_drop`의 지지면 아래6cm·선반 변위·invalid state 기준은 유지하며 hard-load는 진단만 남긴다.
+  10월21일부터singularity 실패가추가됐다. 이전 학습의 실패 원인 7개 기록은 당시 조건이며,
+  이번 변경 후 새 학습 성능은 아직 미확인이다.
 - 10월19일 추가 학습 `15-43-41`과 네 reward 조합 실험을 분석했다. 설정 차이는 활성 reward다.
   공통 checkpoint750을 같은 4장면·8시작자세에서 mean/sample로 평가한320episode는
   통로확보·성공0회, 과부하/센서범위초과278회였다. 초기 raw Clearance0.462601에서 개선이 거의 없다.
@@ -6556,3 +6597,176 @@ CPU 검사는241pass/18skip/152subtest다. 실제GPU4환경×8step은 종료0·�
 검사에서도 disabledhard와 높은 속도가 task success/bootstrapping을 막지 않음을 확인했다.
 상세는 TRAINING_LOG16절과
 outputs/contact_manipulation/physx_failure_20261020/에 보존한다.
+
+### 2026-10-20 — 최신13:08 학습의 후반 정책 불안정 분석
+
+분석 snapshot은13-08-06의 scalar4934(15:44:38KST), checkpoint4900이다. 새12-50-52는191회,
+checkpoint150까지며 설정상test로 단정할 근거가 없다. 둘 다1,024환경/seed0/fresh/목표90000,
+C1.8/D.4/H.01/R.6/M4×.15, 새success·disabled-hard mask가 실제 저장 소스에 적용됐다.
+Time/TerminalOFF, entropy.01/unboundedGaussian/OSC/IdealPD/hand 설정은 이전과 같다.
+
+최신long first100→last100: reward253.66→5.69, episode294.84→9.42step(.188s), 낙하snapshot
+.448→78.112%, timeout84.91→14.84%, 전체meanstd.306→148.235. 최신model의 위치σ는축별
+16.018/14.427/32.082m이며 평균20.842m다(실제이동량X). 이전동일3250은posσ.373m,새것5.251m.
+Value loss는4292부터폭증,4309에3e20,4555최대3.284e32; invalid_state는더늦은4412처음기록.
+마지막value loss28대로작아져도짧은episode·낙하우세는회복되지않았다. Scalar와169checkpoint의
+actor/optimizer는finite이며 critichead weight폭증도없어, 큰유한입력/activation/V/target을확인해야한다.
+
+성공신호는중간일부있지만새predicate는failure와동시true가능하며native scalar는최근원인snapshot이므로
+실패없는실제성공률을복원못한다. C/D로그는reset그룹eps합/8초라거리·가림개선값이아니며 Dweight4배효과도
+섞인다. 지속적clearance/접촉개선을입증하지못했다. Exp action-rate penalty포화와logσentropy증가,
+rawpreviousaction의무정규화history입력은우선추적후보다. Entropy축소/0대조와GPU집계기반의action·obs·V·
+bootstrap/target/gradient로그가다음진단방향이다. 이번에는분석·문서만추가하고production설정은유지했다.
+수집+update시간1.735→3.096초이며update는.20→.19로일정하다. 잦은reset이후보지만세부비용분해는없다.
+TRAINING_LOG17절과 outputs/contact_manipulation/recent_training_20261020/에수치·그래프·재현코드보존.
+
+### 2026-10-20 — Hold 영향과 실제 object physics 정리
+
+16-54-31의3772까지분석에서H/C지급비중은900근처.001894%,1550근처.001919%,마지막100.000040%다.
+H는samepad의previous/current Blocker force>.01N일때pad당.01/step이고첫접촉·pad외링크접촉은0이다.
+실제접촉률은이nativeeps로그에서복원못한다. Weight.03/.05 대조를제안하되실제반복접촉기회와
+접촉이후Clearance진행을계측해야한다. 이번에는weight를변경하지않았다. 현재source의R주석은
+사용자변경으로보존했으며16:54학습YAML의R=.6과구분한다. Robotselfcollision은현재True다.
+
+환경1개native조회로질량kg확인: bottle=0.549279/cup_1=0.447285/cup_2=0.271988/mug_1=0.641424/
+mug_2=0.534807/can=0.368075/YCB003=0.411/004=0.514/005=0.349/006=0.603. 기존6종은질량미지정+기본밀도1000kg/m³로
+충돌체적에서자동계산되며실측값아니다. YCB만명시질량이다. Mass/COM/inertia는Oct14snapshot과동일.
+물체10종·선반·17tactilepad는모두nativeμs=.5/μd=.5/e=0,combineaverage이며재질별차이가없다.
+관성자동계산,선반100kg,contactoffset기존6종+선반1.962mm/YCB5mm,rest0,linear/angular damping0/.05,
+solver16/2,maxdepenetration1m/s,중력활성,CCD비활성,질량/마찰resetrandomization없음.
+각속도USD단위주의: 기존default5729.58deg/s≈100rad/s,YCB100deg/s≈1.745rad/s로상한이다르다.
+Full3×3inertia/COM/원본과composedUSD/native값은TRAINING_LOG18절과
+outputs/contact_manipulation/contact_hold_physics_20261020/에보존. 물성은변경하지않았다.
+
+### 2026-10-20 — Hold0.05·정책100Hz와 self-collision slowdown 확인
+
+사용자 승인으로 Hold weight.01→.05를 적용했다. Same-pad Blocker의 previous/current
+binary 합 수식은 유지하며 최대기여.85/step이다. 마찰은 μs=.5/μd=.5/e=0을 유지하고
+추후 조정할 수 있는 항목으로 남겼다. 사용자 R주석과 Time/Terminal/hard-load OFF도 유지했다.
+
+추가 요청대로 physicsdt.01·decimation1로 정책100Hz를 적용했다. 성공확인10step으로.1초를
+유지하고, tilt.2초는20step·8초공통장면은800step으로 자동 반영된다. 관측244D/action18D는
+유지하되 current/previous 간격은10ms다. γ=.99/rollout32/다른weight/scale은 그대로다.
+Dense는step별지급이므로8초지급기회가두배이며 rollout시간은.32초다. 이전50Hz모델play에는
+`env.decimation=2 env.mdp.stable_steps=5`를 추가한다. GUI렌더까지 맞추려면
+`env.sim.render_interval=2`도 추가한다. 이미 실행 중인 학습은 소스 설정을 자동 반영하지 않는다.
+
+과거13:08/16:54/20:18의동일101–359iteration 비교에서 collection1.630/2.809/2.825초,
+PPOupdate.205/.201/.204초다.13:08→16:54의저장설정차이는selfcollisionFalse→True뿐이며
+16:54→20:18은Roff뿐이다. 최신episode302step은baseline301step과유사하고 일반logging등
+overhead약.0235초여서 이번약1.19초증가를설명하지못한다. 물리/reset최적화rollback은없다.
+
+실제RTX3090/1024환경/동일초기tensor해시/nativehold로재현:32step환경실행은
+selfOFF50Hz1.1380초→selfON50Hz2.3873초,physics호출8.825→22.817ms였다.
+각경우공통장면교체1회·earlytermination0으로reset빈도차이가아니다. SelfON100Hz는1.3069초/32step,
+800stephorizon·success10/H.05/7reward를확인했다. NN추론/PPOupdate없는환경계측이며
+100Hz의같은32stepsimulation시간은절반이어서 새학습iteration성능보장이아니다.
+
+Env0nativecontactmatrix에서palm `right_plam_1`↔proximal5개의 큰 내부 접촉력(약2.9–9.7kN)이
+측정됐다. 서로같은base_link의자식이라parent-child자동filter에서빠지는sibling쌍이다.
+다음개선은handhousing의의도된중첩을형상/관절범위로확인하고필요한pair만공식FilteredPairsAPI로
+제외하는것이다. 아직filter/UR5e/selfcollisionTrue는변경하지않았으며719원인해결도미확정이다.
+CPU241pass/18skip/152subtest,실제100Hz832step+부분reset종료0.
+상세·한계·재현산출물은TRAINING_LOG19절과outputs/contact_manipulation/slowdown_20261020/에보존한다.
+
+### 2026-10-20 — Hand URDF 범위 일치와 실제 역방향 굽힘 검증
+
+원본/relativeURDF의31joint kinematic/limit/mimic 정의는같다. 손12revolute의native
+hard/softpositionlimit도원본과최대1.389e−7rad차이로일치한다. 모두lower0이고
+공식JointPositionToLimitsAction도[-1,1]clip후같은범위에매핑하므로음수목표명령문제가아니다.
+
+하지만실제1환경/100Hz/열린손목표0/200physicsstep에서selfcollisionON은little2−30.21°,
+thumb2−29.69°,middle2−26.53°,ring2−27.34°까지이탈했다. 첫step부터큰housing–proximal
+접촉과한계위반이있고,동일조건OFF에서는최대하한이탈.000017°/상한.000039°수준이었다.
+현재hand내부충돌제약아래solver가관절한계를크게위반하는상태를재현한것이다.
+따라서positionlimit을확대하거나실제q를매step덮어쓸문제가아니다. 우선handhousing의
+의도된중첩과proxy형상을검토해필요한pair만공식filter/형상교정으로처리한다.
+ProductionselfcollisionTrue/UR5e/hand형상은아직변경하지않았고719원인도미확정이다.
+
+별도문제로URDFmimic6개대신실제stageMimic/TendonAPI0/nativefixed·spatialtendon0,
+distal6개PD0passive를재확인했다. OFF에서도thumb3약31°대thumb2약.153°이하로연동이
+보장되지않는다. Mimic공식import복구시개별upper와선형mimic비율충돌도검토해야한다.
+Handeffort상한은원본1Nm대현재10Nm이며이차이는이번대조에서유지했다.
+상세는TRAINING_LOG20절과outputs/contact_manipulation/hand_limits_20261020/에보존한다.
+
+### 2026-10-20 — 공식 Hand mimic 복원과17 tactile 보존
+
+Hand는 공식URDF importer·ImplicitActuator·JointPositionToLimitsAction과 native PhysX
+mimic6개로 연동한다. 설치converter의flag를 실제parse_mimic=True로 전달하고
+joint_drive=None·force drive를 사용한다. Python의매step coupling/관절각 덮어쓰기는 없다.
+Handeffort는URDF1Nm를계승하며 gain은독립6개20/1·종속6개0/0이다.
+
+URDF연동식과전체position/velocity제약을구성시교차해 master한계에반영한다.
+손가락master0–1.36159181rad·.922253966rad/s,thumb2는0–.609220762rad·2rad/s다.
+종속관절은importer의확장limit·별도velocitybrake없는구성을유지한다.
+중복된childstop/brake는native mimic과충돌했다. 실제12관절각을원본URDF범위로검증한다.
+
+Pythonconvexproxy를제거하고원본mesh에공식convexdecomposition을사용한다.
+Palm최대16hull/fingerparent4개각4hull·hull당64정점,17padmesh/body/report는보존한다.
+Housing2×proximal5의연결부10쌍만공식FilteredPairsAPI로제외하고나머지selfcollision은True다.
+공유geometry에서crossbody필터대상을livebodyroot에보존해복제후유실도수정했다.
+Handmaxdepenetration.1m/s,결합robotposition solver32/velocity2다. 팔·손이같은articulation이라
+solver반복수는전체로봇에적용되며UR5econtroller/actuator/collisionmesh는유지한다.
+
+1환경100Hz800stepopen/half/close/reopen에서32회solver의최대mimic오차.030736rad,
+actualURDF하한/상한최대이탈.0000465/.0000677rad,유한관절/F/T를확인했다.
+속도는독립관절native제한이며contact중child순간속도초과는남는다(index2최대9.25rad/s).
+64회solver에서도child별도velocitybrake대조는불안정해채택하지않았다.
+4환경에서17개pad모두실제접촉·binary관측,Blocker구분,hold이력,
+실제부분reset의다른환경보존을통과했다. 관측244D/action18D와reward는유지한다.
+실제1024환경832policy step에서도유한상태·부분reset[0,512]·800step장면교체0→1을통과했다.
+Native32step평균1.33313초(전체reset포함)이며NN추론/PPOupdate는제외한다.
+동일초기상태의짧은비교는solver32회1.330초/64회1.955초로,비용47%차이와관절범위를
+고려해32회를채택했다. .02rad mimic진단기준은32회전체개폐시험에서false로보존했다.
+기존checkpoint와Handdynamics가다르고장기719원인해결은아직입증하지않았다.
+상세·비교는TRAINING_LOG21절과outputs/contact_manipulation/hand_urdf_native_20261020/에보존한다.
+
+### 2026-10-20 — 초기 Clearance 기준 보정 적용
+
+사용자 요청으로Clearance를 `1.8(exp(−x_t)−exp(−x_0))`로변경했다(a_C=1).
+초기와같으면0·개선양수·악화음수이며,초기로복귀하면0이다.
+직전step차이가아니므로개선된상태를유지하면보상은계속된다.
+초기기준은실제초기BlockerOBB에서GPU로계산하며부분reset행만갱신한다.
+Rawquality캐시는유지하고공식manager어댑터에서차이를/dt로반환한다.
+관측·weight·termination은유지한다. 장면별Clearance최대는1.8(1−exp(−x_0)),
+현재전체dense상한은약2.388/step이다. 이후Clearancelog는과거절대점수와직접비교하지않는다.
+상수보정이라개선기울기는같으며고정길이episode에서는return상수이동이다.
+조기종료시생존유인이달라지므로이변경만으로정체해결을보장하지않는다.
+CPU244pass/18skip/332subtest,RTX3090GPU1024행의부호·정지0·부분reset·반복지급을통과했다.
+초기품질CPU/GPU오차2.47e−8,기준query핵심.182ms로전체reset/iteration비용은아니다.
+상세는TRAINING_LOG22절과outputs/contact_manipulation/clearance_initial_20261020/에보존한다.
+
+### 2026-10-20 — Terminal 성공50·Clearance weight4 적용
+
+사용자가활성화한Terminal을성공+50·그외0으로변경했다(weight1).
+기존failure우선감점을제거해success/failure동시참도+50이며episode당한번이다.
+실패판정·종료원인로그는유지한다. 성공없이실패/timeout만있으면0이다.
+Legacy failure_penalty는0으로보존하지만계산에는사용하지않는다.
+
+새비test학습22-33-03(1024환경/100Hz/H.05/TerminalOFF/Roff)의savedgitdiff에
+초기Clearance차감이반영된것을확인했다.101–200회native C5.95921/D7.91652/H.12512/
+M합−1.34249,success원인snapshot7.34094%였다.201–300회C6.70647/D5.23216/H.06193/
+M합−1.35254,successsnapshot3.30649%다.이는episode누적/8초로그이며step보상/누적성공률이아니다.
+이근거로Cweight1.8→4.0(2.22배),a_C1유지다.동일101–200궤적환산C/D는.753→1.673으로,
+새정책성과예측이나최적weight라는근거는아니다.새실행부터반영된다.
+
+같은run의value loss는324에서1.558e10,327(22:45:44KST)에처음Inf이며invalidsnapshot도
+327첫발생했다.이후구간은weight근거에서제외했고원인미확정이다.새weight로해결됐다고하지않는다.
+CPU244pass/18skip/334subtest.상세는TRAINING_LOG23절과
+outputs/contact_manipulation/reward_update_20261020/comparison.json에보존한다.
+
+### 2026-10-20 — Rearrangement 활성화·Blocker 제외·선반 포함
+
+사용자가활성화한Rweight.6/a2를유지하고active&~blocker물체의평균8corner직전step변위에
+선반전체OBB8corner평균변위를더해 `0.6(exp(−2x_R)−1)`로지급한다.
+Target·비가시다른물체는포함하고지정Blocker의병진/회전은모두제외한다.
+정지0·왕복비용은유지하며과거누적path_length는진단용이다.현재reward9개/C4/Terminal50이다.
+
+공식USD BBox API로실제Shelf/rack의전체bodylocalOBB를한번측정해GPU에캐시한다.
+실측크기(.4085,1.01,1.8)m이며작업층크기로대체하지않는다.
+SceneBatch.shelf_local_corners[N,8,3]와TaskState이력으로기존nativeworldpose를GPU변환한다.
+고정episode원점을사용해큰clone좌표의회전변위상쇄를줄이고부분reset복원은과금하지않는다.
+추가PhysXpose/CPU조회·관측채널·production파일은없다.선반1cm/2°종료는유지한다.
+CPU248pass/18skip/374subtest,GPU1024행,실제IsaacLab4환경8step+부분reset을통과했다.
+GPU변위계산핵심.280ms는전체physics/reset/PPO시간이아니다.
+상세는TRAINING_LOG24절과outputs/contact_manipulation/rearrangement_20261020/에보존한다.
