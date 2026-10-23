@@ -15,7 +15,7 @@ import torch
 from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, quat_mul as _lab_quat_mul, quat_unique
 
 __all__ = [
-    "prepare_initial_geometry", "geometry_in_eef_frame", "pack_policy_observation",
+    "prepare_initial_geometry", "select_initial_geometry_indices", "geometry_in_eef_frame", "pack_policy_observation",
     "dynamic_sample", "self_motion_wrench", "calibrate_wrench", "compensate_wrench",
     "policy_observation", "initial_scene_geometry", "current_robot_sample", "previous_robot_sample",
     "quat_apply", "quat_conjugate", "quat_mul",
@@ -37,6 +37,38 @@ def quat_mul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return _lab_quat_mul(*torch.broadcast_tensors(left, right))
 
 
+def select_initial_geometry_indices(
+    geometry_b: torch.Tensor, valid: torch.Tensor, roles: torch.Tensor, capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select fixed role slots and nearest recognized objects, entirely on-device.
+
+    The inputs have already been validated or produced by the visible-surface
+    fitter. Distances use only observed OBB centers, to the nearer visible role.
+    An unseen role contributes no reference point. With neither role visible,
+    source order breaks the otherwise undefined proximity ranking. Ties also
+    keep source order; hidden objects never fill an observation slot.
+    """
+    batch, source_capacity = valid.shape
+    role_sources = roles.clamp_min(0)
+    role_valid = (roles >= 0) & valid.gather(1, role_sources)
+    role_centers = geometry_b[..., :3].gather(1, role_sources[..., None].expand(-1, -1, 3))
+    distances = (geometry_b[:, :, None, :3] - role_centers[:, None]).square().sum(-1)
+    distances = torch.where(role_valid[:, None], distances, float("inf")).amin(-1)
+    distances = torch.where(role_valid.any(-1, keepdim=True), distances, 0.)
+    source_indices = torch.arange(source_capacity, device=geometry_b.device).expand(batch, -1)
+    distractor_valid = valid & (source_indices != roles[:, :1]) & (source_indices != roles[:, 1:2])
+    nearest = torch.where(distractor_valid, distances, float("inf")).argsort(dim=-1, stable=True)
+    nearest = nearest[:, :max(0, capacity - 2)]
+    nearest_valid = distractor_valid.gather(1, nearest)
+    selected = roles.new_full((batch, capacity), -1)
+    selected_valid = valid.new_zeros((batch, capacity))
+    selected[:, :2] = torch.where(role_valid, roles, -1)
+    selected_valid[:, :2] = role_valid
+    selected[:, 2:2 + nearest.shape[1]] = torch.where(nearest_valid, nearest, -1)
+    selected_valid[:, 2:2 + nearest.shape[1]] = nearest_valid
+    return selected, selected_valid
+
+
 def prepare_initial_geometry(
     geometry_b: torch.Tensor,
     valid: torch.Tensor,
@@ -45,12 +77,14 @@ def prepare_initial_geometry(
     *,
     capacity: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reserve role slots and compact observed distractors **once on reset**.
+    """Reserve role slots and select nearby observed distractors once on reset.
 
     Inputs are ``[N, M, 10]`` geometry, ``[N, M]`` validity and ``[N]``
     source-slot indices. Index -1 denotes an unassociated role. An associated
-    but invisible role also leaves its reserved slot zero. Distractors retain
-    their original order. No observed object is silently discarded. Valid OBBs
+    but invisible role also leaves its reserved slot zero. The remaining slots
+    contain recognized objects nearest either visible role's observed OBB center.
+    Excess recognized objects are omitted from the policy input, not physics or
+    the ray scene. No hidden ground-truth position enters the ranking. Valid OBBs
     must be finite, have positive extents and unit quaternions (norm tolerance
     1e-3); accepted floating-point drift is normalized in the stored copy.
 
@@ -83,29 +117,9 @@ def prepare_initial_geometry(
         raise ValueError("Role indices must be -1 or refer to a source geometry slot.")
     if bool(((target_indices == blocker_indices) & (target_indices >= 0)).any()):
         raise ValueError("Target and blocker must be different objects.")
-    role_sources = roles.clamp_min(0)
-    role_valid = (roles >= 0) & valid.gather(1, role_sources)
-    role_geometry = geometry_b.gather(1, role_sources[..., None].expand(-1, -1, 10))
-    role_geometry = torch.where(role_valid[..., None], role_geometry, 0.0)
-
-    source_indices = torch.arange(source_capacity, device=geometry_b.device).expand(batch, -1)
-    distractor_valid = valid & (source_indices != target_indices[:, None]) & (
-        source_indices != blocker_indices[:, None]
-    )
-    if bool((distractor_valid.sum(-1) > capacity - 2).any()):
-        raise ValueError("Geometry capacity cannot hold both reserved roles and all observed distractors.")
-    distractor_indices = torch.where(
-        distractor_valid, source_indices, source_indices + source_capacity
-    ).argsort(dim=-1)[:, :capacity - 2]
-    count = distractor_indices.shape[-1]
-    compact_valid = distractor_valid.gather(1, distractor_indices)
-    compact_geometry = geometry_b.gather(1, distractor_indices[..., None].expand(-1, -1, 10))
-    compact_geometry = torch.where(compact_valid[..., None], compact_geometry, 0.0)
-    output = geometry_b.new_zeros((batch, capacity, 10))
-    output_valid = valid.new_zeros((batch, capacity))
-    output[:, :2], output_valid[:, :2] = role_geometry, role_valid
-    output[:, 2:2 + count], output_valid[:, 2:2 + count] = compact_geometry, compact_valid
-    return output, output_valid
+    indices, output_valid = select_initial_geometry_indices(geometry_b, valid, roles, capacity)
+    output = geometry_b.gather(1, indices.clamp_min(0)[..., None].expand(-1, -1, 10))
+    return torch.where(output_valid[..., None], output, 0.0), output_valid
 
 
 def geometry_in_eef_frame(

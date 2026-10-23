@@ -4,6 +4,19 @@ Sweeping-Policy의 **`min` branch 구조**를 기준으로 구성한 Isaac Lab �
 **장면·센서 생성, episode reset, MDP, GNN·attention 정책과 native PPO를 연결한 프로젝트다.**
 기존 `src/contact_rearrangement`와 별도 패키지이고, 해당 패키지를 import하지 않는다.
 
+**현재 배치 생성은 15–25개 물체의 통합 clutter 규칙이다.** 물리 최대 개수는25개이며,
+공개 관측은 Target·Blocker를 포함한10개 slot과244D를 유지한다. 기존 `parameterized`
+경로의90 ordered pair는10종에서 서로 다른 Target·Blocker를 고르는 `10×9` 종류 조합이며,
+미리 저장한90개 완성 장면을 의미하지 않는다. 기존의 두-row 주변 배치가 역할 물체와 분리되어
+보인다는 문제를 수정하며, 이전10물체·364장면·1,024환경 검증을 새 규칙의 검증으로 사용하지 않는다.
+Blocker의 빈 재배치 공간은 확보하되 이동·pivot 전체 경로를 비워 두지는 않는다.
+이전 최대40개 설정의 `clutter`는98개 standalone 장면과1,024환경 reset·10step을 통과했다.
+해당 검사 범위는20–38물체이며 현재 생성 범위는15–25개로 낮췄다. 정책 관측은244D를 유지한다. 장기 학습·정규 iteration 속도는
+이번 짧은 실행 검사의 범위에 포함하지 않는다.
+현재 경로와 이전 구현은
+아래 [병렬 계산과 reset 연결](#병렬-계산과-reset-연결),
+상세 규칙은 [SPAWN_RULES.md](../../docs/SPAWN_RULES.md)에서 구분한다.
+
 본 학습의 설정·결과·종료 원인과 미해결 수정 과제는
 [학습 기록](../../docs/TRAINING_LOG.md)에 정리한다. 연구·개발 전체 이력은
 [CONTEXT.md](../../docs/CONTEXT.md)를 참고한다.
@@ -60,7 +73,11 @@ contact_manipulation/
 가변 stiffness의 OSC torque 제어를, hand에는 독립 6관절 position 제어를 사용한다.
 에셋 로딩은 예제의 `src/ur5e.py`, `src/shelf_utils.py`를 참고해 `scene.py`에 모았다.
 공통 cfg의 observation은 `initial_scene` 100D, `current` 72D, `previous` 72D 순서로
-각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총 244D로 연결한다.
+각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총244D로 연결한다.
+새 규약에서는 물리 활성 개수15–25와 관측 용량10을 분리한다. 인식한 물체가10개를 넘으면
+Target·Blocker를 slot0/1에 두고, 나머지는 관측된 중심에서 두 역할의 관측 중심까지 거리의
+최솟값이 작은 순서로8개를 선택한다. 보이지 않은 물체를 정답 pose로 채우지 않으며,
+관측 물체가 적으면 나머지는 padding한다. 물리 개수를 늘려도 모델 입력 폭은 늘리지 않는다.
 세 함수는 같은 step의 캐시를 조회하므로 센서 읽기·이력 갱신·기하 계산을 반복하지 않는다.
 
 새 기능도 **cfg에서 선언 → native manager가 호출 → 해당 `mdp` 함수에서 연구 계산**하는
@@ -79,9 +96,10 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
 | 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, 팔 `IdealPDActuator`·Hand `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및 18D 입력 설정 |
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
 | EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
-| 물체 주차 | `RigidObjectCollection.permanent_wrench_composer` | parked mask와 중력 상쇄 force 계산; transient force는 instantaneous composer 사용 |
+| 미사용 물체 | Native `UsdPhysics.RigidBodyAPI`의 kinematic 설정 | 격리된 주차 위치에서 kinematic 유지, 활성 물체만 dynamic으로 전환하며 GPU actor·view 유지 |
+| 바닥·환경 충돌 분리 | Native `GroundPlaneCfg`·cloner의 PhysX 환경 ID | 기존 전역 바닥·4bit bounds encoding 유지 |
 | PPO | 공식 `PPO` 전체와 Actor/Critic의 `MLPModel`, storage·GAE·logger·checkpoint | Actor 특징 추출에 GNN/attention 연결 |
-| 초기 vision | `convert_to_warp_mesh`, Warp mesh query | 후보 pose의 object-only raycast, 두 역할의 무가림 실루엣과 가시성, 관측 표면 OBB |
+| 초기 vision | `convert_to_warp_mesh`, Warp mesh query | 실제 메시 가시성의 연속 구간 사전 계산, 정해진 pose의 object-only 관측과 표면 OBB |
 
 직접 구현을 유지한 이유:
 
@@ -92,8 +110,8 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
   여러 후보를 함께 풀며 수십 번의 DLS를 fused kernel에서 처리하므로 유지한다.
 - `MultiMeshRayCasterCamera`와 `raycast_dynamic_meshes`는 동적 mesh를 지원한다.
   따라서 "native raycast는 동적 물체를 지원하지 않는다"는 이유로 custom을 유지하는 것이 아니다.
-  현재 구현은 **미적용 후보 pose**를 평가하고, Target·Blocker의 무가림 분모 실루엣을 동시에
-  계산하며, projected bounds로 ray query를 줄이고 depth/label을 ray당 한 thread에서 결정한다.
+  새 연속 영역 경로는 실제 메시의 무가림 실루엣과 가림 구간을 시작 전에 계산하고, reset에서는
+  **정해진 pose**를 관측한다. Projected bounds로 ray query를 줄이고 depth/label을 ray당 한 thread에서 결정한다.
   Native multi-mesh kernel의 depth/label 경쟁 쓰기 관련 FIXME도 있어 동일 대체로 취급하지 않는다.
 - Native observation history는 reset 후 첫 sample을 과거 슬롯에도 반복한다. 우리 규약은
   reset 시 previous=0, current/previous 순서와 reset 직전 terminal 관측 보존이므로
@@ -310,8 +328,10 @@ thumb2는0–.609221rad·최대2rad/s다. 공식 action은 이 한계를 그대�
 엄격히 묶는 것은 검증되지 않았다. 닫기 시험에서 index2는 순간9.25rad/s가 관측됐다.
 종속관절에도 별도 native 속도 제한을 중복 적용한 대조는 불안정해 채택하지 않았다.
 Native mimic과 접촉 제약의 수렴을 위해 결합된 로봇 articulation의 position solver를
-32회로 설정한다(velocity2회 유지). 팔·손이 하나의 articulation이므로 이 수치 설정은
-전체 로봇에 적용된다. UR5e의 actuator·controller·collision mesh는 유지한다.
+32회로 설정한다. 2026-10-23 사용자 요청으로 예제용 로컬 USD에 맞춰 velocity solver를
+1회로 변경했고, 물체도 예제 cfg와 같은 position16회·velocity1회다. 팔·손이 하나의
+articulation이므로 로봇의 수치 설정은 전체 로봇에 적용된다. UR5e의 actuator·controller·
+collision mesh는 유지한다. 아래 시험 수치는 변경 전 velocity2회에서 측정한 기록이다.
 100Hz 여닫기 시험에서 최대 관절 범위 이탈은.000068rad, 최대 mimic 연동 오차는.030736rad였다.
 1,024환경의 동일 시작 상태에서 native32step은 solver32회1.330초·64회1.955초였다.
 이는 NN/PPO update가 빠진 환경 실행 시간이며, 64회는 연동 오차를 줄이는 대신 비용이47% 컸다.
@@ -333,14 +353,14 @@ Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 �
 |---|---:|---|
 | Clearance | 4.0 | $\min(d,0)+V_p\max(d,0)$, $d=q_C(t)-q_C(0)$, $q_C=\exp(-a_C x_C)$, $x_C=A_{\mathrm{blocked}}/A_{\mathrm{blocker}}$ |
 | `blocker_distance` | 0.40 | $\exp(-a_d d)$, 17개 pad 표면 대표점에서 현재 Blocker OBB까지의 최소 거리 |
-| `blocker_contact_hold` | 0.05 | $\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$, 같은 pad의 직전·현재 Blocker 접촉 |
+| `blocker_contact_hold` | 0.10 | $\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$, 같은 pad의 직전·현재 Blocker 접촉 |
 | Rearrangement | 1.0 | $\exp(-a_R x_R)-1$, $x_R=$ Blocker를 제외한 물체와 선반의 이번 step OBB 이동량(m) |
 | `motion_action_rate` | 0.15 | $\exp(-a_A x_A)-1$ |
 | `motion_joint_velocity` | 0.15 | $\exp(-a_V x_V)-1$ |
 | `motion_wrench_growth` | 0.30 | $\exp[-(a_F x_F+a_T x_T)/2]-1$, 하나의 보정된 wrench 증가량 |
 | `motion_singularity` | 0.30 | $\exp(-a_S[0.07-s]_+^2)-1$ (현재 팔 자세의 특이점 접근) |
-| `object_stability` | 2.0 | $\exp[-a_P\max(d_{\max}-0.01,0)^2]-1$, 유한 작업판까지의 지지점 거리 |
-| Terminal | 1.0 | 성공 +100, 그 외0·episode당 1회 |
+| `object_stability` | 3.0 | $\exp[-a_P\max(d_{\max}-0.01,0)^2]-1$, 유한 작업판까지의 지지점 거리 |
+| Terminal | 1.0 | 성공 +250, 그 외0·episode당 1회 |
 
 **Clearance는 초기 상태 대비 개선 보상, Rearrangement·Motion은 penalty로 지급한다.**
 품질 함수 `q=exp(−a·x)`와 비용 x의 정의는 유지한다. Clearance는 초기 대비 차이
@@ -378,17 +398,19 @@ Clearance/Distance 비율은.753이었다. Weight를1.8→4로 올려 목표 달
 실제 메시와 다를 수 있으므로 실제 접촉은 별도의 filtered force로 판정한다.
 
 접촉 유지의 $b^B_{i,k}$는 해당 pad와 **현재 episode의 Blocker 사이 normal force norm이
-0.01 N을 초과했는지**이다. 17개를 평균하지 않고 합산하므로 최대 기여는 0.85/step이다.
+0.01 N을 초과했는지**이다. 17개를 평균하지 않고 합산하므로 최대 기여는 1.70/step이다.
 최초 접촉은 0, 같은 pad가 다음 policy sample에서도 접촉하면 지급한다. 다른 물체에서 Blocker로
 바뀌거나 다른 pad로 접촉을 넘긴 첫 sample은 유지로 세지 않는다. 10 ms 간격의 두 sample을
 확인하며 그 사이의 완전한 연속 접촉까지 증명하지는 않는다. 힘을 더 크게 가해도 추가 점수는 없다.
 
 `mdp/sensors.py`의 native `BlockerContactHold(ManagerTermBase)`가 이력을 관리하며,
 **공식 RewardManager가 부분 reset된 행만 초기화**한다. 같은 control step을 재조회해도
-이력은 한 번만 갱신한다. 하나의 PhysX contact view에서 pad×전체 물체 pool을 읽고,
-collection의 실제 `blocker_id` 열을 GPU에서 선택한다. 매 episode 센서를 재생성하지 않는다.
+이력은 한 번만 갱신한다. 하나의 PhysX contact view에서 **현재 Blocker 한 열만** 추적한다.
+공유 장면의 Blocker가 바뀌면 native view를 교체하며, 같은 Blocker를 쓰는 부분 reset에서는
+재사용한다. 과거 Blocker view는 캐시하지 않는다. 센서17개와 물리 body는 재생성하지 않는다.
 Actor는 기존 **상대 구분 없는 binary tactile 17개와 244D observation**을 유지하며,
 Blocker 구분·현재 pose는 reward의 privileged 정보로만 사용한다.
+Binary는 필터와 무관한 전체 `net_forces_w`로 계산하므로 다른 물체·선반 접촉도 감지한다.
 
 두 항의 weight는 초기 실험값이며, 접촉한 채 정지하는 행동도 양의 점수를 받는다.
 따라서 접촉률과 함께 **접촉 이후 Clearance 증가·성공률**을 비교해야 한다.
@@ -501,13 +523,13 @@ s=.005이면약−.288413/step이다(weight포함). s=0의 기여는약−.29311
 현재 `RewardsCfg`는 Clearance/거리/접촉 유지/Rearrangement/Motion4항/물체 지지/Terminal의
 **10개 활성 term**이다. 비활성 Time 항과 매 step의 시간 지수 계산은 제거했다. 함수가
 discrete 값/`step_dt`를 반환해 native manager의 `weight × dt`와 상쇄한다.
-C·거리·Hold의 최대 기여는 기본 `a_C=1`에서 각각약2.528·0.4·0.85이고,
+C·거리·Hold의 최대 기여는 기본 `a_C=1`에서 각각약2.52848·0.4·1.70이고,
 Clearance의 장면별 최대값은 초기 가림비율에 따라 더 작다. 기본 설정에서 Motion 합의 최소 기여는약−.893111,
-Rearrangement의 하한은−1, 물체 지지 비용의 하한은−2다.
+Rearrangement의 하한은−1, 물체 지지 비용의 하한은−3이다.
 Step별 지급이므로 전체 return의 제어주기 불변성을
-주장하지 않는다. 100Hz에서는 같은8초 동안 지급 횟수가50Hz의 두 배다. γ=.99·rollout32를
-유지했으므로 rollout의 simulation 시간은0.32초이며, 같은 물리 시간에 대한 할인도 달라진다.
-γ·action scale과 나머지 weight는 유지한다. 새 지지 비용과 종료는 기존 GPU 기하·cached CUDA
+주장하지 않는다. 100Hz에서는 같은8초 동안 지급 횟수가50Hz의 두 배다. 현재 γ=.98·rollout36이므로
+rollout의 simulation 시간은0.36초다. 이번 weight 조정에서 γ·action scale과 나머지 weight는
+유지한다. 지지 비용과 종료는 기존 GPU 기하·cached CUDA
 graph를 공유하며 센서·물리 step을 추가하지 않는다.
 초기 자세의 warning 구간 여부와 조정 후 검증 결과는 [학습 기록31절](../../docs/TRAINING_LOG.md)에 기록한다.
 세장면의 reset시점 SDK 지표 검사 중 한장면은 새warning36.23%(기존22.36%)였고,
@@ -515,14 +537,14 @@ graph를 공유하며 센서·물리 step을 추가하지 않는다.
 추가로 구분해야 하므로 모든 초기 상태가 정상임을 확인한 결과는 아니다.
 새 수치가 학습 퇴행이나 std·value 폭증을 해결한다고 보장하지 않는다.
 
-Terminal은 사용자 요청으로 성공+100·그 외0을 episode당 한 번 지급한다.
+Terminal은 사용자 요청으로 성공+250·그 외0을 episode당 한 번 지급한다.
 성공 없이 실패나 timeout만 발생하면0이다. **활성 실패가 우선**하므로 같은 step에 원래의
-통로·Target 조건과 실패가 겹쳐도 성공은false이고+100을 지급하지 않는다. 별도 실패 벌점은 없다.
-Native weight1.0과 `/step_dt` 어댑터를 유지해100Hz에서도 실제 보너스는+100이다.
-현재 non-terminal 상한은약3.778/step, γ=.99 할인합 상한은약377.8이며,
+통로·Target 조건과 실패가 겹쳐도 성공은false이고+250을 지급하지 않는다. 별도 실패 벌점은 없다.
+Native weight1.0과 `/step_dt` 어댑터를 유지해100Hz에서도 실제 보너스는+250이다.
+현재 non-terminal 상한은약4.62848/step, γ=.98 할인합 상한은약231.424이며,
 이 느슨한 상한만으로 완료를 서두르는 정책이 학습된다고 판단하지 않는다.
 Native timeout bootstrap은 유지하며, 아래의 유효 재배치 성공 판정을 사용한다.
-변경 근거와 최신 로그의 수치 이상은 [학습 기록23절](../../docs/TRAINING_LOG.md)에 둔다.
+최신 weight 조정 근거와 검증 범위는 [학습 기록47절](../../docs/TRAINING_LOG.md#47-2026-10-22--보상-weight-1차-조정-적용)에 둔다.
 
 Console과 TensorBoard에서 `Episode_Reward/motion_action_rate`, `motion_joint_velocity`,
 `motion_wrench_growth`, `motion_singularity`와 `Episode_Reward/object_stability`를 각각 확인한다. 기존 단일 `motion` 항은
@@ -577,11 +599,12 @@ $$
 안정성을 증명하지 않는다. 지지된 옆넘어짐도 거리0일 수 있어 tilt는 별도로 유지한다.
 
 $$
-r_{\mathrm{stability}}=2\left[\exp\left(-\frac{\ln2}{0.01^2}
+r_{\mathrm{stability}}=3\left[\exp\left(-\frac{\ln2}{0.01^2}
 \max(d_{\max}-0.01,0)^2\right)-1\right].
 $$
 
-거리1cm까지0,2cm에서−1,3cm에서−1.875다. Blocker도 포함하고 물체 수로 비용이 배가되지
+거리1cm까지0,2cm에서−1.5,3cm에서−2.8125다. 경고 시작10mm와 지수 민감도는 유지하고
+weight만2→3으로 높였다. Blocker도 포함하고 물체 수로 비용이 배가되지
 않도록 가장 위험한 활성 물체의 거리만 사용한다. **같은 물체**의 $d_i\ge3$cm가0.1초 지속되면
 `object_support_lost`로 종료한다. 각 물체 카운터는 회복·비활성화 시0이며 부분reset은 선택 환경만
 초기화한다. 진행 Clearance gate와 완료 조건은 기존의 더 엄격한 기하를 유지하고, 실패의 유예
@@ -617,7 +640,7 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
 않다. 현재 활성 실패5개와 성공·timeout을 합쳐 native 종료 term은7개다.
 활성 실패끼리는 동시에 기록될 수 있지만 성공은 활성 실패가 없을 때만 성립한다.
-Terminal은 유효 성공에만+100을 한 번 지급하며 실패·timeout은0이다.
+Terminal은 유효 성공에만+250을 한 번 지급하며 실패·timeout은0이다.
 내부 실패와 PPO `terminated` mask도 초기화 때 읽은 native 활성 term 설정을 따른다.
 
 새로 완료된 episode의 실제 누적 집계도 기존 native logger로 제공한다. `Task_Count/completed`,
@@ -634,10 +657,33 @@ Native실행순서가OSC→physics→termination이므로현재OSC호출에서�
 
 ## 병렬 계산과 reset 연결
 
+현재 기본 `spawn_rules.generation_mode="clutter"`의 계산 순서는 다음과 같다.
+
+```text
+reference10 catalog: T/B 상대 pose·시점·초기 가림만 재사용
+  → 종류·균형 중복 순서와15–25개 요청 구성
+  → GPU FFT: 실제 collider의 비충돌 위치/방향 영역에서 partial seed 생성
+  → 한 번의 CPU 공동 제약 계산: 필수 물체·추가 prefix·빈 Blocker 목적지를 함께 결정
+  → 고정3회 X/Y 유효 구간 mixing
+  → 초기 메시 관측1회 → T/B + 가까운 주변8개 → 정책244D
+```
+
+GPU seed에서 빠진 필수 물체는 최종 장면에서 제거하지 않는다. Partial graph를 받아 공동 제약에서
+필수13개 BG 전체를 포함한다. 추가 물체는 균형 prefix만 사용할 수 있고 큰 종류를 바꾸지 않는다.
+빈 목적지는 초기 시각 보호 공간과 겹쳐도 되지만 T/B·A₀·배경 물체와 충돌하지 않아야 한다.
+이전 full-path witness는 재사용하지 않는다. 공동 제약의 내부 최적화와 무작위 장면의 승인 재시도는
+구분하며 전체 생성이 GPU-only이거나 모든 공간 조건을 기존 cache가 인증한다고 설명하지 않는다.
+
+다음은20–40개 통합 clutter 변경 전에 검증한 `spawn_rules.generation_mode="parameterized"`의
+흐름이다. 기존 두-row 배경 배치·물리/관측 개수 결합을 설명하는 비교 기록이다.
+기존 `constructive` 경로의 DP·compaction·37/74시점 승인은 아래 이전 구현 기록에 보존한다.
+
 ```text
 환경 생성 1회: robot / shelf / 물체 pool / tactile 17링크 통합 센서 / 공유 ray-casting mesh 준비
-새 scene round: Target/Blocker·물체 배치 1개 생성
-              → 한 장면의 GPU ray casting·가시성 검증·template 저장
+             → initialize_certified_catalog: 검증된 연속 영역 cache 로드 / 없으면 사전 계산
+새 scene round: 역할·균형 중복 구성 → 해당 구성의 인증된 family 선택
+              → CDF의 연속 변수 추출 → roles / camera / guard / 두-row background 직접 구성
+              → observe_at_viewpoint: 한 번의 초기 관측 → template 저장
 reset(env_ids): 공통 초기 배치·vision 복사
               → 선택 환경마다 Blocker 앞 EEF 위치·회전을 새로 샘플링
               → GPU 배치 IK·elbow-up·전체 로봇 충돌 검사
@@ -682,38 +728,112 @@ Reset은1.02→0.31초, PPO update는0.32→0.23초로 줄었다. Native PhysX p
 짧은 새 학습의 비교이므로 trajectory와 reset 행 수는 완전히 같지 않다. 상세 계측은
 `outputs/contact_manipulation/full_optimization_20261015/comparison.json`에 있다.
 
-현재 실험은 **10종을 하나씩, 총 10개** 생성하고 매 episode 모두 배치한다.
-배치 전에 Target/Blocker를 정하고, 나머지 8개를 주변 물체로 사용한다. 중복 물체는 없다.
-물리 pool과 관측 capacity 모두 10개다.
+최신 요구는 **4–10종을 유지하면서 총15–25개**를 하나의 clutter로 배치하는 것이다.
+Target 종류는 정확히1개이며 선택된 non-Target 종류별 개수 차이는 최대1개다. 개수는 같은
+선반의 수용 가능한 범위에 연동하되 큰 물체나 선택 종류를 몰래 제외하지 않는다. 이 생성기
+변경은98개 standalone 장면과 native4·1,024환경 검사로 확인했으며 기존10물체 결과와 구분한다.
 
-선반 전체 점유율은 **≥20%**, 2×3 분할 영역별 점유율은 **≥10%**다.
-Footprint 면적 합을 가장자리 여유를 제외한 선반 면적으로 나눈 기준이다.
-실제 USD에서 측정한 10종의 합산 점유율은 약 21.85%여서 이전 35% 조건은 달성 불가능하다.
-이번 10개 실험에 맞춰 전체 점유율 기준만 20%로 낮췄으며 선반 범위와 역할·가시성 조건은 유지한다.
+전체 이동·pivot 경로의 빈 공간 예약은 제거하고 Blocker의 빈 목적 영역만 확보한다.
+이는 충돌 없는 연결 경로나 모든 scene의 조작 성공 가능성을 증명하는 규칙이 아니다.
+정해진 기하 조건에서 직접 만든 seed를 고정3회 조건부 X·Y sampling으로 섞는 helper는
+CPU 검증을 마쳤다. 새4·1,024환경 검사에서는 실제 메시 가시성Target68.85%·Blocker100%,
+관측244D와17개 tactile 채널을 확인했다. 1,024환경의 부분 reset은 다른1,023환경을 그대로 유지하고
+장면·관측을 추가하지 않았다. 초기 특이점·비유한 상태·종료·fallback은0이었다.
 
-이전 30/40-slot checkpoint는 모델 설정과 observation 크기가 달라 기본 resume/play와 호환되지 않는다.
+`CONTACT_MANIPULATION_NUM_OBJECTS`는 최초 topology 구성 전에 읽는 물리 최대 개수로 기본25이다.
+최소4종에서 임의 종류의 균형 중복을 지원하려면 종류별8개, 총80개의 body를 미리 생성해야
+한다. 활성15–25개를 선반에 놓고 나머지는 기존의 격리된 parking 위치에서 유지한다.
+현재 SDK의 GPU 경로에서 simulation OFF→ON 뒤 새 pose가 다음 물리 step에 유지되지 않는
+문제가 재현되어 live simulation flag 전환은 사용하지 않는다. 미사용 물체는 기존의 격리된
+주차 위치에서 native kinematic body로 유지하고 활성 물체만 dynamic으로 전환한다.
+Native actor·GPU view와 collider는 유지하며 gravity flag나 중력 상쇄 외력을 사용하지 않는다.
+Kinematic 물체는 중력 적분과 dynamic solver 처리를 줄일 수 있지만 collider·broadphase·
+transform 관리와 메모리 비용은 남으므로 PhysX 연산에서 완전히 제외하는 방식은 아니다.
+활성 mask가 바뀌는 전체 공유 장면 commit에서만 USD kinematic 속성을 갱신하고 PhysX에
+반영한 뒤 native writer로 pose·velocity를 기록한다. 같은 장면의 부분 reset은 동일 mask를
+재사용하여 USD 속성 변경과 flush를 생략한다.
+바닥은 기존 native 전역 GroundPlane, 환경 ID bounds는 native cloner의4bit 설정을 사용한다.
+스폰 규칙·높이와100Hz 물리·정책 주기는 유지한다. 검증·미확정 범위는
+[TRAINING_LOG](../../docs/TRAINING_LOG.md)에 기록한다.
+이번 변경은 최대30개 설정의100-body pool에서 환경당20개를 줄인다.
+이전130-body source 검사와4환경30step·1,024환경10step을 통과했다. 당시 GPU used는
+10.84GB, host RSS는9.54GB였다. 이 값은 현재80-body 설정의 측정값이 아니다.
+Pool 크기로 첫 body의 주차 변환이 달라지지
+않도록 기존3-copy slot을 유지하고 추가 복사본만 뒤에 둔다. 주차 위치 집합은 그대로다.
 
-배치 생성은 CPU의 역할·물체 구성·조작 경로 준비와 Warp의 주변 물체 배치로 나눈다.
-Blocker는 footprint 차단율을 만족하는 Y 구간 안에서 샘플링한다. 물체 높이와 전체 점유율은
-구성 확정 시 확인하며, 주변 물체 위치는 해당 yaw에서 선반 안에 들어가는 중심 범위에서 만든다.
+관측 용량은 물리 개수와 분리한10개로 고정한다. Target·Blocker가 slot0/1이며 인식한 주변
+물체는 두 역할까지의 최소 거리 순서로 최대8개를 선택한다. 공개 관측 폭은244D다.
+이전30/40-slot checkpoint를 현재10-slot 설정으로 해석하지 않는다.
 
-CUDA 환경에서는 최대 512개 장면의 배치 상태를 GPU에 유지한다. 한 물체당 위치·yaw 후보
-64개를 병렬로 생성·검사·채점하고, 성공한 위치를 저장한다. 두 번 연속 후보가 없으면
-후보와 가장 많이 충돌한 주변 물체 하나만 빼고 현재 물체를 먼저 놓은 뒤 다시 채운다.
-Target·Blocker와 조작 경로는 이 부분 수정 동안 유지한다. 장면당 최대 16회 부분 수정 후에도
-해결되지 않으면 같은 물체 구성으로 역할 pose·경로를 다시 제안한다. 전체 탐색에도 상한이 있다.
+### 이전 10물체 연속 영역 생성 경로의 검증
 
-정밀 충돌 검사는 AABB로 가까운 장애물을 추린 뒤 수행한다. 경로 다각형의 축·투영 구간은
-한 번 계산해 재사용하고, 구역별 점유 면적·이웃 관계는 변경된 물체에 대해서만 갱신한다.
-GPU 기하는 float64/비융합 연산이며, CPU 환경도 같은 Warp 생성기를 사용한다.
-Pivot sweep/convex hull과 Blocker 허용 구간 계산은 Numba로 컴파일한다.
-조작 경로 후보도 고정 크기 배열로 생성해 Python 객체를 후보마다 만들지 않고,
-선택된 경로만 객체로 복원한다. GPU 배치 kernel의 인자는 batch마다 한 번 준비해 반복 실행한다.
-선택한 경로의 회전 구간·footprint·sweep hull은 Numba에서 배열로 만들고, 정점 배열과 유효
-정점 수를 배치 준비까지 유지한다. 구간/꼭짓점마다 Python tuple을 만드는 왕복 변환은 생략한다.
-생성 알고리즘이 바뀌었으므로 이전 버전과 같은 seed의 위치는 달라진다. 같은 버전·device에서는
-환경 순서와 batch 크기에 독립적인 seed 결과를 유지한다. CPU/GPU 사이의 완전한 좌표 일치는
-보장하지 않으며, 두 경로 모두 독립 다각형 검사로 연구 조건을 검증한다.
+학습 전 `initialize_certified_catalog`가 실제 메시의 유효 Blocker 이동 구간, 초기 A₀ 차단,
+카메라·선반·조작 경로와 주변 물체의 공간 예산을 결합한다. 병진 경로로 수용되지 않는 관계에는
+`_precompute_normal_pivot_family`의 pivot 후 이동 경로를 사용할 수 있다.
+`_precompute_guarded_role_family`는 순수±Y 이동으로 A₀를 비울 수 없는 부분 family를 인증한다.
+일반 XY 이동 전체의 불가능성을 주장하지는 않는다. Cache에는 관계식·연속 구간·CDF와 실제 메시
+가시성의 fingerprint를 저장한다. 완성된 전체 장면 bank를 재생하는 방식이 아니다.
+
+같은 주변 종류·개수를 고정해도 두 역할 각각360°를 지원하도록 모든 허용 구성의 **ordered-pair별
+최악 공간 예산**을 적용한다. Guard를 뺀 주변 물체는 별도의 residual 예산을 사용한다.
+최종 공간 인증까지 통과한 guard 비의존 family들의 yaw 합집합에 빈 구간이 없어야 catalog를
+승인한다. 각도 빈도와 변수 간 연동은 균등·독립일 필요가 없으며, 두 yaw의 모든 독립 조합을
+지원한다는 의미는 아니다. 주변 물체도 모든 slot이 자유 yaw slot으로 선택될 양의 확률을 갖는다.
+
+Reset의 `sample_certified_episode → sample_certified_scene`은 먼저 균형 종류·개수를 정하고,
+사용 가능한 관계 영역에서 한 tuple을 추출하여 역할·카메라·필요한 guard·주변 chain을 직접 만든다.
+고정 두-row chain은 회전된 collision footprint의 Minkowski 경계에서 다음 위치를 계산한다.
+`spread_gaps=True`는 가까운 간격을 선호하며 남는 공간 안에서 넓은 간격도 연속적으로 허용한다.
+이 경로는 생성 후 배치 승인·교체·재생성, DP 분할이나37/74개 시점 평가를 하지 않는다.
+이 작은 CPU 기하 계산은 공통 장면 하나에만 수행하고1,024개 clone마다 반복하지 않는다.
+
+기본 cache 위치는 `outputs/contact_manipulation/parameter_domains`다. Geometry·pool copy 수·
+생성 규칙·센서 설정이 바뀌면 cache identity도 바뀌며 checksum을 검증한다. 완료된 ordered pair의
+checkpoint로 사전 계산을 재개한다. 이번90 pair·6,593 family·207,027 cell의 cold-cache 생성은
+**33.68분**이었으며, 같은 입력의 후속 실행은 cache를 로드한다. 이는 reset/iteration 시간이 아니다.
+실제360장면과 guarded4장면의 기하·광선 검증,1,024환경 native robot-start/reset 검증을 통과했다.
+Native 초기 자세의 활성 singularity 기준 위반은0행, fallback은0회였다. Reset은 최초1.960초,
+새 bucket을 준비한5환경 부분 reset0.265초, warm 전체 reset0.117초로 측정했다. 이 값은 전체
+학습 iteration 시간이 아니다. 공식 학습 진입점의
+`2026-10-22_17-19-09_parameterized_default_smoke`는26 iteration·936 step을 완료하고800-step의
+새 장면 전환을 확인했다. 두 장면의 초기 자세 위반과 reset fallback은0이었으며
+actor·critic·optimizer 값도 모두 유한했다. 학습 시간108.254초에는 cold capture가 포함된다.
+이는 짧은 통합 시험으로 장기 안정성이나 iteration당1–2초 달성을 뜻하지 않는다.
+최신 결과는 [학습 기록43절](../../docs/TRAINING_LOG.md#43-2026-10-22--연속-파라미터-구간과-직접-생성-경로)에 둔다.
+
+초기 vision은 실제 카메라나 render product 없이 공유 시각 메시 BVH를 GPU로 조회한다.
+물체만 ray casting하고 로봇·선반 가림은 제외한다. `observe_at_viewpoint`는 정해진 시점의
+첫 교차 표면으로 OBB를 추정하며 가려진 부분을 정답 pose·전체 크기로 채우지 않는다.
+Target40–90%·Blocker≥95%는 startup의 실제 메시 구간에서 인증하며 reset에서 다시 승인하지 않는다.
+따라서 관측의 `visible_fractions=None`은 미측정이라는 뜻이고, cache 예측값은 별도 provenance다.
+관측 기하는 episode 동안 고정하고 매 step 현재 `wrist_3_link` frame으로 재표현한다.
+Headless 학습은 render를 호출하지 않으며 GUI·video의 native 렌더링은 별도다.
+
+구현은 [events.py](contact_manipulation/mdp/events.py)의 catalog·직접 생성·reset,
+[sensors.py](contact_manipulation/mdp/sensors.py)의 `precompute_translation_domain`과
+`observe_at_viewpoint`, [scene.py](contact_manipulation/config/ur5e/scene.py)의
+`inspect_geometry`·native asset 준비에 모았다. 상세 규칙은 [SPAWN_RULES.md](../../docs/SPAWN_RULES.md)를 따른다.
+
+<details>
+<summary>이전 constructive 비교 기록: DP·compaction·37/74시점 승인</summary>
+
+아래는 `env.spawn_rules.generation_mode=constructive`로 비교할 수 있는 이전 생성 경로다.
+아래 시점 후보 승인과3–10mm 이웃 상한은 현재 `parameterized` 규칙이 아니다.
+
+이전 `spawn_rules.generation_mode="constructive"`는 공유 scene seed당 역할·종류 구성·초기 yaw를
+한 번 정한다. Yaw는 각 물체의 전체360°에서 선택한다. Target 앞의 Blocker와 pivot→병진
+witness의 좌표 extrema로 작업 구획을 만든다. ±Y 두 방향을 먼저 계산하고 수용 가능한 유한
+영역의 합집합에서 방향·구획을 선택한다. 주변 물체를 넣을 양옆 영역의 slicing 분할을
+유한 dynamic programming으로 계산한다. 폭·깊이 Pareto frontier에 임의 후보 수 제한을 두지 않는다.
+이후 두 방향에서 각각 한 번 해석적 compaction을 수행한다. 이미 이동한 물체와 아직 이동하지
+않은 물체를 모두 반영하고, convex configuration-space 경계에서 위치를 직접 계산한다.
+충돌할 때까지 다시 난수를 뽑거나 배치를 부분 수정한 뒤 반복 승인하는 방식은 사용하지 않는다.
+
+공유 장면 하나의 구성·구획 계산은 CPU에서 한 번 수행한다. 1,024개 환경이나 physics step마다
+수행하지 않는다. 상세 collision footprint의 Minkowski 경계는 정점 edge-angle 병합으로 계산하고,
+거리 계산은 compiled CPU kernel에 맡긴다. 공간 영역이 비거나 실제 메시 시점 조건이 실패하면
+원인을 보고하며 같은 seed의 장면을 조용히 다시 뽑지 않는다. 이전 재시도 sampler는
+`generation_mode="legacy"`를 지정한 회귀 비교용이다. 새 버전은 같은 과거 seed와 다른 배치를 만든다.
 
 Blocker의 이동·pivot·회전 후 이동을 포함하는 지지면 내 충돌 없는 경로를 하나 확보하고,
 그 경로와 hand 시작 영역을 비워 둔다. 이 경로는 배치 가능성을 확인하는 메타데이터이며
@@ -728,27 +848,46 @@ PhysX articulation의 runtime self-collision 설정을 바꾸지 않는다.
 Box는 평면 collision proxy를 사용하고 바닥 높이에 바로 놓으며
 초기 속도를 0으로 만든다. Reset 안에서 물리 simulation을 진행하는 settling loop는 없다.
 
-여기서 convex hull은 USD의 물리 collider를 재생성하는 작업이 아니다. 배치 단계에서는
-이동/pivot 도중 물체가 지나가는 평면 영역을 보수적으로 감싸서 재배치 공간을 예약한다.
-회전은 최대 5° 구간의 양 끝 footprint hull에 회전 궤적의 오차 여유를 더한다.
+여기서 convex hull은 USD의 물리 collider를 재생성하는 작업이 아니다. 최초에 authored collider의
+upright XY convex hull을 종류별로 캐시하고 선택한 초기 yaw로 회전한다. 가까운 이웃의 목표
+간격은 이 envelope 기준3–10mm이며 Blocker 조작 공간은 별도로 예약한다. 미래의 전체 회전
+여유를 물체마다 확보하는 외접원 구획은 사용하지 않는다. Concave/compound 형상의 빈 공간을
+convex hull이 메우므로 정확한 PhysX 접촉 표면이나 contact offset과 동일하게 취급하지 않는다.
 MDP에서는 기울어진 OBB의 8개 꼭짓점을 XY에 투영한 hull과 A₀의 교차 면적을 계산한다.
 USD collider는 PhysX의 접촉 계산에 사용하며, 경로 여유·선반 점유율·A₀ 차단율을 자동으로
-제공하지 않는다. 배치용 OBB/sweep은 실제 collider보다 보수적인 근사이고 물리 조작 성공을 보장하지 않는다.
+제공하지 않는다. 예약 경로가 있어도 물리 조작 가능성이나 회전의 필수성을 보장하지는 않는다.
+기존 주변 물체1–2개를 해석적 guard 영역에 놓을 수 있으면 `guarded_pivot_translate` mode와
+일반 `pivot_translate` mode를 함께 준비한다. Guarded는 초기 X·yaw를 고정한 순수±Y 양쪽
+탈출이 margin0에서도 막히고 pivot→병진은 가능한 branch다. 일반 XY 병진 해법까지 배제한
+판정은 아니다. 실제 메시 가시성까지 만족하는 guarded mode를 우선 선택하며 없으면 이미
+평가한 일반 mode에서 고른다. Guard는128개 고정 법선의 보수적 이동 envelope 밖에 두며,
+이전 packing용 큰 직사각형 안에 들어갈 수 있다. 이때 `reserved_regions=()`로 표시해
+빈 직사각형 metadata와 실제 witness envelope를 구분한다. 추가 물체나 랜덤 재시도는 없다.
+세부 이전 규칙은 [SPAWN_RULES.md](../../docs/SPAWN_RULES.md)의 `constructive` 기록을 따른다.
 
 초기 관측에는 **실제 카메라·render product·annotator·참조 물체를 생성하지 않는다.**
 Isaac Lab `RayCaster`와 같은 Warp mesh query를 사용한다. 물체 10종의 시각 메시를 한 번
 읽어 종류별 BVH를 공유하고, 활성 물체만 검사한다. 물체 복제본마다 메시를 다시 만들거나
 움직일 때 BVH를 재구성하지 않는다. **로봇·선반에 의한 가림은 제외**한 관측 모델이다.
 이 제외는 ray 관측에만 적용하며, 물리 시뮬레이션과 로봇 초기 자세의 충돌 검사는 유지한다.
-시점 난수·카메라 자세 생성, ray query, 가시율과 후보 선택, OBB 추정은 환경과 같은 CUDA
+시점 영역·카메라 자세 생성, ray query, 가시율과 시점 선택, OBB 추정은 환경과 같은 CUDA
 device에서 배치 처리한다. 물체·시점별 좌표 변환은 한 번 계산해 모든 픽셀이 공유한다.
 시야 밖 광선은 Target/Blocker 메시로 바로 연결한다.
 
-Reset마다 선반 앞 가상 시점의 위치·방향을 기존 범위에서 새로 샘플링한다. 기본 160×120 광선
-격자에서 가장 가까운 표면을 선택하고, Target·Blocker만 따로 조회한 고립 실루엣 대비
-**Target ≥40%, Blocker ≥95%**를 확인한다. 분모는 같은 자세·광선 간격의 2배 넓은 격자로
+새 공유 장면마다 선반 앞 가상 시점을 배치에 결합한다. 배치 가시성 인증은 기존160×120 광선
+격자와 고립 실루엣을 사용하며, Target·Blocker만 따로 조회한 고립 실루엣 대비
+**Target40–90%, Blocker≥95%**를 확인한다. 분모는 같은 자세·광선 간격의2배 넓은 격자로
 계산하며, 실제 시야에서 잘린 role 물체는 거절한다. 이는 렌더링 픽셀 대신 **광선 표본 면적**으로
-계산한 근사 가시율이다. `initial_vision.ray_width`, `ray_height`로 해상도를 조절한다.
+계산한 근사 가시율이다. `initial_vision.ray_width`, `ray_height`는 이 사전 인증의 해상도다.
+기본 clutter reset은 인증된 시점에서 **observation-only ray casting을 한 번** 수행한다.
+
+실제 정책 관측은 **64×48=3,072 rays**다. 이전160×120=19,200 rays보다84% 적다.
+`initial_vision.observation_ray_width`, `observation_ray_height`로 조절하며, 최소 OBB
+관측점은 `observation_min_depth_pixels=3`이다. Low-resolution grid와 intrinsics는 한 번
+만들어 재사용한다. 관측 전용 세 값은 배치 인증 cache key에서 제외하므로 기존 catalog를
+재사용하며 관측 해상도만 바꿔90개 역할 조합을 재계산하지 않는다. 인증의32/16 pixel 조건은
+유지한다. 더 낮은48×36은1,728 rays로 기존의약1/11이며 별도 관측 해상도 비교에 사용할 수 있다.
+낮은 해상도에서 작은 물체의 추정 OBB나 유효 slot 수는 달라질 수 있다.
 
 Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright PCA로 추정한다. 보이지 않는
 물체는 padding으로 남기며, 물체의 정답 pose·전체 크기로 가려진 부분을 채우지 않는다.
@@ -756,21 +895,31 @@ Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright
 사용한다. CUDA에서는 배경 ray를 제외한 count·moment·bounds를 Warp atomic 연산으로 계산한다. 초기 기하는
 기존처럼 episode 중 고정되고 현재 EEF frame으로만 재표현한다. Actor 244D 규약은 유지한다.
 
-`initial_vision.ray_batch_size=32`개 episode 요청을 처리하고, 완료한 자리에 다음 요청을 넣는다.
-`ray_candidates_per_env=4`개 시점을 환경마다 한꺼번에 평가하므로 기본 최대 128개 시점을
-동시에 검사한다. GPU에서 첫 통과 후보를 선택하고 그 후보에만 OBB를 계산한다. 환경별
-독립 seed/후보 번호로 난수를 생성하므로 요청 순서·묶음 크기에 따라 후보가 바뀌지 않는다.
-이전 Python 난수열과 같은 시점을 생성하지는 않는다. CPU에는 요청 포장·완료 큐 관리와
-결과 객체 조립이 남으며, 후보 묶음당 선택 인덱스 한 번과 큐 완료 후 통계만 CPU로 읽는다.
-시점 상한 32회, 가시율 40%/95%, 최소 실루엣 32픽셀·관측 16점은 유지한다.
+이하 전체 영역 평가 설정은 사전 인증/legacy 검증 경로다. 기본 clutter reset은 새 후보
+시점을 평가하거나 재시도하지 않는다.
+`initial_vision.view_domain_shape=(2,9,2)`는 거리2개·좌우9개·높이2개, 고정36개 시점을 뜻한다.
+배치 규칙의 시점1개를 더한다. Mode가 하나면37쌍, base/guarded가 있으면 최대74개의
+mode·시점 쌍을 처음부터 모두 평가한다. `ray_batch_size=32`는 고정 메모리 chunk의
+상한이며 실패 후 후보를 추가하는 재시도 횟수가 아니다. 거리0.55–0.95m, Blocker 기준 좌우
+±0.35m, 선반 위0.18–0.48m의 grid를 사용하고 방향은 두 역할을 바라보도록 계산한다.
+GPU에서 각 mode의 유효 시점 중 Target 가시율이65%에 가장 가까운 것을 선택한다.
+동률이면 Blocker 가시율이 큰 시점, 다시 동률이면 앞선 index를 고른다. 최대2개 mode의 결과는
+CPU에서 유효 guarded 우선으로 정리하며 픽셀·메시를 CPU로 가져와 재검사하지 않는다.
+선택한 시점의 depth·label을 재사용해 OBB를 계산하고 선택된 mode의 물체 pose·충돌 기하·
+초기 vision을 함께 확정한다. 이는 두 mode의 균등 선택이나 실패 후 새 장면 생성이 아니다.
+최소 비가림 실루엣32픽셀·실제 관측16점과 전체 화각 포함 조건도 유지한다.
+유효 시점이 없으면 조건별 가시율·픽셀 수·실패 항목을 보고하고 배치를 재생성하지 않는다.
+고정 영역을 평가한다는 사실이 모든 종류·역할·yaw 조합의 메시 가시성을 보장하지는 않는다.
 RGB는 만들지 않는다. 디버깅 시
-`capture_batch(..., retain_images=True)`는 합성 ray depth와 role mask만 반환한다.
+`capture_view_domain(..., retain_images=True)`는 합성 ray depth와 role mask만 반환한다.
 Headless 학습은 카메라 기능을 켜지 않고 reset에서도 render를 호출하지 않는다.
 GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 별도로 유지한다.
 
 이 관측 모델은 표면을 불투명하게 취급하며 조명·투명/반사 재질·검출 실패·센서 노이즈를
 재현하지 않는다. Triangle mesh는 원본을 사용하고 USD primitive는 tessellation한다.
 물체 association도 이상적이므로 실물 vision과의 차이는 별도로 검증해야 한다.
+
+</details>
 
 50 mm 연결부 중앙 fixed joint의 실제 reaction을 F/T로 읽고, SI-200-8 변환·보상은 MDP에서
 한 번 적용한다. Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
@@ -795,10 +944,15 @@ Tactile 통합 센서 1개는 전체 환경의 갱신 시점이 같은 특성을
 인덱스 탐색을 생략한다. Observation을 읽을 때 최신 native force buffer를 조회한다.
 선반 위치·회전 비교도 GPU tensor로 처리하고, quaternion 내적의 절댓값을 사용해
 `q`와 `-q`를 같은 회전으로 취급한다. 전체 scene sensor는 tactile과 EEF frame의 2개다.
-비활성 물체의 중력 상쇄는 reset 시 native permanent wrench composer에 설정한다.
-매 step force 적용과 transient wrench 합성은 native collection이 수행한다.
-전부 활성 상태면 composer를 비활성으로 유지하여 매 physics step의 0-force 제출을 생략한다.
-실행 중 simulation/gravity flag를 전환하지 않는다. Permanent composer는 주차용으로 예약한다.
+물체의 simulation/gravity flag와 collider는 실행 중 바꾸지 않는다. 전체 공유 장면에서 활성
+mask가 바뀔 때만 `set_active_objects`가 native USD kinematic 속성을 갱신·flush한 뒤
+native writer가 pose·velocity를 기록한다. 미사용 물체는 기존 주차 위치의 kinematic body,
+활성 물체는 dynamic body다. 같은 mask를 사용하는 부분 reset은 USD 변경·flush 없이 선택
+행의 상태만 복구한다. 후보 배치 검증은 object state·활성 mask를 건드리지 않고 로봇 FK만
+임시 검증·복원하므로 준비 실패 시 다른 물체나 환경을 되돌리기 위한 flag 전환도 없다.
+이 방식은 collider·broadphase·transform 관리와 메모리 비용을 제거하지 않는다.
+이전 simulation OFF/ON 또는 중력 상쇄를 사용하던 프로세스에 hotpatch하지 말고 새 프로세스로 실행한다.
+이번 전환의4환경 fixture 검사에서는17개 tactile pad와 Blocker 접촉 필터 구분을 확인했다.
 
 YCB 4종은 native `CollisionPropertiesCfg(contact_offset=0.005)`를 사용한다.
 기존 6종의 자동 offset은 유지한다(현재 PhysX 측정 약 1.962 mm). Rest offset은 0이다.
@@ -885,8 +1039,10 @@ GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 이 배치용 TCP
 성공한 행은 유지하고 실패 행만 최대3회 일반 탐색, 이어2회 기준점 주변의 좁은 범위에서
 재제안한다. 복구 위치는 환경 축별±(2,2,1.5)cm와 원래 영역의 교집합, 회전 범위는±2.5°다.
 Robot 전용 budget은 `robot_start.reset_attempts/recovery_attempts`이며 vision budget과 분리했다.
-새 공유 배치는 anchor를 찾은 뒤 독립seed의 위치·회전 목표8개를 각1회 검사해 최소4개가
-유효할 때 채택한다. 이 유한 probe가 전체 영역의 유효성이나 모든 IK수렴을 보장하지는 않는다.
+구성적 새 공유 배치는 유효 anchor와 실제 PhysX FK·elbow·충돌 검사를 기준으로 확정한다.
+임의6D목표8개의 단일 IK 판정 중4개 이상을 요구하던 추가 gate는 구성적 경로에 적용하지 않는다.
+작은 임의 표본의 실패는 시작 영역의 부재를 증명하지 않기 때문이다. 이4/8 probe는 명시적인
+legacy 회귀 비교 경로에만 남기며 실제 충돌·자세 제약과 환경별 연속 randomization은 유지한다.
 
 끝까지 실패한 행은 같은 장면에서 충돌·물리 FK를 검증한 기준 관절값·TCP·영역으로 복구한다.
 그 행은 새 randomization을 포기하며, 다른 행이나 공유 배치를 변경하지 않는다.
@@ -902,8 +1058,15 @@ Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세 때문에 �
 최근에 재시작한 episode도 이 경계에서 종료하며, 실패 벌점 대신 기존 timeout bootstrap을 쓴다.
 `ManagerBasedRLEnv.step/_reset_idx`는 그대로 사용한다. 새 round의 배치·vision은 env_0에서
 한 장면만 준비해 공유하고, 로봇 시작 자세는 모든 환경에 대해 새로 계산한다.
-배치·시점 후보가 가시성/IK 검사를 통과하지 못하면 제한된 재시도는 여전히 필요하다.
+새 `parameterized` 경로는 배치·시점을 다시 추출하지 않는다. 로봇 후보 탐색과 같은 장면의
+검증 anchor 복구는 별도 budget으로 유지한다.
 공통 round 길이는 `episode_length_s`를 따른다.
+
+<details>
+<summary>이전 legacy 배치·시점 탐색의 연산 기록</summary>
+
+아래 배치 후보·시점 재시도는 이전 sampler의 기록이며 새 연속 영역 경로에는 적용하지 않는다.
+로봇의 GPU IK·충돌 검사와 tensor 적용은 별도로 유지한다.
 
 Reset 준비 연산은 다음과 같이 나눈다.
 
@@ -942,6 +1105,8 @@ GPU IK 난수 생성기로 바뀌어 이전 코드와 같은 seed의 구체적�
 재시도 중 Target·Blocker, 물체 종류·instance 집합과 가시율 기준은 유지한다.
 부분 reset은 layout/vision 검사를 생략하고, 실패한 로봇 IK 행만 재시도한다.
 
+</details>
+
 장면 복제는 Isaac Lab의 기본 USD cloner(`clone_in_fabric=False`, `replicate_physics=True`)를
 사용한다. 따라서 GUI Stage에서 모든 `env_*`를 확인할 수 있다. 마지막 scene spawner가
 env_0의 완성된 rigid body 기하를 임시 USD에 저장하고 instance로 공유한 뒤 환경을 복제한다.
@@ -949,11 +1114,11 @@ env_0의 완성된 rigid body 기하를 임시 USD에 저장하고 instance로 �
 기존 nested instance를 먼저 펼치고 외부 material binding을 함께 옮겨 로봇 메시·재질 누락을
 방지한다. 임시 USD는 프로세스 종료 시 제거하며 원본 에셋은 수정하지 않는다.
 
-배치의 종류·밀집도·충돌·가시성 기준은 유지하고, 승인된 장면을 공통 round 안에서 재사용한다.
+구성한 초기 장면을 공통 round 안에서 재사용한다.
 새 장면의 staging은 전체 환경이 reset되는 경계에서만 수행한다. 부분 reset에서는
 로봇 자세 탐색을 완료한 뒤 선택 행만 쓰며, 미선택 환경의 물리 상태·episode 이력을 유지한다.
 물체 기하·F/T 보상·vision 정렬도 선택 행만 계산한다.
-CPU 배치 탐색과 reset 시 metadata 전송은 남아 있다. 환경별 SciPy IK는 GPU 배치로 대체했고,
+공통 장면의 작은 CPU 기하 계산과 reset 시 metadata 전송은 남아 있다. 환경별 SciPy IK는 GPU 배치로 대체했고,
 초기 관측의 렌더링 경로는 제거했다. 이 탐색·기하 조회·CPU/GPU 동기화는 매 step에 실행하지 않는다.
 Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 배치/vision 생성은 공통 round당
 한 장면에 대해서만 수행하며, IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
@@ -1134,7 +1299,7 @@ hand–arm OBB 여유 위반 10개가 발견됐다(중복 가능). 수정 후 �
 CPU sampler의 4·8개 스레드 실행은 동일한 작업에서 단일 스레드보다 느려 적용하지 않았다.
 주요 잔여 비용은 Python의 회전 경로 convex hull 계산과 후보 생성이며, 작업별 실제 비용을
 측정하면서 개선해야 한다. 여러 seed에서의 처리량과 장시간 학습 안정성은 별도 검증 대상이다.
-별도 play/OBB 시각화 도구와 모델 export도 남아 있다.
+Play와 GUI OBB 표시는 아래 실행 절에서 제공하며, 모델 export는 별도 구현 대상이다.
 
 ## 실행
 
@@ -1166,19 +1331,20 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless --run_name independent_critic
 ```
 
-1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비로
-첫 학습 로그까지 수 분이 걸릴 수 있다. 한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
+1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비가 필요하다.
+`parameterized`의 cache가 없으면 앞서 설명한 최초 연속 영역 계산 시간도 추가된다.
+한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name independent_critic
 ```
 
-기하 관측과 IK의 임시 메모리는 native Hydra 설정으로 조절할 수 있다. 다음 예시는
-동시에 32개 요청의 시점 후보를 각각 4개씩 처리하고 한 번의 IK 후보 수를 512로 제한한다.
+위 명령은 `parameterized` 경로와 기본 cache를 사용한다. Cache 경로와 한 번의 IK 후보 수 상한은
+native Hydra 설정으로 명시할 수 있다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 4 --headless \
-  env.initial_vision.ray_batch_size=32 env.initial_vision.ray_candidates_per_env=4 \
+  env.spawn_rules.parameter_cache_directory=outputs/contact_manipulation/parameter_domains \
   env.robot_start.ik_batch_size=512
 ```
 
@@ -1194,6 +1360,23 @@ Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
   --load_run '.*_independent_critic' \
   --num_envs 4 --real-time
 ```
+
+GUI의 **IsaacLab → Scene Debug Visualization**에서 두 레이어를 별도로 켜고 끈다.
+
+- **Target / Blocker OBB:** 현재 실제 물체의 Target 초록색·Blocker 빨간색 bounds.
+- **Observed objects OBB:** 정책의 유효 observation slot(최대10개)에 해당하는 청록색 OBB.
+  실제 전체 bounds가 아닌 초기 visible-surface 추정값이며, 물체가 움직여도 초기 snapshot을
+  유지한다. 현재 EEF frame의 관측을 world로 되돌린 것과 같은 위치에 표시한다.
+
+둘 다 기본 ON이다. 초기 OFF는 각각 `env.role_obb_debug_vis=False`,
+`env.observation_obb_debug_vis=False`로 지정한다. 두 레이어는 하나의 DebugDraw callback을
+공유하므로 한 레이어의 OFF가 다른 레이어를 지우지 않는다. 모두 OFF일 때 callback을
+해제한다. `isaacsim.util.debug_draw` 선만 사용하고 USD prim·rigid body·collision shape를
+만들지 않는다. Headless에서는 visualizer·UI·callback을 생성하지 않는다.
+
+PhysX의 whole-scene Patch 용량은 `gpu_max_rigid_patch_count=2**18`(262,144)로 설정했다.
+기본163,840에서 관측 요구량184,896을 초과한 오류에 대응한 값이며, contact count·solver
+반복·정책 및 물리100Hz는 유지한다. 이 설정은 새 시뮬레이션 생성 시 적용된다.
 
 `--checkpoint`를 생략하면 native `get_checkpoint_path()`로 최신 run의 마지막 checkpoint를
 선택한다. 이전 tanh 및 공유 actor–critic run은 계약 검사에서 거절되므로

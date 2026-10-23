@@ -98,7 +98,7 @@ class ModelCfg:
     # Serialized checkpoint contract: target slot 0, blocker slot 1, no role-ID channels.
     observation_layout: str = "fixed_roles_v1"
     activation: str = "relu"  # Checkpoint metadata includes parameter-free activations.
-    max_objects: int = 10
+    max_objects: int = 10  # Policy capacity stays fixed when physical scene count changes.
     # Newest first: the current sample and the immediately preceding sample.
     history_steps: int = 2
     action_dim: int = 18

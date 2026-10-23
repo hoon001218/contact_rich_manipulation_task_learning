@@ -1,6 +1,6 @@
 """Native scene assets and once-only USD geometry/kinematics inspection.
 
-The simulator clones one authored robot, shelf and fixed 10-body object pool.
+The simulator clones one authored robot, shelf and a reusable object pool.
 Episode roles and poses are selected by MDP reset events; no prim topology is
 changed during reset. This module has no dependency on the previous project.
 """
@@ -84,10 +84,21 @@ ASSET_SPECS = (
     ObjectSpec("ycb_005_tomato_soup_can", f"{_YCB_FOLDER}/005_tomato_soup_can.usd", _YCB_UPRIGHT),
     ObjectSpec("ycb_006_mustard_bottle", f"{_YCB_FOLDER}/006_mustard_bottle.usd", _YCB_UPRIGHT),
 )
-# Load a reusable pool so non-Target assets can occupy every surrounding slot,
-# identities can change on reset without rebuilding USD or PhysX topology.
-MAX_ACTIVE_OBJECTS = 10
-OBJECT_COPIES_PER_ASSET = 1
+# Load enough copies for balanced non-Target counts at the smallest allowed
+# number of distinct types. Target's type has exactly one active instance.
+# Capacity is selected before USD/PhysX topology is built; reset only moves bodies.
+# This is the physical scene count, independent of the policy's 10 object slots.
+# Twenty-five active objects and four possible types require 8 copies of each of the
+# ten assets so that any type can be selected as a repeated non-Target object.
+try:
+    MAX_ACTIVE_OBJECTS = int(os.environ.get("CONTACT_MANIPULATION_NUM_OBJECTS", "25"))
+except ValueError as error:
+    raise ValueError("CONTACT_MANIPULATION_NUM_OBJECTS must be an integer.") from error
+MIN_ACTIVE_ASSET_TYPES = 4
+if MAX_ACTIVE_OBJECTS < MIN_ACTIVE_ASSET_TYPES:
+    raise ValueError(f"CONTACT_MANIPULATION_NUM_OBJECTS must be at least {MIN_ACTIVE_ASSET_TYPES}.")
+MAX_ACTIVE_ASSET_TYPES = min(MAX_ACTIVE_OBJECTS, len(ASSET_SPECS))
+OBJECT_COPIES_PER_ASSET = math.ceil((MAX_ACTIVE_OBJECTS - 1) / (MIN_ACTIVE_ASSET_TYPES - 1))
 OBJECT_SPECS = tuple(
     ObjectSpec(
         name=spec.name if copy_index == 0 else f"{spec.name}_copy_{copy_index + 1:02d}",
@@ -102,7 +113,17 @@ OBJECT_NAMES = tuple(spec.name for spec in OBJECT_SPECS)
 
 
 def parking_position(index: int) -> tuple[float, float, float]:
-    """Isolate unused bodies above the scene, clear of floor/shelf and each other."""
+    """Isolate bodies while keeping canonical asset transforms capacity-independent.
+
+    The first three copies retain the reference ten-object pool's parking
+    slots. Extra copies occupy its tail. This only permutes parking positions;
+    it avoids changing USD transform arithmetic when the pool grows.
+    """
+    asset_index, copy_index = divmod(index, OBJECT_COPIES_PER_ASSET)
+    if copy_index < 3:
+        index = asset_index * 3 + copy_index
+    else:
+        index = len(ASSET_SPECS) * 3 + asset_index * (OBJECT_COPIES_PER_ASSET - 3) + copy_index - 3
     return (-0.64 + 0.32 * (index % 5), -0.64 + 0.32 * ((index // 5) % 5), 4.0 + 0.4 * (index // 25))
 
 
@@ -610,7 +631,7 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
         enabled_self_collisions=True,
         # Native hand mimic/contact constraints need this convergence budget.
         solver_position_iteration_count=32,
-        solver_velocity_iteration_count=2,
+        solver_velocity_iteration_count=1,
     )
     tool_frame_candidates: tuple[str, ...] = _UR_TOOL_FRAME_CANDIDATES
     hand_base_candidates: tuple[str, ...] = _HAND_BASE_BODY_CANDIDATES
@@ -1487,17 +1508,13 @@ class FlatBoxUsdCfg(sim_utils.UsdFileCfg):
 
 
 class TaskObjectPool(RigidObjectCollection):
-    """Native collection with persistent countergravity for isolated parked objects.
-
-    The permanent wrench composer is reserved for parking. Transient task forces
-    can use the native instantaneous composer and are added by the parent class.
-    Active objects retain gravity and receive zero parking force.
-    """
+    """Keep GPU actors; exclude shared-layout spares from dynamics."""
 
     def __init__(self, cfg):
         self.parked_mask: torch.Tensor | None = None
-        self.gravity: torch.Tensor | None = None
-        self._countergravity: torch.Tensor | None = None
+        self._active_pattern: torch.Tensor | None = None
+        self._active_flags: tuple[bool, ...] | None = None
+        self._activation_attributes = None
         super().__init__(cfg)
 
     def write_object_link_pose_to_sim(self, object_pose, env_ids=None, object_ids=None) -> None:
@@ -1505,24 +1522,58 @@ class TaskObjectPool(RigidObjectCollection):
         # Installed SDK does not invalidate the separate COM-pose cache on writes.
         self._data._object_com_pose_w.timestamp = -1.0
 
-    def refresh_parking(self):
-        if self.parked_mask is None:
+    def set_active_objects(self, active: torch.Tensor, env_ids=None) -> None:
+        """Commit a shared mask before pose writes; partial resets cannot change it.
+
+        Public USD flags preserve actor/GPU indices, unlike simulation OFF/ON.
+        Changes affect all inherited environments, so only a full reset may
+        change the mask. The usual partial reset never edits USD or flushes it.
+        """
+        if env_ids is not None and len(env_ids) == 0:
             return
-        composer = self.permanent_wrench_composer
-        # A zero wrench still activates native per-step force submission. Check
-        # only at reset, and leave the native composer inactive when all objects
-        # are on the shelf.
-        composer.reset()
-        if not self.parked_mask.any():
+        ids = self._ALL_ENV_INDICES if env_ids is None else env_ids
+        if active.dtype != torch.bool or active.shape != (len(ids), self.num_objects):
+            raise ValueError("Object activity must be a boolean (selected environments, pool objects) tensor.")
+        if self._active_pattern is not None and torch.equal(active, self._active_pattern.expand_as(active)):
             return
-        if self._countergravity is None:
-            self._countergravity = -self.data.default_mass.to(self.device) * self.gravity
-        # Refresh conversion frames after repeated pose writes at one timestamp.
-        composer.set_forces_and_torques(
-            forces=self._countergravity * self.parked_mask[..., None], is_global=True,
-        )
-        # No position offset: native collection applies the force at the COM.
-        # No custom write_data_to_sim or direct PhysX force submission is needed.
+        if len(ids) != self.num_instances or not torch.equal(ids.sort().values, self._ALL_ENV_INDICES):
+            raise ValueError("Only a full shared-scene reset may change object activity.")
+        if not torch.equal(active, active[:1].expand_as(active)):
+            raise ValueError("All environments must share the same active object mask.")
+        if self._activation_attributes is None:
+            self._cache_activation_attributes()
+        flags = tuple(active[0].cpu().tolist())
+        old_flags = self._active_flags or (True,) * self.num_objects
+        changed = [index for index, (old, new) in enumerate(zip(old_flags, flags)) if old != new]
+        if changed:
+            from omni.physx import get_physx_simulation_interface
+
+            # A failed USD/native commit must also restore velocities: entering
+            # kinematic mode clears them even if the flags are later reverted.
+            previous_state = self.data.object_state_w.clone()
+            interface = get_physx_simulation_interface()
+            def write_flags(values):
+                with Sdf.ChangeBlock():
+                    for index in changed:
+                        self._activation_attributes[index].Set(not values[index])
+                interface.flush_changes()
+            try:
+                write_flags(flags)
+            except BaseException:
+                write_flags(old_flags)
+                self.write_object_state_to_sim(previous_state)
+                raise
+        self._active_flags = flags
+        self._active_pattern = active[0].clone()
+        self.parked_mask[:] = ~self._active_pattern
+
+    def _cache_activation_attributes(self) -> None:
+        """Resolve editable body roots without touching shared mesh prototypes."""
+        # In this SDK, prototype collider edits need not update live PhysX
+        # instance shapes. Keep those flags intact; spares stay spatially isolated.
+        stage = get_current_stage()
+        self._activation_attributes = [UsdPhysics.RigidBodyAPI(stage.GetPrimAtPath(path)).GetKinematicEnabledAttr()
+            for path in self.root_physx_view.prim_paths[::self.num_instances]]
 
 
 def make_object_collection_cfg() -> RigidObjectCollectionCfg:
@@ -1542,7 +1593,7 @@ def make_object_collection_cfg() -> RigidObjectCollectionCfg:
                         disable_gravity=False,
                         kinematic_enabled=False,
                         solver_position_iteration_count=16,
-                        solver_velocity_iteration_count=2,
+                        solver_velocity_iteration_count=1,
                         max_depenetration_velocity=1.0,
                     ),
                 ),
@@ -1656,22 +1707,33 @@ def inspect_shelf_bounds(env) -> Bounds:
         raise RuntimeError(f"Cannot inspect shelf geometry at {body_path}: {error}") from error
 
 
-def _shelf_rules(cache: UsdGeom.BBoxCache, shelf: Usd.Prim, origin: Point3, rules: SpawnRules) -> SpawnRules:
+def _shelf_rules(cache: UsdGeom.BBoxCache, shelf: Usd.Prim, origin: Point3, rules: SpawnRules,
+                 *, reference_frame=None) -> SpawnRules:
     """Discover support/ceiling panels and clip the support inside vertical posts."""
     collisions: list[Bounds] = []
     panels: list[Bounds] = []
+    xforms = UsdGeom.XformCache(Usd.TimeCode.Default()) if reference_frame is not None else None
     for prim in Usd.PrimRange(shelf, Usd.TraverseInstanceProxies()):
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
         if UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is False:
             continue
         try:
-            lower_w, upper_w = _range_bounds(cache.ComputeWorldBound(prim))
+            if reference_frame is None:
+                bound = cache.ComputeWorldBound(prim)
+            else:
+                # ComputeRelativeBound internally cancels world transforms and
+                # still acquires origin-dependent roundoff. Compose the local
+                # bound with the native relative transform directly instead.
+                bound = cache.ComputeUntransformedBound(prim)
+                bound.Transform(xforms.ComputeRelativeTransform(prim, reference_frame)[0])
+            lower_w, upper_w = _range_bounds(bound)
         except ValueError:
             # Flat or empty collision metadata does not describe a shelf slab.
             continue
-        lower = tuple(value - offset for value, offset in zip(lower_w, origin))
-        upper = tuple(value - offset for value, offset in zip(upper_w, origin))
+        offset = origin if reference_frame is None else (0., 0., 0.)
+        lower = tuple(value - shift for value, shift in zip(lower_w, offset))
+        upper = tuple(value - shift for value, shift in zip(upper_w, offset))
         bounds = lower, upper
         collisions.append(bounds)
         width_x, width_y, height = (high - low for low, high in zip(lower, upper))
@@ -1726,7 +1788,7 @@ def _shelf_rules(cache: UsdGeom.BBoxCache, shelf: Usd.Prim, origin: Point3, rule
     )
 
 
-def _object_support_vertices(body, colliders, upright):
+def _object_support_vertices(body, colliders, upright, *, reference_frame=None):
     """Cache authored collider support points in the canonical upright frame.
 
     Minima of a linear plane-distance function occur on the convex hull, so
@@ -1739,7 +1801,9 @@ def _object_support_vertices(body, colliders, upright):
     import trimesh
 
     xforms = UsdGeom.XformCache(Usd.TimeCode.Default())
-    world = _gf_column(xforms.GetLocalToWorldTransform(body))
+    body_transform = (xforms.GetLocalToWorldTransform(body) if reference_frame is None
+                      else xforms.ComputeRelativeTransform(body, reference_frame)[0])
+    world = _gf_column(body_transform)
     rigid = np.eye(4)
     rigid[:3, :3], rigid[:3, 3] = _rotation_part(world), world[:3, 3]
     world_to_body = np.linalg.inv(rigid)
@@ -1784,7 +1848,9 @@ def _object_support_vertices(body, colliders, upright):
             approximation = radius * (1.0 - math.cos(math.pi / (16 if capsule else 64)))
         if points.ndim != 2 or points.shape[1] != 3 or not len(points) or not np.isfinite(points).all():
             raise ValueError(f"Collider has missing/nonfinite support vertices: {prim.GetPath()}")
-        transform = world_to_body @ _gf_column(xforms.GetLocalToWorldTransform(prim))
+        relative = (xforms.GetLocalToWorldTransform(prim) if reference_frame is None
+                    else xforms.ComputeRelativeTransform(prim, reference_frame)[0])
+        transform = world_to_body @ _gf_column(relative)
         points = points @ transform[:3, :3].T + transform[:3, 3]
         vertices.append(points @ canonical.T)
         error = max(error, approximation * float(np.linalg.norm(transform[:3, :3], ord=2)))
@@ -1801,6 +1867,24 @@ def _object_support_vertices(body, colliders, upright):
     return tuple(map(tuple, points.tolist())), error
 
 
+def _collision_footprint_vertices(support_vertices):
+    """Return the counterclockwise XY hull of upright authored collider points.
+
+    This conservative hull is sufficient for separating adjacent footprints.
+    It bridges holes and gaps in compound/concave colliders; it is not the
+    exact PhysX cooked surface, and does not certify a closest-surface gap.
+    Curved primitive approximation error is retained in ``support_error``.
+    """
+    from scipy.spatial import ConvexHull, QhullError
+
+    points = np.unique(np.asarray(support_vertices, dtype=np.float64)[:, :2], axis=0)
+    try:
+        hull = ConvexHull(points)
+    except QhullError as error:
+        raise ValueError("Object collision footprint must have a nonzero XY area.") from error
+    return tuple(map(tuple, points[hull.vertices].tolist()))
+
+
 def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRules]:
     """Inspect env_0 body bounds and shelf collisions after the scene has spawned.
 
@@ -1812,6 +1896,7 @@ def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRule
     from ...mdp.events import ObjectGeometry
 
     stage = env.scene.stage
+    reference_frame = stage.GetPrimAtPath(env.scene.env_prim_paths[0])
     cache = UsdGeom.BBoxCache(
         Usd.TimeCode.Default(),
         [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
@@ -1819,6 +1904,10 @@ def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRule
         ignoreVisibility=True,
     )
     objects = env.scene["object_collection"]
+    # BBoxCache's untransformed-body query still cancels ancestor world
+    # transforms internally. A composed body reference without the clone
+    # ancestor preserves origin-zero arithmetic and avoids cache-key drift.
+    bounds_stage = Usd.Stage.CreateInMemory()
     # Copies have identical authored geometry. Inspect each asset type once.
     measured = {}
     for spec in OBJECT_SPECS:
@@ -1850,15 +1939,20 @@ def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRule
         if not colliders:
             raise RuntimeError(f"Object {spec.name} has no enabled collision shape below {body.GetPath()}.")
         try:
-            bounds = _range_bounds(cache.ComputeUntransformedBound(body))
-            lower, upper = _upright_bounds(bounds, spec.upright_quat, _body_stretch(body))
-            support_vertices, support_error = _object_support_vertices(body, colliders, spec.upright_quat)
+            bounds_body = bounds_stage.OverridePrim(f"/Object_{len(measured)}")
+            bounds_body.GetReferences().AddReference(stage.GetRootLayer().identifier, body.GetPath())
+            bounds = _range_bounds(cache.ComputeUntransformedBound(bounds_body))
+            lower, upper = _upright_bounds(bounds, spec.upright_quat, _body_stretch(bounds_body))
+            support_vertices, support_error = _object_support_vertices(
+                body, colliders, spec.upright_quat, reference_frame=reference_frame)
+            footprint_vertices = _collision_footprint_vertices(support_vertices)
         except ValueError as error:
             raise RuntimeError(f"Cannot inspect object geometry for {spec.name}: {error}") from error
-        measured[spec.asset_name] = (lower, upper, support_vertices, support_error)
+        measured[spec.asset_name] = (lower, upper, support_vertices, support_error, footprint_vertices)
     geometries = tuple(ObjectGeometry(spec.name, *measured[spec.asset_name][:2], asset_name=spec.asset_name,
                                      support_vertices=measured[spec.asset_name][2],
-                                     support_error=measured[spec.asset_name][3])
+                                     support_error=measured[spec.asset_name][3],
+                                     collision_footprint_vertices=measured[spec.asset_name][4])
                        for spec in OBJECT_SPECS)
 
     shelf_path = _environment_zero_path(env, env.scene.cfg.shelf.prim_path)
@@ -1866,7 +1960,7 @@ def inspect_geometry(env: object) -> tuple[tuple[ObjectGeometry, ...], SpawnRule
     if not shelf.IsValid():
         raise RuntimeError(f"Spawned shelf prim is missing: {shelf_path}")
     origin = tuple(float(value) for value in env.scene.env_origins[0].tolist())
-    rules = _shelf_rules(cache, shelf, origin, env.cfg.spawn_rules)
+    rules = _shelf_rules(cache, shelf, origin, env.cfg.spawn_rules, reference_frame=reference_frame)
     return tuple(geometries), rules
 
 

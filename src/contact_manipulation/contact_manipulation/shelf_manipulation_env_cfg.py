@@ -1,10 +1,12 @@
 """Common scene, MDP terms and simulation settings, following Sweeping-Policy/min."""
 
 from dataclasses import MISSING
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.ui import ManagerBasedRLEnvWindow
 from isaaclab.managers import ActionTermCfg, EventTermCfg, ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import FrameTransformerCfg
@@ -64,6 +66,7 @@ class ObservationsCfg:
 class EventCfg:
     """Scene reset must finish before the MDP snapshot/accumulators are reset."""
 
+    role_obb_visualization = EventTermCfg(func=mdp.initialize_role_obb_visualization, mode="startup")
     reset_scene = EventTermCfg(func=mdp.reset_scene, mode="reset")
     reset_mdp = EventTermCfg(func=mdp.reset_task, mode="reset")
 
@@ -74,7 +77,7 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=4.0)
     blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=0.40)
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.05)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.10)
     rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=1.0)
     # Command variation and actual speed are different control objectives.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
@@ -87,7 +90,7 @@ class RewardsCfg:
     )
     motion_wrench_growth = RewardTermCfg(func=mdp.motion_wrench_growth, weight=0.30)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
-    object_stability = RewardTermCfg(func=mdp.object_stability, weight=2.0)
+    object_stability = RewardTermCfg(func=mdp.object_stability, weight=3.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
@@ -104,11 +107,24 @@ class TerminationsCfg:
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
 
 
+class ShelfManipulationEnvWindow(ManagerBasedRLEnvWindow):
+    """Extend the native debug panel with physical and observed OBB toggles."""
+
+    def __init__(self, env, window_name="IsaacLab"):
+        super().__init__(env, window_name)
+        with self.ui_window_elements["main_vstack"]:
+            with self.ui_window_elements["debug_frame"]:
+                with self.ui_window_elements["debug_vstack"]:
+                    self._create_debug_vis_ui_element("Target / Blocker OBB", env._role_obb_visualizer)
+                    self._create_debug_vis_ui_element("Observed objects OBB", env._observation_obb_visualizer)
+
+
 @configclass
 class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     """Compose native managers without overriding the environment's step/reset loop."""
 
     seed: int = 0
+    ui_window_class_type: type | None = ShelfManipulationEnvWindow
     scene: ShelfManipulationSceneCfg = ShelfManipulationSceneCfg(num_envs=1, env_spacing=MISSING)
     actions: ActionsCfg = ActionsCfg()
     observations: ObservationsCfg = ObservationsCfg()
@@ -116,11 +132,16 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     mdp: MdpCfg = MdpCfg()
-    spawn_rules: SpawnRules = SpawnRules()
+    spawn_rules: SpawnRules = SpawnRules(
+        generation_mode="clutter", min_objects=15,
+        max_objects=int(os.environ.get("CONTACT_MANIPULATION_NUM_OBJECTS", "25")),
+    )
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     target_asset: str | None = None
     blocker_asset: str | None = None
+    role_obb_debug_vis: bool = True
+    observation_obb_debug_vis: bool = True
 
     decimation: int = 1
     episode_length_s: float = 8.0
@@ -133,6 +154,9 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
         # Native solver setting measured with 1024 environments; retain dt and
         # solver iterations while reducing partition/launch overhead.
         self.sim.physx.gpu_max_num_partitions = 1
+        # Whole-scene contact patches exceeded the native 163840 default.
+        # Keep margin above the observed 184896-patch peak.
+        self.sim.physx.gpu_max_rigid_patch_count = 2**18
         self.num_rerenders_on_reset = 0  # Initial perception does not render.
         self.viewer.eye = (1.6, -2.0, 2.0)
         self.viewer.lookat = (-0.5, 0.0, 1.05)
