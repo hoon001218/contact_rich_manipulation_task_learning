@@ -26,9 +26,9 @@ import warp as wp
 from isaaclab.utils.math import convert_quat, matrix_from_quat
 
 from .observations import (
-    SI_200_8_RANGES, SI_200_8_RESOLUTION, calibrate_wrench, compensate_wrench,
+    SI_200_8_RANGES, SI_200_8_RESOLUTION, calibrate_wrench,
     dynamic_sample, geometry_in_eef_frame, pack_policy_observation, prepare_initial_geometry,
-    quat_apply, quat_conjugate, quat_mul, self_motion_wrench,
+    quat_apply, quat_conjugate, quat_mul,
 )
 from .rewards import clearance_quality, object_motion_cost, singularity_margin
 from .terminations import (
@@ -109,10 +109,10 @@ class TransitionBatch:
     corners: torch.Tensor              # N,O,8,3; fixed corner correspondence
     rotation: torch.Tensor             # N,O,4; relative to canonical upright
     velocity: torch.Tensor             # N,O,6; linear velocity at the OBB center
-    sensor_wrench: torch.Tensor        # N,6; SI-200-8 measured, self-load compensated
+    sensor_wrench: torch.Tensor        # N,6; SI-200-8 measured, sensor axes, includes self-load
     sensor_position: torch.Tensor      # N,3; world
     sensor_rotation: torch.Tensor      # N,4; world, wxyz
-    sensor_range_exceeded: torch.Tensor  # N,6; before clipping/compensation
+    sensor_range_exceeded: torch.Tensor  # N,6; before clipping
     shelf_pose: torch.Tensor           # N,7; world link pose, wxyz
     state_valid: torch.Tensor          # N; robot and sensor finite/ready
     sample: torch.Tensor               # N,72; current robot/sensor/action observation
@@ -400,7 +400,6 @@ class TaskState:
         self.initial_clearance_quality = zeros(n)
         self.initial_blocker_area = zeros(n)
         self.previous_wrench = zeros(n, 6)
-        self.wrench_bias = zeros(n, 6)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
         self.tilt_count = zeros(n, o, kind=torch.long)
@@ -495,7 +494,7 @@ class TaskState:
         self.history[ids, 0, 31:37] = 0
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:72] = 0
-        for name in ("previous_wrench", "wrench_bias", "elapsed_time", "stable_count", "tilt_count",
+        for name in ("previous_wrench", "elapsed_time", "stable_count", "tilt_count",
                      "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
                      "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
@@ -550,7 +549,7 @@ class TaskState:
         self.critic_observation = None
 
     @torch.no_grad()
-    def advance(self, batch, step, *, singularity=None):
+    def advance(self, batch, step, *, singularity=None, hand_velocity=None):
         if step == self.last_step:
             return
         if not self.ready:
@@ -601,6 +600,14 @@ class TaskState:
             raw_goal_out=self.raw_goal,
             target_protected_out=self.target_protected,
         )
+        # The official velocity term is logged by the native manager. Include
+        # its result here too, so success/payment never wins an overspeed step.
+        if hand_velocity is not None:
+            if hand_velocity.shape != failed.shape or hand_velocity.dtype != torch.bool:
+                raise ValueError("Hand velocity failure must contain one boolean per environment.")
+            failed = failed | hand_velocity
+            candidate = candidate & ~hand_velocity
+            stable = torch.where(hand_velocity, 0, stable)
         successful, payment, paid = terminal_transition(
             candidate, failed, stable, self.terminal_paid, self.cfg, step_dt=self.dt,
             success_enabled=self.success_enabled,
@@ -710,7 +717,6 @@ class SceneBatch:
     ceiling: torch.Tensor                # N
     shelf_local_corners: torch.Tensor    # N,8,3; full physical shelf in its link frame
     sensor_body_name: str
-    distal_body_names: tuple[str, ...]    # complete hand + distal half-spacer
     support_vertices: torch.Tensor | None = None  # catalog,V,3 canonical collision hulls
     support_vertex_mask: torch.Tensor | None = None  # catalog,V, bool
     support_error: torch.Tensor | None = None  # catalog; primitive approximation bound in meters
@@ -897,33 +903,20 @@ def _bind_scene(env, state, scene):
     if len(arm_ids) != 6 or len(hand_ids) != 6 or len(tcp_ids) != 1:
         raise ValueError("Resolve six arm joints, six hand joints, and one TCP body.")
     names = robot.body_names
-    if not scene.distal_body_names or scene.sensor_body_name not in scene.distal_body_names:
-        raise ValueError("Supply the complete distal hand/spacer body list, including the F/T body.")
-    distal = [names.index(name) for name in scene.distal_body_names]
-    if len(set(distal)) != len(distal):
-        raise ValueError("F/T compensation bodies must not be duplicated.")
     joint_ids = torch.tensor(arm_ids + hand_ids, device=env.device)
-    distal_ids = torch.tensor(distal, device=env.device)
-    masses = robot.root_physx_view.get_masses().to(env.device).index_select(1, distal_ids)
-    inertias = robot.root_physx_view.get_inertias().to(env.device).index_select(1, distal_ids)
-    # PhysX exposes COM inertia in link axes and column-major flattened order.
-    inertias = inertias.reshape(env.num_envs, len(distal), 3, 3).transpose(-1, -2).contiguous()
     n, o = env.num_envs, state.active_capacity
     state.env_origins.copy_(env.scene.env_origins)
     if scene.support_vertices is not None:
         state.support_vertices = scene.support_vertices
         state.support_vertex_counts = scene.support_vertex_mask.sum(-1)
         state.support_error = scene.support_error
-    # These asset properties are fixed in this task. Native COM properties
+    # Object COM offsets are fixed in this task. Native COM properties
     # otherwise fetch CPU buffers again at every physics timestamp/reset.
-    body_com_local = robot.data.body_com_pos_b.index_select(1, distal_ids).clone()
     object_com_local = env.scene["object_collection"].data.object_com_pos_b.clone()
     state.bindings = SimpleNamespace(
         robot=robot, objects=env.scene["object_collection"], shelf=env.scene["shelf"],
-        joint_ids=joint_ids, distal_ids=distal_ids, tcp_id=tcp_ids[0],
-        sensor_id=names.index(scene.sensor_body_name), masses=masses, inertias=inertias,
-        body_com_local=body_com_local, object_com_local=object_com_local,
-        gravity=torch.tensor(env.sim.cfg.gravity, device=env.device),
+        joint_ids=joint_ids, tcp_id=tcp_ids[0],
+        sensor_id=names.index(scene.sensor_body_name), object_com_local=object_com_local,
         ranges=torch.tensor(SI_200_8_RANGES, device=env.device),
         resolution=torch.tensor(SI_200_8_RESOLUTION, device=env.device),
         object_ids=torch.zeros(n, o, dtype=torch.long, device=env.device),
@@ -1007,7 +1000,7 @@ def _transition_tensors(env, state, rows, values):
     """Pure tensor transform after native physics/sensor acquisition."""
     b = state.bindings
     (object_pose, object_velocity, body_position, body_rotation,
-     body_acceleration, body_angular_velocity, root_position, root_rotation, joint_position,
+     root_position, root_rotation, joint_position,
      joint_velocity, ideal_wrench, wrench_valid_all, tactile_force_all, tactile_valid_all,
      shelf_pose, actions, joint_effort) = values
     ids = b.object_ids[rows]
@@ -1026,15 +1019,9 @@ def _transition_tensors(env, state, rows, values):
     raw_wrench, wrench_valid = ideal_wrench[rows], wrench_valid_all[rows]
     tactile_force = tactile_force_all[rows]
     measured, overrange = calibrate_wrench(raw_wrench, b.ranges, b.resolution)
-    distal_rotation = body_rotation.index_select(1, b.distal_ids)
-    distal_com = (body_position.index_select(1, b.distal_ids)
-                  + quat_apply(distal_rotation, b.body_com_local[rows]))
-    self_load = self_motion_wrench(
-        b.masses[rows], b.inertias[rows], distal_com,
-        distal_rotation, body_acceleration[rows].index_select(1, b.distal_ids),
-        body_angular_velocity[rows].index_select(1, b.distal_ids), sensor_position, sensor_rotation, b.gravity,
-    )
-    wrench = compensate_wrench(measured, self_load, state.wrench_bias[rows], wrench_valid)
+    # Use the measured reaction directly; hand weight and inertia remain in
+    # both observation and reward. Invalid/reset sensor samples stay zero.
+    wrench = torch.where(wrench_valid[:, None], measured, 0.0)
     inverse_root = quat_conjugate(root_rotation[rows])
     position = quat_apply(inverse_root, body_position[:, b.tcp_id] - root_position[rows])
     orientation = quat_mul(inverse_root, body_rotation[:, b.tcp_id])
@@ -1063,8 +1050,8 @@ def _read_transition(env, state, env_ids=None):
     b = state.bindings
     data, objects, sensors = b.robot.data, b.objects.data, env.task_sensor_reader()
     values = (objects.object_link_pose_w, objects.object_com_vel_w,
-              data.body_link_pos_w, data.body_link_quat_w, data.body_com_acc_w,
-              data.body_com_ang_vel_w, data.root_pos_w, data.root_quat_w, data.joint_pos, data.joint_vel,
+              data.body_link_pos_w, data.body_link_quat_w,
+              data.root_pos_w, data.root_quat_w, data.joint_pos, data.joint_vel,
               sensors.ideal_wrench, sensors.wrench_valid, sensors.tactile_force, sensors.tactile_valid,
               b.shelf.data.root_link_pose_w, env.action_manager.action, data.applied_torque)
     rows = slice(None) if env_ids is None else env_ids
@@ -1248,7 +1235,16 @@ def get_task_state(env):
         # Shared once here for reward and termination; no matrix is read on CPU.
         arm = env.action_manager.get_term("arm_action")
         margin = singularity_margin(arm.jacobian_w, characteristic_length=state.cfg.singularity_characteristic_length)
-        state.advance(_read_transition(env, state), env.common_step_counter, singularity=margin)
+        # Read the manager's resolved SceneEntityCfg, not env.cfg's unresolved
+        # copy. The official function reuses the native joint-velocity buffer.
+        velocity_failure = None
+        manager = getattr(env, "termination_manager", None)
+        if manager is not None and "hand_velocity" in manager.active_terms:
+            term = manager.get_term_cfg("hand_velocity")
+            if not term.time_out:
+                velocity_failure = term.func(env, **term.params)
+        state.advance(_read_transition(env, state), env.common_step_counter,
+                      singularity=margin, hand_velocity=velocity_failure)
         # Native env resets after reward/done. Preserve the final observation
         # here for the learner's timeout bootstrap, before any reset.
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)
@@ -5776,7 +5772,7 @@ def _initialize_episode_reset(env):
 
     if not env.cfg.robot_start.enabled:
         raise ValueError("Episode starts require collision-checked elbow-up robot randomization.")
-    objects, robot = env.scene["object_collection"], env.scene["robot"]
+    objects = env.scene["object_collection"]
     if tuple(objects.object_names) != tuple(spec.name for spec in OBJECT_SPECS):
         raise ValueError("The native object collection order must match the static pool catalog.")
     env.spawn_geometries, env.spawn_rules = inspect_geometry(env)
@@ -5798,11 +5794,6 @@ def _initialize_episode_reset(env):
     signs = lower.new_tensor(((-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
                              (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1)))
     shelf_corners = (shelf_lower + shelf_upper) * .5 + (shelf_upper - shelf_lower) * .5 * signs
-    link_paths = robot.root_physx_view.link_paths[0]
-    distal = tuple(name for name, path in zip(robot.body_names, link_paths)
-                   if "/ROASRightHand/" in str(path) or name == FORCE_TORQUE_BODY_NAME)
-    if FORCE_TORQUE_BODY_NAME not in distal or not any("force_sensor" in name for name in distal):
-        raise RuntimeError("Cannot determine the physical hand-side F/T compensation subtree.")
     n, o = env.num_envs, env.cfg.mdp.max_objects
     physical = _active_object_capacity(env)
     env.task_scene_data = SceneBatch(
@@ -5818,7 +5809,7 @@ def _initialize_episode_reset(env):
         shelf_top=lower.new_full((n,), env.spawn_rules.shelf_top),
         ceiling=lower.new_full((n,), env.spawn_rules.ceiling),
         shelf_local_corners=shelf_corners.expand(n, -1, -1),
-        sensor_body_name=FORCE_TORQUE_BODY_NAME, distal_body_names=distal,
+        sensor_body_name=FORCE_TORQUE_BODY_NAME,
         support_vertices=support_vertices, support_vertex_mask=support_mask,
         support_error=lower.new_tensor([geometry.support_error for geometry in env.spawn_geometries]),
     )

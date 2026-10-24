@@ -120,8 +120,8 @@ command/curriculum이나 별도의 environment subclass는 추가하지 않는�
   `TaskState`의 두 sample 저장을 유지한다.
 - F/T 원시 반력은 public `ArticulationData.body_incoming_joint_wrench_b`에서 읽는다.
   Quaternion 부호 정규화와 물리 FK 검사의 회전 변환도 `isaaclab.utils.math`를 사용한다.
-  SI-200-8 양자화·범위와 hand 링크의
-  자중/운동 관성 보상, clearance·지지 기하 등은 연구 수식이다.
+  SI-200-8 양자화·범위, clearance·지지 기하 등은 연구 수식이다.
+  F/T 측정값에서 hand 링크의 자중·관성 하중은 제거하지 않는다.
 - 출력 분포는 RSL-RL의 `GaussianDistribution`을 사용한다. Sampling·log-probability·
   analytic entropy·KL은 native 구현에 맡긴다. Actor와 Critic은 각각 공식 `MLPModel`을
   확장하고, GNN·attention·MLP 전체의 가중치를 별도로 학습한다.
@@ -282,7 +282,7 @@ graph Actor의 JIT/ONNX export는 구현하지 않았다.
 | 물체 정보 | 현재 `wrist_3_link` 기준. Actor는 초기 vision 추정값 고정, Critic은 같은 초기 인식 ID들의 현재 실제 OBB 갱신 |
 | 슬롯 | Target 0, Blocker 1, 나머지 관측 물체와 zero padding. Role ID·mask 채널 없음 |
 | 72D sample | 12관절 q/dq 24 + base에서 표현한 `wrist_3_link` pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
-| F/T | SI-200-8 축별 clipping·양자화 → distal 링크 자중·병진/회전 관성 보상 → full scale 정규화 |
+| F/T | Sensor frame의 반력 → SI-200-8 축별 clipping·양자화 → full scale 정규화. 자중·관성 하중 포함 |
 | Tactile | 마지막 physics sample의 normal force norm > 0.01 N이면 1, 미접촉 0, 결측 −1 |
 | Action | 현재 EEF 축 TCP 증분 6 + EEF 축 stiffness 6 + hand 독립 관절 위치 6 = **18D** |
 
@@ -319,8 +319,9 @@ physics substep 동안 유지한다. 이전 목표에 증분을 계속 누적하
 COM→TCP Jacobian/속도 보정, hand 측정 위치 기준 lead 제한, custom effort clipping은 제거했다.
 Native task-frame 변환과 기존 관절별 물리 제한을 사용한다.
 OSC의 gravity compensation은 관절 중력 토크를 feedforward로 더해 제어 출력을 만드는 기능이다.
-F/T 자중·관성 보상은 측정값에서 distal 링크의 하중을 제거하는 별도 센서 처리로 유지한다.
-둘은 서로 다른 경로이며 중복 보상을 뜻하지 않는다. 이 설정만으로 정책 학습 개선을 보장하지 않는다.
+F/T 측정값의 자중·관성 보상은 제거했다. Actor·Critic observation과 F/T 증가량 reward는
+동일한 SI-200-8 측정값을 사용하며 hand 자중·관성에 의한 하중도 포함한다.
+이 센서 처리 변경은 OSC의 gravity compensation=True와 별개다.
 Action/적용 torque의 nonfinite는 MDP에서 검사한다.
 Arm actuator PD gain은0이고 Hand는 공식 `ImplicitActuatorCfg`와
 `JointPositionToLimitsActionCfg`로 독립6관절을 제어한다. 종속6관절에는 별도 action이나
@@ -355,7 +356,8 @@ collision mesh는 유지한다. 아래 시험 수치는 변경 전 velocity2회�
 position PD를 유지한다. 별도 custom controller나 torque clamp는 추가하지 않는다.
 이 출력 제한이 정책의 delta pose/stiffness 요구를 제한하거나 적절한 요구를 학습하도록
 보장하지는 않는다. 측정 joint torque observation/reward는 아직 추가하지 않았다.
-속도 초과 자체에 대한 episode 종료는 연구 MDP에 추가하지 않는다.
+팔6개와 Hand 독립6개 중 하나라도 절대 관절 속도가3rad/s를 초과하면 `hand_velocity`로 종료한다.
+이는 actuator의 물리 속도 상한과 별개인 episode 종료 조건이다.
 
 Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
 이전 base-frame·손바닥 EEF·custom controller checkpoint는 action-contract metadata 검사에서 거절한다.
@@ -479,11 +481,11 @@ r_{T,k}=-60(\Delta T_k)^2\Delta t.
 $$
 
 사용자 결정대로 F/T는 **매 step 증가량의 제곱**이다. 증가율로 나누거나 deadband·exp를
-적용하지 않는다. 자중·관성 보상 후 현재 sensor 중심의 norm을 비교하므로 하중 감소·일정 하중·
+적용하지 않는다. 자중·관성 하중을 포함한 SI-200-8 측정값의 norm을 비교하므로 하중 감소·일정 하중·
 norm이 같은 방향 변화는 비용0이다. 힘과 토크는 서로 상쇄하거나 한 norm에 섞지 않는다.
 각 weight 단위는 N⁻²와(N·m)⁻²이며 ΔF=1N 또는 ΔT=.05N·m가 각각−.15 reward/s,
 100Hz에서−.0015/step이 되는 초기 설정이다. 이 값은 SI 단위를 고려한 시작값이며 성공 조작의
-실측으로 검증한 허용량은 아니다. 센서 해상도·보상 노이즈와 실제 증가량 분포를 새 run에서 확인해야 한다.
+실측으로 검증한 허용량은 아니다. 센서 해상도·자중·관성 하중을 포함한 실제 증가량 분포를 새 run에서 확인해야 한다.
 매 step 증분에 대한 제곱이므로 제어주기를 바꾸면 같은 연속 하중 궤적의 비용까지 불변이지는 않다.
 
 **Singularity.** 현재 팔 자세의 공개 OSC Jacobian으로 다음 보수적 지표를 계산한다.
@@ -613,7 +615,7 @@ invalid·singularity는 유지한다. 손가락 관통의 물리 설정 수정�
 지원 거리 비용은 충돌 누락 방지나 종료 전 감속을 보장하지 않는다.
 
 비활성 `hard_load_or_overrange`의 종료 경로와80N/4N·m hard threshold는 제거했다. SI-200-8의
-raw 범위 초과·보정 진단은 유지하되 성공의 숨은 gate로 적용하지 않는다. 선반은 공식 `RigidObject`로 관리하는
+raw 범위 초과 진단은 유지하되 성공의 숨은 gate로 적용하지 않는다. 선반은 공식 `RigidObject`로 관리하는
 100 kg dynamic body이며, 관성은 PhysX가 collision 형상에서 계산한다. 선반 pose는 observation에
 추가하지 않는다. 부분 reset은 해당 환경의 pose·속도·초기 기준과 지속시간 카운터만 초기화한다.
 Timeout은 native truncation으로 유지한다.
@@ -625,7 +627,8 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 
 실패 원인은 공식 `TerminationManager`의 개별 term으로 기록한다. Console과 TensorBoard의
 `Episode_Termination/<원인>`에서 확인할 수 있으며, 기존 통합 `failure` 로그는 아래 항목으로
-대체했다. 모든 term은 같은 step의 캐시된 판정 결과를 읽으며 물리·센서 조회를 반복하지 않는다.
+대체했다. 연구 task의 term은 같은 step의 캐시된 판정 결과를 읽는다.
+`hand_velocity`는 공식 `joint_vel_out_of_manual_limit`을 사용하며 native 관절 속도 buffer를 재사용한다.
 
 | 원인 이름 | 현재 실패 조건 |
 |---|---|
@@ -634,12 +637,22 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 | `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
 | `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
 | `singularity` | 현재 팔 자세의 보수적 이동능력 지표 s≤0.005 |
+| `hand_velocity` | 팔6개 + Hand 독립6개 중 하나라도 절대 관절 속도 >3rad/s. 한 sample 초과 시 즉시 종료 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
-않다. 현재 활성 실패5개와 성공·timeout을 합쳐 native 종료 term은7개다.
+않다. 현재 활성 실패6개와 성공·timeout을 합쳐 native 종료 term은8개다.
 활성 실패끼리는 동시에 기록될 수 있지만 성공은 활성 실패가 없을 때만 성립한다.
 Terminal은 유효 성공에만+250을 한 번 지급하며 실패·timeout은0이다.
-내부 실패와 PPO `terminated` mask도 초기화 때 읽은 native 활성 term 설정을 따른다.
+연구 task의 내부 실패는 초기화 때 읽은 native 활성 term 설정을 따르며, 속도 실패는
+native manager가 해석한 현재 `hand_velocity` 설정으로 성공·terminal 지급 전에 반영한다.
+따라서 속도 초과와 성공 보상이 동시에 발생하지 않는다. 관절은 action/reward와 동일한 이름으로
+선택하고 mimic/passive 관절은 독립적으로 중복 검사하지 않는다. 경계3rad/s 자체는 통과한다.
+현재 임계값은 최신 원격 `min`의 InspireOpen→Hand/HandMass 계열의3rad/s를 확인한 뒤 사용자 승인으로
+변경했다. 원격은 팔6개만 검사하며, 우리 환경은 사용자 요청에 따라 Hand 독립6개도 포함한다.
+원격 기본 cfg의1rad/s와 별도 HandMassLimit variant는 구분한다. 변경 근거는
+[학습 기록68절](../../docs/TRAINING_LOG.md)을 따른다.
+Action 변화량 자체의 종료·clipping은 추가하지 않았다. Native 순서상 종료 step에도 reward를
+계산하므로 이 속도 종료만으로 큰 finite action/관절속도 비용의 PPO 유입이 차단되지는 않는다.
 
 새로 완료된 episode의 실제 누적 집계도 기존 native logger로 제공한다. `Task_Count/completed`,
 `valid_success`, `raw_goal_seen`, `unsupported_goal_seen`, `goal_and_failure`는 종료된episode를
@@ -714,9 +727,9 @@ Scene15mm·self2mm 여유는 유지한다. 거의 평행한 축은 원래 좌표
 계산해 FP32 상쇄로 겹침을 놓치던 문제를 보정한다. CPU·다른 dtype은 eager 수식을 사용한다.
 
 Reset snapshot은 초기 OBB·로봇/선반 pose·관절값만 읽는다. 초기화 시 버리는 F/T·tactile·action과
-가속도·물체 속도는 계산하지 않는다. 정상 step의 F/T 자중·관성 보상은 유지하며, 고정 local COM은
-한 번 GPU에 저장하고 현재 link pose로 world COM을 계산한다. COM·질량·관성을 randomize한다면
-이 고정 property cache를 함께 갱신해야 한다.
+가속도·물체 속도는 계산하지 않는다. 정상 step도 F/T 자중·관성 보상을 수행하지 않으며,
+이를 위한 hand COM·질량·관성 cache와 링크 가속도·각속도 조회를 제거했다.
+Object 코너 속도 계산용 고정 local COM은 유지하며, object COM을 randomize한다면 함께 갱신해야 한다.
 
 2026-10-15 RTX3090·1,024환경·10물체의 전체 최적화 후30 iteration에서 초기 compile 회차와
 profiler 적용 회차를 제외한28회 평균은 **1.84초/iteration**이었다(1.73~2.02초).
@@ -919,8 +932,8 @@ GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 �
 
 </details>
 
-50 mm 연결부 중앙 fixed joint의 실제 reaction을 F/T로 읽고, SI-200-8 변환·보상은 MDP에서
-한 번 적용한다. Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
+50 mm 연결부 중앙 fixed joint의 실제 reaction을 F/T로 읽고, SI-200-8 범위 제한·양자화를 MDP에서
+한 번 적용한다. 자중·관성 보상은 수행하지 않는다. Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
 `net_forces_w`의 `[N,17,3]`를 `TACTILE_BODY_NAMES` 순서로 정렬하고, 링크별 0.01 N
 기준으로 `[N,17]` binary observation을 만든다. 힘을 링크끼리 합치지 않는다.
 기존 arm·spacer 금지 접촉 센서는 제거했으며, 선반 이동 여부를 종료 조건으로 사용한다.
@@ -929,11 +942,11 @@ GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 �
 Step 계산은 `[N,10,...]`, `[N,12]`, `[N,17]`, `[N,18]` 텐서로 처리한다.
 환경별 Python loop, `.item()`, `.cpu()`, `bool(tensor)`를 step 경로에서 사용하지 않는다.
 OBB hull·clipping은 고정 크기로 병렬 처리하고, 6×6 제어 행렬 계산은 native OSC에 맡긴다.
-관절/body ID·센서 scale·질량·관성·catalog corner는 초기화/reset 때 저장한다.
+관절/body ID·센서 scale·object local COM·catalog corner는 초기화/reset 때 저장한다.
 기존 custom implicit damping·Newton–Schulz·제어 CUDA graph는 제거했다.
 Native OSC의 batched mass/task-inertia 역행렬과 PD 계산을 그대로 사용한다.
 따라서 SDK 내부 선형대수 호출까지 host synchronization이 없다고 보장하지 않는다.
-매 step의 기하 좌표 변환·F/T 보상·동적 sample 구성은 물리 데이터를 읽은 뒤 CUDA graph로 처리한다.
+매 step의 기하 좌표 변환·F/T 범위 제한·양자화·동적 sample 구성은 물리 데이터를 읽은 뒤 CUDA graph로 처리한다.
 Action/effort의 nonfinite flag는 환경별 실패 판정으로 연결한다.
 OBB footprint의 hull·clipping·면적은 활성 물체만 하나의 Warp kernel에서 계산한다.
 CPU는 기존 PyTorch 식을 검증 기준으로 유지한다.
@@ -1012,7 +1025,7 @@ Native `common_step_counter`가 바뀐 경우에만 갱신하여 observation/rew
 Reset event와 센서 reader가 다음 데이터를 제공한다.
 
 - `env.task_scene_data`: `SceneBatch`. Active collection IDs, Target/Blocker IDs, 승인한 초기
-  vision 기하와 association, catalog OBB, A₀·workspace, F/T distal body 이름을 담는다.
+  vision 기하와 association, catalog OBB, A₀·workspace, F/T sensor body 이름을 담는다.
 - `env.task_sensor_reader()`: 완료된 physics sample의 `SensorBatch`. 이상적 joint reaction,
   유효성과 tactile 17채널을 반환한다. 선반 pose는 native rigid-body data에서 별도로 읽는다.
 
@@ -1115,12 +1128,12 @@ env_0의 완성된 rigid body 기하를 임시 USD에 저장하고 instance로 �
 구성한 초기 장면을 공통 round 안에서 재사용한다.
 새 장면의 staging은 전체 환경이 reset되는 경계에서만 수행한다. 부분 reset에서는
 로봇 자세 탐색을 완료한 뒤 선택 행만 쓰며, 미선택 환경의 물리 상태·episode 이력을 유지한다.
-물체 기하·F/T 보상·vision 정렬도 선택 행만 계산한다.
+물체 기하·vision 정렬도 선택 행만 계산하며 reset snapshot에서 F/T는 초기값0을 사용한다.
 공통 장면의 작은 CPU 기하 계산과 reset 시 metadata 전송은 남아 있다. 환경별 SciPy IK는 GPU 배치로 대체했고,
 초기 관측의 렌더링 경로는 제거했다. 이 탐색·기하 조회·CPU/GPU 동기화는 매 step에 실행하지 않는다.
 Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 배치/vision 생성은 공통 round당
 한 장면에 대해서만 수행하며, IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
-질량/관성은 고정 asset 값으로 캐시하므로 향후 dynamics randomization을 추가하면 이 캐시도 갱신해야 한다.
+물체 local COM은 고정 asset 값으로 캐시하므로 향후 COM randomization을 추가하면 이 캐시도 갱신해야 한다.
 
 Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에 보존한다.
 학습은 예제와 같은 native PPO timeout bootstrap·GAE를 사용한다. Timeout 시 저장된
@@ -1128,6 +1141,18 @@ Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에
 `init_at_random_ep_len=True`이며 공통 장면 교체와 부분 reset은 연구 MDP에서 관리한다.
 
 ## 검증과 남은 구현
+
+2026-10-24 관절 속도 종료 임계값을3rad/s로 변경한 뒤 CPU 집중 검사 **41개가 통과**했다.
+±3rad/s 경계·±3.0001rad/s 초과·±2rad/s 허용, 팔/Hand 선택·성공 차단·native 로그·부분 reset을
+검사했다. 실제 GPU·simulation·학습은 실행하지 않았으며 상세는 [학습 기록68절](../../docs/TRAINING_LOG.md)을 따른다.
+
+2026-10-24 예제 기준 팔·Hand 관절 속도 종료 추가 후 CPU 전체 suite는 **415개 통과·23개 skip**이다.
+임계값 경계·12관절 선택·성공 보상 차단·native 로그·부분 reset을 확인했다.
+실제 GPU·simulation·학습은 실행하지 않았으며 상세는 [학습 기록67절](../../docs/TRAINING_LOG.md)을 따른다.
+
+2026-10-24 Hand F/T 자중·관성 보상을 제거한 뒤 CPU 전체 suite는 **411개 통과·23개 skip**이다.
+SI-200-8 측정값의 관측/reward 공유·이력·부분 reset 및 보상용 dynamics 조회 제거를 검사했다.
+실제 GPU·simulation·학습은 실행하지 않았으며 상세는 [학습 기록66절](../../docs/TRAINING_LOG.md)을 따른다.
 
 이 절의 과거 학습·checkpoint 검증은 2026-10-21 독립 Critic 전환 이전 구성의 기록이다.
 새 구성의 검증 결과는 [학습 기록](../../docs/TRAINING_LOG.md)에 별도로 기록한다.

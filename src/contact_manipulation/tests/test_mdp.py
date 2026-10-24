@@ -152,7 +152,7 @@ class DynamicObservationTests(unittest.TestCase):
         tcp = torch.zeros((batch, 7))
         tcp[:, 3] = 1.0
         return dict(joint_pos=torch.zeros((batch, 12)), joint_vel=torch.zeros((batch, 12)),
-                    tcp_pose_b=tcp, compensated_wrench=torch.zeros((batch, 6)),
+                    tcp_pose_b=tcp, measured_wrench=torch.zeros((batch, 6)),
                     tactile_contacts=torch.zeros((batch, 17), dtype=torch.bool),
                     tactile_valid=torch.ones((batch, 17), dtype=torch.bool),
                     previous_action=torch.zeros((batch, 18)))
@@ -161,7 +161,7 @@ class DynamicObservationTests(unittest.TestCase):
         values = self.values(batch=1)
         values["joint_pos"][:] = math.pi
         values["joint_vel"][:] = 2.0
-        values["compensated_wrench"][:] = torch.tensor([200., -200., 360., -8., 8., 80.])
+        values["measured_wrench"][:] = torch.tensor([200., -200., 360., -8., 8., 80.])
         values["tactile_contacts"][:, [0, 5]] = True
         values["tactile_valid"][:, [5, 16]] = False
         values["previous_action"][:, 0] = 2.0
@@ -203,68 +203,17 @@ class DynamicObservationTests(unittest.TestCase):
             current = obs.dynamic_sample(**values)
             transformed = obs.geometry_in_eef_frame(geometry, valid, values["tcp_pose_b"])
             packed = obs.pack_policy_observation(transformed, torch.stack((current, current), dim=1))
-            raw, _ = obs.calibrate_wrench(values["compensated_wrench"])
-            corrected = obs.compensate_wrench(raw, raw, raw, torch.ones(batch, dtype=torch.bool))
+            measured, _ = obs.calibrate_wrench(values["measured_wrench"])
         self.assertEqual(packed.shape, (batch, 244))
-        torch.testing.assert_close(corrected, torch.zeros_like(raw))
+        torch.testing.assert_close(measured, values["measured_wrench"])
 
 
 class WrenchTests(unittest.TestCase):
-    def test_saturation_resolution_and_overload_apply_to_raw_before_compensation(self):
+    def test_saturation_resolution_and_overload_apply_to_sensor_frame_measurement(self):
         ideal = torch.tensor([[200.2, -.14, 360.0, 8.2, .011, -.014]], dtype=torch.float64)
         measured, exceeded = obs.calibrate_wrench(ideal)
         torch.testing.assert_close(measured, torch.tensor([[200., -.1, 360., 8., .01, -.015]], dtype=ideal.dtype))
         torch.testing.assert_close(exceeded, torch.tensor([[True, False, False, True, False, False]]))
-        load = measured - .003
-        corrected = obs.compensate_wrench(measured, load, torch.zeros_like(load), torch.tensor([True]))
-        torch.testing.assert_close(corrected, torch.full_like(corrected, .003))
-
-    def test_static_gravity_and_lever_arm_remove_distal_weight(self):
-        masses = torch.tensor([[2.]], dtype=torch.float64)
-        com = torch.tensor([[[1., 0., 0.]]], dtype=masses.dtype)
-        wrench = obs.self_motion_wrench(
-            masses, torch.eye(3, dtype=masses.dtype)[None, None], com, identity(1, 1),
-            torch.zeros((1, 1, 6), dtype=masses.dtype), torch.zeros((1, 1, 3), dtype=masses.dtype),
-            torch.zeros((1, 3), dtype=masses.dtype), identity(1), torch.tensor([0., 0., -9.81]),
-        )
-        torch.testing.assert_close(wrench, torch.tensor([[0., 0., 19.62, 0., -19.62, 0.]], dtype=masses.dtype))
-
-    def test_articulated_rotational_inertia_matches_independent_world_matrix_oracle(self):
-        generator = torch.Generator().manual_seed(47)
-        def random(*shape):
-            return torch.randn(shape, generator=generator, dtype=torch.float64)
-        batch, bodies = 7, 5
-        masses = random(batch, bodies).abs() + .1
-        basis = random(batch, bodies, 3, 3)
-        inertias = basis @ basis.transpose(-1, -2)
-        body_q, sensor_q = random(batch, bodies, 4), random(batch, 4)
-        body_q = body_q / body_q.norm(dim=-1, keepdim=True)
-        sensor_q = sensor_q / sensor_q.norm(dim=-1, keepdim=True)
-        com, acceleration, omega = random(batch, bodies, 3), random(batch, bodies, 6), random(batch, bodies, 3)
-        sensor_pos, gravity = random(batch, 3), torch.tensor([0., 0., -9.81], dtype=torch.float64)
-        actual = obs.self_motion_wrench(masses, inertias, com, body_q, acceleration, omega,
-                                        sensor_pos, sensor_q, gravity)
-        body_r, sensor_r = rotation_matrix(body_q), rotation_matrix(sensor_q)
-        inertia_world = body_r @ inertias @ body_r.transpose(-1, -2)
-        forces = masses[..., None] * (acceleration[..., :3] - gravity)
-        momentum = (inertia_world @ omega[..., None]).squeeze(-1)
-        moment = (inertia_world @ acceleration[..., 3:, None]).squeeze(-1)
-        moment += torch.linalg.cross(omega, momentum, dim=-1)
-        moment += torch.linalg.cross(com-sensor_pos[:, None], forces, dim=-1)
-        inverse_sensor = sensor_r.transpose(-1, -2)
-        expected = torch.cat(((inverse_sensor @ forces.sum(1)[..., None]).squeeze(-1),
-                              (inverse_sensor @ moment.sum(1)[..., None]).squeeze(-1)), dim=-1)
-        torch.testing.assert_close(actual, expected)
-
-    def test_compensation_cancels_self_load_and_bias_preserves_external_load_and_masks_invalid(self):
-        self_load = torch.arange(18, dtype=torch.float64).reshape(3, 6)
-        bias = torch.full_like(self_load, .025)
-        external = torch.tensor([[1., -2., 3., .1, -.2, .3]], dtype=self_load.dtype).expand(3, -1)
-        raw = self_load + bias + external
-        raw[1] = float("nan")
-        result = obs.compensate_wrench(raw, self_load, bias, torch.tensor([True, False, True]))
-        torch.testing.assert_close(result[[0, 2]], external[[0, 2]])
-        torch.testing.assert_close(result[1], torch.zeros(6, dtype=result.dtype))
 
 def settings():
     return task.MdpCfg()
@@ -305,6 +254,18 @@ def native_reward_compute():
     namespace = {'torch': torch}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[compute], type_ignores=[])), str(source), 'exec'), namespace)
     return namespace['compute']
+
+
+def native_velocity_termination():
+    """Execute the checkout's official velocity predicate without importing Kit."""
+    source = Path(__file__).resolve().parents[3] / 'IsaacLab/source/isaaclab/isaaclab/envs/mdp/terminations.py'
+    function = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'joint_vel_out_of_manual_limit')
+    syntax = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
+                              function], type_ignores=[])
+    namespace = {'torch': torch, 'SceneEntityCfg': lambda name: SimpleNamespace(name=name, joint_ids=slice(None))}
+    exec(compile(ast.fix_missing_locations(syntax), str(source), 'exec'), namespace)
+    return namespace[function.name]
 
 
 
@@ -1598,6 +1559,86 @@ class NativeArmEffortLimitTests(unittest.TestCase):
         torch.testing.assert_close(asset._joint_vel_target_sim[:, arm_ids], torch.full((3, 6), -321.))
 
 
+class NativeVelocityTerminationTests(unittest.TestCase):
+    def test_official_threshold_checks_arm_and_hand_independent_joints_without_host_reads(self):
+        native = native_velocity_termination()
+        # Interleaved PhysX ordering makes an accidental [:6] or [:12] selection visible.
+        ids = [5, 0, 14, 3, 16, 8, 1, 17, 6, 2, 13, 10]
+        omitted = [index for index in range(18) if index not in ids]
+        for dtype in (torch.float32, torch.float64):
+            velocity = torch.zeros(1024, 18, dtype=dtype)
+            velocity[0, ids] = 3.0  # The Inspire variant uses a strict > boundary.
+            velocity[1, ids[4]] = 3.0001  # Arm.
+            velocity[2, ids[11]] = -3.0001  # Independent finger.
+            velocity[3, omitted] = 1.e8  # Mimic joints are not the selected independent DOFs.
+            velocity[4, ids] = -2.0  # The former 1 rad/s cutoff no longer applies.
+            env = SimpleNamespace(scene={'robot': SimpleNamespace(data=SimpleNamespace(joint_vel=velocity))})
+            asset_cfg = SimpleNamespace(name='robot', joint_ids=ids)
+            with patch.object(torch.Tensor, 'item', side_effect=AssertionError('Tensor scalar read')), \
+                 patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('Tensor condition read')), \
+                 patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('CPU transfer')):
+                actual = native(env, max_velocity=3.0, asset_cfg=asset_cfg)
+            expected = torch.zeros(1024, dtype=torch.bool)
+            expected[[1, 2]] = True
+            torch.testing.assert_close(actual, expected)
+
+    def test_ur5e_configuration_uses_same_twelve_named_joints_for_reward_and_termination(self):
+        source = Path(task.__file__).parent.parent / 'config/ur5e/ur5e_env_cfg.py'
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == 'UR5eContactManipulationEnvCfg')
+        method = next(node for node in definition.body
+                      if isinstance(node, ast.FunctionDef) and node.name == '__post_init__')
+        action_names = {}
+        for node in method.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                target = ast.unparse(node.targets[0])
+                if target in ('self.actions.arm_action', 'self.actions.hand_action'):
+                    action_names[target.rsplit('.', 1)[-1]] = next(
+                        ast.literal_eval(keyword.value) for keyword in node.value.keywords
+                        if keyword.arg == 'joint_names')
+        start = next(index for index, node in enumerate(method.body)
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'independent_joint_names'
+                             for target in node.targets))
+        # Execute the original specialization's joint binding; no copied assignment formula.
+        code = compile(ast.fix_missing_locations(ast.Module(body=method.body[start:], type_ignores=[])),
+                       str(source), 'exec')
+        reward_asset = SimpleNamespace(joint_names=None)
+        velocity_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
+        cfg = SimpleNamespace(
+            actions=SimpleNamespace(**{name: SimpleNamespace(joint_names=names)
+                                       for name, names in action_names.items()}),
+            rewards=SimpleNamespace(motion_joint_velocity=SimpleNamespace(params={'asset_cfg': reward_asset})),
+            terminations=SimpleNamespace(hand_velocity=SimpleNamespace(params={'asset_cfg': velocity_asset})),
+        )
+        exec(code, {'self': cfg})
+        expected = action_names['arm_action'] + action_names['hand_action']
+        self.assertEqual(len(set(expected)), 12)
+        self.assertEqual(reward_asset.joint_names, expected)
+        self.assertEqual(velocity_asset.joint_names, expected)
+        self.assertIn('right_little_1_joint', velocity_asset.joint_names)
+        cfg.terminations.hand_velocity = None
+        exec(code, {'self': cfg})  # Disabling only the termination keeps the velocity reward valid.
+        self.assertEqual(reward_asset.joint_names, expected)
+
+    def test_velocity_failure_wins_over_settled_success_without_adding_geometry_failure_columns(self):
+        state, batch, _ = fixture(3)
+        batch.center[:, 1, 0] += .4
+        batch.corners[:, 1, :, 0] += .4
+        state.stable_count.fill_(success_steps(state.cfg, state.dt) - 1)
+        violation = torch.tensor([True, False, True])
+        with patch.object(torch.Tensor, 'item', side_effect=AssertionError('Tensor scalar read')), \
+             patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('Tensor condition read')):
+            state.advance(batch, 1, hand_velocity=violation)
+        torch.testing.assert_close(state.failure, violation)
+        torch.testing.assert_close(state.success, ~violation)
+        torch.testing.assert_close(state.terminal_reward, batch.center.new_tensor([0., 250., 0.]))
+        torch.testing.assert_close(state.stable_count[violation], torch.zeros(2, dtype=torch.long))
+        self.assertFalse(state.clearance_progress_valid[violation].any())
+        self.assertEqual(tuple(state.failure_reasons.shape), (3, 5))
+        self.assertFalse(state.failure_reasons.any())
+
+
 @unittest.skipUnless("isaaclab.controllers" in sys.modules, "Requires Isaac Sim AppLauncher")
 class NativeControllerTests(unittest.TestCase):
     def test_project_osc_task_frame_matches_the_observation_eef(self):
@@ -1618,6 +1659,14 @@ class NativeControllerTests(unittest.TestCase):
         self.assertEqual(arm.controller_cfg.target_types, ["pose_rel"])
         self.assertEqual((arm.position_scale, arm.orientation_scale, arm.stiffness_scale), (1., 1., 100.))
         self.assertTrue(arm.controller_cfg.gravity_compensation)
+        velocity = cfg.terminations.hand_velocity
+        self.assertEqual(velocity.func.__name__, 'joint_vel_out_of_manual_limit')
+        self.assertEqual(velocity.params['max_velocity'], 3.0)
+        self.assertFalse(velocity.time_out)
+        self.assertEqual(velocity.params['asset_cfg'].joint_names,
+                         arm.joint_names + cfg.actions.hand_action.joint_names)
+        self.assertEqual(velocity.params['asset_cfg'].joint_names,
+                         cfg.rewards.motion_joint_velocity.params['asset_cfg'].joint_names)
         # Reset IK targets the palm; changing the control point must preserve
         # both the hand's Blocker-front start and its existing tactile links.
         self.assertEqual(TCP_BODY_NAME, "right_plam_force_sensor")
@@ -1919,7 +1968,7 @@ def native_fixture(n=3):
         upright=torch.tensor([1., 0., 0., 0.]).expand(4, 4).clone(),
         access_region=torch.tensor([-.2, .29, -.2, .2]).expand(n, 4).clone(),
         workspace_bounds=torch.tensor([-1., 1., -1., 1.]).expand(n, 4).clone(),
-        shelf_top=torch.zeros(n), ceiling=torch.ones(n), sensor_body_name="ft", distal_body_names=("ft", "hand"),
+        shelf_top=torch.zeros(n), ceiling=torch.ones(n), sensor_body_name="ft",
         shelf_local_corners=torch.tensor([
             [x, y, z] for x in (-.3, .3) for y in (-.5, .5) for z in (0., 2.)
         ]).expand(n, -1, -1).clone(),
@@ -2643,7 +2692,7 @@ class NativeAdapterTests(unittest.TestCase):
 
         self.assertFalse(torch.allclose(outputs["tcp"][:, :100], outputs["hand"][:, :100]))
         self.assertFalse(torch.allclose(outputs["tcp"][:, 124:131], outputs["hand"][:, 124:131]))
-        # Identical physical sensor pose/distal loads keep SI-200-8 compensated
+        # Identical physical sensor pose/distal loads keep SI-200-8 measured
         # sensor-frame force/torque identical despite the changed EEF frame.
         torch.testing.assert_close(outputs["tcp"][:, 131:137], outputs["hand"][:, 131:137], rtol=0, atol=0)
 
@@ -2727,6 +2776,42 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertFalse(state.terminal_reward.any())
         self.assertFalse(state.terminal_paid.any())
 
+    def test_native_velocity_failure_uses_resolved_manager_config_and_disabled_term_restores_success(self):
+        native = native_velocity_termination()
+        for enabled in (True, False):
+            env, _, _ = native_fixture(3)
+            names = env.cfg.actions.arm_action.joint_names + env.cfg.actions.hand_action.joint_names
+            # env.cfg is deliberately unresolved; only the native manager owns usable IDs.
+            unresolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=dataclasses.MISSING)
+            resolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=list(range(12)))
+            term = SimpleNamespace(func=native, time_out=False,
+                                   params={'max_velocity': 3.0, 'asset_cfg': resolved})
+            env.cfg.terminations = SimpleNamespace(
+                success=SimpleNamespace(func=terminations.success, params={}, time_out=False),
+                hand_velocity=SimpleNamespace(func=native, time_out=False,
+                                              params={'max_velocity': 3.0, 'asset_cfg': unresolved})
+                              if enabled else None)
+            env.termination_manager = SimpleNamespace(
+                active_terms=['hand_velocity'] if enabled else [], get_term_cfg=lambda name: term)
+            task.reset_task(env)
+            env.scene['object_collection'].data.object_link_pose_w[:, 0, 0] = .8
+            env.scene['robot'].data.joint_vel[0, 0] = 3.01
+            env.scene['robot'].data.joint_vel[1, 11] = -3.01
+            for step in range(1, success_steps(env.cfg.mdp, env.step_dt) + 1):
+                env.common_step_counter = step
+                state = task.get_task_state(env)
+            expected_failure = torch.tensor([enabled, enabled, False])
+            torch.testing.assert_close(state.failure, expected_failure)
+            torch.testing.assert_close(state.success, ~expected_failure)
+            torch.testing.assert_close(state.terminal_reward,
+                                       torch.where(expected_failure, 0., 250.))
+            self.assertFalse(state.failure_reasons.any())
+            self.assertTrue(env.extras['terminated'].all())
+            # Every reader at the same counter sees the cached failure/success decision.
+            with patch.object(env.termination_manager, 'get_term_cfg',
+                              side_effect=AssertionError('Repeated velocity check')):
+                self.assertIs(task.get_task_state(env), state)
+
     def test_native_termination_manager_logs_every_cause_and_retains_last_episode_after_partial_reset(self):
         # Run the checkout's real compute/reset methods and our real term config,
         # stubbing only base-manager setup that otherwise starts Isaac Sim.
@@ -2748,7 +2833,9 @@ class NativeAdapterTests(unittest.TestCase):
         manager_path = root / 'IsaacLab/source/isaaclab/isaaclab/managers/termination_manager.py'
         cfg_path = Path(task.__file__).parent.parent / 'shelf_manipulation_env_cfg.py'
         namespace = dict(torch=torch, ManagerBase=ManagerBase, ManagerTermBase=type('ManagerTermBase', (), {}),
-                         TerminationTermCfg=TermCfg, configclass=lambda cls: cls, mdp=terminations)
+                         TerminationTermCfg=TermCfg, configclass=lambda cls: cls, mdp=terminations,
+                         joint_vel_out_of_manual_limit=native_velocity_termination(), MISSING=dataclasses.MISSING,
+                         SceneEntityCfg=lambda name, **kwargs: SimpleNamespace(name=name, joint_ids=slice(None), **kwargs))
         for path, name in ((manager_path, 'TerminationManager'), (cfg_path, 'TerminationsCfg')):
             source = ast.parse(path.read_text())
             node = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == name)
@@ -2758,13 +2845,24 @@ class NativeAdapterTests(unittest.TestCase):
         cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
                if isinstance(value, TermCfg)}
         expected_names = {'time_out', 'success', 'object_support_lost', 'object_tilt',
-                          'shelf_displacement', 'invalid_state', 'singularity'}
+                          'shelf_displacement', 'invalid_state', 'singularity', 'hand_velocity'}
         self.assertEqual(set(cfg), expected_names)
+        velocity_cfg = cfg['hand_velocity']
+        self.assertIs(velocity_cfg.func, namespace['joint_vel_out_of_manual_limit'])
+        self.assertEqual(velocity_cfg.params['max_velocity'], 3.0)
+        self.assertFalse(velocity_cfg.time_out)
+        self.assertIs(velocity_cfg.params['asset_cfg'].joint_names, dataclasses.MISSING)
         names = list(cfg)
         env = self.failure_fixture(termination_cfg=cfg)
+        # Simulate native SceneEntityCfg resolution, skipped by the base-manager stub.
+        velocity_cfg.params['asset_cfg'].joint_names = (
+            env.cfg.actions.arm_action.joint_names + env.cfg.actions.hand_action.joint_names)
+        velocity_cfg.params['asset_cfg'].joint_ids = list(range(12))
+        env.scene['robot'].data.joint_vel[4, 11] = -3.01
         env.episode_length_buf = torch.zeros(env.num_envs, dtype=torch.long)
         env.max_episode_length = 400
         manager = namespace['TerminationManager'](cfg, env)
+        env.termination_manager = manager
         with patch.object(task, '_read_transition', wraps=task._read_transition) as read:
             dones = manager.compute()
         self.assertEqual(read.call_count, 1)
@@ -2773,7 +2871,7 @@ class NativeAdapterTests(unittest.TestCase):
         expected = torch.zeros(9, len(names), dtype=torch.bool)
         for row, name in ((0, 'object_support_lost'), (1, 'object_tilt'), (2, 'object_support_lost'),
                           (3, 'object_support_lost'), (5, 'shelf_displacement'), (6, 'invalid_state'),
-                          (8, 'shelf_displacement'), (8, 'object_support_lost')):
+                          (8, 'shelf_displacement'), (8, 'object_support_lost'), (4, 'hand_velocity')):
             expected[row, names.index(name)] = True
         for column, name in enumerate(names):
             torch.testing.assert_close(manager.get_term(name), expected[:, column])
@@ -2784,12 +2882,13 @@ class NativeAdapterTests(unittest.TestCase):
 
         # Actual task reset clears only selected current causes; native manager
         # statistics retain the completed episode's causes until its next done.
-        ids, untouched = torch.tensor([0, 8]), torch.arange(1, 8)
+        ids, untouched = torch.tensor([0, 4, 8]), torch.tensor([1, 2, 3, 5, 6, 7])
         saved_reasons = env._contact_mdp.failure_reasons[untouched].clone()
         poses = env.scene['object_collection'].data.object_link_pose_w
         poses[ids, 0, 2] = .05
         env.sensors.ideal_wrench[ids, 0] = 1.
         env.scene['shelf'].data.root_link_pose_w[ids, 0] = 0.
+        env.scene['robot'].data.joint_vel[ids] = 0.
         task.reset_task(env, ids)
         torch.testing.assert_close(env._contact_mdp.failure_reasons[untouched], saved_reasons)
         self.assertFalse(env._contact_mdp.failure_reasons[ids].any())
@@ -3147,7 +3246,7 @@ class NativeAdapterTests(unittest.TestCase):
         task.reset_task(env)
         state = env._contact_mdp
         env._episode_reset = SimpleNamespace(pending_reset_metrics=None)
-        env.termination_manager = SimpleNamespace(dones=torch.tensor([True, False, True, True]))
+        env.termination_manager = SimpleNamespace(dones=torch.tensor([True, False, True, True]), active_terms=[])
         # Initial setup / manual reset without a completed physics transition
         # must not become an additional episode in these statistics.
         task.reset_task(env)
@@ -3232,14 +3331,14 @@ class NativeAdapterTests(unittest.TestCase):
         torch.testing.assert_close(state.history[:, 0, 37:54], -torch.ones(3, 17))
         self.assertEqual(int(state.history[:, 0, 54:].count_nonzero()), 0)
 
-    def test_one_native_step_compensates_gravity_and_inertia_and_updates_history_once(self):
+    def test_one_native_step_keeps_gravity_and_inertia_reaction_and_updates_history_once(self):
         env, action, external = native_fixture()
         task.reset_task(env)
         initial_reads = env.sensor_read_count
         initial = env._contact_mdp.history[:, 0].clone()
         data = env.scene["robot"].data
-        # Two 1 kg distal links: +2 m/s² in Z adds 4 N; both Iyy=.02.
-        # Lever moment changes by -.2 Nm; angular acceleration adds +.04 Nm.
+        # The native reaction includes distal weight and inertial loads. They
+        # remain measured sensor input rather than being subtracted afterwards.
         data.body_com_acc_w[:, 2:, 2] = 2.
         data.body_com_acc_w[:, 2:, 4] = 1.
         env.sensors.ideal_wrench[:, 2] += 4.
@@ -3250,8 +3349,11 @@ class NativeAdapterTests(unittest.TestCase):
         env.sensors.tactile_valid[:, 2] = False
         env.common_step_counter = 1
         state = task.get_task_state(env)
+        expected, _ = obs.calibrate_wrench(env.sensors.ideal_wrench)
         torch.testing.assert_close(state.history[:, 1], initial)
-        torch.testing.assert_close(state.history[:, 0, 31:37], external / torch.tensor(task.SI_200_8_RANGES))
+        torch.testing.assert_close(state.previous_wrench, expected)
+        torch.testing.assert_close(state.history[:, 0, 31:37], expected / torch.tensor(task.SI_200_8_RANGES))
+        self.assertFalse(torch.allclose(expected, external))
         torch.testing.assert_close(state.history[:, 0, 37:40], torch.tensor([1., 0., -1.]).expand(3, 3))
         torch.testing.assert_close(state.history[:, 0, 54], torch.full((3,), .4))
         self.assertEqual(env.sensor_read_count, initial_reads + 1)
@@ -3260,6 +3362,30 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertIs(task.get_task_state(env), state)
         torch.testing.assert_close(state.history, saved)
         self.assertEqual(env.sensor_read_count, initial_reads + 1)
+
+    def test_raw_measurement_clipping_and_invalid_mask_feed_both_observation_and_growth_rewards(self):
+        env, _, _ = native_fixture(3)
+        task.reset_task(env)
+        env.sensors.ideal_wrench[:] = torch.tensor([
+            [1.e20, -1.e20, 1.e20, 1.e20, -1.e20, 1.e20],
+            [math.nan, 1., 2., 3., 4., 5.],
+            [.14, -.16, 3., .011, -.014, .2],
+        ])
+        env.sensors.wrench_valid[1] = False
+        env.common_step_counter = 1
+        state = task.get_task_state(env)
+        measured, exceeded = obs.calibrate_wrench(env.sensors.ideal_wrench)
+        expected = measured.clone()
+        expected[1] = 0.
+        torch.testing.assert_close(state.previous_wrench, expected)
+        torch.testing.assert_close(state.history[:, 0, 31:37], expected / torch.tensor(task.SI_200_8_RANGES))
+        growth = expected.reshape(3, 2, 3).norm(dim=-1)
+        torch.testing.assert_close(rewards.motion_force_growth(env), growth[:, 0].square())
+        torch.testing.assert_close(rewards.motion_torque_growth(env), growth[:, 1].square())
+        self.assertTrue(state.failure_reasons[1, state.invalid_reason_index])
+        self.assertTrue(torch.isfinite(state.history[:, 0, 31:37]).all())
+        self.assertTrue(exceeded[0].all())
+        self.assertLessEqual(float(state.history[:, 0, 31:37].abs().max()), 1.)
 
     def test_partial_reset_preserves_other_environment_state_and_completed_terminal_observation(self):
         env, action, _ = native_fixture()
@@ -5700,11 +5826,10 @@ class PartialResetBatchTests(unittest.TestCase):
             torch.testing.assert_close(getattr(actual, name), getattr(expected, name), rtol=0, atol=0)
         torch.testing.assert_close(actual.sample[:, :31], expected.sample[:, :31], rtol=0, atol=0)
 
-    def test_cached_local_com_follows_link_rotation_without_native_world_com_reads(self):
+    def test_cached_object_com_follows_rotation_without_hand_dynamics_reads(self):
         env, _, _ = native_fixture(3)
         robot = env.scene['robot'].data
         objects = env.scene['object_collection'].data
-        robot.body_com_pos_b[:, 3] = torch.tensor([.1, .02, -.03])
         objects.object_com_pos_b[:, 2] = torch.tensor([.03, -.04, .02])
         task.reset_task(env)
         state = env._contact_mdp
@@ -5715,10 +5840,7 @@ class PartialResetBatchTests(unittest.TestCase):
         # local offsets must instead rotate with current link poses on device.
         robot.body_com_pos_w.fill_(math.nan)
         objects.object_com_pos_w.fill_(math.nan)
-        with patch.object(task, 'self_motion_wrench', wraps=task.self_motion_wrench) as compensate:
-            actual = task._read_transition(env, state, torch.arange(3))
-        expected_hand_com = robot.body_link_pos_w[:, 3] + torch.tensor([-.02, .1, -.03])
-        torch.testing.assert_close(compensate.call_args.args[2][:, 1], expected_hand_com)
+        actual = task._read_transition(env, state, torch.arange(3))
         slot = 0  # Collection object 2 occupies the first active slot.
         pose = objects.object_link_pose_w[:, 2, :3] - env.scene.env_origins
         expected_com = pose + torch.tensor([.04, .03, .02])
@@ -5734,6 +5856,25 @@ class PartialResetBatchTests(unittest.TestCase):
         torch.testing.assert_close(rewards.object_motion_cost(actual.center, actual.corners, actual.velocity,
                                                               state.active, state.blocker), expected_cost)
         self.assertTrue(actual.state_valid.all())
+
+    def test_binding_and_transition_do_not_query_hand_mass_inertia_com_or_acceleration(self):
+        env, _, _ = native_fixture(3)
+        class NoHandDynamics(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name in ('body_com_pos_b', 'body_com_pos_w', 'body_com_acc_w',
+                            'body_com_ang_vel_w'):
+                    raise AssertionError(f'Uncompensated F/T fetched unused hand dynamics: {name}')
+                return super().__getattribute__(name)
+        robot = env.scene['robot']
+        robot.data = NoHandDynamics(**vars(robot.data))
+        reject = AssertionError('Uncompensated F/T fetched mass or inertia')
+        with patch.object(robot.root_physx_view, 'get_masses', side_effect=reject), \
+             patch.object(robot.root_physx_view, 'get_inertias', side_effect=reject):
+            task.reset_task(env)
+            env.common_step_counter = 1
+            state = task.get_task_state(env)
+            measured, _ = obs.calibrate_wrench(env.sensors.ideal_wrench)
+            torch.testing.assert_close(state.previous_wrench, measured)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'Transition CUDA graph requires CUDA.')
     def test_transition_graph_matches_eager_after_changed_measurements_and_subset_reset(self):
@@ -5751,7 +5892,6 @@ class PartialResetBatchTests(unittest.TestCase):
             previous = None
             for scale in (1., 1.3):
                 env.scene['robot'].data.joint_vel.fill_(scale)
-                env.scene['robot'].data.body_com_acc_w[..., :3].fill_(scale)
                 env.sensors.ideal_wrench.add_(scale)
                 expected = task._read_transition(env, state, ids)
                 actual = task._read_transition(env, state)
@@ -5763,14 +5903,13 @@ class PartialResetBatchTests(unittest.TestCase):
                 previous = [(v, v.clone()) for v in vars(actual).values()]
                 task.reset_task(env, torch.tensor([1, 4], device='cuda'))
 
-    def test_transition_subset_matches_full_batch_and_limits_geometry_and_self_load_work(self):
+    def test_transition_subset_matches_full_batch_and_limits_geometry_work(self):
         env, action, _ = native_fixture(8)
         task.reset_task(env)
         state = env._contact_mdp
         robot = env.scene['robot'].data
         robot.joint_pos[:, 0] = torch.arange(8) * .01
         robot.joint_vel[:, 1] = torch.arange(8) * .02
-        robot.body_com_acc_w[:, 3, 0] = torch.arange(8) * .1
         env.sensors.tactile_force[:, 2, 0] = torch.arange(8)
         env.scene["shelf"].data.root_link_pose_w[6, 0] += .02
         action.normalized_actions[:, 3] = torch.arange(8) * .01
@@ -5779,12 +5918,10 @@ class PartialResetBatchTests(unittest.TestCase):
         ids = torch.tensor([6, 1])
         def reject(*args, **kwargs):
             raise AssertionError('Subset transition must not read device scalar values')
-        with patch.object(task, 'self_motion_wrench', wraps=task.self_motion_wrench) as compensate, \
-             patch.object(task, 'object_geometry', wraps=task.object_geometry) as geometry, \
+        with patch.object(task, 'object_geometry', wraps=task.object_geometry) as geometry, \
              patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
              patch.object(torch.Tensor, 'cpu', reject):
             subset = task._read_transition(env, state, ids)
-        self.assertEqual(compensate.call_args.args[0].shape[0], 2)
         self.assertEqual(geometry.call_args.args[0].shape[0], 2)
         for field in dataclasses.fields(full):
             with self.subTest(field=field.name):
@@ -5818,13 +5955,11 @@ class PartialResetBatchTests(unittest.TestCase):
                      if isinstance(value, torch.Tensor) and value.shape[:1] == (8,)}
         final_observation = env.extras['terminal_observation'].clone()
         env.task_scene_data.geometry_b[ids, :3, 0] += .01
-        with patch.object(task, 'self_motion_wrench', wraps=task.self_motion_wrench) as compensate, \
-             patch.object(task, '_read_reset_snapshot', wraps=task._read_reset_snapshot) as snapshot, \
+        with patch.object(task, '_read_reset_snapshot', wraps=task._read_reset_snapshot) as snapshot, \
              patch.object(task, 'prepare_initial_geometry', wraps=task.prepare_initial_geometry) as prepare, \
              patch.object(task, 'geometry_in_eef_frame', wraps=task.geometry_in_eef_frame) as transform, \
              patch.object(state, 'reset', wraps=state.reset) as commit:
             task.reset_task(env, ids)
-        compensate.assert_not_called()
         self.assertEqual(snapshot.call_args.args[2].numel(), 2)
         self.assertEqual(prepare.call_args.args[0].shape[0], 2)
         self.assertEqual(transform.call_args.args[0].shape[0], 2)
@@ -6404,7 +6539,6 @@ class SensorRuntimeTests(unittest.TestCase):
     def test_initial_measurement_invalid_then_physics_valid_and_selected_reset_preserves_other_rows(self):
         env, reader, reaction = self.fixture()
         self.assertFalse(reader().wrench_valid.any())
-        self.assertEqual(reader.distal_body_names, ('ToolForceTorqueLink', 'hand_base'))
         env.sim.current_time = .1
 
         def reject(*args, **kwargs):

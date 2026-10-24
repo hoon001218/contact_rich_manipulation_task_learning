@@ -7,6 +7,7 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.mdp import joint_vel_out_of_manual_limit
 from isaaclab.envs.ui import ManagerBasedRLEnvWindow
 from isaaclab.managers import ActionTermCfg, EventTermCfg, ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -92,7 +93,7 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=8.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=1.0, params={"decay": math.log(2.0) / 0.10},
+        func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
     shelf_collision = RewardTermCfg(
@@ -114,8 +115,8 @@ class RewardsCfg:
     )
     # Initial separate SI coefficients: +1 N and +0.05 N*m each cost 0.15 reward/s.
     # These per-step increments are squared directly, without rate conversion or exp.
-    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.15)
-    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-60.0)
+    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.03)
+    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.03)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.50)
     time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
@@ -133,6 +134,11 @@ class TerminationsCfg:
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
+    # Match min's Inspire threshold; include our independent arm and hand joints.
+    hand_velocity = TerminationTermCfg(
+        func=joint_vel_out_of_manual_limit,
+        params={"max_velocity": 3.0, "asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
+    )
 
 
 class ShelfManipulationEnvWindow(ManagerBasedRLEnvWindow):

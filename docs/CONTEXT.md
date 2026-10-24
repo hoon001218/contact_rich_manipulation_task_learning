@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-24, Asia/Seoul**.
+최종 갱신: **2026-10-25, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-10-24
+## 최신 진입점 — 2026-10-25
 
 현재 개발·학습 대상은 **`src/contact_manipulation`**,
 `Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
@@ -18,6 +18,51 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-25 속도 종료 후 즉시 reset·연산 증가를 실제 로그로 확인했다. 임계값3rad/s의
+  `2026-10-24_23-33-13`은 초기 episode1.4–1.7step,302회에도약4step이며 성공/raw goal은0이다.
+  초기 collection 중앙값15.07초 대 이전2.65초, 마지막10회도6.53초다. 부분 reset마다 공통 배치·
+  vision을 재사용하지만 연속 EEF 후보·IK·상태 쓰기는 다시 하므로 reset 폭증이 비용을 늘린다.
+  IK fallback은0이며 최초 초과 관절은 현재 로그로 특정할 수 없다. Reset은 qdot0·현재 위치
+  target으로 일치한다. 첫 정책 입력 후 arm/Hand 속도를 분리해 기록하고 정지 명령과 비교한 뒤
+  OSC scale·속도 종료를 함께 검토한다. std1·상대 pose scale1은 위험 후보이며 원인 확정은 아니다.
+  min Inspire의 joint-position 제어·팔만 검사하는3rad/s는 우리 OSC·12관절에 그대로 호환된다는
+  뜻이 아니다. PPO std·물리·종료를 임의 변경하지 않았으며 상세는 TRAINING_LOG69절을 따른다.
+- 2026-10-24 최신 원격 `min`을 다시 확인한 뒤 사용자 승인으로 `hand_velocity` 임계값을
+  **1→3rad/s**로 변경했다. 팔6개+Hand 독립6개 선택과 공식 `joint_vel_out_of_manual_limit`은
+  유지하며 어느 관절이든 **|qdot|>3rad/s**일 때 즉시 종료한다. 정확히±3rad/s는 통과한다.
+  원격 HEAD `baa3740e38c1a693b2094dc4d141b72de0dd3142`의 기본 cfg는1이지만
+  InspireOpen→Hand/HandMass·센서/질량 변형은3을 상속하고 HandMassLimit만1로 복원한다.
+  이전의 원격 `min` 전체가1이라는 설명은 override를 놓친 불완전한 설명이었다.
+  원격의 팔6개와 달리 Hand 포함은 사용자 승인한 연구 환경의 차이다. URDF·actuator 물리 속도
+  상한·OSC·action·reward 수식/weight는 변경하지 않는다. 아래 최초1rad/s 기록보다 이번 결정이
+  우선하며 상세는 TRAINING_LOG68절을 따른다.
+- 2026-10-24 예제의 `hand_velocity`를 참고해 공식 `joint_vel_out_of_manual_limit` 종료를 처음 추가했다.
+  당시 사용자 추가 요청으로 팔6개와 Hand 독립6개를 함께 검사하며 어느 관절이든 **|qdot|>1rad/s**면
+  즉시 종료한다. 이름 기반 `SceneEntityCfg`를 사용하고 joint velocity reward와 같은 관절이며
+  mimic/passive는 제외한다. `Episode_Termination/hand_velocity`에 독립 기록하고 native manager의
+  해석된 cfg로 검사한 결과를 task 실패·성공 보상 차단에도 반영한다. 속도 초과와 성공 보상은
+  동시에 발생하지 않는다. 사용자는 우선 관절 속도 종료만 선택했으므로 action-rate 종료·clipping,
+  reward 수식·weight·최종 transition 격리는 추가하지 않았다. 따라서 큰 finite action/관절속도
+  비용의 유입 문제 전체가 해결된 것은 아니다. 이전 속도 종료 미추가 기록보다 이 결정이 우선하며
+  변경·검증은 TRAINING_LOG67절을 따른다.
+- 2026-10-24 사용자 요청으로 Hand observation의 F/T 자중·관성 보상을 제거했다.
+  공통 측정 경로는 sensor frame의 native 반력에 SI-200-8 clipping·분해능만 적용한다.
+  Actor·Critic의 현재/직전 F/T 및 Force/Torque 증가량 reward가 같은 측정값을 사용하므로
+  hand 자중·관성 하중이 포함된다. 손 링크 COM·질량·관성 cache와 가속도·각속도 조회,
+  Newton–Euler 보상 함수·bias·distal body 목록을 제거했고 Object COM 보정은 유지한다.
+  reset F/T=0, invalid sensor mask, 관측244D, OSC gravity_compensation=True 및 기존
+  reward 계수·제어·termination은 유지했다. 이 제거만으로 큰 action·관절 속도 원인이나
+  학습 발산이 해결됐다고 판단하지 않는다. 이전 F/T 보상 유지 기록보다 이 결정이 우선하며
+  변경·검증은 TRAINING_LOG66절을 따른다.
+- 2026-10-24 최신 `22-25-22` 학습이0–7회 후 Gaussian sample의 `std >= 0.0` 오류로 종료됐다.
+  최초 이상은3회의 Action-rate−6.17e12·관절속도−1.15e18·F/T 증가−4.18e16/−3.87e30과
+  value loss Inf다. 당시 std는1.004이며 invalid 종료는0으로, 이전 std≈5 증가와 구분한다.
+  큰 finite 관절 상태가 관성 보상과 제곱 비용으로 증폭되는 경로는 확인했지만 최초 물리 원인은
+  미확정이다. Torque 계수−60은 초기값이며 정상 구간2회에도 양의 항 합의약1,045배였다.
+  다음 우선순위는 물리 한계 기반 크기 검사·이상 transition의 PPO 유입 차단·최초 이상 기록이다.
+  종료만 추가해도 native 순서상 reset 전 reward는 지급되므로 충분하지 않다. 이번에는 분석과
+  CPU 수치 확인만 했고 runtime 수정·학습 재현은 하지 않았다. Object 비용은−.0044로 폭발하지
+  않았으며64절의 tanh 제거 결정을 자동 복원하지 않는다. 상세·근거·한계는 TRAINING_LOG65절이다.
 - 2026-10-24 후속 사용자 승인으로 Object 비용의 tanh를 제거하고 **활성 non-Blocker의
   OBB 코너 속도**를 평가한다. 기존 snapshot의 중심 선속도와 각속도로
   `v_corner=v_OBB+ω×(corner−center)`를 구해8코너 norm 평균·물체 합을 환경별로 계산한다.

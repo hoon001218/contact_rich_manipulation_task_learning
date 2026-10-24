@@ -68,8 +68,8 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             body_name="wrist_3_link",
             # Use the UR5e terminal link, before the sensor/hand, for action and observation.
             task_frame_rel_path="Robot/wrist_3_link",
-            position_scale=1.0,
-            orientation_scale=1.0,
+            position_scale=0.5,
+            orientation_scale=0.5,
             stiffness_scale=100.0,
             controller_cfg=OperationalSpaceControllerCfg(
                 target_types=["pose_rel"],
@@ -92,10 +92,12 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
                 "right_thumb_1_joint", "right_thumb_2_joint", "right_index_1_joint",
                 "right_middle_1_joint", "right_ring_1_joint", "right_little_1_joint",
             ],
+            scale=0.5,
             preserve_order=True,
             rescale_to_limits=True,
         )
-        # Select the same independent joints as the action terms; omit mimic joints.
-        self.rewards.motion_joint_velocity.params["asset_cfg"].joint_names = (
-            self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
-        )
+        # Velocity cost and termination use the same twelve independent joints.
+        independent_joint_names = self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
+        self.rewards.motion_joint_velocity.params["asset_cfg"].joint_names = independent_joint_names
+        if self.terminations.hand_velocity is not None:
+            self.terminations.hand_velocity.params["asset_cfg"].joint_names = independent_joint_names

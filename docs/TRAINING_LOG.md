@@ -5425,3 +5425,229 @@ Blocker·미사용·비유한 물체 분리, native RewardManager의 `weight × 
 변경 production Python2개 AST 문법 검사와 `git diff --check`도 통과했다.
 실제 GPU/Kit·학습·simulation·처리량 benchmark는 실행하지 않았으며 장기 학습 효과나
 추가 tensor 연산의 GPU 처리량은 아직 측정하지 않았다.
+
+
+## 65. 2026-10-24 — 초기 finite 상태 폭발과 L2 비용·value loss 발산
+
+사용자 첨부 로그와 `2026-10-24_22-25-22` TensorBoard의0–7회 기록이 일치한다.
+실행 snapshot은 clean commit `f07f3aa47e19a31b3f7aedb334d112cbee97c4b7`이다.
+1,024환경·100Hz·episode8초·rollout36step, native L2/F/T 제곱·Object 코너 속도 수식과
+weight−.03/−.03/−.15/−60이 실제 실행됐다. 이전 수식의 로그가 아니다.
+
+| 지표 | 2회 | 최초 이상3회 |
+|---|---:|---:|
+| Action rate | −0.0708 | −6.173e12 |
+| Joint velocity | −0.1291 | −1.152e18 |
+| Force growth | −3.493 | −4.183e16 |
+| Torque growth | −21.15 | −3.867e30 |
+| Value loss | 7,019 | Inf |
+| Gaussian mean std | 1.0015 | 1.0038 |
+| Invalid-state 종료 | 0 | 0 |
+
+6회에도 같은 이상이 재발했다. Adaptive LR은2회 .0050625,3회1e−5였다.
+이번에는 이전처럼 std가약5까지 커진 뒤가 아니라 **std≈1인 초기부터** 폭발했다.
+2회에도 양의 항 합은약.02024로 Torque 비용이약1,045배다. −60은1N/0.05N·m 참조를
+맞춘 미검증 초기 계수이며, 이 정상 구간의 불균형과 극단적인 수치 오류는 별개로 다룬다.
+
+### 로그에서 확인 가능한 크기와 증폭 경로
+
+`Episode_Reward`는 reset 행의 `sum(weight×raw×dt)` 평균을 최대 episode8초로 나눈 뒤
+rollout callback별 평균한 값이다. 따라서 개별 step의 raw 값이나 실제 최대값은 아니다.
+episode 길이≤8초를 이용하면 적어도 한 contributing transition의 norm은
+`sqrt(abs(logged_cost)/abs(weight))` 이상이다.3회의 보수적 하한은 action 변화18D norm
+1.435e7, 관절속도12D norm6.197e9rad/s, 힘 norm 증가5.281e8N, 토크 norm 증가2.539e14N·m다.
+정상적인 빠른 조작으로 설명할 수 없으며, 정확한 최초 transition·최대값은 저장되지 않았다.
+
+검사는 대부분 `isfinite`라 거대한 finite 상태를 통과시킨다. `nan_to_num`도 finite 값을
+줄이지 않는다. Action-rate·관절속도는 공식 환경별 `sum(dim=1)`이며 환경 전체 합산 오류는
+확인되지 않았다. F/T는 raw 측정치를 센서 범위로 clip한 **뒤** 자중·관성 부하를 뺀다.
+이 부하는 가속도와 `ω×(Iω)`를 포함하므로 큰 관절/링크 속도가 gyro항을 거쳐 증폭되고,
+보상 후 wrench 증가량을 다시 제곱하면 비용은 더 커질 수 있다. 보상 후 observation만의
+clip은 reward 원본을 보호하지 않는다. 이는 가능한 증폭 경로이며 최초 물리 오류의 증명은 아니다.
+
+CPU float32에서 finite target−1e31의 제곱 오차는 Inf다. 따라서 큰 finite reward가
+GAE/return과 value 제곱오차를 오염시키는 수치 경로는 확인했다. Actor/Critic은 독립 모델이고
+native gradient clipping도 각각이므로 Critic gradient가 Actor로 직접 공유된다는 뜻은 아니다.
+Advantage·공통 상태 입력 등 간접 경로는 남는다. 마지막 `std >= 0.0`는 분포의 음수 또는 NaN
+scale로 발생할 수 있지만 최종 파라미터가 없어 어느 쪽인지 확정하지 않는다. 저장된 checkpoint는
+정상 `model_0.pt` 하나뿐이며 Actor/Critic tensor는 모두 finite다.
+
+### 다음 수정의 우선순위와 변경하지 않은 사항
+
+최초 이상 action·관절/링크 상태·가속도·raw/보상 F/T·OSC torque·reset 여부를 보존하고,
+모델의 실제 물리 한계에 근거한 크기 검사와 **이상 transition의 PPO 유입 차단**을 먼저 설계한다.
+Native 순서는 termination→reward→reset이므로 종료만 추가해도 그 step의 비용은 이미 지급된다.
+원인을 숨기는 무차별 reward clipping 대신 비정상 행의 격리와 정상 행 보존을 검증해야 한다.
+Action scale1·무clip은 위험 후보지만 이번 최초 원인으로 확정하지 않는다. 이상치 분리 후
+정상 F/T 분포와 관성 보상 오차를 확인해 weight를 재조정한다.
+
+사용자가 기억을 요청한 Object tanh 제거도 재검토 대상으로 설명하되 자동 복원하지 않는다.
+이번3회의 Object 비용은−.0044로 폭발한 Motion과 다르며, Object 포화 복원만으로 이 오류가
+해결된다는 근거는 없다. 이번 작업은 읽기·CPU 수치 확인·기록만 수행했으며 production·PPO·
+reward·termination·테스트 파일은 수정하지 않았다. 새 학습·GPU/Kit 재현은 실행하지 않았다.
+
+
+## 66. 2026-10-24 — Hand F/T observation의 자중·관성 보상 제거
+
+사용자 요청으로 `src/contact_manipulation`의 F/T 측정 경로에서 중력·병진/회전 관성
+보상을 제거했다. 기존 `contact_rearrangement` 프로젝트는 수정하지 않았다.
+
+기존 흐름은 `native reaction → SI-200-8 clipping·양자화 → self-load/bias 차감`이었다.
+이제 sensor frame의 native joint reaction에 **SI-200-8 clipping·양자화만** 적용한다.
+Actor·Critic의 현재/직전 robot sample은 이 측정값을 full scale로 정규화한다.
+공통 `TransitionBatch.sensor_wrench`를 사용하는 Force/Torque 증가량 reward도 같은
+보상하지 않은 값을 사용하며, 자중과 관성에 따른 norm 증가도 비용에 반영된다.
+Reward 수식·weight·dt 처리는 변경하지 않았다.
+
+`self_motion_wrench`·`compensate_wrench`와 bias 상태, distal subtree 이름/ID,
+손 링크 질량·관성·COM cache 및 매 step 가속도·각속도 조회를 제거했다.
+따라서 SI 범위 제한 뒤 큰 관성 보상값을 빼서 wrench가 증폭되는 경로가 사라졌다.
+Object COM→OBB 중심 속도 보정과 물체 local COM cache는 유지한다.
+OSC의 **gravity_compensation=True** 및 물리 중력·로봇 질량·관성은 유지한다.
+
+Sensor frame·센서 범위/분해능·raw overrange flag·유효하지 않은 sensor 행의0 처리,
+reset current F/T=0·previous sample=0, 부분 reset 및 244D 입력 크기는 유지한다.
+첫 완료 step에서는 previous wrench=0이므로 손 자중도 초기 F/T 증가량에 포함되고,
+이후 일정한 하중의 증가 비용은0이다. 기존 checkpoint와 입력 크기는 같지만 F/T 의미는
+달라지므로 전후 학습/재생 결과를 같은 observation 조건으로 해석하지 않는다.
+
+이번 변경은 큰 action·관절 속도의 최초 원인에 대한 수정이나 발산 해결 검증이 아니다.
+추가 clipping·PPO·action scale·reward weight·termination 변경은 하지 않았다.
+README와 CONTEXT를 현재 측정 경로에 맞게 갱신했으며 새 파일은 만들지 않았다.
+
+### 검증
+
+기존 MDP·모델/PPO CPU 전체 suite **434개 중411개 통과·GPU 전용23개 skip**을 확인했다.
+SI-200-8 포화·분해능·invalid mask, 관측과 reward의 측정값 일치, 현재/직전 이력·부분 reset,
+Object COM 속도 변환 및 F/T 처리에서 손 질량·관성·COM·가속도 조회가 없는 것을 검사했다.
+OSC gravity compensation=True 설정이 유지됨을 소스에서 확인했다.
+Production Python3개 AST 문법 검사와 `git diff --check`가 통과했다.
+CUDA 장치가 없는 환경이므로 실제 GPU/Kit·물리 simulation·학습은 실행하지 않았다.
+
+
+## 67. 2026-10-24 — 예제 기준 팔·Hand 관절 속도 종료 추가
+
+사용자는 `examples/`의 `hand_velocity`를 참고한 종료를 요청했고, 질의에서 우선 관절 속도
+종료만 적용하기로 선택한 뒤 Hand 관절도 포함하도록 요청했다.
+예제 `sweeping_policy/mdp/terminations.py:150`의 실제 조건은 EEF/손가락 속도가 아니라
+팔6개 관절의 `any(abs(qdot)>1.0)`이다. 예제의 일반/random env cfg 모두 threshold1rad/s다.
+
+동일한 공식 `isaaclab.envs.mdp.joint_vel_out_of_manual_limit`을 `TerminationTermCfg`에 직접
+설정했다. `max_velocity=1.0`, `time_out=False`이며 UR5e specialization에서 관절 이름을
+팔6개 + Hand 독립6개로 지정한다. Joint velocity reward와 같은12개이고 mimic/passive는
+중복 검사하지 않는다. Joint ID는 native `SceneEntityCfg`가 해석하므로 asset 관절 순서의
+앞12개를 가정하지 않는다. **정확히±1rad/s는 통과하고 어느 관절이든 절대값>1이면 즉시 종료**한다.
+여러 관절의 norm/합이1을 넘는 조건이나 일정 시간 유지 조건은 아니다.
+
+속도 종료는 native `Episode_Termination/hand_velocity`로 독립 기록한다.
+기존5개 연구 task의 `failure_reasons` 배열은 유지한다. `get_task_state`는 native manager의
+활성 `hand_velocity` term과 resolved asset cfg를 읽어 공식 함수를 평가하고,
+동일한 결과를 `TaskState.advance`의 실패/성공 판정에도 반영한다. 속도 초과 행은
+실패로 표시하고 성공 지속 카운터를0으로 만들어 성공·terminal 지급을 차단한다.
+Termination term을None으로 비활성화하면 이 성공 차단도 적용하지 않는다.
+공식 함수는 기존 native 관절속도 buffer를 환경별 tensor로 평가하며 추가 PhysX fetch나
+환경별 Python loop·CPU tensor 전송을 넣지 않는다. 기존 물리/actuator/OSC 설정은 유지한다.
+
+사용자 선택에 따라 **action-rate 별도 종료·action clipping·reward 수식/weight 변경은 없다.**
+팔 속도만 검사하는 예제와 달리 Hand 독립 관절도 같은1rad/s를 적용한 것이 연구 환경의 차이다.
+Action 변화량 자체를 제한하지 않으며 native `termination → reward → reset` 순서도 그대로다.
+따라서 종료 직전의 큰 finite action/관절속도 제곱 비용은 여전히 reward로 계산될 수 있고,
+65절의 전체 수치 발산 방지가 완료된 것은 아니다. 새 파일은 만들지 않았다.
+
+### 검증
+
+CPU 전체 suite **438개 중415개 통과·GPU 전용23개 skip**을 확인했다. 관련41개 집중 검사도
+통과했다. Checkout의 공식 속도 함수를 실행해±1rad/s 경계·팔/Hand 양방향 초과·비연속
+관절ID·mimic 제외·1,024행 tensor 처리를 검사했다. 실제 UR5e cfg의12관절 이름 연결,
+resolved manager cfg 사용, 속도 초과 시 성공/250 보상 차단, term 비활성화 후 성공 복원,
+native 원인 로그와 부분 reset 보존도 확인했다. Python 문법과 `git diff --check`가 통과했다.
+CUDA 장치가 없어 실제 GPU/Kit·물리 simulation·학습은 실행하지 않았다.
+
+
+## 68. 2026-10-24 — 최신 min Inspire 설정을 확인해 관절 속도 종료 임계값3rad/s 적용
+
+최신 원격 `IROL-SSU/Sweeping-Policy-DRL-Sim-Train`의 `min` HEAD를 다시 조회했다.
+확인한 commit은 `baa3740e38c1a693b2094dc4d141b72de0dd3142`이며 commit 시각은
+2026-10-14T07:46:11Z다. 기본 shelf cfg의1rad/s만으로 원격 전체의 실효 설정을 설명했던 것은
+Inspire specialization의 override를 놓친 불완전한 설명이었다.
+
+[InspireOpen cfg63–68행](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/baa3740e38c1a693b2094dc4d141b72de0dd3142/sweeping_policy/config/ur5e/joint_pos_random_single_inspire_open_env_cfg.py#L63-L68)은
+`hand_velocity`를 `threshold=3.0`, `time_out=False`로 재설정한다.
+InspireHand는Open을, HandMass는Hand를 상속한다. Sensors·MassSensors·InitialMass·PrivilegedMass·
+MassReaching도 이3rad/s를 상속하며, 별도의
+[HandMassLimit cfg53–58행](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/baa3740e38c1a693b2094dc4d141b72de0dd3142/sweeping_policy/config/ur5e/joint_pos_random_single_inspire_hand_mass_env_cfg.py#L53-L58)만
+1rad/s로 복원한다. 원격의
+[실제 종료 함수152–165행](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/baa3740e38c1a693b2094dc4d141b72de0dd3142/sweeping_policy/mdp/terminations.py#L152-L165)은
+이름으로 선택한 팔6개를 검사하며 손가락은 검사하지 않는다.
+
+사용자는 이 확인 후3rad/s 적용을 승인했다. 우리 환경의 공식
+`joint_vel_out_of_manual_limit`의 `max_velocity`만 **1.0→3.0**으로 변경한다.
+67절에서 사용자 요청으로 확장한 **팔6개+Hand 독립6개**와 이름 기반 `SceneEntityCfg`는
+유지한다. 어느 선택 관절이든 `abs(qdot)>3.0`이면 즉시 종료하며 정확히±3.0은 통과한다.
+Native `Episode_Termination/hand_velocity` 로그, 속도 실패와 성공 보상의 동시 지급 차단,
+term 비활성화 시 성공 판정 복원은 동일하다. 67절의1rad/s는 당시 구현·검증의 역사이며,
+현재 임계값은 이68절의3rad/s가 우선한다.
+
+이는 episode 종료 조건만의 변경이다. URDF 관절 범위·actuator 물리 속도/토크 상한·
+OSC·action scale/clipping·reward 수식/weight·관측·모델/PPO는 변경하지 않는다.
+특히 종료 임계값3rad/s가 Hand의 물리 속도 한계를3rad/s로 바꾸는 것은 아니다.
+Action-rate 자체의 제한과 최종 transition 격리도 추가하지 않았으므로, 큰 finite action/
+관절속도 비용의 전체 발산 방지가 해결됐다는 뜻은 아니다. 새 파일은 만들지 않았다.
+
+### 검증
+
+임계값 변경 후 CPU 집중 검사 **41개가1.006초에 통과**했다. 공식 함수의±3rad/s 경계 통과,
+±3.0001rad/s 종료, ±2rad/s 허용과 팔·Hand12관절 선택을 확인했다. Native 원인 로그,
+속도 실패의 성공 보상 차단·조건 비활성화 시 복원, 부분 reset 보존도 검사했다.
+변경한 cfg·테스트 Python2개 AST 문법 검사와 `git diff --check`가 통과했다.
+실제 GPU/Kit·물리 simulation·학습은 실행하지 않았다.
+
+
+## 69. 2026-10-25 — 관절 속도 종료 후 즉시 reset과 연산 증가 분석
+
+사용자는 `hand_velocity` 추가 후 초기에 즉시 종료가 반복되고 IK·연산이 늘어난다고 관찰했다.
+각 run의 저장 cfg와 TensorBoard를 읽어1rad/s/3rad/s 적용 여부·환경 수를 분리했다.
+
+| 실행2026-10-24 | 환경 수 | 속도 종료 | 초기 episode step | Collection1–3회 중앙값 |
+|---|---:|---|---:|---:|
+| 23-03-35 | 1,024 | 없음 | 27–66 | 2.65초 |
+| 23-19-11 | 1,024 | 12관절·1rad/s | 1 | 5.29초 |
+| 23-22-30 | 4 | 12관절·1rad/s | 1 | 2.53초 |
+| 23-31-31 | 4 | 12관절·3rad/s | 1.4–1.7 | 2.47초 |
+| 23-33-13 | 1,024 | 12관절·3rad/s | 1.4–1.7 | 15.07초 |
+
+최초 compile iteration0은 collection 비교에서 제외했다.100Hz이므로 최신 초기 episode는
+14–17ms이며302회에도약4step/40ms다. 마지막10회 collection 중앙값도6.53초다.
+속도 종료 snapshot은 거의1이지만 이는 완료 episode의 정확한 원인 비율은 아니다.
+`Task_Count/completed`의 callback 평균 차이는 초기약2.4–2.5만/iteration, 후반약9,300이다.
+이전 초기약370–490보다 크게 늘었지만 callback 평균이므로 정확한 reset 총수로 쓰지 않는다.
+IK search rounds는 초기약2.8 대 이전약1.4이며 fallback count/total은0이다.
+
+### 짧은 episode와 제어·reset의 관계
+
+현재 `_shared_reset_batch`는 부분 reset마다 Blocker 앞 연속 EEF 시작 후보를 새로 뽑아
+IK·충돌 검사를 수행한다. 물체 배치·vision은 공유한 값을 재사용한다. 따라서 IK 실패 자체보다
+reset 횟수 증가가 유력한 지연 요인이다. 상태 쓰기·센서/manager 초기화·physics forward 등도
+포함되므로 collection 증가를 IK만의 시간으로 단정하지 않는다. 이번 단계별 profiling은 없다.
+
+`_write_robot_reset`은 관절속도를0으로 쓰고 position target도 같은 초기 관절 위치로 맞춘다.
+그러므로 초기 상태에 임의의 큰 qdot를 직접 쓰는 코드는 아니다. 이후 첫 Gaussian 입력은
+std1·무clip, 상대 위치/회전 scale1이다.100Hz에서 큰 arm 목표가 나오는 것은 위험 후보지만
+원인 확정은 아니다. 현재 로그에는 처음 초과한 관절/episode age의 구분이 없어 팔과 Hand 중
+누가 trigger인지 알 수 없다. 공칭 속도는 Hand 독립관절2/.922rad/s, 팔3.14/6.28rad/s이며
+solver의 실제 순간 속도와 별개다. Hand action0도 열린 reset 자세 유지가 아니라 범위 중점이다.
+min Inspire의3rad/s는 joint-position 제어와 팔6개 검사 기준이어서 우리 OSC·12관절과 다르다.
+
+302회까지 valid success/raw goal은0, 접촉 유지도 사실상0이다. Reward−49.5→−.0297,
+value loss1,961→.0016, std1→.478은 과제 성공의 증거가 아니다. 짧은 종료 상태에서 비용을
+줄이는 변화와 구분해야 하며, 특히 충분한 조작 transition이 수집되지 않는 점이 우선 문제다.
+
+### 다음 비교와 변경 범위
+
+초과 관절 ID·팔/Hand별 최대속도·episode age를 기록하고 첫 step에 정지/자세 유지 명령을
+넣어 reset 후 물리 응답과 정책 입력을 분리한다. 그다음 정상 조작 속도와 추종 오차를 기준으로
+공식 OSC position/orientation scale과 속도 종료 전략을 함께 검토한다. Hand가 원인이면
+공식 joint-position EMA도 비교 후보이나 팔 원인을 해결하는 방법으로 오인하지 않는다.
+PPO std를 임의 변경하거나 유예 시간만 늘려 문제를 숨기는 수정은 하지 않았다.
+이번 작업은 저장 로그·코드의 읽기 전용 분석과 문서 기록이며 runtime·테스트·GUI 수정이나
+새 학습·GPU/Kit simulation은 실행하지 않았다. 최초 물리 원인과 단계별 시간은 미확정이다.

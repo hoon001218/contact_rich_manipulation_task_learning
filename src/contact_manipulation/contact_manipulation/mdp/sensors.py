@@ -162,8 +162,8 @@ class SensorReader:
 
     The F/T incoming joint frame is authored at the distal spacer origin with
     identity child rotation. Its parent-on-child reaction is already expressed
-    in physical sensor axes. SI-200-8 calibration and gravity/inertia removal
-    belong to events._read_transition, and are deliberately not repeated here.
+    in physical sensor axes. SI-200-8 calibration belongs to
+    events._read_transition; gravity and inertia are not subtracted.
     """
 
     def __init__(self, env):
@@ -175,10 +175,6 @@ class SensorReader:
         self.env = env
         self.robot = env.scene["robot"]
         self.body_index = self.robot.body_names.index(FORCE_TORQUE_BODY_NAME)
-        self.distal_body_names = tuple(
-            name for name, path in zip(self.robot.body_names, self.robot.root_physx_view.link_paths[0])
-            if name == FORCE_TORQUE_BODY_NAME or "/ROASRightHand/" in str(path)
-        )
         self.tactile = env.scene["tactile_contact"]
         if (self.tactile.num_bodies != len(TACTILE_BODY_NAMES)
                 or set(self.tactile.body_names) != set(TACTILE_BODY_NAMES)
