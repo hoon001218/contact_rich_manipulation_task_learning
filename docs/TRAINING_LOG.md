@@ -4929,3 +4929,313 @@ integration을 제외하지만 collider·broadphase·transform 관리·GPU 메�
 자료: `outputs/contact_manipulation/inactive_applied_20261023/`. 이전 simulation OFF/ON이
 실행된 프로세스를 복구하는 패치는 아니므로 적용 후에는 새 프로세스로 시작해야 한다.
 고정 제어 회귀 검사이며 장기 학습 안정성이나 전체 PPO iteration 개선율을 보장하지 않는다.
+
+
+## 57. 2026-10-23 — Reward 분모·Target gate·F/T 분리·Time 복원
+
+사용자의 전체 reward 검토 후 지시에 따라 다음을 적용했다. Rearrangement와 Object stability는
+수식 설명 후 계속 논의하기로 했으므로 이번 변경에서 수정하지 않았다. 물리·제어·배치·관측·PPO도 유지한다.
+
+- **Target gate:** 초기 pose 대비 위치2cm·회전0.15rad라는 기존 성공 보호 조건을 재사용한다.
+  별도 termination은 추가하지 않는다. 현재 pose가 범위를 벗어난 동안 양의 Clearance와
+  Distance·Contact 보상만0이며, 음의 Clearance와 다른 penalty·Time은 유지한다.
+  허용 범위로 복구하면 보상 지급도 복구한다. Contact의17개 binary 이전/현재 이력은 gate 중에도
+  계속 갱신해 복구 시 오래된 접촉이 보상으로 연결되지 않도록 했다.
+- **Clearance 분모:** reset의 물리 Blocker OBB 투영면적을 환경별로 캐시하고 episode 내에서
+  고정한다. 분자는 현재 겹침면적이다. 초기 대비 품질 차이·weight4·초기 보상0은 유지한다.
+  부분 reset은 선택 행의 면적·보호 상태만 갱신하며 가림 검사나 카메라를 추가하지 않는다.
+- **F/T 분리:** `motion_wrench_growth`를 제거하고 `motion_force_growth`와
+  `motion_torque_growth`를 각각 native weight0.15로 등록했다. 보정된 센서 frame의 norm 증가율,
+  deadband10N/s·0.5Nm/s와 계수ln2/90²·ln2/4.5²를 유지한다. 개별 품질의 반감점은
+  100N/s와5Nm/s이고, 힘을 빼거나 일정한 norm을 유지하면 비용0이다. 결합 exp 계산을 남기지 않는다.
+  내부 component는 `[Clearance, Rearrangement, Force, Torque, Terminal]`5열이며 관측 폭은 동일하다.
+- **Time 복원:** 이전에 선택한 비용률 `c(t)=0.02(exp(0.7t)−1)`을 복원하고 native weight1을
+  등록했다. 완료된 control 구간의 평균 비용률을 함수에서 반환하여 공식 RewardManager의
+  `×dt`가 정확한 구간 적분 `−integral[t−dt,t] c(s) ds`가 되도록 했다. 다른 discrete reward의
+  `/dt` 상쇄와 구분된다. Clock은 완료 전이마다 한 번 증가하고 부분 reset은 선택 행만0이다.
+  Scale0도 허용한다. 총 활성 term은12개다.
+
+### 설명 후 논의가 남은 두 항
+
+현재 Rearrangement는 초기 pose와의 차이나 누적 path가 아니라 **직전 control step의 코너
+이동량**에 exp를 적용한다. `path_length`는 별도로 누적하지만 reward 입력은 increment다.
+함수가 이미 `/step_dt`를 반환하므로 native `×dt`는 상쇄된다. 같은10cm를 첫1step에 이동하고
+99step 정지하면 총−0.8647,100step에 나누면 총−1.9801이다. 초기 변위에 지속 비용을 주는
+방식과는 다른 수식이며, 초기 변위/누적 조작량/step 조작량 중 의도를 다시 정해야 한다.
+
+Object stability는 현재 선반 frame의 물체 중심XY와 실제 충돌형상 최저점을 사용한다.
+중심XY에서 선반 사각형까지 수평 거리와 최저점의 높이 차이를 Euclidean 거리로 묶고,
+10mm를 넘는 최악 활성 물체에 비용을 준다. 20mm에서−1.5/step,30mm에서−2.8125/step이다.
+거리30mm가0.1초 지속되면 지지 이탈 종료이고,80° 전도0.2초는 별도 종료 조건이다.
+지지가 유지되는 기울기·물체 속도·손 접촉 유지 자체는 이 비용의 직접 입력이 아니다.
+사용자는 Blocker 불안정 상태에 추가 보상 gate를 두기보다 이 항의 처벌을 활용하길 원해
+Distance·Contact에 새로운 Blocker 안정성 gate는 추가하지 않았다.
+
+### 검증
+
+CPU180개 중176개 통과, CUDA 전용4개 skip. 실제 기울어진 OBB의 고정 면적 기준,
+Target 위치/회전 위반과 복구·음의 Clearance 유지·Contact 이력·부분 reset의 다른 행 보존,
+F/T 독립 반감점과 native term 등록, Time의 구간 적분/시간 분할 불변성을 검사했다.
+기존 관측·reset·지지·종료·1024행 tensor 연산 회귀도 포함한다. GPU/학습은 실행하지 않았다.
+Time8초 누적값은10/20/100ms 모두약−7.537897이며100Hz의 첫step은약−7.016e−7,
+8초 직전 마지막step은약−0.053696이다. 이는 과거 계수의 복원이며 학습 로그를 이용한 재튜닝은 아니다.
+
+
+## 58. 2026-10-23 — 누적 Rearrangement와 OBB 이탈·기울기 안정성
+
+사용자가 annotation으로 보완 방향을 지정했고 추가 질문에 다음처럼 확정했다.
+Rearrangement는 초기 pose 순변위가 아니라 **episode 중 누적 경로**로 왕복 이동도 남는다.
+Object stability의 XY 이탈은 물체 중심 대신 **전체 OBB의 돌출 거리**를 사용한다.
+기울기는 yaw를 제외한 현재 선반 법선 대비 각도θ를 그대로 exp 지수에 넣으며,
+45°에서 기울기 품질0.5인 계수로 시작한다. 이전57절 변경은 모두 유지한다.
+
+### Rearrangement
+
+기존 step별 OBB 평균 코너 이동량을 계산하고 Blocker를 제외한 활성 물체들 및 선반의
+누적 경로 `path_length`에 더하는 부분은 재사용한다. 실제 reward 입력만 step increment에서
+이 누적값으로 변경했다. 계수20m⁻¹·native weight1·`q−1` 지급을 유지한다.
+
+`P_k=sum_{j<=k} L_j`, `r_R=exp(−20P_k)−1`이다. 정지하면 새 경로는 늘지 않지만
+과거 조작량에 따른 비용은 계속 지급한다. 왕복하면 누적값이 커지며 부분 reset은 선택 행만0이다.
+같은 누적 경로의 현재 비용은 이동을 나눈 step 수와 무관하지만, 빨리 움직인 뒤 기다리는 궤적은
+높아진 누적 비용을 더 오래 받으므로 episode 총합까지 같다는 뜻은 아니다. 순변위가 아니다.
+사용자가 양의 품질 보상도 허용했지만 기존 정지 보너스 문제를 추가하지 않도록
+`exp(−20P)` 자체가 아니라 `exp(−20P)−1`을 지급한다. 모든 관측·action·PPO 설정은 동일하다.
+
+### Object stability
+
+현재 선반 frame에서 각 활성 물체의 8개 OBB 코너를 유한 작업판 사각형과 비교한다.
+가장 멀리 돌출한 코너의 XY 거리 제곱과, 기존 실제 충돌형상 최저점의 지지 높이 차이 제곱을
+더해 reward용 거리 `stability_distance`를 계산한다. 원래 중심XY 기준 `support_distance`는
+기존 support-loss 종료 조건용으로 그대로 남긴다.
+
+`d_i=sqrt(max_corner(dist_XY(corner,panel)^2)+(z_min−height)^2)`
+
+`theta_i=acos(clamp(canonical_up dot shelf_normal,−1,1))`
+
+`risk_i=(ln2/0.01²)*[d_i−0.01]_+²+(ln2/(pi/4))*theta_i`
+
+`r_stability=3*(exp(−max_active(risk_i))−1)`
+
+거리와 각도에는 각각 m⁻²·rad⁻¹ 계수를 적용하므로 지수는 무차원이다. 10mm 거리 여유,
+거리20mm에서 절반 품질, native weight3 및 최악 활성 물체 집계를 유지한다.
+기울기에는 θ² 대신 사용자 요청인 θ를 사용하며 물리적 각도 deadband는 추가하지 않았다.
+거리 이탈이 없을 때45°에서−1.5/step,90°에서−2.25/step이다. Yaw는 비용이 아니다.
+기울기와 이탈이 같은 물체에서 동시에 있으면 그 물체의 위험이 함께 증가한다.
+Blocker도 안정성 평가에는 포함한다. 물체 속도 항이나 새 reward term은 추가하지 않았다.
+
+기존 중심 기준 지지 거리30mm·0.1초 및 전도80°·0.2초의 종료 조건은 변경하지 않는다.
+Support helper에서 계산한 거리·각도를 캐시하고 같은 GPU batch/기존 CUDA graph 경로로
+reward에서 읽는다. 추가 USD/physics 조회나 환경별 Python 반복문은 없다.
+
+### 검증
+
+CPU185개 중181개 통과, CUDA 전용4개 skip. 동일 경로의 분할 비교·정지 뒤 비용·왕복·
+선반 이동/회전·Blocker 제외·부분 reset, OBB 돌출/높이·기울기 반감점·yaw 무관성·
+비활성 padding·기존 종료 조건 불변을 검사했다. 추가 yaw 검사와 문법/diff 검사도 통과했다.
+GPU 시뮬레이션·학습 및 성능 측정은 실행하지 않았다. 누적 비용으로 지급 의미가 달라졌으므로
+기존 step 비용 로그와 수치 크기를 그대로 비교하지 않는다. 기본 계수는 이번에 재튜닝하지 않았다.
+
+
+## 59. 2026-10-24 — 독립 graph Critic과 Actor 실행 순서 확인
+
+사용자 요청으로 Critic에도 Actor와 같은 scene encoder·GNN·역할 조건부 attention을 구성했다.
+두 모델은 같은 공개244D 관측을 받지만 각각 새 encoder와 native MLP를 생성한다.
+공통 클래스로 구조만 재사용하며 파라미터·정규화 통계·compile cache를 공유하지 않는다.
+앞선57·58절의 reward·termination과 환경 생성·물리·제어 설정은 이번 작업에서 변경하지 않았다.
+
+### 현재 구조와 native 경계
+
+- 각 모델: 초기 vision100D → 64D node encoder·GNN2층 → Target/Blocker 조건부 attention과
+  pooling → scene320D → 현재72D·직전72D와 concat → ReLU MLP464→256→128.
+- Actor 출력은18D Gaussian, Critic 출력은 deterministic value1D다. 현재·직전 입력에는
+  별도 학습 encoder를 추가하지 않고 기존 mask·raw history 연결을 그대로 사용한다.
+- `NativeContactActor`와 `NativeContactCritic`은 공통 특징 추출 구현을 통해 공식 `MLPModel`을
+  상속한다. Forward·분포·loss·GAE·optimizer·runner·logger는 native 구현이다.
+  PPO 하이퍼파라미터와 Actor의 초기화·분포·state dict 규약은 유지한다.
+- Critic의 value loss가 Actor encoder/head를 직접 갱신하지 않음을 확인했다.
+  Critic의 value 추정이 GAE·advantage를 통해 Actor 학습에 미치는 영향은 남는다.
+
+시작 로그에서 MLP가 먼저 보였던 원인은 native 생성자가 먼저 등록한 모듈을 PyTorch가
+등록 순서로 나열하기 때문이다. 실제 `MLPModel.forward()`는 `get_latent()`를 호출하여
+scene encoder와 concat을 마친 뒤 MLP를 실행한다. Forward hook으로 두 모델 모두
+scene→concat→MLP 순서와144D raw history 연결을 확인했다. 로그 첫 부분에 이 실행 흐름을
+명시했으며, 등록 순서를 바꿔 기존 Actor의 parameter/optimizer 나열 순서를 변경하지 않았다.
+
+### Checkpoint와 검증
+
+각 graph Critic은 자신의 설정 계약을 native extra state에 저장한다. 기존 raw MLP Critic
+checkpoint와 새 Critic은 구조가 달라 전체 resume를 거절한다. 계약·키·shape를 Actor 가중치
+로딩 전에 확인하므로 실패한 resume가 모델 일부를 갱신하지 않는다. 기존 native Actor v3 및
+지원하던 legacy v1/v2의 play는 이전 Critic 설정을 복원하여 유지한다. 새 graph Critic으로는
+새 학습을 시작해야 하며, 이전 Actor의 play 출력은 유지한다.
+
+CPU 학습 테스트60개 중58개 통과·CUDA 전용2개 skip, 전체 프로젝트 테스트422개 중
+399개 통과·GPU 관련23개 skip. 가중치 메모리·정규화 통계 비공유, 양방향 gradient 격리,
+Critic GNN/attention gradient, native PPO update·로그·checkpoint 왕복 저장과 이전 play를
+검사했다. 문법·diff 검사도 통과했다. 테스트는 CUDA 장치를 숨겨 실행했으며 실제 GPU
+시뮬레이션·학습·처리량은 측정하지 않았다. 별도 scene encoder의 추가 계산 비용과
+기존 value-loss 불안정 개선 여부는 새 학습에서 확인해야 한다.
+
+추가 CPU 감사에서는 실제 Isaac Lab configclass·설정 migration·to_dict와 native PPO 생성까지
+검사했다. 구 MLP 및 새 graph Critic의 저장 설정 복원·strict load 후 출력이 원본과 완전히 같았다.
+HEAD의 이전 Actor와 새 Actor도 같은 seed에서 초기 tensor·parameter/state dict 순서·extra state·
+forward 결과가 모두 같았다. 실제 기본 설정의36step rollout·8epoch native update에서 loss가
+유한하고 Critic encoder 가중치가 갱신되는 것도 확인했다.
+
+
+## 60. 2026-10-24 — 최초 인식 물체만 갱신하는 Critic 관측
+
+사용자와 논의하여 Critic의 물체 정보만 현재 실제 상태로 갱신하는 실험을 적용했다.
+reset에서 인식되지 않았던 물체를 Critic에 추가하거나, 재 ray casting으로 물체 목록을
+교체하는 방식은 사용하지 않는다. Actor의 입력과 reward·termination·PPO 설정은 유지한다.
+
+- **Actor:** `policy` 그룹의 초기 vision 추정 OBB100D와 현재·직전 robot/sensor/action144D.
+  초기 물체 기하는 robot base에서 고정하고 현재 `wrist_3_link` frame으로 재표현한다.
+- **Critic:** `critic` 그룹의 현재 실제 OBB100D와 같은144D history. 초기 인식 ID·슬롯·padding을
+  그대로 고정하고 해당 물체들의 실제 중심·회전만 매 step 갱신한다. 실제 canonical OBB 크기는
+  rigid body이므로 reset에서 캐시한다. 초기 Actor PCA OBB와 Critic의 실제 OBB 값은 다를 수 있다.
+- Target/Blocker slot0/1과 인식된 주변 최대8개를 유지한다. 인식되었던 물체가 가려지거나
+  선반에서 벗어나도 계속 추적하며, 초기 비인식 물체는 포함하지 않는다. Role ID나 mask 채널을
+  추가하지 않았고 두 그룹 모두244D·GNN10node·최종 head464D를 유지한다.
+
+`prepare_initial_geometry`가 이미 계산한 선택 순서를 반환하도록 확장하고, 그 순서의
+인식 object ID를 물리 snapshot 슬롯에 reset당 한 번 연결한다. 같은 SceneBatch의 공통 기하
+cache를 재사용하며 부분 reset은 선택 행의 연결만 갱신한다. 매 step에는 기존
+`TransitionBatch`의 실제 center/rotation을 고정 index로 gather하고, 이미 읽은 native root pose
+cache와 Isaac Lab quaternion 연산을 사용해 base→현재 EEF frame으로 변환한다.
+추가 물체/mesh/PhysX 조회나 ray casting·per-env Python 반복문·per-step 정렬은 없다.
+Robot root의 회전·이동·clone 원점, canonical upright 보정 및 OBB 중심의 link 원점 offset을 반영한다.
+
+공식 ObservationManager에 두 그룹을 선언하고 native PPO의 obs_groups를 Actor=`policy`,
+Critic=`critic`으로 연결했다. 두 모델은 독립 GNN·attention·MLP를 유지한다. Critic의 규약은
+`native_graph_critic_v2`·`tracked_initial_objects_v1`로 기록하며, 이전 초기 vision Critic과는
+같은244D여도 의미가 달라 전체 resume를 거절한다. 이전 v1 graph/MLP checkpoint play는
+원래 `policy` 관측으로 복원한다. Actor의 입력/action 계약과 저장 가중치 이름은 유지한다.
+
+### 검증과 한계
+
+통합 CPU 테스트431개 중408개 통과·GPU 관련23개 skip, 문법·diff 검사 통과.
+새 검사는 현재 GT 이동·회전·offset·upright 보정, 초기 비인식 물체 제외, 초기 슬롯과 padding
+고정, 이동·회전된 robot root와 clone 좌표계, 부분 reset의 다른 행 보존·이전 관측 참조 불변,
+native244D 그룹 연결·Actor GT 차단·공유 history·독립 gradient·PPO update·신구 checkpoint를
+포함한다. 기존 reward 설정 검사 하나가 이전 weight를 가정해 현재 사용자 값인
+Distance4/Hold1/Rearrangement0.5에 맞게 테스트만 수정했으며 실제 reward 설정은 바꾸지 않았다.
+추가 CPU harness에서는 실제 Isaac Lab configclass·RSL-RL 설정 변환·ObservationManager와
+native PPO 생성을 연결했다. 두 그룹 `(3,244)`·같은144D history·서로 다른100D geometry,
+각 모델의 올바른 그룹 선택과 forward·독립 가중치를 확인했다. Kit와 asset adapter는 CPU fixture다.
+
+현재 실행 환경에서 NVIDIA driver에 접근할 수 없어 실제 GPU/Kit 시뮬레이션·처리량·새 학습은
+실행하지 않았다. 이번 변경은 현재 물체 상태를 Critic에 제공하는 실험이며 기존 value loss
+폭증의 해결이나 성공률 개선을 입증하지 않는다. 미관측 물체 상태·누적 path·시간 등 모든
+숨은 reward 상태를 Critic에 추가하는 변경도 아니다. 효과는 새 run에서 비교해야 한다.
+
+
+## 61. 2026-10-24 — 18D action 분포 및 CPU 출력 진단
+
+사용자 요청으로 `2026-10-24_01-11-37`의 모든18개 action을 조사했다. 해당 run의
+TensorBoard는 scalar42종만 저장하며, checkpoint에는 Actor/Critic/optimizer와 metadata만
+있다. 원래 학습의 observation·rollout action·차원별 μ가 저장되지 않아 당시 실제 최대 action은
+복구할 수 없다. 마지막 scalar step은11684이며 mean std는5.06738이다.
+
+### 저장된 분포에서 직접 확인한 사실
+
+234개 checkpoint를 CPU로 순차 검사했다. 모든 floating Actor/Critic tensor가 유한했고
+std도 양수였다. 18개 채널 모두 최대 std는 마지막 저장11650에서 발생했다.
+
+| 0-based index | Action | checkpoint0 std | checkpoint11650 std |
+|---:|---|---:|---:|
+| 0 | Δx | 0.995 | 4.685 |
+| 1 | Δy | 1.002 | 4.792 |
+| 2 | Δz | 0.998 | 4.693 |
+| 3 | rotation vector x | 1.004 | 5.080 |
+| 4 | rotation vector y | 0.999 | 4.985 |
+| 5 | rotation vector z | 1.006 | 5.136 |
+| 6 | Kp x raw | 1.000 | 5.062 |
+| 7 | Kp y raw | 1.003 | 5.169 |
+| 8 | Kp z raw | 1.004 | 5.229 |
+| 9 | Kp rx raw | 1.007 | 5.126 |
+| 10 | Kp ry raw | 0.999 | 5.189 |
+| 11 | Kp rz raw | 1.002 | 5.128 |
+| 12 | thumb1 raw | 1.007 | 5.071 |
+| 13 | thumb2 raw | 1.000 | 5.158 |
+| 14 | index1 raw | 0.995 | 5.048 |
+| 15 | middle1 raw | 0.994 | 5.131 |
+| 16 | ring1 raw | 1.001 | 5.144 |
+| 17 | little1 raw | 0.999 | 5.200 |
+
+해당 run의 position/orientation scale은1.0이며 pose 입력에 추가 clip은 없다. Kp는 raw×100을
+50–200에, hand는 raw를±1로 제한한 뒤 joint limit에 대응시킨다. 18D raw action은 모두
+그대로 previous_action에 들어간다. Gaussian의μ와 무관하게 성립하는11650의 확률 하한은
+각 병진 성분의 절대값10cm 초과98.30% 이상,1m 초과83.10% 이상이다. Hand의 끝값 clamp는
+각 축84.30% 이상, Kp의50/200 clamp는 각 축88.22% 이상이다. 이는 저장된 분포의 수학적
+성질이며 원래 학습에서 측정한 빈도나 실제 EEF 이동량을 뜻하지 않는다.
+
+### CPU 진단과 한계
+
+현재 native Actor를 원래 v3 계약으로 strict load하고,9 checkpoint에 같은256개의 유계 합성
+관측을 제공했다. FK/IK로 정합성을 확인한 실제 시뮬레이션 관측은 아니다. 각 입력에서 새로
+128회 샘플링하고 전체18D의μ·σ·raw action을 집계했다. 11650의 최대|μ|는9.9473,
+새 표본의 최대|action|은28.9746이다. 450은 각각3.0988/8.4299,900은5.6779/11.0900이다.
+
+물리 상태를 고정하고 current/previous raw action만200전이 갱신하는 추가 진단에서는
+11650의 새 확률 출력의 전체 기간 최대값이61.0251이었다. 다만10^6 이상의 action이나
+거대한 value는 이 조건에서 재현하지 않았으며, 원래 학습의 value loss 급증을 action
+feedback만으로 설명하는 결과는 아니다. 원래 궤적·OSC 출력·실행 토크는 재현하지 않았다.
+
+Production code·reward·controller·checkpoint는 변경하지 않았으며 GPU/Kit·학습도 실행하지 않았다.
+이전의`action_feedback_initial_observation.pt` 역시 합성 데이터이며, 다른 run의 simulation 재생을
+이번 학습의 실측으로 해석하지 않는다. 결과는`outputs/contact_manipulation/action_audit_20261024/`의
+`checkpoint_std.json`과`cpu_policy_probe.json`에 저장했다. 과거 실제 action의 최대값을 특정하려면
+당시 기록이 필요하며, 이후 run에서는 raw action·μ·σ를18축별로 기록해야 한다.
+
+
+## 62. 2026-10-24 — Clearance 우선 reward weight 조정
+
+사용자가 reward 항별 weight 추천안을 승인하여 다음 세 값만 변경했다. 적용 직전 코드는
+Clearance4·Distance4·Hold/pad1이었으며, README의 과거 Distance0.4·Hold0.1 표를
+현재 코드의 이전값으로 해석하지 않는다. 기존 학습의 params·로그·checkpoint는 수정하지 않는다.
+
+| Native reward | 이전 weight | 적용 weight |
+|---|---:|---:|
+| Clearance | 4.0 | 8.0 |
+| Blocker distance | 4.0 | 1.0 |
+| Blocker contact hold / pad | 1.0 | 0.2 |
+
+Rearrangement0.5, Action rate/Joint velocity/Force growth/Torque growth각0.15,
+Singularity0.3, Object stability3, Time1, Terminal weight1 및 성공1회+250은 유지한다.
+수식·exp 민감도·Target gate·성공/실패 조건·policy 주기·action·PPO·물리·reset은 변경하지 않는다.
+기존 실행 중인 환경의 메모리 설정에는 소급 적용되지 않으며 다음 환경 생성부터 새 기본값을 쓴다.
+
+### 조정 근거와 한계
+
+직전 `2026-10-24_01-11-37`의 마지막25% 구간에서 weighted `Episode_Reward` 중앙값은
+Clearance+0.411, Distance+12.64, Hold+0.101, Rearrangement−3.13, Stability−2.75였다.
+이 값은 weighted episode 합을 최대 episode 길이8초로 나눈 native 로그이며 순간 reward나
+실제 episode 길이로 나눈 평균이 아니다. Distance가 Clearance의 약31배여서, 접근 상태의
+유지보다 초기 가림 대비 개선을 우선하는 비교 실험으로 C를2배·D를1/4로 조정한다.
+같은 궤적의 단순 환산은 C0.822/D3.16이며 새 정책의 행동·성공률을 예측하는 결과가 아니다.
+
+Hold의 낮은 로그 기여만으로 weight가 부족하다고 판단하지 않는다. 17개 binary의 합이므로
+이전 weight1은3pad 유지 시+3/step·이론적 최대+17이었다. 새 weight0.2는 각각+0.6과+3.4다.
+접촉 유지의 지원은 남기되 다수 pad 접촉에서 체류 보상이 커지는 것을 줄인다. Penalty는
+이미 상당한 음의 기여가 있어 이번에는 함께 강화하지 않는다.
+
+기본 a_C=1에서 새 Clearance 양의 전역 상한은8(1−exp(−1))≈5.056964/step,
+Distance 상한1, Hold 상한3.4다. 양의 dense 합의 느슨한 상한은9.456964/step,
+γ=.98 무한 할인합 상한은472.848224다. 실제 초기 가림과 동시 접촉 가능성을 고려한 값은
+더 작을 수 있으며, 성공250이 이 상한을 넘거나 성공 선호를 보장한다고 주장하지 않는다.
+거리·접촉의 양의 지속 지급과 누적 Rearrangement 비용 자체는 유지되므로 weight만으로
+접촉 후 정체나 회피 해법이 불가능해지는 것도 아니다.
+
+새 `2026-10-24_16-57-56`은 조사 시점0–5회뿐이어서 효과 판단에 쓰지 않았다.
+직전 run 후반 value loss 중앙값약3.18×10¹¹·Gaussian std중앙값4.63이라는 별도
+수치 불안정성이 있었으며 이번 변경을 그 원인의 확정이나 해결로 해석하지 않는다.
+
+### 검증
+
+기존 native reward 등록 검사의 기대값을 새3개 weight에 맞췄다. Reward/ContactReward/
+SingularityReward/ObjectSupportValidity의 관련 CPU43개 중41개 통과·GPU 전용2개 skip.
+변경한 Python 파일 문법 검사와 `git diff --check`도 통과했다. 새 테스트 파일이나 term은
+추가하지 않았으며 GPU/Kit·학습·시뮬레이션은 실행하지 않았다. 프로젝트 README의 현재
+weight·지급 예시와 CONTEXT 최신 진입점도 동기화한다.

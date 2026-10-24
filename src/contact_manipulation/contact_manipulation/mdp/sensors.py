@@ -405,7 +405,7 @@ class BlockerContactHold(ManagerTermBase):
         from .events import get_task_state
         from .rewards import blocker_contact_hold
 
-        get_task_state(env)
+        state = get_task_state(env)
         # A timeline PLAY recreates sensor views without necessarily resetting
         # the environment. Reconnect from the retained host ID in that case.
         if self.sensor._blocker_id is None:
@@ -421,7 +421,9 @@ class BlockerContactHold(ManagerTermBase):
             self.held_count.copy_(held)
             self.previous_contact.copy_(current)
             self.last_step = env.common_step_counter
-        return self.held_count / env.step_dt
+        # Keep contact history current while gated so restoring the Target
+        # resumes ordinary consecutive-sample contact evaluation.
+        return (self.held_count * state.target_protected) / env.step_dt
 
 
 def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:

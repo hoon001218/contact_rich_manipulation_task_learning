@@ -45,7 +45,7 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Initial geometry and current/previous sensor samples: 244D, without masks/role IDs."""
+    """Separate 244D actor/critic groups with identical history and tracked IDs."""
 
     @configclass
     class PolicyCfg(ObservationGroupCfg):
@@ -61,6 +61,20 @@ class ObservationsCfg:
 
     policy: PolicyCfg = PolicyCfg()
 
+    @configclass
+    class CriticCfg(ObservationGroupCfg):
+        """Current true OBBs for initial vision slots, followed by the same history."""
+
+        current_scene = ObservationTermCfg(func=mdp.critic_scene_geometry)
+        current = ObservationTermCfg(func=mdp.current_robot_sample)
+        previous = ObservationTermCfg(func=mdp.previous_robot_sample)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    critic: CriticCfg = CriticCfg()
+
 
 @configclass
 class EventCfg:
@@ -75,10 +89,10 @@ class EventCfg:
 class RewardsCfg:
     """Clearance with approach/contact support and bounded exp penalties."""
 
-    clearance = RewardTermCfg(func=mdp.clearance, weight=4.0)
-    blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=0.40)
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.10)
-    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=1.0)
+    clearance = RewardTermCfg(func=mdp.clearance, weight=8.0)
+    blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=1.0)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
+    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.5)
     # Command variation and actual speed are different control objectives.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
     motion_joint_velocity = RewardTermCfg(
@@ -88,9 +102,11 @@ class RewardsCfg:
             "hand_cfg": SceneEntityCfg("robot", joint_names=MISSING),
         },
     )
-    motion_wrench_growth = RewardTermCfg(func=mdp.motion_wrench_growth, weight=0.30)
+    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=0.15)
+    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=0.15)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
-    object_stability = RewardTermCfg(func=mdp.object_stability, weight=3.0)
+    object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.50)
+    time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 

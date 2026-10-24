@@ -1,11 +1,11 @@
-"""Sweeping-Policy random-task PPO settings with the research actor encoder."""
+"""Sweeping-Policy PPO settings with independent research actor/critic encoders."""
 
 from dataclasses import asdict
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-from .model import ModelCfg
+from .model import CRITIC_OBSERVATION_CONTRACT, ModelCfg
 
 
 @configclass
@@ -26,22 +26,24 @@ class ContactActorCfg(RslRlMLPModelCfg):
 
 
 @configclass
+class ContactCriticCfg(ContactActorCfg):
+    class_name: str = "contact_manipulation.config.ur5e.agents.model:NativeContactCritic"
+    observation_contract: str = CRITIC_OBSERVATION_CONTRACT
+    distribution_cfg: dict | None = None
+
+
+@configclass
 class ContactManipulationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """Match examples/Sweeping-Policy's registered random-task rsl_rl_ppo_cfg_02."""
+    """Keep the example PPO settings; use separate graph models for both roles."""
 
     num_steps_per_env = 36
     max_iterations = 90000
     save_interval = 50
     experiment_name = "contact_manipulation"
-    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    obs_groups = {"actor": ["policy"], "critic": ["critic"]}
     clip_actions = None  # Match the min baseline's Gaussian output without an extra action clip.
     actor = ContactActorCfg()
-    critic = RslRlMLPModelCfg(
-        hidden_dims=[256, 128, 64],
-        activation="elu",
-        obs_normalization=False,
-        distribution_cfg=None,
-    )
+    critic = ContactCriticCfg()
     algorithm = RslRlPpoAlgorithmCfg(
         class_name="PPO",
         value_loss_coef=1.0,

@@ -16,7 +16,11 @@ import torch
 
 from ....mdp.observations import SI_200_8_RANGES, SI_200_8_RESOLUTION
 # Keep old actor import paths usable without retaining a custom PPO algorithm.
-from .model import ACTION_CONTRACT, ModelCfg, NativeContactActor
+from .model import ACTION_CONTRACT, CRITIC_OBSERVATION_CONTRACT, ModelCfg, NativeContactActor
+
+
+_MODEL_SETTINGS = ("hidden_dims", "activation", "obs_normalization", "distribution_cfg")
+_GRAPH_CRITIC = "contact_manipulation.config.ur5e.agents.model:NativeContactCritic"
 
 
 def _actor_contract(checkpoint):
@@ -56,28 +60,95 @@ def _actor_contract(checkpoint):
             "model_cfg": model, "actor_model": dict(actor_model)}
 
 
+def _critic_contract(checkpoint):
+    """Older independent MLP critics have no extra state; graph critics do."""
+    state = checkpoint.get("critic_state_dict")
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("Checkpoint critic weights are missing.")
+    contract = state.get("_extra_state")
+    if contract is None:
+        return None
+    if (not isinstance(contract, Mapping)
+            or contract.get("architecture") not in ("native_graph_critic_v1", "native_graph_critic_v2")
+            or contract.get("action_contract") != ACTION_CONTRACT):
+        raise ValueError("Checkpoint critic architecture or action contract differs from this task.")
+    if (contract["architecture"] == "native_graph_critic_v2"
+            and contract.get("observation_contract") != CRITIC_OBSERVATION_CONTRACT):
+        raise ValueError("Checkpoint critic tracked-object observation contract differs from this task.")
+    return deepcopy(dict(contract))
+
+
+def _critic_settings(checkpoint):
+    contract = _critic_contract(checkpoint)
+    if contract is not None:
+        settings = contract.get("critic_model")
+        if not isinstance(settings, Mapping) or not isinstance(contract.get("model_cfg"), Mapping):
+            raise ValueError("Checkpoint graph critic configuration is missing.")
+        settings = dict(settings)
+        settings.update(class_name=_GRAPH_CRITIC, model_cfg=deepcopy(contract["model_cfg"]))
+        settings["observation_contract"] = (
+            CRITIC_OBSERVATION_CONTRACT if contract["architecture"] == "native_graph_critic_v2"
+            else "initial_vision_v1")
+    else:
+        metadata = checkpoint.get("research_metadata")
+        settings = metadata.get("critic_model") if isinstance(metadata, Mapping) else None
+        if settings is None:
+            # Native Actor v3 predates graph critics and used this fixed native MLP.
+            settings = dict(class_name="MLPModel", hidden_dims=[256, 128, 64], activation="elu",
+                            obs_normalization=False, distribution_cfg=None)
+        if not isinstance(settings, Mapping) or settings.get("class_name") != "MLPModel":
+            raise ValueError("Legacy playback requires an independent native MLP critic.")
+        settings = dict(settings)
+    for name in _MODEL_SETTINGS:
+        if name not in settings:
+            raise ValueError(f"Checkpoint critic setting is missing: {name}.")
+    if settings["distribution_cfg"] is not None:
+        raise ValueError("The value critic must not contain an action distribution.")
+    return deepcopy(settings)
+
+
+def _check_critic_before_load(checkpoint, critic, *, inference):
+    """Reject incompatible critics before native PPO loads any actor weights."""
+    saved_contract = _critic_contract(checkpoint)
+    expected = critic.state_dict()
+    if saved_contract != expected.get("_extra_state"):
+        suffix = ("Prepare playback with prepare_inference_checkpoint first." if inference
+                  else "The critic architecture changed; start a new training run.")
+        raise ValueError(f"Checkpoint critic model configuration differs from this critic. {suffix}")
+    saved = checkpoint["critic_state_dict"]
+    if (saved.keys() != expected.keys()
+            or any(not isinstance(saved[name], torch.Tensor) or saved[name].shape != value.shape
+                   for name, value in expected.items() if isinstance(value, torch.Tensor))):
+        raise ValueError("Checkpoint critic weight layout differs from this critic; start a new training run.")
+
+
 def prepare_inference_checkpoint(agent_cfg, path):
     """Restore checkpoint model settings before constructing the playback runner.
 
-    PPO hyperparameters stay at the current baseline: only the actor and legacy
-    critic architecture are restored. In particular, a log-Gaussian checkpoint
+    PPO hyperparameters stay at the current baseline: only the actor and critic
+    architectures are restored. In particular, a log-Gaussian checkpoint
     must never be interpreted as a scalar-Gaussian policy.
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     contract = _actor_contract(checkpoint)
     agent_cfg.actor.model_cfg = deepcopy(contract["model_cfg"])
-    for name in ("hidden_dims", "activation", "obs_normalization", "distribution_cfg"):
+    for name in _MODEL_SETTINGS:
         if name not in contract["actor_model"]:
             raise ValueError(f"Checkpoint actor setting is missing: {name}.")
         setattr(agent_cfg.actor, name, deepcopy(contract["actor_model"][name]))
-    critic = checkpoint.get("research_metadata", {}).get("critic_model")
-    if critic is not None:
-        if not isinstance(critic, Mapping) or critic.get("class_name") != "MLPModel":
-            raise ValueError("Legacy playback requires an independent native MLP critic.")
-        for name in ("class_name", "hidden_dims", "activation", "obs_normalization", "distribution_cfg"):
+    critic = _critic_settings(checkpoint)
+    if critic["class_name"] == "MLPModel":
+        # Configclass serialization uses instance fields. Remove graph-specific
+        # kwargs rather than passing them into the old native MLP constructor.
+        for name in tuple(vars(agent_cfg.critic)):
             if name not in critic:
-                raise ValueError(f"Checkpoint critic setting is missing: {name}.")
-            setattr(agent_cfg.critic, name, deepcopy(critic[name]))
+                delattr(agent_cfg.critic, name)
+    for name, value in critic.items():
+        setattr(agent_cfg.critic, name, deepcopy(value))
+    agent_cfg.obs_groups = {
+        "actor": ["policy"],
+        "critic": ["critic"] if critic.get("observation_contract") == CRITIC_OBSERVATION_CONTRACT else ["policy"],
+    }
     return checkpoint
 
 
@@ -92,6 +163,7 @@ def load_checkpoint(runner, path, *, inference=False, checkpoint=None):
     contract = _actor_contract(checkpoint)
     if contract != runner.alg.actor.get_extra_state():
         raise ValueError("Checkpoint observation/model configuration or action distribution differs from this actor.")
+    _check_critic_before_load(checkpoint, runner.alg.critic, inference=inference)
     load_cfg = ({"actor": True, "critic": True, "iteration": True, "optimizer": False, "rnd": False}
                 if inference else None)
     device = str(runner.device)

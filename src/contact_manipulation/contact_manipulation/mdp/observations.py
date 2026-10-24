@@ -2,7 +2,8 @@
 
 Initial camera geometry is frozen in robot-base coordinates. Only its reference
 frame changes with the measured EEF pose. Slots 0/1 are target/blocker; history
-contains the current and previous sample, newest first. All quaternions use
+contains the current and previous sample, newest first. The critic tracks the
+current true geometry of these same initially recognized objects. All quaternions use
 ``(w, x, y, z)``. Quaternion operations use Isaac Lab tensor utilities.
 """
 
@@ -17,7 +18,8 @@ from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, q
 __all__ = [
     "prepare_initial_geometry", "select_initial_geometry_indices", "geometry_in_eef_frame", "pack_policy_observation",
     "dynamic_sample", "self_motion_wrench", "calibrate_wrench", "compensate_wrench",
-    "policy_observation", "initial_scene_geometry", "current_robot_sample", "previous_robot_sample",
+    "policy_observation", "initial_scene_geometry", "critic_observation", "critic_scene_geometry",
+    "current_robot_sample", "previous_robot_sample",
     "quat_apply", "quat_conjugate", "quat_mul",
 ]
 
@@ -76,7 +78,8 @@ def prepare_initial_geometry(
     blocker_indices: torch.Tensor,
     *,
     capacity: int = 10,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reserve role slots and select nearby observed distractors once on reset.
 
     Inputs are ``[N, M, 10]`` geometry, ``[N, M]`` validity and ``[N]``
@@ -89,7 +92,8 @@ def prepare_initial_geometry(
     1e-3); accepted floating-point drift is normalized in the stored copy.
 
     Semantic checks synchronize the device here, at initial-snapshot acceptance;
-    observation construction never repeats this sort or these checks.
+    observation construction never repeats this sort or these checks. Optional
+    source indices bind the critic to the exact same objects and slot order.
     """
     if geometry_b.ndim != 3 or geometry_b.shape[-1] != 10 or valid.shape != geometry_b.shape[:2]:
         raise ValueError("Expected geometry [N, M, 10] and validity [N, M].")
@@ -119,7 +123,8 @@ def prepare_initial_geometry(
         raise ValueError("Target and blocker must be different objects.")
     indices, output_valid = select_initial_geometry_indices(geometry_b, valid, roles, capacity)
     output = geometry_b.gather(1, indices.clamp_min(0)[..., None].expand(-1, -1, 10))
-    return torch.where(output_valid[..., None], output, 0.0), output_valid
+    result = torch.where(output_valid[..., None], output, 0.0)
+    return (result, output_valid, indices) if return_indices else (result, output_valid)
 
 
 def geometry_in_eef_frame(
@@ -269,6 +274,28 @@ def policy_observation(env) -> torch.Tensor:
 def initial_scene_geometry(env) -> torch.Tensor:
     """Initial visible geometry in the current EEF frame; target/blocker first."""
     return policy_observation(env)[:, :100]
+
+
+def critic_observation(env) -> torch.Tensor:
+    """Current GT for reset-time recognized IDs, with the same robot history.
+
+    Membership, role slots and padding stay fixed until reset. No visibility
+    query runs here, and objects absent from initial vision are never inserted.
+    A fresh packed tensor preserves completed observations across auto-reset.
+    """
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    if state.critic_observation is None:
+        valid = state.geometry_valid & (state.critic_source_indices >= 0)
+        geometry = geometry_in_eef_frame(state.critic_geometry_b, valid, state.tcp_pose_b)
+        state.critic_observation = pack_policy_observation(geometry, state.history)
+    return state.critic_observation
+
+
+def critic_scene_geometry(env) -> torch.Tensor:
+    """True current OBBs in the current EEF frame for initial vision slots."""
+    return critic_observation(env)[:, :100]
 
 
 def current_robot_sample(env) -> torch.Tensor:

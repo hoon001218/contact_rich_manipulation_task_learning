@@ -1,11 +1,12 @@
-"""Initial-scene graph and finite sensor-history actor.
+"""Independent scene graph models with current/previous sensor history.
 
-This module deliberately has no Isaac Sim imports. The observation contains
-initial camera geometry, with target and blocker in reserved slots 0 and 1,
-and the current/previous robot and sensor samples. Callers derive masks from
-that observation before passing observation and masks separately to the model.
+This module deliberately has no Isaac Sim imports. The actor receives initial
+camera geometry; the critic receives current ground-truth geometry for those
+same initially observed object identities. Both reserve target/blocker slots 0/1
+and receive the same current/previous robot and sensor samples. Callers derive masks from their own
+observation before passing observation and masks separately to the model.
 Masks control padding, sensor filtering, and role selection; they are not learned features.
-The independent native MLP critic is configured in the runner settings.
+Actor and critic each construct their own graph, attention, and native MLP head.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import triton.language as tl
 
 
 ACTION_CONTRACT = "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3"
+CRITIC_OBSERVATION_CONTRACT = "tracked_initial_objects_v1"
 
 
 @triton.jit
@@ -302,7 +304,7 @@ class ContactManipulationEncoder(nn.Module):
         return torch.cat((scene, values), dim=-1).reshape(*leading, 5 * self.cfg.node_dim + values.shape[-1])
 
 
-class NativeContactActor(MLPModel):
+class _NativeContactModel(MLPModel):
     """Extend the native feature extractor; inherit the MLP head and PPO interface.
 
     As in RSL-RL's CNNModel, geometry is encoded separately from normalized 1D
@@ -311,17 +313,34 @@ class NativeContactActor(MLPModel):
     or role/padding selection. The default keeps normalization disabled.
     """
 
+    _role: str
+    _architecture: str
+
     def __init__(
         self, obs: Mapping[str, Tensor], obs_groups: dict[str, list[str]], obs_set: str,
         output_dim: int, model_cfg: dict | ModelCfg | None = None,
         max_forward_batch_size: int = 512, compile_model: bool = False,
         obs_normalization: bool = False, distribution_cfg: dict | None = None,
         stochastic: bool = False, hidden_dims: list[int] | tuple[int, ...] | None = None,
-        activation: str | None = None,
+        activation: str | None = None, observation_contract: str | None = None,
     ):
+        self._observation_group = "policy"
+        self._observation_contract = None
+        if self._role == "Critic":
+            self._observation_contract = observation_contract or CRITIC_OBSERVATION_CONTRACT
+            if self._observation_contract == CRITIC_OBSERVATION_CONTRACT:
+                self._observation_group = "critic"
+            elif self._observation_contract == "initial_vision_v1":
+                # Restore the previous graph critic only for checkpoint playback.
+                self._architecture = "native_graph_critic_v1"
+            else:
+                raise ValueError("Unsupported Critic observation contract.")
+        elif observation_contract is not None:
+            raise ValueError("Actor observation contract is fixed to initial policy vision.")
         self.cfg = model_cfg if isinstance(model_cfg, ModelCfg) else ModelCfg(**(model_cfg or {}))
-        if output_dim != self.cfg.action_dim:
-            raise ValueError(f"Actor output must contain {self.cfg.action_dim} research actions.")
+        expected_output = self.cfg.action_dim if self._role == "Actor" else 1
+        if output_dim != expected_output:
+            raise ValueError(f"{self._role} output must contain {expected_output} values.")
         if not isinstance(max_forward_batch_size, int) or isinstance(max_forward_batch_size, bool) or max_forward_batch_size <= 0:
             raise ValueError("max_forward_batch_size must be a positive integer.")
         if type(compile_model) is not bool:
@@ -330,9 +349,12 @@ class NativeContactActor(MLPModel):
         self.compile_model = compile_model
         hidden_dims = list(hidden_dims) if hidden_dims is not None else [2 * self.cfg.latent_dim, self.cfg.latent_dim]
         activation = activation or self.cfg.activation
-        distribution_cfg = deepcopy(distribution_cfg) if distribution_cfg is not None else {
-            "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.0,
-        }
+        if self._role == "Actor":
+            distribution_cfg = deepcopy(distribution_cfg) if distribution_cfg is not None else {
+                "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.0,
+            }
+        elif distribution_cfg is not None or stochastic:
+            raise ValueError("Critic must be deterministic, without an output distribution.")
         self.native_model_cfg = {
             "hidden_dims": hidden_dims, "activation": activation,
             "obs_normalization": obs_normalization, "distribution_cfg": deepcopy(distribution_cfg),
@@ -350,28 +372,40 @@ class NativeContactActor(MLPModel):
 
     def get_extra_state(self):
         """Store the research input/action contract through native state_dict."""
-        return {
-            "architecture": "native_graph_actor_v3", "action_contract": ACTION_CONTRACT,
-            "model_cfg": asdict(self.cfg), "actor_model": deepcopy(self.native_model_cfg),
+        state = {
+            "architecture": self._architecture, "action_contract": ACTION_CONTRACT,
+            "model_cfg": asdict(self.cfg), f"{self._role.lower()}_model": deepcopy(self.native_model_cfg),
         }
+        if self._role == "Critic" and self._observation_contract == CRITIC_OBSERVATION_CONTRACT:
+            state["observation_contract"] = self._observation_contract
+        return state
 
     def set_extra_state(self, state):
         if state != self.get_extra_state():
-            raise ValueError("Checkpoint Actor input/action/model configuration differs from this policy.")
+            raise ValueError(f"Checkpoint {self._role} input/action/model configuration differs from this model.")
+
+    def extra_repr(self) -> str:
+        # nn.Module lists children in registration order, not execution order.
+        # Keep that order (and native optimizer parameter ordering) unchanged.
+        return ("forward: scene encoder (GNN + role attention) -> "
+                "concat(current, previous) -> mlp"
+                + (" -> Gaussian distribution" if self.distribution is not None else " -> value"))
 
     def _get_obs_dim(self, obs, obs_groups, obs_set):
         groups, width = super()._get_obs_dim(obs, obs_groups, obs_set)
-        if groups != ["policy"] or width != self.cfg.observation_dim:
-            raise ValueError(f"Expected the single public policy observation with width {self.cfg.observation_dim}.")
+        if groups != [self._observation_group] or width != self.cfg.observation_dim:
+            raise ValueError(f"Expected the single {self._observation_group} observation "
+                             f"with width {self.cfg.observation_dim}.")
         return groups, self.cfg.history_steps * self.cfg.step_features
 
     def _get_latent_dim(self) -> int:
         return 5 * self.cfg.node_dim + self.cfg.history_steps * self.cfg.step_features
 
     def get_policy_observation(self, obs: Mapping[str, Tensor]) -> Tensor:
-        value = obs["policy"]
+        value = obs[self._observation_group]
         if value.ndim < 1 or value.shape[-1] != self.cfg.observation_dim:
-            raise ValueError(f"Expected a policy observation with width {self.cfg.observation_dim}.")
+            raise ValueError(f"Expected a {self._observation_group} observation "
+                             f"with width {self.cfg.observation_dim}.")
         return value
 
     def _feature_chunk(self, observation: Tensor, history: Tensor) -> Tensor:
@@ -381,7 +415,7 @@ class NativeContactActor(MLPModel):
         observation = self.get_policy_observation(obs)
         selectors = build_policy_masks(observation, self.cfg)
         history = self.encoder.history_input(observation, masks=selectors)
-        history = super().get_latent({"policy": history})
+        history = super().get_latent({self._observation_group: history})
         leading = observation.shape[:-1]
         raw = observation.reshape(-1, self.cfg.observation_dim)
         values = history.reshape(-1, self.cfg.history_steps * self.cfg.step_features)
@@ -407,11 +441,25 @@ class NativeContactActor(MLPModel):
         if self.obs_normalization:
             raw = self.get_policy_observation(obs)
             history = self.encoder.history_input(raw, masks=build_policy_masks(raw, self.cfg))
-            super().update_normalization({"policy": history})
+            super().update_normalization({self._observation_group: history})
 
     def as_jit(self):
         raise NotImplementedError("Graph/history policy export is not implemented.")
 
     def as_onnx(self, verbose: bool = False):
         raise NotImplementedError("Graph/history policy export is not implemented.")
+
+
+class NativeContactActor(_NativeContactModel):
+    """Graph/attention features followed by the native Gaussian action head."""
+
+    _role = "Actor"
+    _architecture = "native_graph_actor_v3"
+
+
+class NativeContactCritic(_NativeContactModel):
+    """Independent value model tracking the actor's initially observed objects."""
+
+    _role = "Critic"
+    _architecture = "native_graph_critic_v2"
 

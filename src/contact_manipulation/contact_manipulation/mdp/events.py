@@ -59,6 +59,9 @@ class MdpCfg:
     motion_torque_rate_decay: float = math.log(2.0) / 4.5**2
     force_rate_deadband: float = 10.0
     torque_rate_deadband: float = 0.5
+    # Previously selected increasing exponential cost rate, in reward/s and 1/s.
+    time_penalty_scale: float = 0.02
+    time_penalty_growth_rate: float = 0.7
     # One-time bonus for the enabled success termination.
     # With a_C=1, clearance weight 4, distance .4 and contact .1/pad,
     # the dense upper bound is 4.6285/step, or 231.424 at gamma=.98.
@@ -78,6 +81,8 @@ class MdpCfg:
     success_xy_tolerance: float = 0.005
     support_warning_distance: float = 0.010
     support_stability_decay: float = math.log(2.0) / 0.010**2
+    # User-selected linear tilt-angle exponent: isolated 45-degree tilt has half quality.
+    stability_tilt_decay: float = math.log(2.0) / (math.pi / 4.0)
     support_loss_distance: float = 0.030
     support_loss_duration: float = 0.100
     max_tilt: float = math.radians(80.0)
@@ -105,7 +110,8 @@ class MdpCfg:
         for name, value in vars(self).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
-            if (name.endswith("_ref") or name.endswith("_scale")) and value <= 0:
+            if ((name.endswith("_ref") or name.endswith("_scale"))
+                    and name != "time_penalty_scale" and value <= 0):
                 raise ValueError(f"{name} must be positive.")
 
 
@@ -360,7 +366,7 @@ def collision_support_minimum(vertices_catalog, vertex_counts, object_ids, norma
 
 
 class TaskState:
-    """Preallocated batch buffers; geometry is vision-only, physical poses reward-only."""
+    """Cached task state with frozen actor vision and tracked-object critic geometry."""
 
     def __init__(self, num_envs, device, cfg, dt, *, dtype=torch.float32, step=0, termination_cfg=None,
                  active_capacity=None):
@@ -373,6 +379,7 @@ class TaskState:
         self.ready = False
         self.bindings = None
         self.observation = None
+        self.critic_observation = None
         self.empty_env_ids = torch.empty(0, dtype=torch.long, device=device)
         n, observed = num_envs, cfg.max_objects
         o = observed if active_capacity is None else active_capacity
@@ -383,6 +390,8 @@ class TaskState:
             return torch.zeros(shape, device=device, dtype=kind)
         self.geometry_b = zeros(n, observed, 10)
         self.geometry_valid = zeros(n, observed, kind=torch.bool)
+        self.critic_geometry_b = zeros(n, observed, 10)
+        self.critic_source_indices = torch.full((n, observed), -1, dtype=torch.long, device=device)
         self.tcp_pose_b = zeros(n, 7)
         self.history = zeros(n, 2, 72)
         self.active = zeros(n, o, kind=torch.bool)
@@ -402,6 +411,7 @@ class TaskState:
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
         self.initial_clearance_quality = zeros(n)
+        self.initial_blocker_area = zeros(n)
         self.previous_corners = zeros(n, o, 8, 3)
         self.shelf_local_corners = zeros(n, 8, 3)
         self.previous_shelf_corners = zeros(n, 8, 3)
@@ -413,7 +423,10 @@ class TaskState:
         self.tilt_count = zeros(n, o, kind=torch.long)
         self.support_loss_count = zeros(n, o, kind=torch.long)
         self.support_distance = zeros(n, o)
+        self.stability_distance = zeros(n, o)
+        self.tilt_angle = zeros(n, o)
         self.clearance_progress_valid = zeros(n, kind=torch.bool)
+        self.target_protected = zeros(n, kind=torch.bool)
         self.completion_valid = zeros(n, kind=torch.bool)
         self.raw_goal = zeros(n, kind=torch.bool)
         self.raw_goal_seen = zeros(n, kind=torch.bool)
@@ -427,8 +440,8 @@ class TaskState:
         self.failure_reasons = zeros(n, len(FAILURE_REASON_NAMES), kind=torch.bool)
         self.failure_mask, self.success_enabled = configured_terminations(termination_cfg, device=device)
         self.invalid_reason_index = FAILURE_REASON_NAMES.index("invalid_state")
-        # Clearance, rearrangement, coupled F/T growth, terminal.
-        self.components = zeros(n, 4)
+        # Clearance, rearrangement, force growth, torque growth, terminal.
+        self.components = zeros(n, 5)
         self.wrench_rate_cost = zeros(n, 2)
         self.rearrangement_increment = zeros(n)
         self.blocker_overlap = zeros(n)
@@ -437,7 +450,7 @@ class TaskState:
     @torch.no_grad()
     def reset(self, ids, batch, *, geometry_b, geometry_valid, active, target, blocker,
               access_region, workspace_bounds, shelf_top, ceiling, shelf_local_corners,
-              step, batch_is_selected=False):
+              step, batch_is_selected=False, critic_source_indices=None):
         """Commit selected rows after physical reset and accepted initial vision.
 
         By default all inputs have a full-environment leading dimension. With
@@ -481,6 +494,21 @@ class TaskState:
         self.initial_rotation[ids] = batch.rotation[rows]
         self.previous_corners[ids] = batch.corners[rows]
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
+        if critic_source_indices is None:
+            # Numerical callers without an ID association never invent GT slots.
+            self.critic_source_indices[ids] = -1
+        else:
+            self.critic_source_indices[ids] = critic_source_indices[rows]
+        selected = self.critic_source_indices[ids].clamp_min(0)
+        corners = batch.corners[rows].gather(1, selected[..., None, None].expand(-1, -1, 8, 3))
+        # The rigid canonical OBB size is fixed during an episode. Corner order
+        # is ---, --+, -+-, -++, +--, +-+, ++-, +++.
+        self.critic_geometry_b[ids, :, 7:] = torch.stack((
+            torch.linalg.vector_norm(corners[:, :, 4] - corners[:, :, 0], dim=-1),
+            torch.linalg.vector_norm(corners[:, :, 2] - corners[:, :, 0], dim=-1),
+            torch.linalg.vector_norm(corners[:, :, 1] - corners[:, :, 0], dim=-1),
+        ), dim=-1)
+        self._update_critic_geometry(batch.center[rows], batch.rotation[rows], ids)
         self.history[ids] = 0
         self.history[ids, 0] = batch.sample[rows]
         # The reset state has no completed action/contact sample in this episode.
@@ -488,7 +516,8 @@ class TaskState:
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:72] = 0
         for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count", "tilt_count",
-                     "support_loss_count", "support_distance", "clearance_progress_valid", "completion_valid", "raw_goal",
+                     "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
+                     "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
                      "success", "failure", "terminal_paid", "failure_reasons", "components",
                      "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
@@ -496,13 +525,16 @@ class TaskState:
         # One batched geometry query for reset rows only. The initial reference
         # stays fixed until those environments start another episode.
         areas, overlap = projected_areas(batch.corners[rows], blocker[rows] & active[rows], access_region[rows])
+        self.initial_blocker_area[ids] = areas.sum(-1)
         initial_quality = torch.nan_to_num(
-            clearance_quality(self.cfg, overlap.sum(-1), areas.sum(-1)), nan=0.0, posinf=0.0, neginf=0.0,
+            clearance_quality(self.cfg, overlap.sum(-1), self.initial_blocker_area[ids]),
+            nan=0.0, posinf=0.0, neginf=0.0,
         )
         self.initial_clearance_quality[ids] = initial_quality
+        self.target_protected[ids] = True
         self.components[ids, 0] = initial_quality
         self.components[ids, 1] = 1.0  # Reset/idle rearrangement has zero penalty.
-        self.components[ids, 2] = 1.0  # No completed load-growth transition at reset.
+        self.components[ids, 2:4] = 1.0  # No completed load-growth transition at reset.
         # No completed physics sample yet; reset rows start with zero warning cost.
         self.singularity_margin[ids] = self.cfg.motion_singularity_threshold
         self.ready = True
@@ -517,6 +549,27 @@ class TaskState:
             observation[ids] = pack_policy_observation(geometry, self.history[ids])
             self.observation = observation
         self.last_step = step
+
+    def _update_critic_geometry(self, center, rotation, ids=None):
+        """Gather the fixed recognized slots from the already-read physics batch."""
+        rows = slice(None) if ids is None else ids
+        source = self.critic_source_indices[rows]
+        selected = source.clamp_min(0)
+        position = center.gather(1, selected[..., None].expand(-1, -1, 3))
+        orientation = rotation.gather(1, selected[..., None].expand(-1, -1, 4))
+        if self.bindings is not None:
+            # Root properties were acquired by _read_transition/reset_snapshot
+            # at this physics timestamp; these public reads reuse native caches.
+            data = self.bindings.robot.data
+            inverse_root = quat_conjugate(data.root_quat_w[rows, None])
+            root_position = data.root_pos_w[rows] - self.env_origins[rows]
+            position = quat_apply(inverse_root, position - root_position[:, None])
+            orientation = quat_mul(inverse_root, orientation)
+        geometry = torch.cat((position, orientation, self.critic_geometry_b[rows, :, 7:]), dim=-1)
+        valid = self.geometry_valid[rows] & (source >= 0)
+        self.critic_geometry_b[rows] = torch.where(valid[..., None], torch.nan_to_num(
+            geometry, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+        self.critic_observation = None
 
     @torch.no_grad()
     def advance(self, batch, step, *, singularity=None):
@@ -535,9 +588,8 @@ class TaskState:
         safe_corners = torch.nan_to_num(batch.corners, nan=0.0, posinf=0.0, neginf=0.0)
         # Clearance and its success gate concern only the designated Blocker.
         # Skip polygon clipping for other objects; their path/safety checks remain.
-        areas, overlap = projected_areas(safe_corners, self.blocker & self.active, self.access_region)
+        _, overlap = projected_areas(safe_corners, self.blocker & self.active, self.access_region)
         blocked = overlap.sum(-1)
-        blocker_area = areas.sum(-1)
         self.blocker_overlap.copy_(blocked)
         shelf_corners = ((batch.shelf_pose[:, :3] - self.initial_shelf_pose[:, :3])[:, None]
                          + quat_apply(batch.shelf_pose[:, None, 3:], self.shelf_local_corners))
@@ -549,7 +601,7 @@ class TaskState:
         # center: adding r x F at the initial origin would charge pure travel
         # under a constant load as a torque increase.
         components, costs = reward_components(
-            self.cfg, blocked, blocker_area, self.rearrangement_increment,
+            self.cfg, blocked, self.initial_blocker_area, self.path_length,
             batch.sensor_wrench, self.previous_wrench, self.dt,
         )
         support = self._support_validity(batch)
@@ -567,20 +619,24 @@ class TaskState:
             singularity=singularity,
             support_validity=support,
             raw_goal_out=self.raw_goal,
+            target_protected_out=self.target_protected,
         )
         successful, payment, paid = terminal_transition(
             candidate, failed, stable, self.terminal_paid, self.cfg, step_dt=self.dt,
             success_enabled=self.success_enabled,
         )
-        self.clearance_progress_valid.copy_(support.progress_valid & ~failed & ~reasons[:, self.invalid_reason_index])
+        self.clearance_progress_valid.copy_(support.progress_valid & self.target_protected
+                                           & ~failed & ~reasons[:, self.invalid_reason_index])
         self.completion_valid.copy_(support.completion_valid)
         self.raw_goal_seen.logical_or_(self.raw_goal)
         self.unsupported_goal_seen.logical_or_(self.raw_goal & ~support.progress_valid)
         self.goal_failure_seen.logical_or_(self.raw_goal & failed)
         self.support_loss_count.copy_(support.support_loss_count)
         self.support_distance.copy_(support.support_distance)
-        self.components[:, :3] = components
-        self.components[:, 3] = payment
+        self.stability_distance.copy_(support.stability_distance)
+        self.tilt_angle.copy_(support.tilt_angle)
+        self.components[:, :4] = components
+        self.components[:, 4] = payment
         self.wrench_rate_cost.copy_(costs)
         self.stable_count.copy_(stable)
         self.tilt_count.copy_(tilted)
@@ -591,6 +647,7 @@ class TaskState:
         self.history[:, 1].copy_(self.history[:, 0])
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
         self.tcp_pose_b.copy_(torch.nan_to_num(batch.tcp_pose_b, nan=0.0, posinf=0.0, neginf=0.0))
+        self._update_critic_geometry(batch.center, batch.rotation)
         self.previous_corners.copy_(batch.corners)
         self.previous_shelf_corners.copy_(shelf_corners)
         self.previous_wrench.copy_(batch.sensor_wrench)
@@ -1109,10 +1166,16 @@ def _prepare_reset_geometry(scene, ids):
     observed_blocker = (observed_ids == scene.blocker_id[ids, None]) & valid
     roles = torch.stack((observed_target.long().argmax(-1), observed_blocker.long().argmax(-1)), -1)
     roles = torch.where(torch.stack((observed_target.any(-1), observed_blocker.any(-1)), -1), roles, -1)
-    geometry, valid = prepare_initial_geometry(scene.geometry_b[ids], valid, roles[:, 0], roles[:, 1])
+    geometry, valid, observed_indices = prepare_initial_geometry(
+        scene.geometry_b[ids], valid, roles[:, 0], roles[:, 1], return_indices=True)
+    observed = observed_ids.gather(1, observed_indices.clamp_min(0))
+    matches = ((observed[:, :, None] == object_ids[:, None]) & active[:, None] & valid[:, :, None])
+    if bool((valid & ~matches.any(-1)).any()):
+        raise ValueError("Recognized objects must refer to active physical objects.")
+    critic_sources = torch.where(valid, matches.long().argmax(-1), -1)
     return SimpleNamespace(object_ids=selected, local_center=center, local_corners=corners,
                            upright=scene.upright[selected], active=active, target=target, blocker=blocker,
-                           geometry=geometry, valid=valid)
+                           geometry=geometry, valid=valid, critic_source_indices=critic_sources)
 
 
 @torch.no_grad()
@@ -1182,6 +1245,7 @@ def reset_task(env, env_ids=None):
         metrics["Task_Rate/valid_success"] = state.completed_totals[1] / state.completed_totals[0].clamp_min(1)
         runtime.pending_reset_metrics = metrics
     state.reset(ids, initial, geometry_b=expand(prepared.geometry), geometry_valid=expand(prepared.valid),
+                critic_source_indices=expand(prepared.critic_source_indices),
                 active=expand(prepared.active), target=expand(prepared.target), blocker=expand(prepared.blocker),
                 access_region=scene.access_region[ids],
                 workspace_bounds=scene.workspace_bounds[ids], shelf_top=scene.shelf_top[ids],

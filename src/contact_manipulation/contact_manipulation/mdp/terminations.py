@@ -52,6 +52,8 @@ class ObjectSupportValidity(NamedTuple):
     support_loss_count: torch.Tensor
     lost: torch.Tensor
     support_distance: torch.Tensor
+    stability_distance: torch.Tensor
+    tilt_angle: torch.Tensor
 
 
 def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, active, upright_z,
@@ -71,6 +73,8 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
     loss measure for lifting, falling, and leaving the panel. These events are
     not separately thresholded and OR-ed. Tipping remains an independent check:
     a tipped object can still touch the panel at zero support distance.
+    Reward stability additionally measures the most protruding OBB corner in
+    XY and canonical-up tilt. These do not change the existing failure timers.
 
     All object predicates, including finite checks and timers, ignore inactive
     slots. Only final completion requires settled objects. Failure timers belong
@@ -121,6 +125,14 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
     closest_xy = torch.maximum(torch.minimum(center_shelf[..., :2], bound_hi), bound_lo)
     distance = torch.sqrt((center_shelf[..., :2] - closest_xy).square().sum(-1) + signed_gap.square())
     distance = torch.where(active, torch.where(finite, distance, math.inf), 0.)
+    corner_xy = corners_shelf[..., :2]
+    outside_xy = torch.maximum(bound_lo.unsqueeze(-2) - corner_xy,
+                               corner_xy - bound_hi.unsqueeze(-2)).clamp_min(0.)
+    outside_squared = outside_xy.square().sum(-1).amax(-1)
+    stability_distance = torch.sqrt(outside_squared + signed_gap.square())
+    stability_distance = torch.where(active, torch.where(finite, stability_distance, math.inf), 0.)
+    tilt_angle = torch.acos(upright_z.clamp(-1., 1.))
+    tilt_angle = torch.where(active, torch.where(finite, tilt_angle, math.inf), 0.)
     unsupported = (distance >= cfg.support_loss_distance) & active & finite
     support_steps = max(1, math.ceil(cfg.support_loss_duration / step_dt - 1.e-9))
     next_loss = torch.where(unsupported, (support_loss_count + 1).clamp_max(support_steps), 0)
@@ -128,6 +140,7 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
         (progress_object | ~active).all(-1) & valid_metadata,
         (complete_object | ~active).all(-1) & valid_metadata,
         next_loss, (next_loss >= support_steps).any(-1), distance,
+        stability_distance, tilt_angle,
     )
 
 
@@ -162,7 +175,8 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
                     initial_center, initial_rotation, blocker_overlap, sensor_wrench,
                     stable_count, tilt_count, step_dt, workspace_bounds, shelf_top, ceiling,
                     shelf_pose=None, initial_shelf_pose=None, state_valid=None,
-                    failure_mask=None, singularity=None, support_validity=None, raw_goal_out=None):
+                    failure_mask=None, singularity=None, support_validity=None, raw_goal_out=None,
+                    target_protected_out=None):
     """Evaluate a full parallel batch without reading tensors back to Python.
 
     Object tensors have shapes (N, O, 3), (N, O, 8, 3), (N, O, 4), and
@@ -186,6 +200,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     enabled native causes for aggregate failure without erasing diagnostics.
     ``raw_goal_out`` optionally receives the protected-target/cleared-blocker
     predicate before completion validity, so diagnostics do not recompute poses.
+    ``target_protected_out`` exposes the same pose predicate to reward gates.
     Inactive slots never trigger a failure, even
     when padded with NaN. state_valid optionally incorporates robot, tactile, or
     other integration-specific finite checks supplied by the environment.
@@ -226,6 +241,10 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     target_active = target & active
     protected = ((target_active.sum(-1) == 1)
                  & (within_target_tolerance | ~target_active).all(-1))
+    if target_protected_out is not None:
+        if target_protected_out.shape != blocker_overlap.shape or target_protected_out.dtype != torch.bool:
+            raise ValueError("Target-protection output must have one boolean entry per environment.")
+        target_protected_out.copy_(protected)
 
     up_z = 1.0 - 2.0 * rotation[..., 1:3].square().sum(-1) / rotation_norm.square().clamp_min(1.0e-12)
     # Inclusive angular boundary, allowing only floating-point round-off at 80 degrees.

@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-23, Asia/Seoul**.
+최종 갱신: **2026-10-24, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-10-23
+## 최신 진입점 — 2026-10-24
 
 현재 개발·학습 대상은 **`src/contact_manipulation`**,
 `Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
@@ -18,6 +18,48 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-24 사용자 승인으로 reward weight만 **Clearance4→8·Distance4→1·Hold/pad1→0.2**로
+  조정했다. Rearrangement0.5·Action rate/Joint velocity/Force growth/Torque growth각0.15·
+  Singularity0.3·Object stability3·Time1·Terminal weight1/성공250은 유지한다. 수식·민감도·
+  gate·종료·action·PPO는 변경하지 않는다. 직전 `01-11-37` run 후반25%의 weighted
+  Episode_Reward 중앙값은 Distance12.64/ Clearance0.411로, 접근 상태 체류보다 가림 개선을
+  우선하는 비교 실험이다. `16-57-56`의0–5회만으로 효과를 판단하지 않는다.
+  아래 과거 weight 기록보다 이 설정이 우선하며 변경·검증 기록은 TRAINING_LOG62절을 따른다.
+- 2026-10-24 최신 run `01-11-37`의234 checkpoint를 CPU로 조사했다.18D 모든std가 약1에서
+  최종4.685–5.229로 증가했지만 원래 step별 action/관측은 저장되지 않아 당시 최대값은 복구할 수
+  없다. 유계 합성 관측의11650 정책 CPU 진단은 최대|μ|9.947·새 sample28.975였고,
+  고정 물리 상태 action feedback은 최대61.025였으며 원래 궤적 재현은 아니다. 이 조건에서
+  10^6 action/거대value는 재현하지 않았다. Pose scale1·무clip과raw18D history경로를 확인했고
+  production을 수정하지 않았다. 근거·18축 std·해석 한계는 TRAINING_LOG61절을 따른다.
+- 2026-10-24 후속 사용자 확정으로 Critic에 **최초 인식된 물체만 현재 GT로 갱신**하는
+  별도 `critic` 관측 그룹을 연결했다. Actor의 초기 vision10개·244D는 유지하며 Critic도
+  같은 인식 ID·슬롯·padding의10개·244D다. 초기 비인식 물체 추가·가림에 따른 삭제·재 ray casting은
+  없다. 기존 physics snapshot의 실제 OBB 중심·회전과 reset에 캐시한 크기를 현재 EEF frame으로
+  변환한다. 현재·직전144D는 Actor와 같다. 전체 물체GT·별도scalar상태·reward/PPO 변경은 없다.
+  새 Critic 계약은 `native_graph_critic_v2`·`tracked_initial_objects_v1`이다. 같은폭의 이전
+  초기 vision Critic은 의미가 달라 전체 resume를 거절하며 기존 play는 원래 관측으로 복원한다.
+  구현·검증과 한계는 TRAINING_LOG60절을 따른다.
+- 2026-10-24 사용자 요청으로 Critic에도 **별도 scene encoder·GNN·역할 attention**을 구성했다.
+  Actor와 같은 공개244D에서 scene320D와 현재/직전144D를 concat하고, 각각 독립 ReLU MLP
+  `464→256→128`을 사용한다. Actor는 Gaussian18D, Critic은 deterministic value1D다.
+  두 모델은 encoder·head·정규화 통계를 공유하지 않으며 native `MLPModel.forward`·PPO는 유지한다.
+  시작 로그의 MLP 우선 표시는 모듈 등록 순서이고 실제 forward는 scene→concat→MLP다.
+  로그에 실행 흐름을 명시했다. 기존 Actor 규약은 유지하지만 raw MLP Critic의 전체 resume는
+  호환되지 않아 새 학습이 필요하며, 이전 checkpoint play는 저장된 구성을 복원한다.
+  아래 독립 raw MLP/ELU Critic 기록은 당시 상태다. 검증은 TRAINING_LOG59절을 따른다.
+- 2026-10-23 추가 사용자 확인으로 Rearrangement를 **episode 누적 OBB 경로**에 대한
+  `exp(-20P)-1`로 바꿨다. 왕복·정지 후에도 비용이 남으며 Blocker 이동은 제외한다.
+  Object stability는 XY 전체OBB돌출·기존collision최저Z의 거리와 upright기울기각을
+  같은 물체의 위험으로 결합한다. 각도는 제곱하지 않고 `aθ=ln2/(π/4)`를 적용한다.
+  기존 중심 기반 지지 실패·tilt 종료·gate는 유지한다. 아래 직전step R/기울기미평가 기록보다
+  마지막「누적 Rearrangement와 전체 OBB·기울기 안정성」의 최신 결정이 우선한다.
+- 2026-10-23 후속 reward 정리: 성공과 같은 Target 보호2cm/0.15rad를 공통 gate로 써서
+  위반 중 양의 Clearance·Distance·Contact만0으로 만들고, 회복하면 재개한다. 추가 종료는 없다.
+  Clearance 분모는 초기 Blocker 투영면적으로 고정한다. F/T는 독립 native term 각각weight.15로
+  분리하고, Time은 기존 비용률`.02*(exp(.7*t)-1)`의 구간 적분·weight1로 복원했다.
+  현재 reward는12개이며 아래 과거10개/결합wrench/Time제거 기록보다 이 결정이 우선한다.
+  Rearrangement의직전step이동량 수식·지지 거리 비용·물리/PPO는 유지한다. 자세한 의도와
+  미결 논의는 문서 마지막「Target 보호 gate·초기 면적·F/T 분리와 Time 복원」을 따른다.
 - 2026-10-23 학습 종료 후 Patch 용량262,144, observation ray64×48/min3,
   GUI의 청록색 관측 OBB 독립 toggle을 적용했다. 가시성 인증160×120과 기존 cache는
   유지한다. 시각화는 초기 관측 추정값이며 PhysX에 참여하지 않고 headless에서는 생성되지
@@ -7746,3 +7788,88 @@ bit-exact였다. Native kinematic 수가 unused 수와 일치하며 주차/reset
 실제 bounds4bit·전역 plane1개를 확인했다. 결과는 production1024/support.json과applied_summary.json이다.
 장기 학습 안정성을 보증하는 결과는 아니다. 이미 OFF/ON을 사용한 앱은 새 프로세스로 시작한다.
 상세: TRAINING_LOG56절, outputs/contact_manipulation/inactive_applied_20261023/.
+
+
+## 2026-10-23 — Target 보호 gate·초기 면적·F/T 분리와 Time 복원
+
+사용자는10,000 iteration을 초기 학습으로 보고, 접촉·통로 확보 행동의 발전과 수치 이상을
+구분해서 평가하도록 교정했다. 낮은 초기 성공률이나 원시reward 진동만으로 학습 실패를
+단정하지 않는다. 최신 후속 검토에서는 모든 penalty를 일괄 증액하지 않고 수식의 불일치를
+먼저 정리하기로 했다. 최종 사용자 선택은 **추가 Target 종료 없이 회복 가능한 gate**다.
+
+- Target 초기 pose 대비 이동≤2cm·회전≤0.15rad라는 기존 성공 조건을 공통 함수로 사용한다.
+  이를 벗어난 동안 양의 Clearance·Distance·Contact 유지 보상을0으로 만든다. 음의 Clearance와
+  Rearrangement·Motion·지지·Time 비용은 유지한다. Target이 범위로 돌아오면 보상을 재개하며
+  실제 접촉 이력도 gate와 독립적으로 갱신한다. Object stability와 중복되는 새 Blocker 불안정
+  gate는 추가하지 않는다. 기존 물리 진행 gate는 양의 Clearance에 계속 적용한다.
+- Clearance는 현재 Blocker와 초기 접근영역의 교차면적을 **초기 Blocker의 XY 투영면적**으로
+  나누고0~1로 제한한다. 분모와 초기 품질은 episode 동안 고정하며 선택된 reset행만 갱신한다.
+  기울어짐·회전으로 현재 투영면적이 달라져 분모가 바뀌는 효과를 제거한다. 지급은 여전히
+  초기 대비 품질 차이를 반복 지급하는 방식이며 직전step개선량으로 변경하지 않았다.
+- F/T는 `motion_force_growth`·`motion_torque_growth` 각각native weight.15로 분리한다.
+  보정 후 현재 센서 중심의 힘·토크 norm 증가율에서10N/s·0.5N·m/s를 각각 뺀 양수부 제곱을
+  독립exp에 넣는다. 계수는`ln(2)/90²`·`ln(2)/4.5²`이므로100N/s·5N·m/s에서 각각품질.5,
+  비용−.075다. 하중 감소는0이며 힘과 토크의 단위를 직접 합치지 않는다. 결합wrench함수는
+  제거하고 components는`[C,R,F,T,Terminal]`5열로 바꾼다. 작은 비용 기울기와 F/T총하한−.30은
+  유지하지만 중간 곡선은 이전 결합식과 다르므로 과거로그를 동일한 점수로 비교하지 않는다.
+- Time은 사용자가 앞서 정한 지수형 비용률`c(t)=.02*(exp(.7*t)-1)`의 완료 control 구간
+  적분을 음수로 지급한다. `T_ref`는 없고 native weight1이다. 함수는 구간 평균 비용률을 반환해
+  공식 RewardManager의dt가 한 번만 적용된다. 경과시간은 완료전이당1회 증가하고 재조회로
+  늘지 않으며, 부분reset은 선택행만0으로 초기화한다. 할인 전8초합−7.53789735503,
+  100Hz 마지막step−.0536964239다. 이는 과거초기값 복원이며 새 최적weight를 측정한 값은 아니다.
+
+Rearrangement는 **직전step**의 non-Blocker 물체·선반 평균8-corner 이동량 합에
+`exp(-20*x)-1`을 적용하는 기존 방식이다. Native manager가dt를 곱하지만 adapter가dt로
+나눠 상쇄하므로 초기위치와의변위나누적경로를 매step반복과금하는 방식이 아니다.
+동일10cm를1step에 움직이면약−.865,10step에 균등분할하면총−1.813이라는 시간분할편향은
+현재남아있다. 누적경로는진단용이며 수식변경은 이번에 확정하지 않았다.
+
+Object stability도 현재선반frame의`(OBB중심XY,실제collider최저Z)`에서 유한작업판 최근접점까지의
+거리만 사용한다. 이거리는지지·회전안정성이나접촉지지다각형의증명이 아니며, 지지된 전도나
+빠른평면이동은거리0일수있다. weight3·10mm무감점·같은물체3cm/.1초종료·기존tilt80°/.2초는
+그대로두고 구체적기하의의미를 사용자와 더 논의한다. 임의의속도·기울기 penalty는 추가하지 않았다.
+
+활성reward는12개, native종료는기존7개이며 성공bonus250·PPO·모델·action·스폰·물리주기는
+유지한다. 이 변경으로 학습 개선이나 기존 value-loss 이상 해결을 입증한 것은 아니다.
+상세 코드·회귀 검증 결과는 TRAINING_LOG의 최신 적용 기록을 따른다.
+
+
+## 2026-10-23 — 누적 Rearrangement와 전체 OBB·기울기 안정성
+
+사용자가 Rearrangement의 의도를 **초기부터 발생한 전체 조작량의 누적**으로 다시 확인했다.
+이에 직전step 증분만 평가하던 방식을 episode 누적 경로`P_k=sum_j ell_j`로 변경한다.
+`ell_j`는 지정Blocker를 제외한 활성물체와 선반 각각의 대응8-corner변위norm평균의 합이다.
+이 값은 초기·현재pose의 순변위가 아니므로 왕복도 남는다. 기존 `path_length`를 보상 입력에
+사용하며 `rearrangement_increment`는 진단용이다. 품질`exp(-20*P_k)`에서1을 빼고 weight1로
+매step지급하므로 이동후멈춰도 비용이남는다. 누적1cm이면 매step약−.181269,10cm이면−.864665다.
+완전히 미교란인상태만0이며 정지 자체의 양의보상은 없다. Native adapter의 `/step_dt`와
+manager의dt는 기존처럼 상쇄하며, 전체이동량에 대한 일회성 선형비용이나 주기불변비용이라고
+해석하지 않는다. 선택된행만 reset 시 누적0·이전corner현재값으로초기화한다.
+
+Object stability는 사용자승인으로 경계돌출과기울기를 기존term에 반영한다. 선반frame에서
+물체i의 OBB8개 XYcorner가 작업판사각형바깥으로 벗어난 거리의 최대값을`delta_xy`로 구한다.
+Z는 기존과같이 실제collision기하의최저점과 작업판높이 사이 signed gap `g`다.
+새reward거리 `d_stab=sqrt(delta_xy²+g²)`는 중심이안에있어도 물체가돌출하면 커지며,
+OBB의 빈Z모서리를 collider최저점 대신 사용하지 않는다.
+
+물체upright기준위쪽축과 선반법선의 내적에서 `theta=acos(clamp(dot,-1,1))`를 구한다.
+평면yaw는제외한다. 사용자는 **theta 자체를 exp에 넣고 제곱하지 않도록** 선택했다.
+물체별무차원위험은 `x_i=(ln2/.01²)*[d_stab-.01]_+²+(ln2/(π/4))*theta_i`다.
+기존weight3으로 `3*(exp(-max_active(x_i))-1)`을 지급한다. 같은물체에서거리와각도를합친뒤
+가장위험한활성물체를선택하므로 서로다른물체의최악거리·최악기울기를따로더하지않는다.
+Blocker도포함하며 센서·물리query·환경별Pythonloop는추가하지 않는다.
+
+거리쪽10mmdeadband와20mm단독half-quality는유지한다. 각도는별도deadband없이0부터
+평가하며 `stability_tilt_decay=ln2/(π/4) rad^-1`이다. 단독45°에서품질.5·비용−1.5이고,
+같은물체가거리20mm와45°를함께보이면품질.25·비용−2.25다. 정상pivot도각도가생기면비용을
+받는설계이므로 이값은실제성공조작의허용범위를측정한결과가아닌초기민감도다.
+
+종료에쓰는`support_distance`는 기존 **OBB중심XY+collision최저Z**의 유한작업판거리다.
+같은물체3cm/.1초지속 종료와tilt80°/.2초·성공/진행gate는변경하지않는다. 새reward기하로
+종료기준을몰래강화하지않으며 속도penalty나추가Blocker gate도없다. Helper는기존출력에
+`stability_distance`·`tilt_angle`두필드를추가하고 TaskState에한번복사한다. 같은step의
+반복rewardquery는재계산하지않고 부분reset은선택행만초기화한다.
+
+앞선Target보호gate·초기Blocker분모·F/T분리·Time복원과12개native reward·7개종료·
+성공bonus250·물리/PPO/관측은유지한다. 이수정으로장기학습개선을확인한것은아니며
+실행/회귀검증의범위는TRAINING_LOG최신적용기록을따른다.

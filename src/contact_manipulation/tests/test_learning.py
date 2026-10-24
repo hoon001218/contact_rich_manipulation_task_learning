@@ -38,7 +38,7 @@ if "isaaclab.utils.math" not in sys.modules:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contact_manipulation.config.ur5e.agents.model import (
-    ContactManipulationEncoder, NativeContactActor, build_policy_masks,
+    ContactManipulationEncoder, NativeContactActor, NativeContactCritic, build_policy_masks,
 )
 from contact_manipulation.config.ur5e.agents.model import ModelCfg, _masked_softmax
 from contact_manipulation.config.ur5e.agents.ppo import (
@@ -583,11 +583,13 @@ def runner_config(model_cfg=None, **algorithm_overrides):
     return dict(
         class_name="OnPolicyRunner", num_steps_per_env=4, max_iterations=2, save_interval=2,
         logger="tensorboard", experiment_name="contact_manipulation", run_name="",
-        obs_groups={"actor": ["policy"], "critic": ["policy"]},
+        obs_groups={"actor": ["policy"], "critic": ["critic"]},
         actor=dict(class_name=f"{AGENTS}.model:NativeContactActor", model_cfg=asdict(model_cfg),
                    max_forward_batch_size=32,
                    distribution_cfg={"class_name": "GaussianDistribution", "std_type": "log", "init_std": .3}),
-        critic=dict(class_name="MLPModel", hidden_dims=[256, 128, 64], activation="elu",
+        critic=dict(class_name=f"{AGENTS}.model:NativeContactCritic", model_cfg=asdict(model_cfg),
+                    max_forward_batch_size=32,
+                    hidden_dims=[2 * model_cfg.latent_dim, model_cfg.latent_dim], activation="relu",
                     obs_normalization=False, distribution_cfg=None),
         algorithm=algorithm, multi_gpu=None,
     )
@@ -596,7 +598,7 @@ def runner_config(model_cfg=None, **algorithm_overrides):
 class SmallVectorEnv:
     """A deterministic vector API fixture with real observations and auto-resets."""
 
-    def __init__(self, model_cfg, num_envs=2):
+    def __init__(self, model_cfg, num_envs=2, critic_cfg=None):
         self.num_envs = num_envs
         self.num_actions = model_cfg.action_dim
         self.device = "cpu"
@@ -605,10 +607,14 @@ class SmallVectorEnv:
         self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
         self.initial = observation(model_cfg, num_envs)
         self.current = self.initial.clone()
+        critic_cfg = critic_cfg or model_cfg
+        self.critic_initial = observation(critic_cfg, num_envs)
+        self.critic_current = self.critic_initial.clone()
         self.steps = 0
 
     def get_observations(self):
-        return TensorDict({"policy": self.current.clone()}, batch_size=[self.num_envs])
+        critic = torch.cat((self.critic_current[:, :-144], self.current[:, -144:]), dim=-1)
+        return TensorDict({"policy": self.current.clone(), "critic": critic}, batch_size=[self.num_envs])
 
     def step(self, actions):
         if actions.shape != (self.num_envs, self.num_actions):
@@ -616,6 +622,7 @@ class SmallVectorEnv:
         self.steps += 1
         self.episode_length_buf += 1
         self.current[:, :3] += .001
+        self.critic_current[:, :3] += .003
         final = self.current.clone()
         done = self.episode_length_buf >= self.max_episode_length
         index = torch.arange(self.num_envs)
@@ -623,6 +630,7 @@ class SmallVectorEnv:
         truncated = done & ~terminated
         rewards = (index + 1).float()
         self.current[done] = self.initial[done]
+        self.critic_current[done] = self.critic_initial[done]
         self.episode_length_buf[done] = 0
         extras = dict(
             terminal_observation=final, time_outs=truncated, terminated=terminated,
@@ -634,7 +642,8 @@ class SmallVectorEnv:
 def make_algorithm(cfg=None, num_envs=2):
     cfg = runner_config() if cfg is None else cfg
     model_cfg = ModelCfg(**cfg["actor"]["model_cfg"])
-    env = SmallVectorEnv(model_cfg, num_envs)
+    critic_cfg = ModelCfg(**cfg["critic"]["model_cfg"]) if "model_cfg" in cfg["critic"] else None
+    env = SmallVectorEnv(model_cfg, num_envs, critic_cfg=critic_cfg)
     with redirect_stdout(io.StringIO()):
         algorithm = PPO.construct_algorithm(env.get_observations(), env, deepcopy(cfg), "cpu")
     return algorithm, env
@@ -692,18 +701,25 @@ class NativeLearningTests(unittest.TestCase):
                          expected["algorithm"])
         self.assertNotIn("seed", actual)  # Inherit the same native runner default.
         self.assertIsNone(actual["clip_actions"])
-        self.assertEqual(actual["critic"]["hidden_dims"], expected["policy"]["critic_hidden_dims"])
-        self.assertEqual(actual["critic"]["activation"], expected["policy"]["activation"])
-        self.assertEqual(actual["critic"]["obs_normalization"], expected["policy"]["critic_obs_normalization"])
+        self.assertEqual(actual["obs_groups"], {"actor": ["policy"], "critic": ["critic"]})
         actor = class_settings(production, "ContactActorCfg")
         self.assertEqual(actor["obs_normalization"], expected["policy"]["actor_obs_normalization"])
         self.assertEqual(actor["distribution_cfg"], {
             "class_name": "GaussianDistribution", "std_type": "scalar",
             "init_std": expected["policy"]["init_noise_std"],
         })
-        # The research feature extractor and final actor architecture remain deliberate exceptions.
+        # Both research feature extractors and final heads are deliberate exceptions.
         self.assertEqual(actor["hidden_dims"], [256, 128])
         self.assertEqual(actor["activation"], "relu")
+        critic = class_settings(production, "ContactCriticCfg")
+        self.assertEqual(critic["class_name"], f"{AGENTS}.model:NativeContactCritic")
+        self.assertIsNone(critic["distribution_cfg"])
+        # The critic inherits the actor's feature/head configuration, rather than
+        # diverging silently from the independently instantiated actor.
+        production_tree = ast.parse(production.read_text())
+        critic_class = next(node for node in production_tree.body
+                            if isinstance(node, ast.ClassDef) and node.name == "ContactCriticCfg")
+        self.assertIn("ContactActorCfg", [base.id for base in critic_class.bases if isinstance(base, ast.Name)])
 
     def test_native_runner_owns_collection_storage_gae_and_episode_logs(self):
         cfg = runner_config()
@@ -739,7 +755,11 @@ class NativeLearningTests(unittest.TestCase):
 
     def test_independent_native_critic_has_separate_parameters_and_checkpoint(self):
         algorithm, _ = make_algorithm()
-        self.assertIs(type(algorithm.critic), MLPModel)
+        self.assertIs(type(algorithm.critic), NativeContactCritic)
+        self.assertIsInstance(algorithm.critic, MLPModel)
+        self.assertIsNone(algorithm.critic.distribution)
+        self.assertIsNot(algorithm.actor.encoder, algorithm.critic.encoder)
+        self.assertIsNot(algorithm.actor.encoder.scene_encoder, algorithm.critic.encoder.scene_encoder)
         self.assertFalse(hasattr(algorithm.actor, "critic"))
         self.assertFalse(hasattr(algorithm.actor, "consume_cached_value"))
         self.assertIsInstance(algorithm.actor.distribution, GaussianDistribution)
@@ -750,6 +770,8 @@ class NativeLearningTests(unittest.TestCase):
         self.assertTrue(critic_parameters)
         self.assertTrue({id(value) for value in actor_parameters}.isdisjoint(
             id(value) for value in critic_parameters))
+        self.assertTrue({value.data_ptr() for value in actor_parameters}.isdisjoint(
+            value.data_ptr() for value in critic_parameters))
         expected = actor_parameters + critic_parameters
         actual = algorithm.optimizer.param_groups[0]["params"]
         self.assertEqual([id(value) for value in actual], [id(value) for value in expected])
@@ -764,8 +786,108 @@ class NativeLearningTests(unittest.TestCase):
         self.assertFalse(any("critic" in name for name in saved["actor_state_dict"]))
         self.assertIn("distribution.log_std_param", saved["actor_state_dict"])
         self.assertTrue(saved["critic_state_dict"])
-        self.assertEqual(algorithm.critic.mlp[0].out_features, 256)
-        self.assertIsInstance(algorithm.critic.mlp[1], torch.nn.ELU)
+        critic_metadata = saved["critic_state_dict"]["_extra_state"]
+        self.assertEqual(critic_metadata["architecture"], "native_graph_critic_v2")
+        self.assertEqual(critic_metadata["action_contract"], ACTION_CONTRACT)
+        self.assertEqual(critic_metadata["observation_contract"], "tracked_initial_objects_v1")
+        self.assertEqual(critic_metadata["model_cfg"], asdict(algorithm.critic.cfg))
+        self.assertEqual(algorithm.critic.cfg.max_objects, algorithm.actor.cfg.max_objects)
+        self.assertEqual(critic_metadata["critic_model"], algorithm.critic.native_model_cfg)
+        self.assertEqual(algorithm.critic.mlp[0].in_features, algorithm.actor.mlp[0].in_features)
+        self.assertEqual(algorithm.critic.mlp[0].out_features, algorithm.actor.mlp[0].out_features)
+        self.assertEqual(algorithm.critic.mlp[2].out_features, algorithm.actor.mlp[2].out_features)
+        self.assertEqual(algorithm.critic.mlp[-1].out_features, 1)
+        self.assertIsInstance(algorithm.critic.mlp[1], torch.nn.ReLU)
+        self.assertFalse(any("distribution" in name for name in saved["critic_state_dict"]))
+        for name in ("forward", "reset", "get_hidden_state", "detach_hidden_state"):
+            self.assertIs(getattr(NativeContactCritic, name), getattr(MLPModel, name))
+
+    def test_actor_and_critic_execute_scene_encoder_before_final_native_mlp(self):
+        algorithm, env = make_algorithm()
+        obs = env.get_observations()
+        for model, width in ((algorithm.actor, 18), (algorithm.critic, 1)):
+            calls, scene_features, head_inputs = [], [], []
+
+            def scene_hook(_module, _args, output):
+                calls.append("scene")
+                scene_features.append(output.detach().clone())
+
+            def head_hook(_module, args):
+                calls.append("mlp")
+                head_inputs.append(args[0].detach().clone())
+
+            hooks = (model.encoder.scene_encoder.register_forward_hook(scene_hook),
+                     model.mlp.register_forward_pre_hook(head_hook))
+            try:
+                output = model(obs)
+            finally:
+                for hook in hooks:
+                    hook.remove()
+            with self.subTest(model=type(model).__name__):
+                self.assertEqual(calls, ["scene", "mlp"])
+                self.assertEqual(output.shape, (env.num_envs, width))
+                torch.testing.assert_close(head_inputs[0][:, :5 * model.cfg.node_dim], scene_features[0])
+                source = obs["policy" if model is algorithm.actor else "critic"]
+                masks = build_policy_masks(source, model.cfg)
+                expected_history = model.encoder.history_input(source, masks=masks)
+                torch.testing.assert_close(head_inputs[0][:, -144:], expected_history)
+                self.assertFalse(hasattr(model.encoder, "history_encoder"))
+                self.assertFalse(hasattr(model.encoder, "fusion"))
+
+    def test_asymmetric_groups_keep_tracked_current_geometry_out_of_actor(self):
+        algorithm, env = make_algorithm()
+        inputs = env.get_observations()
+        self.assertEqual(inputs["policy"].shape[-1], algorithm.actor.cfg.observation_dim)
+        self.assertEqual(inputs["critic"].shape[-1], algorithm.critic.cfg.observation_dim)
+        self.assertEqual(inputs["policy"].shape, inputs["critic"].shape)
+        self.assertFalse(torch.equal(inputs["policy"][:, :-144], inputs["critic"][:, :-144]))
+        torch.testing.assert_close(inputs["policy"][:, -144:], inputs["critic"][:, -144:])
+        with torch.no_grad():
+            actions, values = algorithm.actor(inputs), algorithm.critic(inputs)
+            hidden_truth = inputs.clone()
+            hidden_truth["critic"].fill_(float("nan"))
+            torch.testing.assert_close(algorithm.actor(hidden_truth), actions, rtol=0, atol=0)
+            hidden_vision = inputs.clone()
+            hidden_vision["policy"].fill_(float("nan"))
+            torch.testing.assert_close(algorithm.critic(hidden_vision), values, rtol=0, atol=0)
+        captured = []
+        hook = algorithm.critic.encoder.register_forward_pre_hook(
+            lambda _module, args: captured.append(args[0].clone()))
+        try:
+            algorithm.critic(inputs)
+        finally:
+            hook.remove()
+        torch.testing.assert_close(captured[0], inputs["critic"], rtol=0, atol=0)
+        collect(algorithm, env)
+        stored = algorithm.storage.observations
+        self.assertEqual(stored["policy"].shape[-1], algorithm.actor.cfg.observation_dim)
+        self.assertEqual(stored["critic"].shape[-1], algorithm.critic.cfg.observation_dim)
+
+    def test_independent_graph_models_do_not_share_normalization_buffers(self):
+        cfg = runner_config()
+        cfg["actor"]["obs_normalization"] = True
+        cfg["critic"]["obs_normalization"] = True
+        algorithm, env = make_algorithm(cfg)
+        actor, critic = algorithm.actor, algorithm.critic
+        actor_buffers = dict(actor.obs_normalizer.named_buffers())
+        critic_buffers = dict(critic.obs_normalizer.named_buffers())
+        self.assertEqual(actor_buffers.keys(), critic_buffers.keys())
+        self.assertTrue(actor_buffers)
+        for name in actor_buffers:
+            self.assertIsNot(actor_buffers[name], critic_buffers[name], name)
+            self.assertNotEqual(actor_buffers[name].data_ptr(), critic_buffers[name].data_ptr(), name)
+        obs = env.get_observations()
+        actor.update_normalization(obs)
+        self.assertEqual(int(actor.obs_normalizer.count), env.num_envs)
+        self.assertEqual(int(critic.obs_normalizer.count), 0)
+        actor_statistics = {name: value.clone() for name, value in actor.obs_normalizer.named_buffers()}
+        changed_obs = obs.clone()
+        changed_obs["critic"] *= 2.
+        critic.update_normalization(changed_obs)
+        for name, value in actor.obs_normalizer.named_buffers():
+            torch.testing.assert_close(value, actor_statistics[name], rtol=0, atol=0)
+        self.assertEqual(int(critic.obs_normalizer.count), env.num_envs)
+        self.assertFalse(torch.equal(actor.obs_normalizer.mean, critic.obs_normalizer.mean))
 
     @staticmethod
     def transition(algorithm, obs, values):
@@ -848,7 +970,7 @@ class NativeLearningTests(unittest.TestCase):
             restored = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
             restored.load(checkpoint, map_location="cpu")
             self.assertEqual(restored.current_learning_iteration, 1)
-            self.assertIs(type(restored.alg.critic), MLPModel)
+            self.assertIs(type(restored.alg.critic), NativeContactCritic)
             for first, second in zip(runner.alg.actor.parameters(), restored.alg.actor.parameters()):
                 torch.testing.assert_close(first, second, rtol=0, atol=0)
             for first, second in zip(runner.alg.critic.parameters(), restored.alg.critic.parameters()):
@@ -877,10 +999,12 @@ class NativeLearningTests(unittest.TestCase):
     def test_native_actor_normalization_statistics_roundtrip_with_checkpoint(self):
         cfg = runner_config()
         cfg["actor"]["obs_normalization"] = True
+        cfg["critic"]["obs_normalization"] = True
         original, env = make_algorithm(cfg)
         obs = env.get_observations()
         original.actor.update_normalization(obs)
         original.actor.update_normalization(TensorDict({"policy": obs["policy"] * 1.2}, batch_size=obs.batch_size))
+        original.critic.update_normalization(TensorDict({"critic": obs["critic"] * 1.5}, batch_size=obs.batch_size))
         saved = deepcopy(original.save())
         restored, _ = make_algorithm(cfg)
         restored.load(saved, load_cfg=None, strict=True)
@@ -890,11 +1014,22 @@ class NativeLearningTests(unittest.TestCase):
         torch.testing.assert_close(restored.actor.obs_normalizer.std, original.actor.obs_normalizer.std,
                                    rtol=0, atol=0)
         self.assertEqual(restored.actor.obs_normalizer.count, original.actor.obs_normalizer.count)
+        self.assertTrue(saved["critic_state_dict"]["_extra_state"]["critic_model"]["obs_normalization"])
+        torch.testing.assert_close(restored.critic.obs_normalizer.mean, original.critic.obs_normalizer.mean,
+                                   rtol=0, atol=0)
+        torch.testing.assert_close(restored.critic.obs_normalizer.std, original.critic.obs_normalizer.std,
+                                   rtol=0, atol=0)
+        self.assertEqual(restored.critic.obs_normalizer.count, original.critic.obs_normalizer.count)
         with torch.no_grad():
             torch.testing.assert_close(restored.actor(obs), original.actor(obs), rtol=0, atol=0)
+            torch.testing.assert_close(restored.critic(obs), original.critic(obs), rtol=0, atol=0)
 
     def test_playback_restores_legacy_distribution_without_resuming_custom_optimizer(self):
-        original, env = make_algorithm()
+        legacy_cfg = runner_config()
+        legacy_cfg["obs_groups"]["critic"] = ["policy"]
+        legacy_cfg["critic"] = dict(class_name="MLPModel", hidden_dims=[256, 128, 64], activation="elu",
+                                    obs_normalization=False, distribution_cfg=None)
+        original, env = make_algorithm(legacy_cfg)
         saved = deepcopy(original.save())
         saved["actor_state_dict"].pop("_extra_state")
         saved["iter"], saved["infos"] = 19100, {"test": "legacy"}
@@ -904,7 +1039,7 @@ class NativeLearningTests(unittest.TestCase):
             "model_cfg": {**asdict(original.actor.cfg), "initial_std": .3},
             "actor_model": deepcopy(original.actor.native_model_cfg),
             "output_distribution": deepcopy(original.actor.native_model_cfg["distribution_cfg"]),
-            "critic_model": deepcopy(runner_config()["critic"]),
+            "critic_model": deepcopy(legacy_cfg["critic"]),
             "force_torque": {"name": "ATI Axia80 SI-200-8", "ranges": SI_200_8_RANGES,
                              "resolution": SI_200_8_RESOLUTION},
         }
@@ -932,12 +1067,16 @@ class NativeLearningTests(unittest.TestCase):
                 cfg["actor"]["distribution_cfg"] = {
                     "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.,
                 }
-                agent_cfg = SimpleNamespace(actor=SimpleNamespace(**cfg["actor"]),
+                agent_cfg = SimpleNamespace(obs_groups=deepcopy(cfg["obs_groups"]),
+                                            actor=SimpleNamespace(**cfg["actor"]),
                                             critic=SimpleNamespace(**cfg["critic"]))
                 loaded = prepare_inference_checkpoint(agent_cfg, path)
                 self.assertNotIn("initial_std", agent_cfg.actor.model_cfg)
                 self.assertEqual(agent_cfg.actor.distribution_cfg["std_type"], "log")
+                self.assertEqual(agent_cfg.critic.class_name, "MLPModel")
+                self.assertEqual(agent_cfg.obs_groups["critic"], ["policy"])
                 cfg["actor"], cfg["critic"] = vars(agent_cfg.actor), vars(agent_cfg.critic)
+                cfg["obs_groups"] = agent_cfg.obs_groups
                 player = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
                 with self.subTest(version=version):
                     with self.assertRaisesRegex(ValueError, "Legacy optimizer resume"):
@@ -966,11 +1105,16 @@ class NativeLearningTests(unittest.TestCase):
             load_checkpoint(restored, path)
             self.assertEqual(restored.current_learning_iteration, 4)
             self.assertTrue(restored.alg.optimizer.state)
-            agent_cfg = SimpleNamespace(actor=SimpleNamespace(**deepcopy(cfg["actor"])),
+            agent_cfg = SimpleNamespace(obs_groups=deepcopy(cfg["obs_groups"]),
+                                        actor=SimpleNamespace(**deepcopy(cfg["actor"])),
                                         critic=SimpleNamespace(**deepcopy(cfg["critic"])))
             agent_cfg.actor.distribution_cfg = {"class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.}
             checkpoint = prepare_inference_checkpoint(agent_cfg, path)
             self.assertEqual(agent_cfg.actor.distribution_cfg, cfg["actor"]["distribution_cfg"])
+            self.assertEqual(agent_cfg.obs_groups, cfg["obs_groups"])
+            self.assertEqual(agent_cfg.critic.model_cfg, cfg["critic"]["model_cfg"])
+            for name in ("class_name", "hidden_dims", "activation", "obs_normalization", "distribution_cfg"):
+                self.assertEqual(getattr(agent_cfg.critic, name), cfg["critic"][name], name)
             checkpoint["actor_state_dict"]["_extra_state"]["action_contract"] = "old_base_frame"
             invalid = Path(directory) / "old_frame.pt"
             torch.save(checkpoint, invalid)
@@ -978,6 +1122,106 @@ class NativeLearningTests(unittest.TestCase):
                 prepare_inference_checkpoint(agent_cfg, invalid)
             with self.assertRaisesRegex(ValueError, "action contract"):
                 load_checkpoint(restored, invalid)
+
+    def test_previous_native_actor_mlp_critic_checkpoint_still_plays_without_resuming_graph_critic(self):
+        legacy_cfg = runner_config()
+        legacy_cfg["obs_groups"]["critic"] = ["policy"]
+        legacy_cfg["critic"] = dict(class_name="MLPModel", hidden_dims=[256, 128, 64], activation="elu",
+                                    obs_normalization=False, distribution_cfg=None)
+        env = SmallVectorEnv(ModelCfg(**legacy_cfg["actor"]["model_cfg"]))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            source = OnPolicyRunner(env, deepcopy(legacy_cfg), log_dir=None, device="cpu")
+            collect(source.alg, env)
+            source.alg.update()
+            path = Path(directory) / "native_mlp_critic.pt"
+            with patch.object(Logger, "save_model"):
+                source.save(str(path), infos={"test": "previous_native"})
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertIn("_extra_state", checkpoint["actor_state_dict"])
+            self.assertNotIn("_extra_state", checkpoint["critic_state_dict"])
+            self.assertNotIn("research_metadata", checkpoint)
+            current_cfg = runner_config()
+            current = OnPolicyRunner(env, deepcopy(current_cfg), log_dir=None, device="cpu")
+            before = {name: value.clone() for name, value in current.alg.actor.named_parameters()}
+            with self.assertRaisesRegex(ValueError, "[Cc]ritic"):
+                load_checkpoint(current, path)
+            for name, value in current.alg.actor.named_parameters():
+                torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+            self.assertFalse(current.alg.optimizer.state)
+            agent_cfg = SimpleNamespace(obs_groups=deepcopy(current_cfg["obs_groups"]),
+                                        actor=SimpleNamespace(**deepcopy(current_cfg["actor"])),
+                                        critic=SimpleNamespace(**deepcopy(current_cfg["critic"])))
+            loaded = prepare_inference_checkpoint(agent_cfg, path)
+            self.assertEqual(agent_cfg.critic.class_name, "MLPModel")
+            self.assertEqual(agent_cfg.critic.hidden_dims, [256, 128, 64])
+            self.assertEqual(agent_cfg.critic.activation, "elu")
+            self.assertEqual(agent_cfg.obs_groups["critic"], ["policy"])
+            current_cfg["actor"], current_cfg["critic"] = vars(agent_cfg.actor), vars(agent_cfg.critic)
+            current_cfg["obs_groups"] = agent_cfg.obs_groups
+            player = OnPolicyRunner(env, deepcopy(current_cfg), log_dir=None, device="cpu")
+            infos = load_checkpoint(player, path, inference=True, checkpoint=loaded)
+            self.assertEqual(infos, {"test": "previous_native"})
+            self.assertFalse(player.alg.optimizer.state)
+            with torch.no_grad():
+                torch.testing.assert_close(player.get_inference_policy()(env.get_observations()),
+                                           source.get_inference_policy()(env.get_observations()), rtol=0, atol=0)
+
+    def test_previous_vision_graph_critic_checkpoint_restores_policy_group_for_play_only(self):
+        old_cfg = runner_config()
+        old_cfg["obs_groups"]["critic"] = ["policy"]
+        old_cfg["critic"]["model_cfg"] = deepcopy(old_cfg["actor"]["model_cfg"])
+        old_cfg["critic"]["observation_contract"] = "initial_vision_v1"
+        source, env = make_algorithm(old_cfg)
+        saved = deepcopy(source.save())
+        saved["iter"] = 450
+        saved["infos"] = None
+        contract = saved["critic_state_dict"]["_extra_state"]
+        self.assertEqual(contract["architecture"], "native_graph_critic_v1")
+        self.assertNotIn("observation_contract", contract)
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            path = Path(directory) / "vision_graph_critic.pt"
+            torch.save(saved, path)
+            cfg = runner_config()
+            current_env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]),
+                                         critic_cfg=ModelCfg(**cfg["critic"]["model_cfg"]))
+            current = OnPolicyRunner(current_env, deepcopy(cfg), log_dir=None, device="cpu")
+            before = {name: value.clone() for name, value in current.alg.actor.named_parameters()}
+            with self.assertRaisesRegex(ValueError, "[Cc]ritic"):
+                load_checkpoint(current, path)
+            for name, value in current.alg.actor.named_parameters():
+                torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+            agent_cfg = SimpleNamespace(obs_groups=deepcopy(cfg["obs_groups"]),
+                                        actor=SimpleNamespace(**deepcopy(cfg["actor"])),
+                                        critic=SimpleNamespace(**deepcopy(cfg["critic"])))
+            loaded = prepare_inference_checkpoint(agent_cfg, path)
+            self.assertEqual(agent_cfg.obs_groups["critic"], ["policy"])
+            self.assertEqual(agent_cfg.critic.observation_contract, "initial_vision_v1")
+            cfg["obs_groups"] = agent_cfg.obs_groups
+            cfg["actor"], cfg["critic"] = vars(agent_cfg.actor), vars(agent_cfg.critic)
+            player = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+            load_checkpoint(player, path, inference=True, checkpoint=loaded)
+            self.assertEqual(player.current_learning_iteration, 450)
+            self.assertFalse(player.alg.optimizer.state)
+            inputs = env.get_observations()
+            with torch.no_grad():
+                torch.testing.assert_close(player.alg.actor(inputs), source.actor(inputs), rtol=0, atol=0)
+                torch.testing.assert_close(player.alg.critic(inputs), source.critic(inputs), rtol=0, atol=0)
+
+    def test_graph_critic_contract_mismatch_rejects_resume_before_actor_mutation(self):
+        cfg = runner_config()
+        env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            source = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+            saved = deepcopy(source.alg.save())
+            saved["critic_state_dict"]["_extra_state"]["model_cfg"]["graph_layers"] += 1
+            path = Path(directory) / "incompatible_critic.pt"
+            torch.save(saved, path)
+            target = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+            before = {name: value.clone() for name, value in target.alg.actor.named_parameters()}
+            with self.assertRaisesRegex(ValueError, "[Cc]ritic"):
+                load_checkpoint(target, path)
+            for name, value in target.alg.actor.named_parameters():
+                torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
     def test_native_actor_checkpoint_rejects_changed_input_or_action_contract(self):
         algorithm, _ = make_algorithm()
@@ -1006,12 +1250,12 @@ class NativeLearningTests(unittest.TestCase):
         self.assertTrue((actions > 1.).all())
         torch.testing.assert_close(actions, expected, atol=0, rtol=0)
 
-    def test_native_act_uses_actor_encoder_once_and_critic_never_calls_it(self):
+    def test_native_act_uses_each_independent_encoder_once(self):
         algorithm, env = make_algorithm()
         with torch.inference_mode():
             obs = env.get_observations()
             with patch.object(algorithm.actor.encoder, "forward", wraps=algorithm.actor.encoder.forward) as forward, \
-                 patch.object(algorithm.critic, "forward", wraps=algorithm.critic.forward) as critic:
+                 patch.object(algorithm.critic.encoder, "forward", wraps=algorithm.critic.encoder.forward) as critic:
                 algorithm.act(obs)
             self.assertEqual(forward.call_count, 1)
             self.assertEqual(critic.call_count, 1)
@@ -1030,6 +1274,9 @@ class NativeLearningTests(unittest.TestCase):
         critic_gradients = [value.grad for value in algorithm.critic.parameters()]
         self.assertTrue(all(value is not None and torch.isfinite(value).all() for value in critic_gradients))
         self.assertGreater(sum(float(value.abs().sum()) for value in critic_gradients), 0.)
+        graph = algorithm.critic.encoder.scene_encoder
+        for module in (*graph.messages, graph.role_queries, graph.keys, graph.values):
+            self.assertGreater(sum(float(value.grad.abs().sum()) for value in module.parameters()), 0.)
         algorithm.optimizer.step()
         for name, value in algorithm.actor.named_parameters():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
@@ -1053,10 +1300,12 @@ class NativeLearningTests(unittest.TestCase):
     def test_compilation_is_optional_on_cpu_and_does_not_register_checkpoint_wrappers(self):
         cfg = runner_config()
         cfg["actor"]["compile_model"] = True
+        cfg["critic"]["compile_model"] = True
         algorithm, env = make_algorithm(cfg)
         with patch.object(torch, "compile", side_effect=AssertionError("CPU must remain eager")):
             algorithm.act(env.get_observations())
         self.assertIsNone(algorithm.actor._compiled_features)
+        self.assertIsNone(algorithm.critic._compiled_features)
         self.assertTrue(all(name == "_extra_state" or name.startswith(("encoder.", "mlp.", "distribution."))
                             for name in algorithm.actor.state_dict()))
         cfg["actor"]["compile_model"] = "yes"
@@ -1109,7 +1358,7 @@ class NativeLearningTests(unittest.TestCase):
                 "terminal_observation": final,
             })
 
-    def test_actor_rollout_chunks_do_not_change_distribution_or_random_samples(self):
+    def test_model_rollout_chunks_do_not_change_distribution_samples_or_critic_values(self):
         algorithm, env = make_algorithm(num_envs=7)
         obs = env.get_observations()
         with torch.no_grad():
@@ -1117,11 +1366,14 @@ class NativeLearningTests(unittest.TestCase):
             full = algorithm.actor(obs, stochastic_output=True)
             full_values = algorithm.critic(obs)
             algorithm.actor.max_forward_batch_size = 3
+            algorithm.critic.max_forward_batch_size = 3
             torch.manual_seed(45)
-            with patch.object(algorithm.actor.encoder, "forward", wraps=algorithm.actor.encoder.forward) as forward:
+            with patch.object(algorithm.actor.encoder, "forward", wraps=algorithm.actor.encoder.forward) as forward, \
+                 patch.object(algorithm.critic.encoder, "forward", wraps=algorithm.critic.encoder.forward) as critic_forward:
                 chunked = algorithm.actor(obs, stochastic_output=True)
-            chunked_values = algorithm.critic(obs)
+                chunked_values = algorithm.critic(obs)
         self.assertEqual([call.args[0].shape[0] for call in forward.call_args_list], [3, 3, 1])
+        self.assertEqual([call.args[0].shape[0] for call in critic_forward.call_args_list], [3, 3, 1])
         torch.testing.assert_close(chunked, full, atol=2e-7, rtol=2e-6)
         torch.testing.assert_close(chunked_values, full_values, atol=2e-7, rtol=2e-6)
 
