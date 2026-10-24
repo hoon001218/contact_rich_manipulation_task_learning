@@ -423,7 +423,7 @@ class BlockerContactHold(ManagerTermBase):
             self.last_step = env.common_step_counter
         # Keep contact history current while gated so restoring the Target
         # resumes ordinary consecutive-sample contact evaluation.
-        return (self.held_count * state.target_protected) / env.step_dt
+        return self.held_count * state.target_protected
 
 
 def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:

@@ -1,13 +1,9 @@
-"""Batched research rewards and thin Isaac Lab RewardManager adapters.
+"""Task reward terms following the Sweeping-Policy ManagerBased examples.
 
-The numerical kernels use only PyTorch and do not read simulator state. Every
-argument carries an environment leading dimension; there are no per-environment
-Python loops or device-to-host reads. Native RewardTermCfg weights remain the
-only reward weights. Clearance pays its exp(-a*x) quality relative to episode
-start; rearrangement and motion use exp(-a*x) - 1 penalties. Cached components
-retain the original qualities for task-state diagnostics. The adapters divide
-discrete payments by dt to cancel the native RewardManager's dt factor. Time
-returns the interval-mean cost rate so the native dt factor integrates it once.
+Dense terms return an environment-sized raw score or positive cost. The native
+RewardManager applies the configured weight and control dt. Only the one-time
+terminal bonus is converted to a rate to preserve its fixed episode payment.
+Shared physical snapshots avoid duplicate geometry, sensor reads and histories.
 """
 
 from __future__ import annotations
@@ -15,9 +11,11 @@ from __future__ import annotations
 import math
 
 import torch
+from isaaclab.utils.math import quat_error_magnitude
 
 __all__ = [
-    "corner_path_increment", "clearance_quality", "reward_components", "clearance", "rearrangement",
+    "clearance_quality", "clearance", "shelf_collision", "object_collision",
+    "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability", "time_penalty",
@@ -156,86 +154,10 @@ def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, va
     return (current & previous_contact).sum(-1).to(filtered_force.dtype), current
 
 
-def corner_path_increment(previous_corners, corners, active):
-    """Sum selected objects' mean eight-corner displacement, in meters.
-
-    Corners have fixed object-local correspondence and shape (N, O, 8, 3),
-    expressed in the fixed environment frame. Translation, rotation, pivoting,
-    and out-and-back movement all contribute. Averaging the eight corners makes
-    a pure translation of one object contribute exactly its translation length;
-    objects themselves are summed, including objects absent from initial vision.
-    Inactive padded slots are removed before arithmetic, even if they hold NaN.
-    """
-    if corners.shape != previous_corners.shape or corners.shape[-2:] != (8, 3):
-        raise ValueError("Current and previous corners must have matching (..., objects, 8, 3) shapes.")
-    if active.shape != corners.shape[:-2]:
-        raise ValueError("Active mask must contain one flag per object.")
-    delta = torch.where(active[..., None, None], corners - previous_corners, 0.0)
-    return torch.linalg.vector_norm(delta, dim=-1).mean(-1).sum(-1)
-
-
 def clearance_quality(cfg, blocked, blocker_area):
     """Absolute Blocker overlap quality, shared by reset and completed steps."""
     ratio = (blocked / blocker_area.clamp_min(1.0e-12)).clamp(0.0, 1.0)
     return torch.exp(-cfg.clearance_decay * ratio)
-
-
-def reward_components(cfg, blocked, blocker_area, path_length, wrench, previous_wrench, dt):
-    """Return unweighted clearance, rearrangement, force and torque qualities.
-
-    Clearance evaluates only the designated Blocker against the episode's fixed
-    initial Blocker area; its manager adapter subtracts the initial quality.
-    The caller supplies non-Blocker objects' and the shelf's cumulative corner
-    path since reset, including rotation and return motion. Rearrangement's
-    exp(-a*x) quality stays reduced after motion stops; the manager adapter
-    subtracts one so an undisturbed scene has zero penalty.
-
-    Force and torque each use a calibrated exponential of positive norm-growth
-    rate, with separate dead bands and inverse-unit coefficients. Constant load,
-    release and direction-only changes have
-    quality one, which maps to zero penalty in the manager adapters. Wrenches
-    are self-load compensated at the current sensor center:
-    rotations of their axes preserve norms, but translating the torque origin
-    would change the measured load. Return the two excess-rate squared costs
-    separately for diagnostics, in (N/s)^2 and (N*m/s)^2.
-
-    Nonfinite numerical results are replaced by zero; termination separately marks invalid
-    active physical state as failure so a failed simulation cannot poison PPO.
-    """
-    if not math.isfinite(dt) or dt <= 0.0:
-        raise ValueError("Control dt must be finite and positive.")
-    batch_shape = blocked.shape
-    if blocker_area.shape != batch_shape or path_length.shape != batch_shape:
-        raise ValueError("Areas and path length must contain one value per environment.")
-    if wrench.shape != (*batch_shape, 6) or previous_wrench.shape != wrench.shape:
-        raise ValueError("Current and previous wrench must contain six components per environment.")
-
-    clear = clearance_quality(cfg, blocked, blocker_area)
-    rearr = torch.exp(-cfg.rearrangement_decay * path_length.clamp_min(0.0))
-
-    force_increase = (torch.linalg.vector_norm(wrench[..., :3], dim=-1)
-                      - torch.linalg.vector_norm(previous_wrench[..., :3], dim=-1)).clamp_min(0.0)
-    torque_increase = (torch.linalg.vector_norm(wrench[..., 3:], dim=-1)
-                       - torch.linalg.vector_norm(previous_wrench[..., 3:], dim=-1)).clamp_min(0.0)
-    force_cost = (force_increase / dt - cfg.force_rate_deadband).clamp_min(0.0).square()
-    torque_cost = (torque_increase / dt - cfg.torque_rate_deadband).clamp_min(0.0).square()
-    rate_cost = torch.stack((force_cost, torque_cost), -1)
-    force_score = torch.exp(-cfg.motion_force_rate_decay * force_cost)
-    torque_score = torch.exp(-cfg.motion_torque_rate_decay * torque_cost)
-
-    components = torch.stack((clear, rearr, force_score, torque_score), -1)
-    return (torch.nan_to_num(components, nan=0.0, posinf=0.0, neginf=0.0),
-            torch.nan_to_num(rate_cost, nan=0.0, posinf=0.0, neginf=0.0))
-
-
-def _reward_rate(env, index, *, baseline=0.0):
-    # Lazy import keeps the numerical kernels independent of scene integration.
-    from .events import get_task_state
-
-    value = get_task_state(env).components[:, index]
-    if baseline:
-        value = value - baseline
-    return value / env.step_dt
 
 
 def clearance(env):
@@ -243,8 +165,8 @@ def clearance(env):
     from .events import get_task_state
 
     state = get_task_state(env)
-    delta = state.components[:, 0] - state.initial_clearance_quality
-    return torch.where(state.clearance_progress_valid, delta, delta.clamp_max(0.0)) / env.step_dt
+    delta = state.clearance_quality - state.initial_clearance_quality
+    return torch.where(state.clearance_progress_valid, delta, delta.clamp_max(0.0))
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
@@ -262,44 +184,96 @@ def blocker_distance(env, decay=math.log(2.0) / 0.10):
     center = pose[:, :3] + quat_apply(rotation, (lower + upper) * .5)
     quality, _ = blocker_distance_quality(
         tactile_pad_points(env), center, rotation, (upper - lower) * .5, decay=decay)
-    return torch.where(state.target_protected, quality, 0.0) / env.step_dt
+    return torch.where(state.target_protected, quality, 0.0)
 
 
-def rearrangement(env):
-    """Penalty for cumulative non-Blocker object and shelf corner path since reset."""
-    return _reward_rate(env, 1, baseline=1.0)
+def object_motion_cost(center, corners, velocity, active, blocker):
+    """Sum active non-Blocker mean OBB corner speeds, in meters per second.
+
+    The linear velocity is measured at the OBB center, in the same fixed axes
+    as the corners and angular velocity. Averaging the eight corners preserves
+    the physical speed under pure translation; objects themselves are summed.
+    No saturation is applied to valid costs. Nonfinite object measurements are
+    unavailable costs; the existing physical-state termination handles them.
+    """
+    selected = active & ~blocker
+    twist = torch.where(selected[..., None], velocity, 0.0)
+    origin = torch.where(selected[..., None], center, 0.0)
+    offset = torch.where(selected[..., None, None], corners, 0.0) - origin.unsqueeze(-2)
+    corner_velocity = twist[..., None, :3] + torch.linalg.cross(twist[..., None, 3:], offset, dim=-1)
+    speed = torch.linalg.vector_norm(corner_velocity, dim=-1).mean(-1)
+    speed = torch.nan_to_num(speed, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.nan_to_num(speed.sum(-1), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def motion_action_rate(env):
-    """Exp-minus-one penalty of native raw action differences, without /dt in x."""
-    from isaaclab.envs.mdp.rewards import action_rate_l2
+def object_collision(env):
+    """Current non-Blocker corner motion, including translation and rotation."""
     from .events import get_task_state
 
-    cfg = get_task_state(env).cfg
-    score = torch.exp(-cfg.motion_action_rate_decay * action_rate_l2(env))
-    # Invalid quality becomes the maximum bounded penalty, never an idle bonus.
-    return (torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) - 1.0) / env.step_dt
+    state = get_task_state(env)
+    return state.object_motion_cost
 
 
-def motion_joint_velocity(env, arm_cfg, hand_cfg):
-    """Exp-minus-one penalty of native joint-velocity sums at the final substep."""
-    from isaaclab.envs.mdp.rewards import joint_vel_l2
+def shelf_motion_cost(pose, velocity, initial_pose, *, translation_threshold=0.005,
+                      rotation_threshold=math.pi / 180.0, linear_velocity_threshold=0.005,
+                      angular_velocity_threshold=0.05):
+    """Example-style moved flag with separate, unit-consistent thresholds.
+
+    Pose uses the shelf link frame; velocity is its COM twist. No old gripper
+    link names, fixed shelf height or added contact sensor is required.
+    """
+    displacement = torch.linalg.vector_norm(pose[:, :3] - initial_pose[:, :3], dim=-1)
+    rotation = quat_error_magnitude(pose[:, 3:], initial_pose[:, 3:])
+    linear_speed = torch.linalg.vector_norm(velocity[:, :3], dim=-1)
+    angular_speed = torch.linalg.vector_norm(velocity[:, 3:], dim=-1)
+    finite = torch.isfinite(pose).all(-1) & torch.isfinite(velocity).all(-1)
+    moved = ((displacement > translation_threshold) | (rotation > rotation_threshold)
+             | (linear_speed > linear_velocity_threshold) | (angular_speed > angular_velocity_threshold))
+    return (moved | ~finite).to(pose.dtype)
+
+
+def shelf_collision(env, asset_cfg, *, translation_threshold=0.005,
+                    rotation_threshold=math.pi / 180.0, linear_velocity_threshold=0.005,
+                    angular_velocity_threshold=0.05):
+    """Shelf pose/speed disturbance; the native manager assigns its negative weight."""
     from .events import get_task_state
 
-    cfg = get_task_state(env).cfg
-    velocity_cost = joint_vel_l2(env, arm_cfg) + joint_vel_l2(env, hand_cfg)
-    score = torch.exp(-cfg.motion_joint_velocity_decay * velocity_cost)
-    return (torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0) - 1.0) / env.step_dt
+    state = get_task_state(env)
+    shelf = env.scene[asset_cfg.name]
+    return shelf_motion_cost(
+        shelf.data.root_link_pose_w, shelf.data.root_com_vel_w, state.initial_shelf_pose,
+        translation_threshold=translation_threshold, rotation_threshold=rotation_threshold,
+        linear_velocity_threshold=linear_velocity_threshold,
+        angular_velocity_threshold=angular_velocity_threshold,
+    )
 
 
 def motion_force_growth(env):
-    """Force-norm growth above its N/s dead band; unloading has zero cost."""
-    return _reward_rate(env, 2, baseline=1.0)
+    """Squared positive force-norm increase per control step, in N squared."""
+    from .events import get_task_state
+
+    return get_task_state(env).force_growth.square()
 
 
 def motion_torque_growth(env):
-    """Torque-norm growth above its N*m/s dead band; unloading has zero cost."""
-    return _reward_rate(env, 3, baseline=1.0)
+    """Squared positive torque-norm increase per control step, in (N*m) squared."""
+    from .events import get_task_state
+
+    return get_task_state(env).torque_growth.square()
+
+
+def motion_action_rate(env):
+    """Native L2 cost; invalid-state rows must not send NaN/Inf to PPO."""
+    from isaaclab.envs.mdp.rewards import action_rate_l2
+
+    return torch.nan_to_num(action_rate_l2(env), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def motion_joint_velocity(env, asset_cfg):
+    """Native selected-joint L2 cost with the same invalid-state protection."""
+    from isaaclab.envs.mdp.rewards import joint_vel_l2
+
+    return torch.nan_to_num(joint_vel_l2(env, asset_cfg), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def time_penalty(env):
@@ -319,7 +293,7 @@ def time_penalty(env):
               if abs(window) < 1.0e-3 else math.expm1(window) / window - 1.0)
     start = (state.elapsed_time - env.step_dt).clamp_min(0.0)
     cost_rate = scale * (torch.expm1(growth * start) * (1.0 + offset) + offset)
-    return torch.where(state.elapsed_time > 0.0, -cost_rate, 0.0).to(state.components.dtype)
+    return torch.where(state.elapsed_time > 0.0, -cost_rate, 0.0).to(state.clearance_quality.dtype)
 
 
 def object_stability(env):
@@ -337,7 +311,7 @@ def object_stability(env):
     excess = (distance - state.cfg.support_warning_distance).clamp_min(0.0)
     risk = state.cfg.support_stability_decay * excess.square() + state.cfg.stability_tilt_decay * tilt
     risk = torch.nan_to_num(risk, nan=math.inf, posinf=math.inf, neginf=math.inf)
-    return torch.expm1(-risk.amax(-1)) / env.step_dt
+    return torch.expm1(-risk.amax(-1))
 
 
 def singularity_margin(jacobian, *, characteristic_length=0.25):
@@ -379,9 +353,11 @@ def motion_singularity(env):
     return singularity_penalty(
         state.singularity_margin, threshold=state.cfg.motion_singularity_threshold,
         decay=state.cfg.motion_singularity_decay,
-    ) / env.step_dt
+    )
 
 
 def terminal(env):
     """One-time success bonus converted to a native reward rate."""
-    return _reward_rate(env, 4)
+    from .events import get_task_state
+
+    return get_task_state(env).terminal_reward / env.step_dt

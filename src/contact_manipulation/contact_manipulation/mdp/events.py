@@ -1,7 +1,7 @@
 """Episode/reset bookkeeping shared by native observation/reward/done terms.
 
 Pure tensor calculation comes first, followed by native scene-data adapters.
-One batched update per common_step_counter keeps history and path integrals
+One batched update per common_step_counter keeps history and task transitions
 independent of manager call order. Only selected rows change on partial reset.
 """
 
@@ -30,7 +30,7 @@ from .observations import (
     dynamic_sample, geometry_in_eef_frame, pack_policy_observation, prepare_initial_geometry,
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench,
 )
-from .rewards import clearance_quality, corner_path_increment, reward_components, singularity_margin
+from .rewards import clearance_quality, object_motion_cost, singularity_margin
 from .terminations import (
     FAILURE_REASON_NAMES, configured_terminations, object_support_validity, task_conditions, terminal_transition,
 )
@@ -42,30 +42,16 @@ _DEFAULT_MAX_OBJECTS = 10  # Policy slots; physical scene count is configured se
 class MdpCfg:
     max_objects: int = _DEFAULT_MAX_OBJECTS
     clearance_decay: float = 1.0
-    rearrangement_decay: float = 20.0
-    # The original four Motion scores each have weight 0.15. Near zero cost,
-    # 0.15 * 0.004 matches min's native 0.03 penalty weight * 0.02 s dt.
-    motion_action_rate_decay: float = 0.004
-    motion_joint_velocity_decay: float = 0.004
     # Geometric warning/hard margins; initial tuning, not certified safety limits.
     # L matches the existing IK angular weighting; s is inverse-Frobenius margin.
     singularity_characteristic_length: float = 0.25
     motion_singularity_threshold: float = 0.07
     motion_singularity_decay: float = math.log(2.0) / 0.03**2
     singularity_termination_threshold: float = 0.005
-    # Initial design: half quality at +100 N/s or +5 N*m/s, respectively.
-    # Dead bands cover small sensor changes, not validated task impact limits.
-    motion_force_rate_decay: float = math.log(2.0) / 90.0**2
-    motion_torque_rate_decay: float = math.log(2.0) / 4.5**2
-    force_rate_deadband: float = 10.0
-    torque_rate_deadband: float = 0.5
     # Previously selected increasing exponential cost rate, in reward/s and 1/s.
     time_penalty_scale: float = 0.02
     time_penalty_growth_rate: float = 0.7
     # One-time bonus for the enabled success termination.
-    # With a_C=1, clearance weight 4, distance .4 and contact .1/pad,
-    # the dense upper bound is 4.6285/step, or 231.424 at gamma=.98.
-    # This bonus exceeds that bound; it is an initial tuning value.
     success_reward: float = 250.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
@@ -397,6 +383,7 @@ class TaskState:
         self.active = zeros(n, o, kind=torch.bool)
         self.target = zeros(n, o, kind=torch.bool)
         self.blocker = zeros(n, o, kind=torch.bool)
+        self.object_motion_cost = zeros(n)
         self.access_region = zeros(n, 4)
         self.workspace_bounds = zeros(n, 4)
         self.shelf_top = zeros(n)
@@ -412,12 +399,8 @@ class TaskState:
         self.initial_rotation = zeros(n, o, 4)
         self.initial_clearance_quality = zeros(n)
         self.initial_blocker_area = zeros(n)
-        self.previous_corners = zeros(n, o, 8, 3)
-        self.shelf_local_corners = zeros(n, 8, 3)
-        self.previous_shelf_corners = zeros(n, 8, 3)
         self.previous_wrench = zeros(n, 6)
         self.wrench_bias = zeros(n, 6)
-        self.path_length = zeros(n)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
         self.tilt_count = zeros(n, o, kind=torch.long)
@@ -440,10 +423,11 @@ class TaskState:
         self.failure_reasons = zeros(n, len(FAILURE_REASON_NAMES), kind=torch.bool)
         self.failure_mask, self.success_enabled = configured_terminations(termination_cfg, device=device)
         self.invalid_reason_index = FAILURE_REASON_NAMES.index("invalid_state")
-        # Clearance, rearrangement, force growth, torque growth, terminal.
-        self.components = zeros(n, 5)
-        self.wrench_rate_cost = zeros(n, 2)
-        self.rearrangement_increment = zeros(n)
+        # Named transition measurements; each native reward term owns its formula.
+        self.clearance_quality = zeros(n)
+        self.force_growth = zeros(n)
+        self.torque_growth = zeros(n)
+        self.terminal_reward = zeros(n)
         self.blocker_overlap = zeros(n)
         self.singularity_margin = zeros(n)
 
@@ -484,15 +468,11 @@ class TaskState:
         lo, hi = panel.amin(-2), panel.amax(-2)
         self.support_bounds[ids] = torch.stack((lo[:, 0], hi[:, 0], lo[:, 1], hi[:, 1]), -1)
         self.support_height[ids] = panel[..., 2].mean(-1)
-        self.shelf_local_corners[ids] = shelf_local_corners[rows]
-        # Fixed episode origin at the initial shelf position, world-oriented
-        # axes: retain rotation displacement without adding large clone offsets.
-        self.previous_shelf_corners[ids] = quat_apply(
-            batch.shelf_pose[rows, None, 3:], self.shelf_local_corners[ids],
-        )
         self.initial_center[ids] = batch.center[rows]
         self.initial_rotation[ids] = batch.rotation[rows]
-        self.previous_corners[ids] = batch.corners[rows]
+        self.object_motion_cost[ids] = object_motion_cost(
+            batch.center[rows], batch.corners[rows], batch.velocity[rows], self.active[ids], self.blocker[ids],
+        )
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
         if critic_source_indices is None:
             # Numerical callers without an ID association never invent GT slots.
@@ -515,12 +495,12 @@ class TaskState:
         self.history[ids, 0, 31:37] = 0
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:72] = 0
-        for name in ("previous_wrench", "wrench_bias", "path_length", "elapsed_time", "stable_count", "tilt_count",
+        for name in ("previous_wrench", "wrench_bias", "elapsed_time", "stable_count", "tilt_count",
                      "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
                      "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
-                     "success", "failure", "terminal_paid", "failure_reasons", "components",
-                     "wrench_rate_cost", "rearrangement_increment", "blocker_overlap"):
+                     "success", "failure", "terminal_paid", "failure_reasons", "clearance_quality",
+                     "force_growth", "torque_growth", "terminal_reward", "blocker_overlap"):
             getattr(self, name)[ids] = 0
         # One batched geometry query for reset rows only. The initial reference
         # stays fixed until those environments start another episode.
@@ -532,9 +512,7 @@ class TaskState:
         )
         self.initial_clearance_quality[ids] = initial_quality
         self.target_protected[ids] = True
-        self.components[ids, 0] = initial_quality
-        self.components[ids, 1] = 1.0  # Reset/idle rearrangement has zero penalty.
-        self.components[ids, 2:4] = 1.0  # No completed load-growth transition at reset.
+        self.clearance_quality[ids] = initial_quality
         # No completed physics sample yet; reset rows start with zero warning cost.
         self.singularity_margin[ids] = self.cfg.motion_singularity_threshold
         self.ready = True
@@ -587,23 +565,25 @@ class TaskState:
             self.singularity_margin.copy_(singularity)
         safe_corners = torch.nan_to_num(batch.corners, nan=0.0, posinf=0.0, neginf=0.0)
         # Clearance and its success gate concern only the designated Blocker.
-        # Skip polygon clipping for other objects; their path/safety checks remain.
+        # Skip polygon clipping for other objects; their safety checks remain.
         _, overlap = projected_areas(safe_corners, self.blocker & self.active, self.access_region)
         blocked = overlap.sum(-1)
         self.blocker_overlap.copy_(blocked)
-        shelf_corners = ((batch.shelf_pose[:, :3] - self.initial_shelf_pose[:, :3])[:, None]
-                         + quat_apply(batch.shelf_pose[:, None, 3:], self.shelf_local_corners))
-        increment = (corner_path_increment(self.previous_corners, batch.corners, self.active & ~self.blocker)
-                     + torch.linalg.vector_norm(shelf_corners - self.previous_shelf_corners, dim=-1).mean(-1))
-        self.rearrangement_increment.copy_(torch.nan_to_num(increment, nan=0.0, posinf=0.0, neginf=0.0))
-        self.path_length.add_(self.rearrangement_increment)
+        self.clearance_quality.copy_(torch.nan_to_num(
+            clearance_quality(self.cfg, blocked, self.initial_blocker_area),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        ))
         # Force/torque norms are rotation-invariant. Keep the current sensor
         # center: adding r x F at the initial origin would charge pure travel
         # under a constant load as a torque increase.
-        components, costs = reward_components(
-            self.cfg, blocked, self.initial_blocker_area, self.path_length,
-            batch.sensor_wrench, self.previous_wrench, self.dt,
-        )
+        growth = (torch.linalg.vector_norm(batch.sensor_wrench.reshape(-1, 2, 3), dim=-1)
+                  - torch.linalg.vector_norm(self.previous_wrench.reshape(-1, 2, 3), dim=-1)).clamp_min(0.0)
+        growth = torch.nan_to_num(growth, nan=0.0, posinf=0.0, neginf=0.0)
+        self.force_growth.copy_(growth[:, 0])
+        self.torque_growth.copy_(growth[:, 1])
+        self.object_motion_cost.copy_(object_motion_cost(
+            batch.center, batch.corners, batch.velocity, self.active, self.blocker,
+        ))
         support = self._support_validity(batch)
         candidate, stable, tilted, reasons, failed = task_conditions(
             self.cfg, center=batch.center, corners=batch.corners, rotation=batch.rotation,
@@ -635,9 +615,7 @@ class TaskState:
         self.support_distance.copy_(support.support_distance)
         self.stability_distance.copy_(support.stability_distance)
         self.tilt_angle.copy_(support.tilt_angle)
-        self.components[:, :4] = components
-        self.components[:, 4] = payment
-        self.wrench_rate_cost.copy_(costs)
+        self.terminal_reward.copy_(payment)
         self.stable_count.copy_(stable)
         self.tilt_count.copy_(tilted)
         self.success.copy_(successful)
@@ -648,8 +626,6 @@ class TaskState:
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
         self.tcp_pose_b.copy_(torch.nan_to_num(batch.tcp_pose_b, nan=0.0, posinf=0.0, neginf=0.0))
         self._update_critic_geometry(batch.center, batch.rotation)
-        self.previous_corners.copy_(batch.corners)
-        self.previous_shelf_corners.copy_(shelf_corners)
         self.previous_wrench.copy_(batch.sensor_wrench)
         self.elapsed_time.add_(self.dt)
         self.observation = None
@@ -1137,7 +1113,10 @@ def _read_reset_snapshot(env, state, ids):
     joints = data.joint_pos[ids].index_select(1, b.joint_ids) / state.cfg.joint_position_scale
     velocity = data.joint_vel[ids].index_select(1, b.joint_ids) / state.cfg.joint_velocity_scale
     sample = torch.cat((joints, velocity, tcp_pose, joints.new_zeros((ids.numel(), 41))), -1)
+    # reset_scene writes zero object velocities before this snapshot. Reuse that
+    # known reset state instead of requesting an extra PhysX velocity buffer.
     return SimpleNamespace(center=center, corners=corners, rotation=rotation,
+                           velocity=center.new_zeros((*center.shape[:-1], 6)),
                            shelf_pose=b.shelf.data.root_link_pose_w[ids], sensor_position=position[:, b.sensor_id],
                            tcp_pose_b=tcp_pose, sample=sample)
 

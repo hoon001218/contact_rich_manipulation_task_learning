@@ -18,6 +18,33 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-24 후속 사용자 승인으로 Object 비용의 tanh를 제거하고 **활성 non-Blocker의
+  OBB 코너 속도**를 평가한다. 기존 snapshot의 중심 선속도와 각속도로
+  `v_corner=v_OBB+ω×(corner−center)`를 구해8코너 norm 평균·물체 합을 환경별로 계산한다.
+  Target·초기 비인식 활성 물체도 포함하고 Blocker·미사용 slot은 제외한다. Native weight−.5와
+  dt를 유지하므로 병진·회전 조작 경로 길이의 근사이고, 10cm 병진은0.1초든1초든 할인 전−.05다.
+  코너 이력·누적 cache·추가 SDK/ray casting/환경별 loop는 없으며 환경별 scalar
+  `object_motion_cost`를 step당1회 계산한다. 비유한 물체의 기여만0이고 invalid 종료는 동일하다.
+  **사용자 요청에 따라 향후 수정 방향을 물으면 이 선택을 반드시 다시 설명한다.** 이전 tanh는
+  예제를 옮기며 추가한 Object cost 포화였고 policy action tanh가 아니다. 선형 비용은 빠른 burst도
+  경로에 비례해 평가하지만 큰 순간 속도·진동·노이즈 기여가 커질 수 있다. 이전 tanh와의 비교를
+  제안할 수 있으나 임의로 복원하지 않는다. Time weight.1·Shelf 연속비용은 논의만 했으며
+  **미적용**이다. 현재 Time1과 다른 모든 weight·reward·termination·제어·모델은 그대로다.
+  아래 Object 선속도L1/tanh 기록보다 이 변경이 우선한다. 세부사항은 TRAINING_LOG64절을 따른다.
+- 2026-10-24 직전 사용자 승인으로 reward를 로컬 examples의 native 구조로 수정했다.
+  Dense 함수의 `/step_dt` 상쇄를 제거하고 native `weight×dt`를 적용한다. 성공1회+250만
+  `250/dt` 반환으로 유지하고 Time의 구간 적분도 그대로 둔다. 누적 Rearrangement를 제거하고
+  Shelf/Object collision weight각−.5로 대체했다. 당시 Object는 활성 non-Blocker의 선속도 L1합에
+  tanh를 적용했으며 이후 위 OBB 코너 속도 방식으로 대체했다. Shelf는 위치5mm/회전1°/
+  선속도.005m/s/각속도.05rad/s 기준을 cfg에서 분리한다. Action-rate·12독립관절 velocity는
+  공식 L2 함수각−.03을 사용하며 반환 NaN/Inf만0으로 처리한다. F/T는 사용자 확정인 **매 step norm 양의 증가량 제곱**,
+  weight−.15N⁻²/−60(N·m)⁻²의 별도 초기 계수이며 exp·deadband·증가율 변환은 없다.
+  C8/D1/H.2, Singularity.3, 수정 직전 사용자 Stability.5, Time1, 성공250을 유지한다.
+  cfg에서 함수·weight·파라미터를 선언하고 mdp/rewards.py에서 수식이 직접 보이도록 정리했다.
+  누적 path·OBB 이력·packed reward_components를 제거하고 기존 GPU snapshot은 재사용한다.
+  현재13term이며 아래12term/누적R/exp Motion/dense dt상쇄 기록보다 이 결정이 우선한다.
+  성공·termination·관측·action·모델·PPO는 동일하다. 구현·단위·Terminal 상대 강도 변화와
+  검증 한계는 TRAINING_LOG63절을 따른다. 새 설정의 학습 성능·처리량은 아직 측정하지 않았다.
 - 2026-10-24 사용자 승인으로 reward weight만 **Clearance4→8·Distance4→1·Hold/pad1→0.2**로
   조정했다. Rearrangement0.5·Action rate/Joint velocity/Force growth/Torque growth각0.15·
   Singularity0.3·Object stability3·Time1·Terminal weight1/성공250은 유지한다. 수식·민감도·

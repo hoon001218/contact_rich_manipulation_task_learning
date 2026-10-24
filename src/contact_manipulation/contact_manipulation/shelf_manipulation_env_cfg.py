@@ -1,6 +1,7 @@
 """Common scene, MDP terms and simulation settings, following Sweeping-Policy/min."""
 
 from dataclasses import MISSING
+import math
 import os
 
 import isaaclab.sim as sim_utils
@@ -87,23 +88,34 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Clearance with approach/contact support and bounded exp penalties."""
+    """Raw task scores/costs, integrated by the native RewardManager."""
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=8.0)
-    blocker_distance = RewardTermCfg(func=mdp.blocker_distance, weight=1.0)
+    blocker_distance = RewardTermCfg(
+        func=mdp.blocker_distance, weight=1.0, params={"decay": math.log(2.0) / 0.10},
+    )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
-    rearrangement = RewardTermCfg(func=mdp.rearrangement, weight=0.5)
-    # Command variation and actual speed are different control objectives.
-    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=0.15)
-    motion_joint_velocity = RewardTermCfg(
-        func=mdp.motion_joint_velocity, weight=0.15,
+    shelf_collision = RewardTermCfg(
+        func=mdp.shelf_collision, weight=-0.5,
         params={
-            "arm_cfg": SceneEntityCfg("robot", joint_names=MISSING),
-            "hand_cfg": SceneEntityCfg("robot", joint_names=MISSING),
+            "asset_cfg": SceneEntityCfg("shelf"),
+            "translation_threshold": 0.005,
+            "rotation_threshold": math.pi / 180.0,
+            "linear_velocity_threshold": 0.005,
+            "angular_velocity_threshold": 0.05,
         },
     )
-    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=0.15)
-    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=0.15)
+    object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
+    # Command variation and actual speed are different control objectives.
+    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
+    motion_joint_velocity = RewardTermCfg(
+        func=mdp.motion_joint_velocity, weight=-0.03,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
+    )
+    # Initial separate SI coefficients: +1 N and +0.05 N*m each cost 0.15 reward/s.
+    # These per-step increments are squared directly, without rate conversion or exp.
+    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.15)
+    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-60.0)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.50)
     time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=1.0)

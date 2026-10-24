@@ -5239,3 +5239,189 @@ SingularityReward/ObjectSupportValidity의 관련 CPU43개 중41개 통과·GPU 
 변경한 Python 파일 문법 검사와 `git diff --check`도 통과했다. 새 테스트 파일이나 term은
 추가하지 않았으며 GPU/Kit·학습·시뮬레이션은 실행하지 않았다. 프로젝트 README의 현재
 weight·지급 예시와 CONTEXT 최신 진입점도 동기화한다.
+
+
+## 63. 2026-10-24 — 예제 구조의 native dt reward와 움직임 비용
+
+**이 절은 적용 당시 기록이다. Object 선속도 L1합의 tanh와 `object_linear_velocity` cache는
+후속64절의 OBB 코너 속도·선형 비용으로 대체됐다. 나머지 native dt·weight·성공 조건은 유지한다.**
+
+사용자가 로컬 `examples/Sweeping-Policy-DRL-Sim-Train`의 reward formulation과 코드 구조를
+기준으로 수정하도록 요청했다. Dense score의 `/step_dt` 상쇄를 없애고 native manager가
+`weight × dt`를 적용하게 한다. Action-rate·joint-velocity를 공식 L2 비용으로 연결하고,
+누적 Rearrangement를 예제의 Shelf/Object collision 방식으로 대체한다. F/T 증가 항은
+추가 질문에 **매 step 증가량의 제곱**으로 확정했다. 성공 후 종료·Terminal은 그대로 둔다.
+
+### 수식·설정과 코드 구조
+
+모든 term의 함수·weight·파라미터는 `shelf_manipulation_env_cfg.py::RewardsCfg`에 선언한다.
+Action-rate·joint-velocity 계산은 공식 `action_rate_l2`·`joint_vel_l2`에 맡기고,
+반환 NaN/Inf만0으로 바꾸는 얇은 wrapper를 cfg에 연결한다. `invalid_state`로 종료돼도
+reset 전에 reward가 평가되므로 이전의 비유한 보상 보호를 유지한다. 정상 유한 비용을
+clipping하거나 L2 수식을 재구현하지 않는다. Task별 수식은 `mdp/rewards.py`에 둔다.
+물체 기하와 F/T는 기존 `TaskState`의 한-step GPU cache를 재사용한다. Native RewardManager가
+합산·부분 reset·로그를 처리하며 자체 reward 합산이나 환경 subclass를 추가하지 않는다.
+
+| Term | Native weight | Raw score / cost |
+|---|---:|---|
+| Clearance | 8 | 초기 대비 품질 차이, 기존 Target 보호·진행 gate 유지 |
+| Blocker distance | 1 | 기존 현재 pad-to-OBB exp 품질·Target gate 유지 |
+| Blocker contact hold | 0.2 | 기존17개 pad의 직전/현재 Blocker binary AND 합·Target gate 유지 |
+| Shelf collision | −0.5 | 선반 pose 또는 속도 기준을 넘으면1 |
+| Object collision | −0.5 | 활성 non-Blocker 선속도 XYZ L1합의 tanh |
+| Motion action rate | −0.03 | 전체 raw18D action 차이 제곱합, 공식 함수 |
+| Motion joint velocity | −0.03 | 팔6+hand 독립6관절 속도 제곱합, 공식 함수 |
+| Motion force growth | −0.15 | `[norm(F_now)−norm(F_prev)]_+²` |
+| Motion torque growth | −60 | `[norm(T_now)−norm(T_prev)]_+²` |
+| Motion singularity | 0.3 | 기존 `exp(−a deficit²)−1` |
+| Object stability | 0.5 | 기존 전체OBB XY·collision 최저Z·기울기의 `exp(−risk)−1` |
+| Time | 1 | 기존 지수형 시간 비용률의 control 구간 평균 |
+| Terminal | 1 | 성공일 때만 `250/dt` 반환, native dt 후 고정+250 |
+
+수정 직전 코드에서 **Object stability는 사용자 설정0.5**였다. 62절과 그 이전 기록의3을
+복원하지 않고0.5를 유지했다. Clearance8/Distance1/Hold0.2도 유지한다. 과거 기록의
+weight와 수식을 덮어쓰지 않으며 현재 설정의 우선순위는 이 절이다.
+
+Shelf의 기준은 초기 위치 대비5mm, 초기 자세 대비1°, 현재 선속도0.005m/s,
+각속도0.05rad/s이며 하나라도 초과하면 비용1이다. 길이·각도·속도 기준을 cfg에서 분리한다.
+예제의 `norm(position_delta)+norm(linear/angular_velocity)>0.005` 혼합식과 오래된 gripper
+링크·고정 높이 기반 근접 항은 복사하지 않는다. 기존1cm/2° 선반 종료는 유지한다.
+
+Object는 Target과 초기 비인식 물체를 포함한 **모든 활성 non-Blocker**의 현재 선속도를 본다.
+Blocker·비활성 pool slot은 제외하고 방향·물체·XYZ를 환경별로 합산한다. 예제의 속도 소수
+두 자리 반올림은 넣지 않아 작은 움직임도 연속적으로 반영한다. 이름은 collision이지만
+접촉 impulse나 충돌 대상 판별을 추가하는 항은 아니다. 회전·누적 경로·초기 pose 오차를
+직접 평가하지 않으며, 정지하면 Object 비용은0이다. Shelf는 초기 pose 변위가 남으면 비용도 남는다.
+
+Motion의 네 L2 비용에는 exp·기준값 나눗셈·deadband를 사용하지 않는다. F/T는 자중·관성
+보상 후 현재 sensor 중심에서 norm의 양의 차이만 제곱한다. 하중 감소·일정 norm의 방향 변화는0,
+힘과 토크는 별도 term이므로 서로 상쇄하지 않는다. 사용자 선택은 증가율이 아닌 step 증가량이므로
+`/dt`를 x에 넣지 않는다. Native dt만 마지막에 한 번 적용한다.
+
+F/T 계수−0.15N⁻²·−60(N·m)⁻²는 ΔF=1N과 ΔT=0.05N·m의 weighted rate가 각각−0.15,
+100Hz 지급이 각각−0.0015가 되도록 둔 **초기 설정**이다. 센서 SI 단위에 맞춘 출발점이며
+성공 조작의 분포로 재튜닝한 값은 아니다. 실제 증가량·센서 보상 노이즈·접촉/비접촉 구간의
+기여를 새 run에서 확인해야 한다. 제어주기를 바꾸면 step 증분 비용도 달라질 수 있다.
+Action·velocity 비용도 더 이상−1로 포화되지 않아 전체 reward의 유한 하한은 없다.
+
+### Native dt와 Terminal 예외
+
+현재100Hz에서는 각 dense term이 `raw × weight × 0.01`로 지급된다. 이전 대부분 term은
+`/step_dt`로 native dt를 상쇄했으므로 같은 raw score와 weight라도 step 지급이1/100이 된다.
+Distance 최대1초 합은1, Hold의 이론적 최대1초 합은3.4다. F/T 등 수식도 달라졌으므로
+모든 이전 로그를 일괄1/100로 바꿔 새 정책 결과를 예측할 수는 없다.
+
+Time은 기존 구간 적분을 유지한다. 함수가 반환하는 평균 비용률의 dt는 discrete score 상쇄용
+adapter와 다르며, native dt 후8초 할인 전 합−7.537897은 그대로다. Terminal도 사용자의
+유지 요청에 따라 일회 성공+250을 그대로 지급한다. 이 항만 `250/dt`로 변환하여 native dt를
+상쇄한다. 따라서 Terminal·Time은 다른 dense 항 대비 상대 강도가 크게 달라진다.
+성공 정의·안정 유지0.5초·실패 우선·Target gate·실패/timeout의 Terminal0은 변경하지 않는다.
+과거 bounded reward/step·Motion 하한·value 상한 수치는 현재 수식의 전체 범위가 아니다.
+
+### 환경별 sum 확인과 제거한 코드
+
+사용자가 예제 `torch.sum()`이 환경별인지 다시 확인하도록 요청했다. 실제 예제는 입력
+`objects_lin_vel_w.shape=(num_envs,num_objects,3)`에 `torch.sum(torch.abs(...))`를 쓰며
+`dim`이 없어 **환경축까지 모두 합친 scalar**를 반환한다. 환경0만 x속도0.2이고 환경1은0이면
+원본은 tanh(.2)=.197375라는 단일 값이 되어 manager에서 두 환경 모두 같은 값으로 방송된다.
+우리 구현은 `sum(dim=(1,2))`여서 `[.197375, 0]`을 반환한다. 예제의 이 부분은 그대로 복사하지 않는다.
+
+누적 Rearrangement·`path_length`·이전 물체/선반 OBB 코너 이력·packed `reward_components`와
+관련 누적 연산을 제거했다. `clearance_quality`, `terminal_reward`, `force_growth`,
+`torque_growth`, `object_linear_velocity`를 이름 있는 tensor로 유지한다. 사용하지 않는
+Motion exp decay·증가율 deadband 설정도 제거한다. Step별 센서 읽기·기하 생성·CPU 전송을
+늘리지 않으며 부분 reset 행만 이력 초기화하는 규칙은 유지한다.
+
+### 검증
+
+MDP 전체364개 중343개 통과·GPU 전용21개 skip, 학습/model 전체62개 중60개 통과·GPU
+전용2개 skip을 확인했다. 이후 비유한 L2 보호 회귀2개를 추가하고 RewardTests12개를 다시
+실행해 모두 통과했다. 공식 L2 위임·유한 행 동일성·NaN/Inf 행 분리, 실제 native
+RewardManager.compute 구현의 dt 합산과 성공250, 환경별 속도 합산·Blocker/padding 면제·
+Target 포함·부분 reset·contact 이력·관측/독립 Critic·성공/실패 기존 동작을 검사했다.
+변경 Python 파일 문법 검사와 `git diff --check`도 통과했다. 새 파일은 추가하지 않았다.
+실제 GPU/Kit 학습·처리량·성공률 효과는 아직 검증하지 않았다. Scene 생성·물리·제어·
+Actor/Critic 관측·모델·PPO 설정은 변경하지 않는다.
+
+
+## 64. 2026-10-24 — Object 비용의 OBB 코너 속도와 tanh 제거
+
+사용자가 병진·회전을 함께 반영하는 OBB 코너 속도 비용에 동의하고, 기존 Object 비용의
+tanh를 빼서 진행하도록 요청했다. 동시에 이 선택을 기억하여 **나중에 수정 방향을 물으면
+다시 설명할 것**을 명시했다. 이전 tanh는 예제의 `object_collision`을 옮기는 과정에서
+추가했던 포화 함수이며, 사용자가 policy action에 tanh를 요청한 것이 아니다.
+
+### 적용 수식과 의미
+
+물체 $i$의 현재 OBB 중심 $\mathbf o_i$, 그 중심의 선속도 $\mathbf v_i$, 각속도
+$\boldsymbol\omega_i$, 코너 $\mathbf p_{i,c}$에서 다음 값을 계산한다.
+
+$$
+\mathbf v_{i,c}=\mathbf v_i+\boldsymbol\omega_i\times(\mathbf p_{i,c}-\mathbf o_i),\qquad
+c_{O,k}=\sum_{i\ne B,\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2,\qquad
+r_{O,k}=-0.5c_{O,k}\Delta t.
+$$
+
+8코너는 평균하여 순수 병진의 이동을8번 세지 않는다. 물체들은 합산하여 여러 주변 물체의
+움직임을 모두 비용에 포함하며 물체 개수로 나누지 않는다. 기존과 같이 reward의 privileged
+물리 정보로 **Target과 초기 비인식 물체를 포함한 모든 활성 non-Blocker**를 평가한다.
+Blocker의 일반 이동은 면제하고 미사용 pool slot도 제외한다. 환경별 계산이므로 다른 환경의
+움직임이 현재 환경에 섞이지 않는다.
+
+선속도는 OBB 중심의 속도이며 actor origin이나 COM 속도를 중심 속도로 오인해 사용하지 않는다.
+현재 수식은 m/s 하나의 단위로 병진·회전을 결합한다. Native dt로 적분하면 정책 sample에서
+근사한 총 코너 경로 길이를 억제한다. 빠른 속도 자체의 비용이나 초기 pose 오차가 아니며
+정지하면0이다. 왕복은 양방향 경로가 남는다. Policy step 사이의 충격 궤적까지 정확히 복원하는
+이동거리는 아니고 할인율까지 고려하면 빠른/느린 조작의 return이 완전히 같은 것도 아니다.
+
+할인 전·일정 속도·순수 x방향 병진의 비교는 다음과 같다. 이전 항은 속도의 XYZ L1합에 tanh를
+적용했으므로 순수 x방향으로 비교해야 두 식의 차이를 분리할 수 있다.
+
+| 조작 | 이전 tanh 비용 | 현재 선형 코너 속도 비용 |
+|---|---:|---:|
+| 한 물체10cm를0.1초에 이동,1m/s | 약−0.038080 | −0.05 |
+| 한 물체10cm를1초에 이동,0.1m/s | 약−0.049834 | −0.05 |
+| 10×10cm 상자 제자리 yaw90° | 각속도는 직접 미평가 | 약−0.055536 |
+
+마지막 행은 중심의 XY 코너 반경 $\sqrt{0.05^2+0.05^2}$에 $\pi/2$를 곱한
+평균 코너 경로0.111072m를 기준으로 한다. 같은 방향·같은 경로에서 tanh의 포화가 빠른 burst에
+더 작은 누적 비용을 주는 효과를 제거한다. 동시에 새 항은 큰 순간 속도·진동·노이즈에도
+선형으로 반응하므로 실제 로그에서 Object 기여와 성공·상호작용을 함께 봐야 한다.
+
+### 코드 구조와 변경 범위
+
+`RewardsCfg.object_collision`의 함수 등록과 weight−0.5는 유지한다. 수식은
+`mdp/rewards.py::object_motion_cost(center, corners, velocity, active, blocker)`에 두고,
+기존 GPU physics snapshot을 처리하는 `events.py`에서 step당1회 계산한다.
+이전 `(num_envs,num_objects,3)`의 `TaskState.object_linear_velocity` cache 대신
+환경별 `(num_envs,)`인 `TaskState.object_motion_cost`를 보관하며 native reward 함수는
+해당 scalar를 반환한다. 부분 reset은 선택 행만 초기화·갱신한다.
+
+활성·Blocker mask는 코너 속도 계산 전에 적용하여 주차된 미사용 물체의 비유한 값이
+정상 물체에 섞이지 않게 한다. 비유한 물체의 기여만0으로 처리하며 기존 `invalid_state`
+termination은 변경하지 않는다. 코너의 직전step 이력·누적 path·추가 SDK 조회·ray casting·
+환경별 Python 반복문·속도의 `/dt` 변환은 추가하지 않는다. 기존 기하와 tensor 연산을 재사용한다.
+
+Time weight1→0.1, Shelf 이진 비용→연속 위험 비용, Distance 계수10은 앞선 **검토 제안이며
+이번에는 적용하지 않는다.** 모든 weight, Time 수식, 성공1회+250, Shelf·Motion·Stability·
+Target gate·termination·Actor/Critic·PPO·scene 생성·제어·물리 설정은 그대로다.
+새 파일은 추가하지 않는다.
+
+### 후속 수정 논의 시 기억할 사항
+
+사용자가 다시 reward 수정 방향을 물으면 **현재의 선형 코너 속도 비용과 이전 tanh 포화의
+차이를 다시 설명한다.** 큰 조작의 기여·sample 사이 진동·센서/상태 노이즈·주변 물체 수가
+늘 때의 합산 규모를 실제 로그로 확인한다. 선형 비용이 강해 접촉을 회피하는지와 tanh가 빠른
+burst에 유리한 편향을 주는지를 비교 대상으로 둘 수 있다. 사용자가 기억해 달라고 한 것은
+이 선택과 재검토 가능성이며, tanh를 자동 복원하라는 승인이 아니다.
+
+### 검증
+
+MDP 전체373개 중352개 통과·GPU 전용21개 skip, 학습/model62개 중60개 통과·GPU 전용2개
+skip을 확인했다. 전체435개 중412개 통과·23개 skip이다. SceneMotion11개도 모두 통과했다.
+순수 병진·회전·pivot, 좌표계 불변성, COM→OBB 중심 속도 보정, Target·비인식 물체 포함,
+Blocker·미사용·비유한 물체 분리, native RewardManager의 `weight × dt`, 같은 경로의
+속도별 할인 전 비용, 부분 reset·step당1회 cache·1,024환경 tensor 계산을 검사했다.
+변경 production Python2개 AST 문법 검사와 `git diff --check`도 통과했다.
+실제 GPU/Kit·학습·simulation·처리량 benchmark는 실행하지 않았으며 장기 학습 효과나
+추가 tensor 연산의 GPU 처리량은 아직 측정하지 않았다.

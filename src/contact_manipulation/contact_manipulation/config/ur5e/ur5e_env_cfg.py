@@ -96,5 +96,6 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             rescale_to_limits=True,
         )
         # Select the same independent joints as the action terms; omit mimic joints.
-        self.rewards.motion_joint_velocity.params["arm_cfg"].joint_names = self.actions.arm_action.joint_names.copy()
-        self.rewards.motion_joint_velocity.params["hand_cfg"].joint_names = self.actions.hand_action.joint_names.copy()
+        self.rewards.motion_joint_velocity.params["asset_cfg"].joint_names = (
+            self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
+        )
