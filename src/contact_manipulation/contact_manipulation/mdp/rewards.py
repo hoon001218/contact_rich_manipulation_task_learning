@@ -18,7 +18,7 @@ __all__ = [
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
-    "object_stability", "time_penalty",
+    "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
     "terminal",
 ]
@@ -102,12 +102,14 @@ def tactile_pad_points(env):
 
 def blocker_distance_quality(pad_points, blocker_center, blocker_rotation, blocker_half_extent,
                              *, decay=math.log(2.0) / 0.10):
-    """Exp quality of the nearest pad point to the current solid Blocker OBB.
+    """Mean per-pad exp quality to the current solid Blocker OBB.
 
     Points are [N, 17, 3]; center, wxyz rotation and half extents are [N, 3/4/3]
-    in the same frame. Points inside or on the OBB have zero distance. Nonfinite
-    pads are ignored, while an invalid Blocker or no valid pad gives zero
-    quality and infinite distance. No simulator access or device scalar reads.
+    in the same frame. Points inside or on the OBB have zero distance. Each pad
+    contributes exp(-decay * distance) / 17; invalid pads contribute zero without
+    changing the denominator. Return quality and mean distance, both [N]. Any
+    invalid pad makes the mean distance infinite. An invalid Blocker gives zero
+    quality. No simulator access or device scalar reads.
     """
     from .observations import quat_apply, quat_conjugate
 
@@ -126,9 +128,9 @@ def blocker_distance_quality(pad_points, blocker_center, blocker_rotation, block
     valid_blocker = (torch.isfinite(blocker_center).all(-1) & torch.isfinite(blocker_rotation).all(-1)
                      & torch.isfinite(blocker_half_extent).all(-1) & (blocker_half_extent > 0).all(-1)
                      & (blocker_rotation.square().sum(-1) > 0))
-    valid = torch.isfinite(pad_points).all(-1) & valid_blocker[:, None]
-    distance = torch.where(valid, distance, math.inf).amin(-1)
-    return torch.exp(-decay * distance), distance
+    valid = torch.isfinite(pad_points).all(-1) & torch.isfinite(distance) & valid_blocker[:, None]
+    distance = torch.where(valid, distance, math.inf)
+    return torch.exp(-decay * distance).mean(-1), distance.mean(-1)
 
 
 def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, valid=None):
@@ -170,7 +172,7 @@ def clearance(env):
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
-    """Nearest tactile surface distance; pay only while Target remains protected."""
+    """All-pad distance quality; pay only while Target remains protected."""
     from .events import get_task_state
     from .observations import quat_apply, quat_conjugate, quat_mul
 
@@ -274,26 +276,6 @@ def motion_joint_velocity(env, asset_cfg):
     from isaaclab.envs.mdp.rewards import joint_vel_l2
 
     return torch.nan_to_num(joint_vel_l2(env, asset_cfg), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def time_penalty(env):
-    """Mean exponential cost rate over the completed control interval.
-
-    RewardManager multiplies this by dt, producing exactly
-    -integral[t-dt,t] a*(exp(b*s)-1) ds. The task clock advances once per
-    completed transition and resets only for selected environments.
-    """
-    from .events import get_task_state
-
-    state = get_task_state(env)
-    scale, growth = state.cfg.time_penalty_scale, state.cfg.time_penalty_growth_rate
-    window = growth * env.step_dt
-    # expm1(window)/window - 1, without cancellation for tiny intervals.
-    offset = (window * (.5 + window * (1 / 6 + window * (1 / 24 + window / 120)))
-              if abs(window) < 1.0e-3 else math.expm1(window) / window - 1.0)
-    start = (state.elapsed_time - env.step_dt).clamp_min(0.0)
-    cost_rate = scale * (torch.expm1(growth * start) * (1.0 + offset) + offset)
-    return torch.where(state.elapsed_time > 0.0, -cost_rate, 0.0).to(state.clearance_quality.dtype)
 
 
 def object_stability(env):

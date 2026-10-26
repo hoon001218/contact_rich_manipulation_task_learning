@@ -292,7 +292,7 @@ graph Actor의 JIT/ONNX export는 구현하지 않았다.
 `ActionManager.process_action → native process_actions/set_command → physics substep의
 native apply_actions/compute → scene.write_data_to_sim` 순서로 실행한다.
 
-OSC gain·scale 설정은 원격 `min` branch의
+OSC 구조·gain 설정은 원격 `min` branch의
 [`UR5eSweepKpOSCRelativeObsEnvCfg`](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py)를 따른다.
 2026-10-20 사용자 교정에 따라 제어 body는 UR5e의 실제 말단 rigid body인
 `wrist_3_link`로 정한다. `body_offset`은 사용하지 않으며 `tool0` 가상 frame과 구분한다.
@@ -303,13 +303,14 @@ task frame을 지정하지 않아 base 축 증분을 사용한다는 점에서 �
 
 | 입력/설정 | 현재 native 동작 |
 |---|---|
-| Arm 앞 6D | 현재 EEF 축 `pose_rel`; position/orientation scale 모두 1.0 (m, rad) |
+| Arm 앞 6D | 현재 EEF 축 `pose_rel`; position/orientation scale 모두 0.5 (m, rad) |
 | Arm 뒤 6D | EEF 축별 `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
 | 현재 Gaussian 정책의 Kp 범위 | raw 출력에 ±1 상한이 없어 native 범위 50–200을 사용 가능 |
 | OSC | Full inertia decoupling, damping ratio 1, gravity compensation=True, nullspace 없음 |
-| Hand 6D | raw action을 native에서 [−1,1]로 clamp한 뒤 live soft limit 범위에 매핑 |
+| Hand 6D | `0.5 × raw action`을 native에서 [−1,1]로 clamp한 뒤 live soft limit 범위에 매핑 |
 
-Scale 1.0은 위치 action 0.01이 1 cm, 회전 action 0.01이 0.01 rad라는 뜻이다.
+사용자가 직접 조정한 현재 scale0.5에서는 위치 action0.01이5mm, 회전 action0.01이0.005rad다.
+Hand scale도0.5이며, Hand를 속도 종료에서 제외하는 수정에서 이 세 scale은 변경하지 않았다.
 정책 step 시작 시 측정한 EEF pose를 task frame으로 사용한다. Base 기준 EEF pose가
 $(p_t,R_t)$이면 목표는 $p^*=p_t+R_t\Delta p_{\mathrm{EEF}}$,
 $R^*=R_t\operatorname{Exp}(\Delta r_{\mathrm{EEF}})$다. 회전 입력은 Euler가 아닌 회전벡터다.
@@ -356,7 +357,8 @@ collision mesh는 유지한다. 아래 시험 수치는 변경 전 velocity2회�
 position PD를 유지한다. 별도 custom controller나 torque clamp는 추가하지 않는다.
 이 출력 제한이 정책의 delta pose/stiffness 요구를 제한하거나 적절한 요구를 학습하도록
 보장하지는 않는다. 측정 joint torque observation/reward는 아직 추가하지 않았다.
-팔6개와 Hand 독립6개 중 하나라도 절대 관절 속도가3rad/s를 초과하면 `hand_velocity`로 종료한다.
+UR5e 팔6개 중 하나라도 절대 관절 속도가3rad/s를 초과하면 `hand_velocity`로 종료한다.
+Hand는 이 종료 검사에서 제외하며, joint velocity reward는 팔6개+Hand 독립6개를 유지한다.
 이는 actuator의 물리 속도 상한과 별개인 episode 종료 조건이다.
 
 Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
@@ -380,31 +382,32 @@ Blocker 접촉은 `ManagerTermBase`를 사용하고, 공통 기하·F/T는 기�
 
 | Reward | Weight | 함수가 반환하는 raw score / cost |
 |---|---:|---|
-| Clearance | 8.0 | $\min(d,0)+V_pV_T\max(d,0)$, $d=q_C(t)-q_C(0)$, $q_C=\exp(-a_Cx_C)$ |
-| `blocker_distance` | 1.0 | $V_T\exp(-a_d d)$, 17개 pad 표면 대표점에서 현재 Blocker OBB까지 최소 거리 |
+| Clearance | 12.0 | $\min(d,0)+V_pV_T\max(d,0)$, $d=q_C(t)-q_C(0)$, $q_C=\exp(-2x_C)$ |
+| `blocker_distance` | 1.0 | $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-15d_i)$, 각 pad 표면 대표점에서 현재 Blocker OBB까지 거리 |
 | `blocker_contact_hold` | 0.20 | $V_T\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$ |
-| `shelf_collision` | −0.50 | 초기 대비 선반 pose 또는 현재 속도가 허용값을 넘으면1, 아니면0 |
-| `object_collision` | −0.50 | $\sum_{i\ne B,\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2$ — 현재 OBB 코너 속도 |
-| `motion_action_rate` | −0.03 | $\sum_{j=1}^{18}(a_{j,k}-a_{j,k-1})^2$ — 공식 `action_rate_l2` |
-| `motion_joint_velocity` | −0.03 | $\sum_{j=1}^{12}\dot q_{j,k}^2$ — 공식 `joint_vel_l2` |
-| `motion_force_growth` | −0.15 | $[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+^2$ |
-| `motion_torque_growth` | −60.0 | $[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+^2$ |
+| `shelf_collision` | −2.0 | 초기 대비 선반 pose 또는 현재 속도가 허용값을 넘으면1, 아니면0 |
+| `object_collision` | −1.0 | $\sum_{i\ne B,\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2$ — 현재 OBB 코너 속도 |
+| `motion_action_rate` | −0.01 | $\sum_{j=1}^{18}(a_{j,k}-a_{j,k-1})^2$ — 공식 `action_rate_l2` |
+| `motion_joint_velocity` | −0.01 | $\sum_{j=1}^{12}\dot q_{j,k}^2$ — 공식 `joint_vel_l2` |
+| `motion_force_growth` | −0.03 | $[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+^2$ |
+| `motion_torque_growth` | −0.03 | $[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+^2$ |
 | `motion_singularity` | 0.30 | $\exp(-a_S[0.07-s]_+^2)-1$ |
-| `object_stability` | 0.50 | $\exp[-\max_i(a_P[d_i^{\mathrm{stab}}-0.01]_+^2+a_\theta\theta_i)]-1$ |
-| `time_penalty` | 1.0 | control 구간 평균 비용률 $-\Delta t^{-1}\int_{t_k-\Delta t}^{t_k}0.02[\exp(0.7s)-1]\,ds$ |
+| `object_stability` | 1.0 | $\exp[-\max_i(a_P[d_i^{\mathrm{stab}}-0.01]_+^2+a_\theta\theta_i)]-1$ |
+| `time_penalty` | −2.0 | 공식 `is_alive`: $\mathbf1[\neg\mathrm{terminated}]$ |
 | Terminal | 1.0 | 성공일 때만 $250/\Delta t$, 그 외0·episode당1회 |
 
 기존 누적 Rearrangement와 그 OBB 경로 이력은 제거했다. 예제의 선반·주변 물체 움직임 비용으로
 대체했으며, **Motion 네 항도 exp 포화 없이 양의 cost × 음의 weight**로 계산한다.
 예전 모든 dense 항의 `/step_dt` 상쇄와 양의 reward/step 예시는 현재 설정에 적용하지 않는다.
-Object stability는 수정 직전 사용자 설정인 weight0.5를 유지했다. 아래 과거 학습·검증 수치는
-당시 설정의 기록이며 새로운 reward 규모의 실측으로 읽지 않는다.
+Clearance·Distance의 weight와exp계수, Motion·환경 교란 비용과 음의 Time을 함께 조정했다.
+이는 첫 비교 실험 설정이며 새 정책의 성능 개선을 측정한 결과는 아니다. 아래 과거 학습·검증
+수치는 당시 설정의 기록이며 새로운 reward 규모의 실측으로 읽지 않는다.
 
 **Clearance.** 분모는 episode 초기 Blocker의 XY 투영 footprint 전체 면적이다.
 
 $$
 x_C(t)=\operatorname{clip}\!\left(\frac{A_{\mathrm{blocked}}(t)}{A_{\mathrm{blocker},0}},0,1\right),\qquad
-q_C(t)=\exp[-x_C(t)],\qquad d=q_C(t)-q_C(0).
+q_C(t)=\exp[-2x_C(t)],\qquad d=q_C(t)-q_C(0).
 $$
 
 Target·주변 물체의 overlap은 제외하고 GPU 다각형 clipping도 Blocker만 평가한다.
@@ -415,18 +418,25 @@ Target·주변 물체의 overlap은 제외하고 GPU 다각형 clipping도 Block
 사용하되 속도·tactile 조건은 넣지 않아 정상적으로 미는 동안에도 보상한다.
 Target이 초기 pose에서2cm 또는0.15rad를 넘으면 `V_T=0`으로 양의 Clearance·Distance·Contact만
 차단한다. 복구하면 재개하며 추가 termination은 없다. Contact 이력은 실제 접촉대로 갱신한다.
-예를 들어 초기 가림비율.5→.3이면 weighted rate약+1.074,100Hz 지급약+0.01074다.
-기본 `a_C=1`에서 Clearance의 양의 rate 전역 상한은약5.05696이며 실제 상한은 초기 가림에 의존한다.
+예를 들어 초기 가림비율.5→.3이면 weighted rate약+2.17119,100Hz 지급약+0.0217119이다.
+기본 `a_C=2`·weight12에서 양의 rate 전역 상한은약10.37598이며 실제 상한은 초기 가림에 의존한다.
+개선 민감도는 $w_Ca_C\exp(-a_Cx_C)$다. $x_C=.5$에서는 이전4.85225에서8.82911로
+약82% 커진다. 계수만 키우면 큰 가림에서 기울기가 작아질 수 있어 weight와 함께 변경했다.
 
 **Distance·Contact.** 실제 tactile collision mesh의 노출된 local+Z 표면에서 대표점 하나씩을
-초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 최소 pad-to-OBB 거리의
-$a_d=\ln(2)/(0.10\,\mathrm m)$이므로10cm에서 품질0.5,20cm에서0.25다.
-OBB 내부·표면은 거리0이며, 컵 빈 공간 등 실제 접촉 여부는 별도 filtered force로 판정한다.
+초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 17개 pad 각각의 OBB 거리 $d_i$에
+대해 $\exp(-15d_i)$를 계산한 뒤 평균한다. 점수 범위는0–1이며 weight1·decay15를 사용한다.
+한 pad만 접근해도 다른16개의 거리가 계속 반영된다. 모든 pad가10cm이면 품질약0.2231다.
+반감거리는6.93cm에서4.62cm로 줄었다. 가까운 영역에 상대적으로 집중하면서 전체 지급과
+절대 거리 기울기도 낮춘다. 기존 접근 학습이 사라지지 않는지 새 실험에서 확인해야 한다.
+Invalid pad는0점으로 두고 분모17을 유지한다. OBB 내부·표면은 거리0이며, 컵 빈 공간 등
+실제 접촉 여부는 별도 filtered force로 판정한다. 모든 환경·pad를 한 번의 batched tensor 연산으로 처리한다.
 
 접촉 binary는 현재 Blocker와 pad 사이 normal force norm이0.01N을 초과하는지다.
 같은 pad의 직전·현재 binary가 모두true이면1점이며17개를 평균하지 않고 합산한다.
 최초 접촉·다른 pad로 전환한 첫 sample은0,3개 pad 유지 시 weighted rate+0.6·100Hz 지급+0.006,
-이론적 최대 rate+3.4·step당+0.034다. 두 sample 사이의 완전한 연속 접촉을 증명하는 것은 아니다.
+이론적 최대 rate+3.4·step당+0.034이다. 직전·현재 policy sample은10ms 간격이며,
+두 sample 사이의 완전한 연속 접촉을 증명하는 것은 아니다.
 `BlockerContactHold(ManagerTermBase)`가 이력을 관리하고 native manager가 reset 행만 초기화한다.
 현재 Blocker1열의 PhysX contact view를 재사용하며 Blocker 교체 때만 view를 바꾼다.
 Actor의 binary tactile17개·244D는 유지한다. Observation은 전체 `net_forces_w`를 써서 다른 물체·선반
@@ -447,7 +457,7 @@ $\mathbf v_i$, 코너 위치를 $\mathbf p_{i,c}$, 각속도를 $\boldsymbol\ome
 $$
 \mathbf v_{i,c}=\mathbf v_i+\boldsymbol\omega_i\times(\mathbf p_{i,c}-\mathbf o_i),\qquad
 c_O=\sum_{i\ne B,\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2,\qquad
-r_{O,k}=-0.5c_O\Delta t.
+r_{O,k}=-c_O\Delta t.
 $$
 
 코너8개는 평균하여 순수 병진을8번 중복 계산하지 않고, 물체들은 합산하여 여러 물체의
@@ -459,7 +469,7 @@ $$
 step마다 한 번 계산하고 환경별 scalar `object_motion_cost`를 캐시한다. 추가 physics 조회·
 ray casting·환경별 반복문·코너 이력·속도의 `/dt` 변환은 없다. Native dt로 적분한 합은
 병진·회전을 포함한 조작 경로 길이의 근사이며 빠른 움직임 자체의 벌점은 아니다. 동일10cm
-병진은0.1초든1초든 할인 전−0.05이고 왕복은 양쪽 경로 모두 남는다. 속도는 policy sample이므로
+병진은0.1초든1초든 할인 전−0.1이고 왕복은 양쪽 경로 모두 남는다. 속도는 policy sample이므로
 sample 사이 충격 궤적까지 정확히 복원하지는 않는다. 정지 후에는 비용0이며 초기 pose 오차를
 유지하는 항도 아니다. 급격한 조작·힘 증가·기울기와 이탈은 별도 Motion·Stability가 평가한다.
 
@@ -476,16 +486,17 @@ Joint velocity는 팔6+hand 독립6관절의 제곱합으로 mimic/passive는 �
 $$
 \Delta F_k=[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+,\qquad
 \Delta T_k=[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+,\qquad
-r_{F,k}=-0.15(\Delta F_k)^2\Delta t,\qquad
-r_{T,k}=-60(\Delta T_k)^2\Delta t.
+r_{F,k}=-0.03(\Delta F_k)^2\Delta t,\qquad
+r_{T,k}=-0.03(\Delta T_k)^2\Delta t.
 $$
 
 사용자 결정대로 F/T는 **매 step 증가량의 제곱**이다. 증가율로 나누거나 deadband·exp를
 적용하지 않는다. 자중·관성 하중을 포함한 SI-200-8 측정값의 norm을 비교하므로 하중 감소·일정 하중·
 norm이 같은 방향 변화는 비용0이다. 힘과 토크는 서로 상쇄하거나 한 norm에 섞지 않는다.
-각 weight 단위는 N⁻²와(N·m)⁻²이며 ΔF=1N 또는 ΔT=.05N·m가 각각−.15 reward/s,
-100Hz에서−.0015/step이 되는 초기 설정이다. 이 값은 SI 단위를 고려한 시작값이며 성공 조작의
-실측으로 검증한 허용량은 아니다. 센서 해상도·자중·관성 하중을 포함한 실제 증가량 분포를 새 run에서 확인해야 한다.
+두 항의 입력 단위는 각각N²와(N·m)²다. 실제 weight는 둘 다−.03이므로 ΔF=1N은−.03 reward/s,
+ΔT=.05N·m는−.000075 reward/s다. 100Hz에서는 각각−.0003/step과−.00000075/step이다.
+같은 weight가 같은 물리적 민감도를 뜻하지 않는다. 과거−.15/−60 계수의 설명은 현재 값에
+적용하지 않는다. 센서 해상도·자중·관성 하중을 포함한 실제 증가량 분포를 새 run에서 확인해야 한다.
 매 step 증분에 대한 제곱이므로 제어주기를 바꾸면 같은 연속 하중 궤적의 비용까지 불변이지는 않다.
 
 **Singularity.** 현재 팔 자세의 공개 OSC Jacobian으로 다음 보수적 지표를 계산한다.
@@ -509,21 +520,47 @@ Controller의 역산·토크에는 개입하지 않는다. $a_S=\ln(2)/.03^2$, w
 20mm에서 거리 품질0.5,45°에서 기울기 품질0.5인 계수를 유지한다.
 
 $$
-r_{P,k}=0.5\left\{\exp\!\left[-\max_{i\text{ active}}
+r_{P,k}=\left\{\exp\!\left[-\max_{i\text{ active}}
 \left(\frac{\ln2}{0.01^2}[d_i^{\mathrm{stab}}-0.01]_+^2+
 \frac{\ln2}{\pi/4}\theta_i\right)\right]-1\right\}\Delta t.
 $$
 
-Blocker도 포함하며 속도 항은 아니다. 기존 중심기반 지지 실패·전도 종료는 그대로 둔다.
+Blocker도 포함하며 속도 항은 아니다. 기울기만45°이면−.5/s, 기울기 없이 지지 오차20mm면
+−.5/s가 된다. 기존 중심기반 지지 실패·전도 종료는 그대로 둔다.
 
-**Time·Terminal.** Time은 비용률 $c(t)=0.02[\exp(0.7t)-1]$의 control 구간 평균을 반환한다.
-Native dt가 한 번 곱해져 구간 적분이 되며8초 할인 전 합은−7.537897이다. 완료된 transition마다
-elapsed가 한 번 증가하고 부분 reset은 해당 행만0이다. Time 함수의 구간 평균을 위한 dt는
-기존 discrete score를 상쇄하던 adapter와 목적이 다르다.
+**Time·Terminal.** `RewardsCfg.time_penalty`는 공식 `isaaclab.envs.mdp.is_alive`를 직접
+사용하며 weight는−2다. 별도의 task 함수·elapsed 조회·exp 계수·구간 적분 wrapper는 없다.
+
+$$
+f_{T,k}=\mathbf1[\neg\mathrm{terminated}_k],\qquad
+r_{T,k}=-2\Delta t\,f_{T,k}.
+$$
+
+일반 step의 비용은100Hz에서−.02,50Hz라면−.04로 같은 실제1초의 비용이−2가 된다.
+현재 정책·물리 주기는100Hz 그대로다. 1/2/4/8초 동안 모든 step이 과금되면 할인 전 합은
+−2/−4/−8/−16이다. 비용률은 처음부터끝까지−2/s이며 경과 시간에 따라 가팔라지지 않는다.
+따라서 성공이 드문 초기에도 기다리는 매step에 비용이 있고, 성공이 일찍 끝나면 남은 비용을
+피한다. 초반이 거의0이었던 옛 증가형이나 계속 생존하면 양수가 누적되던 직전 Time과 다르다.
+
+Native step은 **termination 계산 → reward 계산 → reset** 순서다. 성공·실패의 non-timeout
+종료step은 `terminated=True`여서 이 비용이0이다. Timeout만 발생한 step은 truncated이며
+`terminated=False`이므로−.02다. 공통 장면 교체로 truncated가 된 step에도 같은 비용이 붙는다.
+예를 들어2초째200번째step에서 성공하면 Time합은−3.98,
+8초 timeout800step은−16이다. 성공step의 기존 Terminal+250은 그대로 지급된다.
+Reset 자체에는 과금하지 않으며 새episode는 첫 정상step부터−.02다. Time 보상은elapsed나
+처리 횟수 이력을 관리하지 않아 부분reset에도 별도의 상태복구가 필요하지 않다.
+
+이는 빠른 성공만을 구별하는 항은 아니다. 실패도 남은 시간 비용을 피할 수 있어 조기 실패
+유인이 생길 수 있다. 현재γ=.98·100Hz의 할인반감기는약.343초이며,8초 Time 보상열 자체의
+할인합은약−1이다. 무할인−16과 구분해야 한다. Timeout에서는 PPO가 다음 가치도 bootstrap하므로
+이 값이 전체 학습 return은 아니다. Time만으로 모든 정체를 제거하거나 빠른 조작을 보장하지
+않으며, 이번에는 Clearance/Distance 민감도·Motion·환경 손상 비용과 함께 맞춘다.
+성공률과 접촉 후 정체 시간, 실제 종료 원인별 counter를 비교한다. 기존 양의 `time_reward`
+함수·cfg term·decay 설정은 제거했다.
 Terminal만 고정 성공 bonus250을 rate로 바꿔 native dt 후+250을 한 번 지급한다. 실패·timeout은0,
 활성 실패가 성공보다 우선이다. 사용자의 요청대로 성공 후 종료와 terminal 수식·weight는 유지한다.
 Dense 값은 이전보다100Hz에서1/100로 바뀌었지만 Terminal은250이므로 상대 강도가 크게 달라진다.
-Distance 최대값의8초 합은8, Hold는27.2, Clearance는40.4557이라는 느슨한 할인 전 상한이다.
+Distance 최대값의8초 합은8, Hold는27.2, Clearance는83.0078이라는 느슨한 할인 전 상한이다.
 이들이 동시에 성립한다고 가정한 성공 선호 보장은 하지 않는다. 음의 L2 비용은 무한히 커질 수 있어
 과거 유계 reward·value 상한 비교를 새 설정의 전체 범위로 사용하지 않는다.
 
@@ -637,7 +674,7 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 | `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
 | `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
 | `singularity` | 현재 팔 자세의 보수적 이동능력 지표 s≤0.005 |
-| `hand_velocity` | 팔6개 + Hand 독립6개 중 하나라도 절대 관절 속도 >3rad/s. 한 sample 초과 시 즉시 종료 |
+| `hand_velocity` | UR5e 팔6개 중 하나라도 절대 관절 속도 >3rad/s. 한 sample 초과 시 즉시 종료. Hand 제외 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
 않다. 현재 활성 실패6개와 성공·timeout을 합쳐 native 종료 term은8개다.
@@ -645,10 +682,12 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 Terminal은 유효 성공에만+250을 한 번 지급하며 실패·timeout은0이다.
 연구 task의 내부 실패는 초기화 때 읽은 native 활성 term 설정을 따르며, 속도 실패는
 native manager가 해석한 현재 `hand_velocity` 설정으로 성공·terminal 지급 전에 반영한다.
-따라서 속도 초과와 성공 보상이 동시에 발생하지 않는다. 관절은 action/reward와 동일한 이름으로
-선택하고 mimic/passive 관절은 독립적으로 중복 검사하지 않는다. 경계3rad/s 자체는 통과한다.
+따라서 속도 초과와 성공 보상이 동시에 발생하지 않는다. 관절은 팔 action과 동일한 이름으로
+선택하고 Hand·mimic/passive 관절은 검사하지 않는다. 경계3rad/s 자체는 통과한다.
+Joint velocity reward는 이 종료와 별개로 팔6개+Hand 독립6개를 평가한다.
 현재 임계값은 최신 원격 `min`의 InspireOpen→Hand/HandMass 계열의3rad/s를 확인한 뒤 사용자 승인으로
-변경했다. 원격은 팔6개만 검사하며, 우리 환경은 사용자 요청에 따라 Hand 독립6개도 포함한다.
+변경했다. 후속 사용자 요청으로 우리 환경도 팔6개만 검사하도록 Hand를 제외했다.
+관절 선택 변경은 [학습 기록70절](../../docs/TRAINING_LOG.md)을 따른다.
 원격 기본 cfg의1rad/s와 별도 HandMassLimit variant는 구분한다. 변경 근거는
 [학습 기록68절](../../docs/TRAINING_LOG.md)을 따른다.
 Action 변화량 자체의 종료·clipping은 추가하지 않았다. Native 순서상 종료 step에도 reward를
@@ -1142,6 +1181,10 @@ Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에
 
 ## 검증과 남은 구현
 
+2026-10-25 `hand_velocity`에서 Hand를 제외한 뒤 CPU 집중 검사 **41개가 통과**했다.
+팔3rad/s 경계와 초과·Hand/mimic 제외·12관절 velocity reward 유지·성공 차단·native 로그·부분 reset을
+검사했다. 실제 GPU·simulation·학습은 실행하지 않았으며 상세는 [학습 기록70절](../../docs/TRAINING_LOG.md)을 따른다.
+
 2026-10-24 관절 속도 종료 임계값을3rad/s로 변경한 뒤 CPU 집중 검사 **41개가 통과**했다.
 ±3rad/s 경계·±3.0001rad/s 초과·±2rad/s 허용, 팔/Hand 선택·성공 차단·native 로그·부분 reset을
 검사했다. 실제 GPU·simulation·학습은 실행하지 않았으며 상세는 [학습 기록68절](../../docs/TRAINING_LOG.md)을 따른다.
@@ -1335,6 +1378,8 @@ Play와 GUI OBB 표시는 아래 실행 절에서 제공하며, 모델 export는
 위 계측 당시에는 rollout 32·PPO 4 epochs×4 minibatches·물리 120 Hz·정책 30 Hz를 사용했다.
 현재 기본값은 사용자 요청에 따라 물리100Hz·정책100Hz(`dt=0.01`, `decimation=1`)다.
 현재 rollout36은 환경별0.36초, 최대8초 episode는800step이다.
+OSC 토크는 물리100Hz마다 재계산하고 상대 목표는10ms 동안 유지한다. γ=.98과 action scale은
+유지한다. Action-rate·F/T 증가량 제곱은 주기 불변 비용이 아니므로50Hz 결과와 구분한다.
 위 성능 수치는 현재 PPO 설정과 주기로 측정한 결과가 아니다.
 GPU 난수 생성·수치 연산 순서 변경으로 reset/학습 궤적이 달라질 수 있어 장기 처리량 보장은 아니다.
 주요 잔여 비용은 물리 step과 CPU reset 준비·큐 처리다. 자세한 계측과 검증은
@@ -1384,18 +1429,33 @@ Launcher는 기본적으로 이 저장소의 `IsaacLab/`을 사용한다.
   --num_envs 4 --real-time
 ```
 
-GUI의 **IsaacLab → Scene Debug Visualization**에서 두 레이어를 별도로 켜고 끈다.
+GUI의 **IsaacLab → Scene Debug Visualization**에서 각 표시를 별도로 켜고 끈다.
 
 - **Target / Blocker OBB:** 현재 실제 물체의 Target 초록색·Blocker 빨간색 bounds.
 - **Observed objects OBB:** 정책의 유효 observation slot(최대10개)에 해당하는 청록색 OBB.
   실제 전체 bounds가 아닌 초기 visible-surface 추정값이며, 물체가 움직여도 초기 snapshot을
   유지한다. 현재 EEF frame의 관측을 world로 되돌린 것과 같은 위치에 표시한다.
+- **Tactile / F/T monitor:** 기본 OFF. 기존 **Environment Index**로 선택한 환경의
+  17개 tactile pad와 F/T를 표시한다. GUI의 환경1은 `env_0`이다.
+  손 위 pad 표면의 점과 손가락별 타일은 접촉 시 초록색, 미접촉 시 회색,
+  아직 유효하지 않은 측정은 주황색이다. 접촉은 observation과 동일한 threshold의
+  **모든 물체에 대한 binary**이며, Blocker-only 접촉 표시는 아니다.
+  F/T 위치에는 센서 XYZ축(빨강·초록·파랑), 힘 방향 화살표(청록), 오른손 법칙의
+  토크 원호(주황)를 그린다. 힘은1cm/N·최대25cm, 토크는반경6cm·1N·m당288°·최대288°다.
+  패널에는0중심의 축별 양방향 막대와 Force/Torque 이력 그래프도 표시한다.
+  막대는 SI-200-8 전체 범위(Fx/Fy±200N,Fz±360N,Tx/Ty/Tz±8N·m)를 사용하며,
+  그래프는 처음에±20N/±1N·m로 확대하고 native **Autoscale**로 조절할 수 있다.
+  값은 센서 frame의 보정된 측정 반력으로 **Hand 자중·관성 성분을 포함**한다.
+  패널은 최대20Hz로 갱신하고 환경 변경·episode reset 때 그래프를 비운다.
 
-둘 다 기본 ON이다. 초기 OFF는 각각 `env.role_obb_debug_vis=False`,
-`env.observation_obb_debug_vis=False`로 지정한다. 두 레이어는 하나의 DebugDraw callback을
-공유하므로 한 레이어의 OFF가 다른 레이어를 지우지 않는다. 모두 OFF일 때 callback을
-해제한다. `isaacsim.util.debug_draw` 선만 사용하고 USD prim·rigid body·collision shape를
-만들지 않는다. Headless에서는 visualizer·UI·callback을 생성하지 않는다.
+OBB 두 표시는 기본 ON이다. 초기 OFF는 각각 `env.role_obb_debug_vis=False`,
+`env.observation_obb_debug_vis=False`로 지정하며, 센서 모니터의 초기 ON은
+`env.sensor_monitor_debug_vis=True`다. 세 표시는 하나의 DebugDraw callback을 공유하므로
+한 표시의 OFF가 다른 표시를 지우지 않는다. 모두 OFF일 때 callback을 해제한다.
+`isaacsim.util.debug_draw` 선·점만 사용하고 USD prim·rigid body·collision shape를 만들지 않는다.
+모니터는 이미 계산한 센서 cache만 읽고 센서를 추가 갱신하거나 reward·observation의 이력을
+변경하지 않는다. Monitor OFF에서는 데이터 조회·GPU 연산·CPU 전송이 없으며,
+Headless에서는 visualizer·UI·callback을 생성하지 않는다.
 
 PhysX의 whole-scene Patch 용량은 `gpu_max_rigid_patch_count=2**18`(262,144)로 설정했다.
 기본163,840에서 관측 요구량184,896을 초과한 오류에 대응한 값이며, contact count·solver
@@ -1415,12 +1475,11 @@ export는 수행하지 않는다. 모델 구조와 action 계약이 모두 같�
 현재 환경 설정을 사용하므로 과거의 배치·관측 모델까지 복원하는 기능은 아니다.
 필요한 설정 변경은 학습과 같은 Hydra `env.*`, `agent.*` 인자로 전달한다.
 
-동일한 독립 Critic 구조로50Hz에서 학습한 checkpoint의 정책 주기를 맞추려면
-`env.decimation=2 env.mdp.success_duration=0.5`를 추가한다. 성공 유지시간은50Hz에서도
-0.5초(25 sample)다. GUI 렌더링 주기는 `env.sim.render_interval=2`로 맞춘다. 과거 성공 판정까지
-그대로 복원하는 것은 아니며, Play는 checkpoint의 env.yaml에서 주기를 자동 복원하지 않는다.
-새100Hz 학습에는 이 인자를 붙이지 않는다. 마찰은 현재값(정지·동마찰0.5, 반발0)을 유지하며, 추후 물성 조정은
-Hold weight·정책 주기 변경과 분리해 비교한다.
+Play 기본값도100Hz다. 동일한 독립 Critic 구조로50Hz에서 학습한 checkpoint의 정책 주기를
+맞추려면 `env.decimation=2 env.sim.render_interval=2`를 추가한다. 성공 유지시간은 어느 주기든
+0.5초이며 기본100Hz에서는50 sample다. 과거 성공 판정까지 그대로 복원하는 것은 아니며,
+Play는 checkpoint의 env.yaml에서 주기를 자동 복원하지 않는다. 마찰은 현재값(정지·동마찰0.5,
+반발0)을 유지하며, 추후 물성 조정은 Hold weight·정책 주기 변경과 분리해 비교한다.
 
 GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`을 사용한다.
 영상은 다음과 같이 저장하며 checkpoint 옆 `videos/play/`에 생성된다.

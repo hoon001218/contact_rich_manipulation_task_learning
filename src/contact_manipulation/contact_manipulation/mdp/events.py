@@ -41,16 +41,13 @@ _DEFAULT_MAX_OBJECTS = 10  # Policy slots; physical scene count is configured se
 @dataclass
 class MdpCfg:
     max_objects: int = _DEFAULT_MAX_OBJECTS
-    clearance_decay: float = 1.0
+    clearance_decay: float = 2.0
     # Geometric warning/hard margins; initial tuning, not certified safety limits.
     # L matches the existing IK angular weighting; s is inverse-Frobenius margin.
     singularity_characteristic_length: float = 0.25
     motion_singularity_threshold: float = 0.07
     motion_singularity_decay: float = math.log(2.0) / 0.03**2
     singularity_termination_threshold: float = 0.005
-    # Previously selected increasing exponential cost rate, in reward/s and 1/s.
-    time_penalty_scale: float = 0.02
-    time_penalty_growth_rate: float = 0.7
     # One-time bonus for the enabled success termination.
     success_reward: float = 250.0
     success_overlap_area: float = 1.0e-5
@@ -96,8 +93,7 @@ class MdpCfg:
         for name, value in vars(self).items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
-            if ((name.endswith("_ref") or name.endswith("_scale"))
-                    and name != "time_penalty_scale" and value <= 0):
+            if (name.endswith("_ref") or name.endswith("_scale")) and value <= 0:
                 raise ValueError(f"{name} must be positive.")
 
 
@@ -737,11 +733,11 @@ class SensorBatch:
 
 
 class RoleObbVisualizer:
-    """Shared viewport drawing for physical roles and observed initial OBBs.
+    """Shared viewport drawing for OBBs and the optional sensor monitor.
 
     Physical role bounds follow current body-link poses. Observation bounds
     remain the initial visible-surface snapshot used by the policy. Both layers
-    share one draw callback because DebugDraw's line buffer is global. No USD
+    share one draw callback because DebugDraw's buffers are global. No USD
     prims, rigid bodies, collision shapes or markers are made.
     """
 
@@ -775,11 +771,14 @@ class RoleObbVisualizer:
         import weakref
 
         env = self._env
-        if not (self.debug_vis or self.observation_debug_vis):
+        sensor_monitor = getattr(env, "_sensor_monitor", None)
+        if not (self.debug_vis or self.observation_debug_vis
+                or (sensor_monitor is not None and sensor_monitor.debug_vis)):
             if env.sim.render_callback_exists(self.callback_name):
                 env.sim.remove_render_callback(self.callback_name)
             if self._draw is not None:
                 self._draw.clear_lines()
+                self._draw.clear_points()
             return
         if self._draw is None:
             from isaacsim.core.utils.extensions import enable_extension
@@ -818,12 +817,19 @@ class RoleObbVisualizer:
     @torch.no_grad()
     def update(self, _event=None):
         env = self._env
+        # Native live visualizers also skip STOP/PAUSE: PhysX views may have
+        # been invalidated by the timeline even while the window stays open.
+        if not env.sim.is_playing():
+            return
         scene, state = getattr(env, "task_scene_data", None), getattr(env, "_contact_mdp", None)
+        sensor_monitor = getattr(env, "_sensor_monitor", None)
+        sensors_enabled = sensor_monitor is not None and sensor_monitor.debug_vis
         # Startup rendering can precede the first committed scene/MDP reset.
-        if (not (self.debug_vis or self.observation_debug_vis) or scene is None
+        if (not (self.debug_vis or self.observation_debug_vis or sensors_enabled) or scene is None
                 or state is None or state.bindings is None or env._is_closed):
             return
         line_batches, colors, widths = [], [], []
+        points = None
         if self.observation_debug_vis:
             corners = self._observation_corners(state)
             lines = corners[:, self._edges].reshape(-1, 2, 3)
@@ -839,13 +845,27 @@ class RoleObbVisualizer:
             line_batches.append(corners[:, :, self._edges].reshape(-1, 2, 3))
             colors.extend(self._colors)
             widths.extend(self._widths)
-        # One device-to-host transfer per render, never per physics step.
-        lines = torch.cat(line_batches).transpose(0, 1).contiguous().cpu().tolist()
+        if sensors_enabled:
+            primitives = sensor_monitor.render_geometry()
+            if primitives is not None:
+                sensor_lines, sensor_colors, sensor_widths, points, point_colors, point_sizes = primitives
+                line_batches.append(sensor_lines)
+                colors.extend(sensor_colors)
+                widths.extend(sensor_widths)
+        # Transfers belong only to GUI drawing, never the physics-step loop.
+        lines = (torch.cat(line_batches).transpose(0, 1).contiguous().cpu().tolist()
+                 if line_batches else [[], []])
         self._draw.clear_lines()
         self._draw.draw_lines(lines[0], lines[1], colors, widths)
+        self._draw.clear_points()
+        if points is not None:
+            self._draw.draw_points(points.cpu().tolist(), point_colors, point_sizes)
 
     def close(self):
         self.debug_vis = self.observation_debug_vis = False
+        sensor_monitor = getattr(self._env, "_sensor_monitor", None)
+        if sensor_monitor is not None:
+            sensor_monitor.close()
         self._refresh_debug_vis()
 
 
@@ -867,10 +887,16 @@ class ObservationObbVisualizer:
 
 
 def initialize_role_obb_visualization(env, env_ids=None):
-    """Prepare both GUI toggles; headless training creates neither visualizer."""
-    if env.sim.has_gui() and not hasattr(env, "_role_obb_visualizer"):
-        env._role_obb_visualizer = RoleObbVisualizer(env)
-        env._observation_obb_visualizer = ObservationObbVisualizer(env._role_obb_visualizer)
+    """Prepare GUI toggles; headless training creates no visualizer resources."""
+    if env.sim.has_gui():
+        if not hasattr(env, "_role_obb_visualizer"):
+            env._role_obb_visualizer = RoleObbVisualizer(env)
+            env._observation_obb_visualizer = ObservationObbVisualizer(env._role_obb_visualizer)
+        if not hasattr(env, "_sensor_monitor"):
+            from .sensors import SensorMonitor
+
+            env._sensor_monitor = SensorMonitor(env)
+            env._role_obb_visualizer._refresh_debug_vis()
 
 
 def _ensure_state(env):
@@ -5989,6 +6015,8 @@ def _clutter_gpu_seed(polygon_variants, support_variants, fixed_obstacles, suppo
     Optional rows retain their input order and stop at the first failure. No
     pocket or complete trajectory is reserved here. This is a partial graph
     seed, not an accepted active scene or permission to drop mandatory types.
+    FFT kernels stay cached only until their last use in this call; unique
+    rotated shapes must not accumulate full-grid spectra across all bodies.
     """
     from scipy.fft import next_fast_len
 
@@ -6061,15 +6089,18 @@ def _clutter_gpu_seed(polygon_variants, support_variants, fixed_obstacles, suppo
                     - poly[:, 1] * np.roll(poly[:, 0], -1)))) for poly in row)
         return -extent, -area, index
     order = sorted(range(minimum_count), key=size_order) + list(range(minimum_count, len(polygons)))
+    keys = tuple(tuple((poly.shape, poly.tobytes(), obb.shape, obb.tobytes())
+                       for poly, obb in zip(row, obbs[index])) for index, row in enumerate(polygons))
+    last_use = {key: step for step, index in enumerate(order) for key in keys[index]}
+    unique_kernels, peak_cached_kernels = 0, 0
     queries = 0
-    for index in order:
+    for step, index in enumerate(order):
         if index >= minimum_count and minimum_count and (variant_ids[:minimum_count] < 0).any():
             break
         variants = polygons[index]
         scene_fft = transform(padded(grid.to(torch.float64), (1, 1, 1, 1)))
         choices = []
-        for variant, (poly, obb) in enumerate(zip(variants, obbs[index])):
-            key = (poly.shape, poly.tobytes(), obb.shape, obb.tobytes())
+        for variant, (poly, obb, key) in enumerate(zip(variants, obbs[index], keys[index])):
             if key not in cache:
                 low = np.floor((poly.min(axis=0) - half_gap) / resolution) * resolution
                 high = np.ceil((poly.max(axis=0) + half_gap) / resolution) * resolution
@@ -6092,9 +6123,12 @@ def _clutter_gpu_seed(polygon_variants, support_variants, fixed_obstacles, suppo
                 upper = np.floor((allowed_high - origin + mask_origin) / resolution + 1.e-9).astype(int)
                 cache[key] = (mask, mask_origin, transform(body.to(torch.float64)).conj(),
                               transform(ring.to(torch.float64)).conj(), lower, upper)
+                unique_kernels += 1
+                peak_cached_kernels = max(peak_cached_kernels, len(cache))
             mask, mask_origin, kernel, contact_kernel, lower, upper = cache[key]
             height, width = mask.shape
             if height > shape[0] or width > shape[1] or np.any(lower > upper):
+                del kernel, contact_kernel
                 continue
             size = (int(shape[0]) - height + 1, int(shape[1]) - width + 1)
             counts = torch.fft.irfft2(scene_fft * kernel, s=fft_shape)[:size[0], :size[1]]
@@ -6108,21 +6142,25 @@ def _clutter_gpu_seed(polygon_variants, support_variants, fixed_obstacles, suppo
             error = torch.maximum(error, (contact - contact.round()).abs().amax())
             score = torch.where(free, contact.round(), torch.full_like(contact, -1.e15))
             value, position = score.flatten().max(0)
-            choices.append((value, position, variant, size[1], key))
+            choices.append((value, position, variant, size[1], mask, mask_origin))
+            del counts, rounded, free, rows, columns, contact, score, kernel, contact_kernel
+        del scene_fft
+        for key in keys[index]:
+            if last_use[key] == step:
+                cache.pop(key, None)
         queries += 1
         if not choices:
             if index < minimum_count:
                 continue
             break
         selected = int(torch.stack([choice[0] for choice in choices]).argmax().item())
-        value, position, variant, width, key = choices[selected]
+        value, position, variant, width, mask, mask_origin = choices[selected]
         value, position = float(value.item()), int(position.item())
         if value < -1.e14:
             if index < minimum_count:
                 continue
             break
         x, y = divmod(position, width)
-        mask, mask_origin = cache[key][:2]
         height, width = mask.shape
         grid[x:x + height, y:y + width] |= mask
         centers[index] = origin + np.asarray((x, y)) * resolution - mask_origin
@@ -6137,7 +6175,8 @@ def _clutter_gpu_seed(polygon_variants, support_variants, fixed_obstacles, suppo
         mandatory_count=minimum_count, mandatory_seeded_count=int((variant_ids[:minimum_count] >= 0).sum()),
         seeded_count=int((variant_ids >= 0).sum()), pose_proposals=0, approval_retries=0, placement_queries=queries,
         resolution=float(resolution), grid_shape=shape.tolist(), fft_shape=fft_shape,
-        fft_roundtrip_max_error=numerical_error, unique_shape_kernels=len(cache), virtual_reservation=False)
+        fft_roundtrip_max_error=numerical_error, unique_shape_kernels=unique_kernels,
+        peak_cached_shape_kernels=peak_cached_kernels, virtual_reservation=False)
 
 
 def _clutter_composition_sequence(geometries, rules, rng, target_id, blocker_id):

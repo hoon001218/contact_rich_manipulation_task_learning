@@ -231,7 +231,7 @@ def native_motion_rewards():
     import os
     lab = Path(os.environ.get("ISAACLAB_PATH", Path(__file__).resolve().parents[3] / "IsaacLab"))
     source = lab / "source/isaaclab/isaaclab/envs/mdp/rewards.py"
-    names = ('action_rate_l2', 'joint_vel_l2')
+    names = ('action_rate_l2', 'joint_vel_l2', 'is_alive')
     functions = [node for node in ast.parse(source.read_text()).body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
     syntax = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
@@ -309,9 +309,9 @@ class ContactRewardTests(unittest.TestCase):
             native_rotation.as_quat()[:, [3, 0, 1, 2]], dtype=dtype)
         centers = poses[torch.arange(2), blocker, :3].numpy() + canonical.apply(
             ((lower[blocker] + upper[blocker]) * .5).numpy())
-        points = torch.full((2, 17, 3), 99., dtype=dtype)
-        points[torch.arange(2), [2, 14]] = torch.tensor(
-            centers + canonical.apply([[.3, 0., 0.], [.4, 0., 0.]]), dtype=dtype)
+        points = torch.tensor(
+            centers + canonical.apply([[.3, 0., 0.], [.4, 0., 0.]]), dtype=dtype
+        )[:, None].expand(-1, 17, -1).clone()
         env = SimpleNamespace(
             step_dt=.02,
             task_scene_data=SimpleNamespace(blocker_id=blocker, lower=lower, upper=upper, upright=upright),
@@ -335,38 +335,55 @@ class ContactRewardTests(unittest.TestCase):
             state.return_value.target_protected[0] = True
             torch.testing.assert_close(rewards.blocker_distance(env), score)
 
-    def test_distance_uses_nearest_point_and_rotated_blocker_surface(self):
+    def test_distance_uses_all_pad_points_and_rotated_blocker_surface(self):
         # An asymmetric box checks that its orientation, not an axis-aligned
-        # bound, determines the nearest surface. All 17 pads start far away.
+        # bound, determines each pad's distance. Equal-distance pads retain
+        # the original exp quality, independent of the batch's other rows.
         points = torch.full((4, 17, 3), 10., dtype=torch.float64)
         center = torch.zeros((4, 3), dtype=points.dtype)
         rotation = identity(4)
         half = torch.tensor([[.2, .1, .05]], dtype=points.dtype).expand(4, -1)
-        points[0, 3] = points.new_tensor([.2, 0., 0.])        # On surface.
-        points[1, 8] = points.new_tensor([.3, 0., 0.])        # 10 cm beyond +X.
-        points[2, 12] = points.new_tensor([.3, .2, .05])      # 10 cm along two axes.
+        points[0] = points.new_tensor([.2, 0., 0.])          # On surface.
+        points[1] = points.new_tensor([.3, 0., 0.])          # 10 cm beyond +X.
+        points[2] = points.new_tensor([.3, .2, .05])         # 10 cm along two axes.
         rotation[3] = points.new_tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
         center[3] = points.new_tensor([1., 2., 3.])
-        points[3, 16] = points.new_tensor([1., 2.3, 3.])       # Rotated box +X is world +Y.
+        points[3] = points.new_tensor([1., 2.3, 3.])         # Rotated box +X is world +Y.
         quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
         expected = torch.tensor([0., .1, math.sqrt(.02), .1], dtype=points.dtype)
         torch.testing.assert_close(distance, expected)
         torch.testing.assert_close(quality, torch.exp(-math.log(2.) / .1 * expected))
+
+    def test_each_additional_near_pad_contributes_without_saturating_the_other_pads(self):
+        points = torch.zeros((4, 17, 3), dtype=torch.float64)
+        points[..., 0] = 1.1  # One meter from the OBB.
+        points[1, 0, 0] = .1
+        points[2, :2, 0] = .1
+        points[3, :, 0] = .1
+        center = torch.zeros((4, 3), dtype=points.dtype)
+        half = torch.full_like(center, .1)
+        quality, distance = rewards.blocker_distance_quality(points, center, identity(4), half, decay=10.)
+        far = math.exp(-10.)
+        expected = points.new_tensor([far, (1 + 16 * far) / 17, (2 + 15 * far) / 17, 1.])
+        torch.testing.assert_close(quality, expected)
+        torch.testing.assert_close(distance, points.new_tensor([1., 16 / 17, 15 / 17, 0.]))
+        self.assertGreater(float(quality[2]), float(quality[1]))
+        # Average per-pad qualities, rather than exponentiating mean distance.
+        self.assertGreater(float(quality[1]), float(torch.exp(-10. * distance[1])))
 
     def test_distance_inside_is_zero_and_invalid_geometry_cannot_receive_quality(self):
         points = torch.ones((5, 17, 3), dtype=torch.float64)
         center, rotation = torch.zeros((5, 3), dtype=points.dtype), identity(5)
         half = torch.full((5, 3), .1, dtype=points.dtype)
         points[0, 0] = 0.  # A point inside the solid OBB has distance zero.
-        points[0, 1] = math.nan  # Ignore a missing pad rather than poison valid pads.
+        points[0, 1:] = math.nan  # Missing pads contribute zero with fixed denominator 17.
         points[1] = math.nan
         center[2, 0] = math.inf
         half[3, 2] = 0.
         rotation[4] = 0.
         quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
-        torch.testing.assert_close(quality, torch.tensor([1., 0., 0., 0., 0.], dtype=points.dtype))
-        self.assertEqual(float(distance[0]), 0.)
-        self.assertTrue(torch.isinf(distance[1:]).all())
+        torch.testing.assert_close(quality, torch.tensor([1 / 17, 0., 0., 0., 0.], dtype=points.dtype))
+        self.assertTrue(torch.isinf(distance).all())
 
     def test_hold_counts_same_pad_only_and_invalid_reading_breaks_continuity(self):
         force = torch.zeros((3, 17, 3), dtype=torch.float64)
@@ -494,14 +511,14 @@ class RewardTests(unittest.TestCase):
         asset_cfg = SimpleNamespace(name='robot', joint_ids=slice(0, 12))
         env = SimpleNamespace(scene={'robot': SimpleNamespace(data=SimpleNamespace(joint_vel=velocity))},
                               action_manager=SimpleNamespace(action=action, prev_action=torch.zeros_like(action)))
-        configs = [SimpleNamespace(func=rewards.motion_action_rate, weight=-.03, params={}),
-                   SimpleNamespace(func=rewards.motion_joint_velocity, weight=-.03, params={'asset_cfg': asset_cfg})]
+        configs = [SimpleNamespace(func=rewards.motion_action_rate, weight=-.01, params={}),
+                   SimpleNamespace(func=rewards.motion_joint_velocity, weight=-.01, params={'asset_cfg': asset_cfg})]
         manager = SimpleNamespace(_env=env, _term_names=['action', 'velocity'], _term_cfgs=configs,
                                   _reward_buf=torch.zeros(3), _step_reward=torch.zeros(3, 2),
                                   _episode_sums={'action': torch.zeros(3), 'velocity': torch.zeros(3)})
         with native_motion_rewards():
             actual = native_reward_compute()(manager, .01)
-        torch.testing.assert_close(actual, -.03 * .01 * torch.tensor([30., 12., 18.]))
+        torch.testing.assert_close(actual, -.01 * .01 * torch.tensor([30., 12., 18.]))
         self.assertTrue(torch.isfinite(manager._step_reward).all())
 
     def test_dense_terms_use_native_manager_dt_but_success_bonus_remains_250(self):
@@ -514,15 +531,15 @@ class RewardTests(unittest.TestCase):
         for dt in (.01, .02, .1):
             env = SimpleNamespace(step_dt=dt)
             configs = [SimpleNamespace(func=fn, weight=w, params={}) for fn, w in
-                       ((rewards.clearance, 8.), (rewards.motion_force_growth, -.15),
-                        (rewards.motion_torque_growth, -.15), (rewards.terminal, 1.))]
+                       ((rewards.clearance, 12.), (rewards.motion_force_growth, -.03),
+                        (rewards.motion_torque_growth, -.03), (rewards.terminal, 1.))]
             manager = SimpleNamespace(_env=env, _term_names=['clear', 'force', 'torque', 'terminal'], _term_cfgs=configs,
                                       _reward_buf=torch.zeros(2), _step_reward=torch.zeros(2, 4),
                                       _episode_sums={name: torch.zeros(2) for name in ['clear', 'force', 'torque', 'terminal']})
             with patch.object(task, 'get_task_state', return_value=state):
                 actual = compute(manager, dt)
-            expected = 8 * (state.clearance_quality - .5) * dt
-            expected -= .15 * (state.force_growth.square() + state.torque_growth.square()) * dt
+            expected = 12 * (state.clearance_quality - .5) * dt
+            expected -= .03 * (state.force_growth.square() + state.torque_growth.square()) * dt
             expected += state.terminal_reward
             torch.testing.assert_close(actual, expected)
             torch.testing.assert_close(manager._episode_sums['terminal'], state.terminal_reward)
@@ -559,53 +576,83 @@ class RewardTests(unittest.TestCase):
                          ('object_collision', 'object_collision'), ('shelf_collision', 'shelf_collision')):
             self.assertEqual(terms[name][0], fn)
             self.assertLess(terms[name][1], 0.)
-        self.assertEqual(terms['clearance'], ('clearance', 8.))
+        self.assertEqual(terms['clearance'], ('clearance', 12.))
         self.assertEqual(terms['blocker_distance'], ('blocker_distance', 1.))
         self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', .2))
-        self.assertEqual(terms['object_stability'], ('object_stability', .5))
+        self.assertEqual(terms['object_collision'], ('object_collision', -1.))
+        self.assertEqual(terms['shelf_collision'], ('shelf_collision', -2.))
+        self.assertEqual(terms['motion_action_rate'], ('motion_action_rate', -.01))
+        self.assertEqual(terms['motion_joint_velocity'], ('motion_joint_velocity', -.01))
+        self.assertEqual(terms['motion_force_growth'], ('motion_force_growth', -.03))
+        self.assertEqual(terms['motion_torque_growth'], ('motion_torque_growth', -.03))
+        self.assertEqual(terms['motion_singularity'], ('motion_singularity', .3))
+        self.assertEqual(terms['object_stability'], ('object_stability', 1.))
+        self.assertEqual(terms['time_penalty'], ('is_alive', -2.))
+        self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
-        for removed in ('reward_components', 'corner_path_increment', 'rearrangement'):
+        distance = next(n for n in definition.body if isinstance(n, ast.Assign)
+                        and n.targets[0].id == 'blocker_distance')
+        params = next(item.value for item in distance.value.keywords if item.arg == 'params')
+        self.assertEqual(ast.literal_eval(params), {'decay': 15.})
+        self.assertEqual(settings().clearance_decay, 2.)
+        for removed in ('reward_components', 'corner_path_increment', 'rearrangement', 'time_penalty', 'time_reward'):
             self.assertFalse(hasattr(rewards, removed))
 
-    def test_time_integral_is_zero_at_reset_and_independent_of_control_partition(self):
-        cfg = settings()
-        self.assertEqual((cfg.time_penalty_scale, cfg.time_penalty_growth_rate), (.02, .7))
-        end = 8.
-        expected_total = -.02 / .7 * (math.expm1(.7 * end) - .7 * end)
+    def test_native_time_penalty_charges_alive_and_timeout_but_not_success_or_failure(self):
+        terminated = torch.tensor([False, False, True, True])
+        env = SimpleNamespace(termination_manager=SimpleNamespace(
+            terminated=terminated, time_outs=torch.tensor([False, True, False, False])))
         for dt in (.01, .02, .1):
-            elapsed = torch.arange(round(end / dt) + 1, dtype=torch.float64) * dt
-            state = SimpleNamespace(cfg=cfg, elapsed_time=elapsed,
-                                    clearance_quality=torch.zeros(len(elapsed), dtype=torch.float64))
-            env = SimpleNamespace(step_dt=dt)
-            with patch.object(task, 'get_task_state', return_value=state), \
+            with native_motion_rewards() as native:
+                manager = SimpleNamespace(
+                    _env=env, _term_names=['time_penalty'],
+                    _term_cfgs=[SimpleNamespace(func=native.is_alive, weight=-2., params={})],
+                    _reward_buf=torch.zeros(4), _step_reward=torch.zeros(4, 1),
+                    _episode_sums={'time_penalty': torch.zeros(4)})
+                with patch.object(task, 'get_task_state', side_effect=AssertionError('unneeded task/clock read')), \
                  patch.object(torch.Tensor, 'item', side_effect=AssertionError('host scalar')), \
                  patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('host condition')), \
                  patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('host transfer')):
-                payments = rewards.time_penalty(env) * dt
-            self.assertEqual(float(payments[0]), 0.)
-            self.assertTrue((payments[1:] < 0).all())
-            self.assertTrue((payments[2:] < payments[1:-1]).all())
-            self.assertAlmostEqual(float(payments.sum()), expected_total, places=11)
-            self.assertAlmostEqual(float(payments[1]),
-                                   -.02 / .7 * (math.expm1(.7 * dt) - .7 * dt), places=13)
+                    actual = native_reward_compute()(manager, dt).clone()
+            torch.testing.assert_close(actual, torch.tensor([-2 * dt, -2 * dt, 0., 0.]))
+            torch.testing.assert_close(manager._episode_sums['time_penalty'], actual)
+        torch.testing.assert_close(terminated, torch.tensor([False, False, True, True]))
 
+    def test_native_time_penalty_integrates_to_same_eight_second_cost_at_each_control_period(self):
+        env = SimpleNamespace(termination_manager=SimpleNamespace(terminated=torch.zeros(1, dtype=torch.bool)))
+        with native_motion_rewards() as native:
+            compute = native_reward_compute()
+            for dt in (.01, .02, .1):
+                manager = SimpleNamespace(
+                    _env=env, _term_names=['time_penalty'],
+                    _term_cfgs=[SimpleNamespace(func=native.is_alive, weight=-2., params={})],
+                    _reward_buf=torch.zeros(1, dtype=torch.float64),
+                    _step_reward=torch.zeros(1, 1, dtype=torch.float64),
+                    _episode_sums={'time_penalty': torch.zeros(1, dtype=torch.float64)})
+                for _ in range(round(8 / dt)):
+                    compute(manager, dt)
+                # Official is_alive returns float32 even when the manager's sum
+                # is float64, hence the tolerance for per-step float32 rounding.
+                torch.testing.assert_close(manager._episode_sums['time_penalty'],
+                                           torch.tensor([-16.], dtype=torch.float64), rtol=1.e-7, atol=0.)
 
-    def test_time_clock_partial_reset_restarts_only_selected_rows(self):
+    def test_time_cost_is_independent_of_partial_reset_clock_and_preserves_selected_row_reset(self):
         state, batch, reset = fixture(4)
         state.advance(batch, 1)
         state.advance(batch, 2)
-        env = SimpleNamespace(step_dt=state.dt)
-        with patch.object(task, 'get_task_state', return_value=state):
-            previous = rewards.time_penalty(env).clone()
+        env = SimpleNamespace(termination_manager=SimpleNamespace(terminated=torch.zeros(4, dtype=torch.bool)))
+        with native_motion_rewards() as native:
+            previous = native.is_alive(env)
+            elapsed = state.elapsed_time.clone()
             ids, untouched = torch.tensor([3, 1]), torch.tensor([0, 2])
             state.reset(ids, batch, **reset, step=2)
-            current = rewards.time_penalty(env)
-            torch.testing.assert_close(current[ids], torch.zeros(2, dtype=current.dtype))
-            torch.testing.assert_close(current[untouched], previous[untouched])
+            torch.testing.assert_close(state.elapsed_time[ids], torch.zeros(2, dtype=elapsed.dtype))
+            torch.testing.assert_close(state.elapsed_time[untouched], elapsed[untouched])
+            torch.testing.assert_close(native.is_alive(env), previous)
             state.advance(batch, 3)
-            current = rewards.time_penalty(env)
-            self.assertTrue((current[untouched] < previous[untouched]).all())
-            self.assertTrue((current[ids] > previous[ids]).all())
+            torch.testing.assert_close(state.elapsed_time[ids], torch.full((2,), state.dt, dtype=elapsed.dtype))
+            torch.testing.assert_close(state.elapsed_time[untouched], elapsed[untouched] + state.dt)
+            torch.testing.assert_close(native.is_alive(env), previous)
 
 
     def test_object_stability_distance_deadband_half_cost_padding_and_dt(self):
@@ -1560,17 +1607,19 @@ class NativeArmEffortLimitTests(unittest.TestCase):
 
 
 class NativeVelocityTerminationTests(unittest.TestCase):
-    def test_official_threshold_checks_arm_and_hand_independent_joints_without_host_reads(self):
+    def test_official_threshold_checks_arm_only_and_ignores_hand_without_host_reads(self):
         native = native_velocity_termination()
         # Interleaved PhysX ordering makes an accidental [:6] or [:12] selection visible.
-        ids = [5, 0, 14, 3, 16, 8, 1, 17, 6, 2, 13, 10]
-        omitted = [index for index in range(18) if index not in ids]
+        ids = [5, 0, 14, 3, 16, 8]
+        hand_ids = [1, 17, 6, 2, 13, 10]
+        omitted = [index for index in range(18) if index not in ids + hand_ids]
         for dtype in (torch.float32, torch.float64):
             velocity = torch.zeros(1024, 18, dtype=dtype)
             velocity[0, ids] = 3.0  # The Inspire variant uses a strict > boundary.
             velocity[1, ids[4]] = 3.0001  # Arm.
-            velocity[2, ids[11]] = -3.0001  # Independent finger.
-            velocity[3, omitted] = 1.e8  # Mimic joints are not the selected independent DOFs.
+            velocity[2, ids[-1]] = -3.0001  # Arm, opposite direction.
+            velocity[3, hand_ids] = 1.e8  # Independent fingers do not trigger this term.
+            velocity[5, omitted] = -1.e8  # Mimic/passive joints are also excluded.
             velocity[4, ids] = -2.0  # The former 1 rad/s cutoff no longer applies.
             env = SimpleNamespace(scene={'robot': SimpleNamespace(data=SimpleNamespace(joint_vel=velocity))})
             asset_cfg = SimpleNamespace(name='robot', joint_ids=ids)
@@ -1582,7 +1631,7 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             expected[[1, 2]] = True
             torch.testing.assert_close(actual, expected)
 
-    def test_ur5e_configuration_uses_same_twelve_named_joints_for_reward_and_termination(self):
+    def test_ur5e_configuration_keeps_twelve_reward_joints_and_only_six_arm_termination_joints(self):
         source = Path(task.__file__).parent.parent / 'config/ur5e/ur5e_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'UR5eContactManipulationEnvCfg')
@@ -1615,8 +1664,10 @@ class NativeVelocityTerminationTests(unittest.TestCase):
         expected = action_names['arm_action'] + action_names['hand_action']
         self.assertEqual(len(set(expected)), 12)
         self.assertEqual(reward_asset.joint_names, expected)
-        self.assertEqual(velocity_asset.joint_names, expected)
-        self.assertIn('right_little_1_joint', velocity_asset.joint_names)
+        self.assertEqual(velocity_asset.joint_names, action_names['arm_action'])
+        self.assertEqual(len(velocity_asset.joint_names), 6)
+        self.assertTrue(set(velocity_asset.joint_names).isdisjoint(action_names['hand_action']))
+        self.assertIn('right_little_1_joint', reward_asset.joint_names)
         cfg.terminations.hand_velocity = None
         exec(code, {'self': cfg})  # Disabling only the termination keeps the velocity reward valid.
         self.assertEqual(reward_asset.joint_names, expected)
@@ -1657,16 +1708,15 @@ class NativeControllerTests(unittest.TestCase):
         self.assertEqual(arm.body_name, observation_eef.rsplit("/", 1)[-1])
         self.assertIsNone(arm.body_offset)
         self.assertEqual(arm.controller_cfg.target_types, ["pose_rel"])
-        self.assertEqual((arm.position_scale, arm.orientation_scale, arm.stiffness_scale), (1., 1., 100.))
+        self.assertEqual((arm.position_scale, arm.orientation_scale, arm.stiffness_scale), (.5, .5, 100.))
         self.assertTrue(arm.controller_cfg.gravity_compensation)
         velocity = cfg.terminations.hand_velocity
         self.assertEqual(velocity.func.__name__, 'joint_vel_out_of_manual_limit')
         self.assertEqual(velocity.params['max_velocity'], 3.0)
         self.assertFalse(velocity.time_out)
-        self.assertEqual(velocity.params['asset_cfg'].joint_names,
+        self.assertEqual(velocity.params['asset_cfg'].joint_names, arm.joint_names)
+        self.assertEqual(cfg.rewards.motion_joint_velocity.params['asset_cfg'].joint_names,
                          arm.joint_names + cfg.actions.hand_action.joint_names)
-        self.assertEqual(velocity.params['asset_cfg'].joint_names,
-                         cfg.rewards.motion_joint_velocity.params['asset_cfg'].joint_names)
         # Reset IK targets the palm; changing the control point must preserve
         # both the hand's Blocker-front start and its existing tactile links.
         self.assertEqual(TCP_BODY_NAME, "right_plam_force_sensor")
@@ -2185,7 +2235,7 @@ class StateTests(unittest.TestCase):
         batch.center[:, 1, 0] = positions
         batch.corners[:, 1, :, 0] += delta[:, None]
         state.reset(torch.arange(3), batch, **reset, step=0)
-        expected = torch.exp(batch.center.new_tensor([-1., -.5, -.2]))
+        expected = torch.exp(-state.cfg.clearance_decay * batch.center.new_tensor([1., .5, .2]))
         torch.testing.assert_close(state.initial_clearance_quality, expected)
         torch.testing.assert_close(state.clearance_quality, expected)
         env = SimpleNamespace(step_dt=state.dt)
@@ -2209,8 +2259,8 @@ class StateTests(unittest.TestCase):
         shift = batch.center.new_tensor([.03, -.02, 0.])
         batch.center[:, 1, 0] += shift
         batch.corners[:, 1, :, 0] += shift[:, None]
-        expected_quality = torch.exp(batch.center.new_tensor([-.2, -.7, -.5]))
-        expected_payment = expected_quality - math.exp(-.5)
+        expected_quality = torch.exp(-state.cfg.clearance_decay * batch.center.new_tensor([.2, .7, .5]))
+        expected_payment = expected_quality - math.exp(-state.cfg.clearance_decay * .5)
         env = SimpleNamespace(step_dt=state.dt)
         with patch.object(task, 'get_task_state', return_value=state):
             for step in (1, 2):
@@ -2312,7 +2362,7 @@ class StateTests(unittest.TestCase):
             field.name: getattr(batch, field.name)[ids].clone() for field in dataclasses.fields(batch)})
         state.reset(ids, selected, **{name: value[ids] for name, value in reset.items()},
                     step=1, batch_is_selected=True)
-        expected = torch.exp(batch.center.new_tensor([-.6, 0.]))
+        expected = torch.exp(-state.cfg.clearance_decay * batch.center.new_tensor([.6, 0.]))
         torch.testing.assert_close(state.initial_clearance_quality[ids], expected)
         torch.testing.assert_close(state.clearance_quality[ids], expected)
         for name, saved in before.items():
@@ -2487,7 +2537,7 @@ class StateTests(unittest.TestCase):
         torch.testing.assert_close(state.blocker_overlap,
                                    torch.tensor([0., .005], dtype=batch.center.dtype))
         torch.testing.assert_close(state.clearance_quality,
-                                   torch.tensor([1., math.exp(-.5)], dtype=batch.center.dtype))
+                                   torch.tensor([1., math.exp(-state.cfg.clearance_decay * .5)], dtype=batch.center.dtype))
         torch.testing.assert_close(state.success, torch.tensor([True, False]))
 
     def test_object_motion_includes_target_and_unobserved_distractor_but_excludes_blocker(self):
@@ -2780,10 +2830,10 @@ class NativeAdapterTests(unittest.TestCase):
         native = native_velocity_termination()
         for enabled in (True, False):
             env, _, _ = native_fixture(3)
-            names = env.cfg.actions.arm_action.joint_names + env.cfg.actions.hand_action.joint_names
+            names = env.cfg.actions.arm_action.joint_names
             # env.cfg is deliberately unresolved; only the native manager owns usable IDs.
             unresolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=dataclasses.MISSING)
-            resolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=list(range(12)))
+            resolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=list(range(6)))
             term = SimpleNamespace(func=native, time_out=False,
                                    params={'max_velocity': 3.0, 'asset_cfg': resolved})
             env.cfg.terminations = SimpleNamespace(
@@ -2800,7 +2850,7 @@ class NativeAdapterTests(unittest.TestCase):
             for step in range(1, success_steps(env.cfg.mdp, env.step_dt) + 1):
                 env.common_step_counter = step
                 state = task.get_task_state(env)
-            expected_failure = torch.tensor([enabled, enabled, False])
+            expected_failure = torch.tensor([enabled, False, False])
             torch.testing.assert_close(state.failure, expected_failure)
             torch.testing.assert_close(state.success, ~expected_failure)
             torch.testing.assert_close(state.terminal_reward,
@@ -2855,10 +2905,10 @@ class NativeAdapterTests(unittest.TestCase):
         names = list(cfg)
         env = self.failure_fixture(termination_cfg=cfg)
         # Simulate native SceneEntityCfg resolution, skipped by the base-manager stub.
-        velocity_cfg.params['asset_cfg'].joint_names = (
-            env.cfg.actions.arm_action.joint_names + env.cfg.actions.hand_action.joint_names)
-        velocity_cfg.params['asset_cfg'].joint_ids = list(range(12))
-        env.scene['robot'].data.joint_vel[4, 11] = -3.01
+        velocity_cfg.params['asset_cfg'].joint_names = env.cfg.actions.arm_action.joint_names
+        velocity_cfg.params['asset_cfg'].joint_ids = list(range(6))
+        env.scene['robot'].data.joint_vel[4, 5] = -3.01
+        env.scene['robot'].data.joint_vel[7, 11] = 30.
         env.episode_length_buf = torch.zeros(env.num_envs, dtype=torch.long)
         env.max_episode_length = 400
         manager = namespace['TerminationManager'](cfg, env)
@@ -6613,6 +6663,302 @@ class SensorRuntimeTests(unittest.TestCase):
                 self.sensors.InitialVisionCfg(**kwargs)
 
 
+class SensorMonitorVisualizationTests(unittest.TestCase):
+    """Read-only viewport math; no Kit, physics stepping or GPU allocation."""
+
+    @classmethod
+    def setUpClass(cls):
+        SensorRuntimeTests.setUpClass.__func__(cls)
+
+    def fixture(self):
+        class Env:
+            pass
+        class Reader:
+            def __call__(self):
+                raise AssertionError('Viewport refreshed the physical sensor reader')
+        env = Env()
+        env.num_envs, env.device = 2, 'cpu'
+        env.cfg = SimpleNamespace(sensor_monitor_debug_vis=False,
+                                  mdp=SimpleNamespace(tactile_threshold=.01),
+                                  viewer=SimpleNamespace(env_index=0))
+        positions = torch.arange(2 * 18 * 3, dtype=torch.float32).reshape(2, 18, 3) / 100
+        rotations = identity(2, 18).float()
+        robot = SimpleNamespace(data=SimpleNamespace(body_link_pos_w=positions, body_link_quat_w=rotations))
+        reader = Reader()
+        reader.body_index = 17
+        reader.batch = task.SensorBatch(torch.zeros(2, 6), torch.ones(2, dtype=torch.bool),
+            torch.zeros(2, 17, 3), torch.ones(2, 17, dtype=torch.bool))
+        env.task_sensor_reader = reader
+        env._contact_mdp = SimpleNamespace(previous_wrench=torch.tensor([
+            [10., 0., 0., 0., 1., 0.], [0., 20., 0., 0., 0., 2.]]),
+            elapsed_time=torch.tensor([.1, .2]))
+        # Canonical sensor channel order deliberately differs from native body order.
+        indices, offsets = torch.arange(16, -1, -1), torch.zeros(17, 3)
+        offsets[:, 2] = .002
+        env._tactile_reward_geometry = robot, indices, offsets
+        env.scene = {'robot': robot}
+        return env, self.sensors.SensorMonitor(env), reader, robot
+
+    def test_binary_snapshot_preserves_channel_order_and_marks_nonfinite_samples_invalid(self):
+        force = torch.zeros(17, 3)
+        force[0, 0], force[5, 1], force[12, 2] = .02, .005, .03
+        force[8, 0] = float('nan')
+        valid = torch.ones(17, dtype=torch.bool)
+        valid[12] = False
+        wrench = torch.tensor([1., -2., 3., .1, -.2, .3])
+        saved = (force.clone(), valid.clone(), wrench.clone())
+        contact, clean_valid, measured, wrench_valid = self.sensors.sensor_monitor_snapshot(
+            force, valid, wrench, torch.tensor(True), .01)
+        self.assertEqual(contact.nonzero().flatten().tolist(), [0])
+        self.assertEqual((~clean_valid).nonzero().flatten().tolist(), [8, 12])
+        torch.testing.assert_close(measured, wrench)
+        self.assertTrue(wrench_valid)
+        torch.testing.assert_close(force, saved[0], equal_nan=True)
+        torch.testing.assert_close(valid, saved[1])
+        torch.testing.assert_close(wrench, saved[2])
+
+    def test_invalid_wrench_is_never_turned_into_a_plausible_zero_measurement(self):
+        force, valid = torch.zeros(17, 3), torch.ones(17, dtype=torch.bool)
+        for wrench, ready in ((torch.tensor([1., 2., float('inf'), .1, .2, .3]), True),
+                              (torch.ones(6), False)):
+            with self.subTest(ready=ready):
+                _, _, measured, wrench_valid = self.sensors.sensor_monitor_snapshot(
+                    force, valid, wrench, torch.tensor(ready), .01)
+                self.assertFalse(wrench_valid)
+                self.assertTrue(torch.isfinite(measured).all())
+
+    def test_wrench_gizmo_rotates_sensor_axes_force_and_torque_into_world_together(self):
+        origin = torch.tensor([.3, -.2, 1.1])
+        wrench = torch.tensor([100., -50., 90., 2., -3., 4.])
+        base, colors, widths = self.sensors.sensor_monitor_wrench_lines(
+            torch.zeros(3), torch.tensor([1., 0., 0., 0.]), wrench)
+        for axis in (0, 1, 2):
+            quaternion = torch.zeros(4)
+            quaternion[0], quaternion[axis + 1] = math.sqrt(.5), math.sqrt(.5)
+            actual, rotated_colors, rotated_widths = self.sensors.sensor_monitor_wrench_lines(
+                origin, quaternion, wrench)
+            expected = base @ rotation_matrix(quaternion).mT + origin
+            torch.testing.assert_close(actual, expected, atol=2.e-6, rtol=1.e-5)
+            self.assertEqual(colors, rotated_colors)
+            self.assertEqual(widths, rotated_widths)
+        self.assertEqual(base.shape[-2:], (2, 3))
+        self.assertEqual(base.shape[0], len(colors))
+        self.assertEqual(base.shape[0], len(widths))
+        self.assertGreater(base.shape[0], 6)  # Force arrow plus torque arc and axes.
+        self.assertTrue(torch.isfinite(base).all())
+
+    def test_zero_wrench_has_finite_geometry_and_force_arrow_uses_sensor_direction(self):
+        origin = torch.tensor([.3, -.2, 1.1])
+        quaternion = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        zero, _, _ = self.sensors.sensor_monitor_wrench_lines(origin, quaternion, torch.zeros(6))
+        self.assertTrue(torch.isfinite(zero).all())
+        wrench = torch.tensor([200., 0., 0., 0., 0., 0.])
+        lines, _, _ = self.sensors.sensor_monitor_wrench_lines(origin, quaternion, wrench)
+        # The first three lines are the sensor axes, followed by the force shaft.
+        torch.testing.assert_close(lines[3, 0], origin)
+        direction = lines[3, 1] - lines[3, 0]
+        self.assertGreater(float(direction[1]), 0.)
+        torch.testing.assert_close(direction[[0, 2]], torch.zeros(2), atol=2.e-6, rtol=0.)
+
+    def test_disabled_monitor_returns_before_touching_sensors_geometry_or_ui(self):
+        env, monitor, _, _ = self.fixture()
+        del env.task_sensor_reader, env._contact_mdp, env._tactile_reward_geometry, env.scene
+        with patch.object(monitor, '_update_ui', side_effect=AssertionError('Disabled monitor touched UI')), \
+             patch.object(self.sensors, 'sensor_monitor_snapshot',
+                          side_effect=AssertionError('Disabled monitor sampled sensors')):
+            self.assertIsNone(monitor.render_geometry())
+        self.assertIsNone(monitor._vis_frame)
+        self.assertFalse(monitor._ui_ready)
+
+    def test_selected_environment_draws_17_canonical_pad_surfaces_without_mutating_physics(self):
+        env, monitor, reader, robot = self.fixture()
+        reader.batch.tactile_force[1, 3, 0] = .02
+        reader.batch.tactile_valid[1, 8] = False
+        reader.batch.tactile_force[1, 12, 0] = float('nan')
+        robot.data.body_link_quat_w[1, 16] = torch.tensor([math.sqrt(.5), 0., math.sqrt(.5), 0.])
+        tensors = (robot.data.body_link_pos_w, robot.data.body_link_quat_w,
+                   reader.batch.tactile_force, reader.batch.tactile_valid,
+                   reader.batch.wrench_valid, env._contact_mdp.previous_wrench)
+        before = [value.clone() for value in tensors]
+        monitor.set_env_selection(1)
+        monitor.set_debug_vis(True)
+        lines, colors, widths, points, point_colors, sizes = monitor.render_geometry()
+        expected = robot.data.body_link_pos_w[1, torch.arange(16, -1, -1)].clone()
+        expected[:, 2] += .002
+        expected[0] = robot.data.body_link_pos_w[1, 16] + torch.tensor([.002, 0., 0.])
+        torch.testing.assert_close(points, expected)
+        self.assertEqual(points.shape, (17, 3))
+        self.assertEqual(len(point_colors), 17)
+        self.assertEqual(len(sizes), 17)
+        self.assertGreater(point_colors[3][1], point_colors[3][0])  # Contact: green.
+        self.assertEqual(point_colors[0][0], point_colors[0][1])  # No contact: gray.
+        for index in (8, 12):  # Missing and nonfinite contact samples: amber.
+            self.assertGreater(point_colors[index][0], point_colors[index][1])
+            self.assertGreater(point_colors[index][1], point_colors[index][2])
+        torch.testing.assert_close(lines[:3, 0], robot.data.body_link_pos_w[1, 17].expand(3, -1))
+        self.assertEqual(len(colors), len(widths))
+        for value, saved in zip(tensors, before):
+            torch.testing.assert_close(value, saved, equal_nan=True)
+        monitor.set_env_selection(0)
+        first_points = monitor.render_geometry()[3]
+        self.assertFalse(torch.equal(points, first_points))
+        monitor.set_debug_vis(False)
+        self.assertIsNone(monitor.render_geometry())
+
+    def test_selection_and_close_clear_only_local_history_and_release_ui_references(self):
+        from unittest.mock import Mock
+        env, monitor, _, _ = self.fixture()
+        plot, frame = Mock(), SimpleNamespace(visible=True)
+        monitor._plots, monitor._vis_frame = [plot], frame
+        monitor.set_env_selection(999)
+        self.assertEqual(monitor.env_index, 1)
+        plot.clear.assert_called_once()
+        monitor.set_env_selection(-5)
+        self.assertEqual(monitor.env_index, 0)
+        self.assertEqual(plot.clear.call_count, 2)
+        monitor.close()
+        self.assertFalse(frame.visible)
+        self.assertFalse(monitor.debug_vis)
+        self.assertIsNone(monitor._vis_frame)
+        self.assertFalse(monitor._plots)
+        plot.cleanup.assert_called_once()
+
+    def test_invalid_body_poses_never_send_nonfinite_vertices_to_debug_draw(self):
+        env, monitor, reader, robot = self.fixture()
+        robot.data.body_link_pos_w[0, 16, 0] = float('nan')  # Canonical pad zero.
+        robot.data.body_link_quat_w[0, 15] = 0.  # Canonical pad one.
+        robot.data.body_link_pos_w[0, 17, 2] = float('inf')
+        reader.batch.tactile_force[0, :2, 0] = .2
+        monitor.set_debug_vis(True)
+        lines, colors, widths, points, point_colors, sizes = monitor.render_geometry()
+        self.assertEqual(lines.shape, (0, 2, 3))
+        self.assertEqual(colors, [])
+        self.assertEqual(widths, [])
+        self.assertTrue(torch.isfinite(points).all())
+        self.assertEqual(sizes[:2], [0., 0.])
+        self.assertEqual(point_colors[0], point_colors[1])
+        self.assertGreater(point_colors[0][0], point_colors[0][1])
+
+    def test_panel_uses_signed_centered_axis_bars_and_distinguishes_missing_from_clear(self):
+        from unittest.mock import Mock
+        env, monitor, _, _ = self.fixture()
+        monitor._vis_frame, monitor._ui_ready = object(), True
+        monitor._status = SimpleNamespace(text='')
+        monitor._pads = [SimpleNamespace(text=f'{index} --', style={}) for index in range(17)]
+        monitor._pad_backgrounds = [SimpleNamespace(style={}) for _ in range(17)]
+        monitor._bars = [tuple(SimpleNamespace(width=None, text='') for _ in range(5))
+                         for _ in range(6)]
+        monitor._plots = [Mock(), Mock()]
+        contact, valid = [0.] * 17, [1.] * 17
+        contact[3], valid[8] = 1., 0.
+        wrench = [100., -100., 180., 4., -4., 0.]
+        values = contact + valid + wrench + [1., 1.] + [1.] * 17 + [0., .5]
+        omni, ui = types.ModuleType('omni'), types.ModuleType('omni.ui')
+        ui.Percent = lambda value: value
+        omni.ui = ui
+        with patch.dict(sys.modules, {'omni': omni, 'omni.ui': ui}), \
+             patch('time.monotonic', return_value=1.):
+            monitor._update_ui(values)
+        self.assertIn('1/17', monitor._status.text)
+        self.assertIn('valid', monitor._status.text)
+        self.assertIn('CONTACT', monitor._pads[3].text)
+        self.assertIn('clear', monitor._pads[5].text)
+        self.assertIn('--', monitor._pads[8].text)
+        self.assertNotEqual(monitor._pad_backgrounds[3].style, monitor._pad_backgrounds[5].style)
+        self.assertNotEqual(monitor._pad_backgrounds[8].style, monitor._pad_backgrounds[5].style)
+        self.assertTrue(all('background_color' not in tile.style for tile in monitor._pads))
+        for bar, expected in zip(monitor._bars, ((0., 50.), (50., 0.), (0., 50.),
+                                                (0., 50.), (50., 0.), (0., 0.))):
+            negative_space, negative, positive, positive_space, _ = bar
+            self.assertEqual((negative.width, positive.width), expected)
+            self.assertEqual(negative_space.width + negative.width, 100.)
+            self.assertEqual(positive_space.width + positive.width, 100.)
+        monitor._plots[0].add_datapoint.assert_called_once_with(wrench[:3])
+        monitor._plots[1].add_datapoint.assert_called_once_with(wrench[3:])
+        values[40] = 0.
+        with patch.dict(sys.modules, {'omni': omni, 'omni.ui': ui}), \
+             patch('time.monotonic', return_value=2.):
+            monitor._update_ui(values)
+        self.assertIn('unavailable', monitor._status.text)
+        for negative_space, negative, positive, positive_space, label in monitor._bars:
+            self.assertEqual((negative.width, positive.width), (0., 0.))
+            self.assertEqual(label.text, '--')
+        self.assertEqual(monitor._plots[0].add_datapoint.call_count, 1)
+        self.assertEqual(monitor._plots[1].add_datapoint.call_count, 1)
+        # A reset can occur between GUI frames at exactly the same elapsed time.
+        # The episode counter must break the history even without a time decrease.
+        values[40], values[-2] = 1., 1.
+        with patch.dict(sys.modules, {'omni': omni, 'omni.ui': ui}), \
+             patch('time.monotonic', return_value=3.):
+            monitor._update_ui(values)
+        for plot in monitor._plots:
+            plot.clear.assert_called_once()
+            self.assertEqual(plot.add_datapoint.call_count, 2)
+
+    def test_native_panel_builds_17_colored_rectangles_behind_labels_and_two_axis_plots(self):
+        from unittest.mock import Mock
+        env, monitor, _, _ = self.fixture()
+        stack, widgets, plots = [], [], []
+
+        class Widget:
+            def __init__(self, kind, *args, **kwargs):
+                self.kind, self.args, self.kwargs = kind, args, kwargs
+                self.text = args[0] if kind == 'Label' and args else ''
+                self.style = kwargs.get('style', {})
+                self.parent = stack[-1] if stack else None
+                widgets.append(self)
+
+            def __enter__(self):
+                stack.append(self)
+                return self
+
+            def __exit__(self, *_):
+                self.assert_context = stack.pop() is self
+
+        class Plot:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self._autoscale_model = Mock()
+                plots.append(self)
+
+        omni, ui = types.ModuleType('omni'), types.ModuleType('omni.ui')
+        for kind in ('VStack', 'HStack', 'ZStack', 'Label', 'Rectangle', 'Spacer'):
+            setattr(ui, kind, lambda *args, _kind=kind, **kwargs: Widget(_kind, *args, **kwargs))
+        ui.Percent = lambda value: value
+        ui.Alignment = SimpleNamespace(CENTER=0, RIGHT_CENTER=1)
+        omni.ui = ui
+        lab_ui, lab_widgets = types.ModuleType('isaaclab.ui'), types.ModuleType('isaaclab.ui.widgets')
+        lab_widgets.LiveLinePlot = Plot
+        lab_ui.widgets = lab_widgets
+        monitor.debug_vis = True
+        with patch.dict(sys.modules, {'omni': omni, 'omni.ui': ui,
+                                     'isaaclab.ui': lab_ui, 'isaaclab.ui.widgets': lab_widgets}):
+            monitor._build_ui()
+        self.assertTrue(monitor._ui_ready)
+        self.assertFalse(stack)
+        self.assertEqual(len(monitor._pads), 17)
+        self.assertEqual(len(monitor._pad_backgrounds), 17)
+        self.assertEqual(len({id(background) for background in monitor._pad_backgrounds}), 17)
+        for index, (label, background) in enumerate(zip(monitor._pads, monitor._pad_backgrounds)):
+            self.assertEqual(label.kind, 'Label')
+            self.assertEqual(background.kind, 'Rectangle')
+            self.assertIs(label.parent, background.parent)
+            self.assertEqual(label.parent.kind, 'ZStack')
+            self.assertEqual(label.parent.kwargs['height'], 25 if index == 0 else 21)
+            self.assertIn('background_color', background.style)
+            self.assertNotIn('background_color', label.style)
+        self.assertEqual(monitor._pads[0].text, 'Palm  --')
+        self.assertEqual(len(monitor._bars), 6)
+        self.assertEqual(len(plots), 2)
+        self.assertEqual([plot.kwargs['legends'] for plot in plots],
+                         [['Fx', 'Fy', 'Fz'], ['Tx', 'Ty', 'Tz']])
+        self.assertEqual([(plot.kwargs['y_min'], plot.kwargs['y_max']) for plot in plots],
+                         [(-20., 20.), (-1., 1.)])
+        for plot in plots:
+            plot._autoscale_model.set_value.assert_called_once_with(False)
+            self.assertEqual(plot.kwargs['max_datapoints'], 199)
+
+
 class BatchedRobotKinematicsTests(unittest.TestCase):
     def test_parallel_obb_axes_do_not_falsely_accept_overlapping_boxes(self):
         # A rounded rotation can produce spurious cross-axis residuals in
@@ -8834,6 +9180,10 @@ class CertifiedSceneDomainTests(unittest.TestCase):
 
 
 class ObservationObbVisualizationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        SensorRuntimeTests.setUpClass.__func__(cls)
+
     @contextmanager
     def fixture(self):
         from unittest.mock import Mock
@@ -8846,6 +9196,8 @@ class ObservationObbVisualizationTests(unittest.TestCase):
                 self.callbacks = {}
                 self.add_count = 0
             def has_gui(self):
+                return True
+            def is_playing(self):
                 return True
             def render_callback_exists(self, name):
                 return name in self.callbacks
@@ -8870,6 +9222,8 @@ class ObservationObbVisualizationTests(unittest.TestCase):
             'isaacsim.util', 'isaacsim.util.debug_draw')}
         modules['isaacsim.core.utils.extensions'].enable_extension = enable
         modules['isaacsim.util.debug_draw']._debug_draw = SimpleNamespace(acquire_debug_draw_interface=acquire)
+        # Use the production pure tensor/controller section without importing Kit.
+        modules['contact_manipulation.mdp.sensors'] = self.sensors
         with patch.dict(sys.modules, modules):
             task.initialize_role_obb_visualization(env)
             try:
@@ -8953,6 +9307,64 @@ class ObservationObbVisualizationTests(unittest.TestCase):
             task.initialize_role_obb_visualization(env)
         self.assertFalse(hasattr(env, '_role_obb_visualizer'))
         self.assertFalse(hasattr(env, '_observation_obb_visualizer'))
+        self.assertFalse(hasattr(env, '_sensor_monitor'))
+
+    def test_sensor_monitor_toggle_shares_draw_callback_without_erasing_remaining_obbs(self):
+        with self.fixture() as (env, draw, acquire, _):
+            owner, monitor = env._role_obb_visualizer, env._sensor_monitor
+            robot = env.scene['robot']
+            env.task_sensor_reader = SimpleNamespace(batch=env.sensors, body_index=2)
+            env._contact_mdp.previous_wrench = env.sensors.ideal_wrench.clone()
+            env._tactile_reward_geometry = (robot, torch.full((17,), 3, dtype=torch.long),
+                                             torch.zeros(17, 3))
+            monitor.set_debug_vis(True)
+            self.assertEqual(len(draw.draw_points.call_args.args[0]), 17)
+            self.assertEqual(len(env.sim.callbacks), 1)
+            sensor_lines = len(draw.draw_lines.call_args.args[0])
+            self.assertGreater(sensor_lines, 6)
+            owner.set_debug_vis(True)
+            env._observation_obb_visualizer.set_debug_vis(True)
+            self.assertEqual(len(draw.draw_lines.call_args.args[0]), sensor_lines + (6 + 4) * 12)
+            self.assertEqual(env.sim.add_count, 1)
+            acquire.assert_called_once()
+            monitor.set_debug_vis(False)
+            self.assertEqual(len(draw.draw_lines.call_args.args[0]), (6 + 4) * 12)
+            self.assertEqual(len(env.sim.callbacks), 1)
+            self.assertTrue(owner.debug_vis)
+            env._observation_obb_visualizer.set_debug_vis(False)
+            self.assertEqual(len(draw.draw_lines.call_args.args[0]), 4 * 12)
+            owner.set_debug_vis(False)
+            self.assertFalse(env.sim.callbacks)
+            draw.clear_points.assert_called()
+
+    def test_visualizer_close_stops_sensor_rendering_and_releases_the_single_callback(self):
+        with self.fixture() as (env, draw, _, _):
+            owner, monitor = env._role_obb_visualizer, env._sensor_monitor
+            owner.set_debug_vis(True)
+            monitor.debug_vis = True
+            owner.close()
+            self.assertFalse(owner.debug_vis)
+            self.assertFalse(monitor.debug_vis)
+            self.assertFalse(env.sim.callbacks)
+            draw.clear_lines.assert_called()
+            draw.clear_points.assert_called()
+
+    def test_stopped_timeline_returns_before_scene_sensor_or_physics_access(self):
+        from unittest.mock import Mock
+
+        class StoppedEnvironment:
+            sim = SimpleNamespace(is_playing=lambda: False)
+            _is_closed = False
+
+            def __getattr__(self, name):
+                raise AssertionError(f'Stopped viewport tried to access environment field {name}')
+
+        owner = task.RoleObbVisualizer.__new__(task.RoleObbVisualizer)
+        env = StoppedEnvironment()
+        owner._env, owner._draw = env, Mock()
+        owner.debug_vis = owner.observation_debug_vis = True
+        owner.update()
+        self.assertFalse(owner._draw.mock_calls)
 
 
 class ObservationCapacityTests(unittest.TestCase):
@@ -9383,6 +9795,52 @@ class ClutterGpuSeedTests(unittest.TestCase):
                 task._clutter_gpu_seed((), (), (), (-.1, .1, -.1, .1), .003, device='cpu')
             with self.assertRaises(ValueError):
                 task._clutter_gpu_seed(((self.square(.02),),), (), (), (-.1, .1, -.1, .1), .003, device='cuda')
+
+    def test_fft_kernel_lifetimes_preserve_packing_and_reuse_without_cuda(self):
+        # Exercise the actual FP64 FFT math on CPU; production remains CUDA-only.
+        # Weak references track spectra, not allocator-reserved memory.
+        import weakref
+
+        def cpu_allocation(original):
+            def allocate(*args, **kwargs):
+                kwargs['device'] = 'cpu'
+                return original(*args, **kwargs)
+            return allocate
+
+        unique = []
+        for index in range(22):
+            angle = index * .037
+            rotation = np.array([[math.cos(angle), -math.sin(angle)],
+                                 [math.sin(angle), math.cos(angle)]])
+            polygon = self.square(.012 + index * .00015, .009 + index * .0001) @ rotation.T
+            unique.append((polygon, polygon @ np.array([[0., 1.], [-1., 0.]])))
+        shared = (self.square(.02), self.square(.02, .01))
+        original_fft = torch.fft.rfft2
+        allocators = {name: cpu_allocation(getattr(torch, name)) for name in ('as_tensor', 'zeros', 'arange')}
+        for polygons, expected_unique in ((tuple(unique), 44), ((shared,) * 8, 2)):
+            spectra, peak, calls = [], 0, 0
+
+            def tracked_fft(*args, **kwargs):
+                nonlocal peak, calls
+                result = original_fft(*args, **kwargs)
+                spectra[:] = [reference for reference in spectra if reference() is not None]
+                spectra.append(weakref.ref(result))
+                peak, calls = max(peak, len(spectra)), calls + 1
+                return result
+
+            with patch.multiple(torch, **allocators), patch.object(torch.fft, 'rfft2', tracked_fft):
+                centers, variants, provenance = task._clutter_gpu_seed(
+                    polygons, polygons, (), (-.2, .2, -.3, .3), .003, device='cuda', resolution=.0025)
+            self.assertEqual(provenance['maximum_greedy_prefix'], len(polygons))
+            self.assertEqual(provenance['unique_shape_kernels'], expected_unique)
+            self.assertLessEqual(provenance['peak_cached_shape_kernels'], 2)
+            self.assertLessEqual(peak, 6)  # Wall, scene and two cached spectrum pairs.
+            self.assertFalse(any(reference() is not None for reference in spectra))
+            self.assertEqual(calls, 1 + len(polygons) + 2 * expected_unique)
+            world = [polygons[index][int(which)] + centers[index] for index, which in enumerate(variants)]
+            for index, actual in enumerate(world):
+                for other in world[:index]:
+                    self.assertGreaterEqual(task.polygon_distance(actual, other), .003 - 1.e-9)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required for GPU free-domain seed')
     def test_first_failed_body_ends_balanced_prefix_without_skipping_types(self):

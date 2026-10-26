@@ -220,6 +220,286 @@ class SensorReader:
         return b
 
 
+def sensor_monitor_snapshot(tactile_force, tactile_valid, wrench, wrench_valid, threshold):
+    """Sanitize one selected environment without advancing any sensor/history."""
+    tactile_valid = tactile_valid & torch.isfinite(tactile_force).all(-1)
+    contact = tactile_valid & (torch.linalg.vector_norm(tactile_force, dim=-1) > threshold)
+    wrench_valid = wrench_valid & torch.isfinite(wrench).all(-1)
+    return contact, tactile_valid, torch.where(wrench_valid, wrench, 0.), wrench_valid
+
+
+def sensor_monitor_wrench_lines(position, orientation, wrench):
+    """Sensor-frame RGB axes, cyan force and right-handed orange torque arc.
+
+    This is viewport geometry only: force uses 1 cm/N, capped at 25 cm. Torque
+    uses a 6 cm radius and 1 N m produces a 288 degree arc. Constructing the
+    whole glyph in sensor coordinates makes it covariant with sensor rotation.
+    The fixed 32 segments need no device scalar reads or conditional launches.
+    """
+    axes = torch.eye(3, device=wrench.device, dtype=wrench.dtype)
+
+    def arrow_head(tip, direction, length):
+        reference = torch.where(direction[2].abs() < .9, axes[2], axes[0])
+        side = torch.linalg.cross(direction, reference)
+        side = side / torch.linalg.vector_norm(side).clamp_min(1.e-8)
+        tails = tip - length * direction + torch.stack((side, -side)) * length * .45
+        return torch.stack((tip.expand(2, -1), tails), dim=1)
+
+    force_norm = torch.linalg.vector_norm(wrench[:3])
+    force_direction = wrench[:3] / force_norm.clamp_min(1.e-8)
+    force_length = (force_norm * .01).clamp_max(.25)
+    force_tip = force_direction * force_length
+    force = torch.cat((torch.stack((torch.zeros_like(force_tip), force_tip))[None],
+                       arrow_head(force_tip, force_direction, (force_length * .25).clamp_max(.02))))
+    torque_norm = torch.linalg.vector_norm(wrench[3:])
+    normal = wrench[3:] / torque_norm.clamp_min(1.e-8)
+    reference = torch.where(normal[2].abs() < .9, axes[2], axes[0])
+    tangent_x = torch.linalg.cross(normal, reference)
+    tangent_x = tangent_x / torch.linalg.vector_norm(tangent_x).clamp_min(1.e-8)
+    tangent_y = torch.linalg.cross(normal, tangent_x)
+    angle = torque_norm.clamp_max(1.) * (1.6 * math.pi)
+    phase = torch.linspace(0., 1., 25, device=wrench.device, dtype=wrench.dtype) * angle
+    arc = .06 * (phase.cos()[:, None] * tangent_x + phase.sin()[:, None] * tangent_y)
+    torque_lines = torch.stack((arc[:-1], arc[1:]), dim=1)
+    tangent = -phase[-1].sin() * tangent_x + phase[-1].cos() * tangent_y
+    torque_lines = torch.cat((torque_lines, arrow_head(arc[-1], tangent, (.06 * angle * .2).clamp_max(.018))))
+    axis_lines = torch.stack((torch.zeros_like(axes), .045 * axes), dim=1)
+    local = torch.cat((axis_lines, force, torque_lines))
+    lines = position + quat_apply(orientation.expand(local.shape[0], 2, -1), local)
+    colors = [(1., .2, .2, 1.), (.2, 1., .2, 1.), (.2, .45, 1., 1.)]
+    colors += [(0., 1., 1., 1.)] * 3 + [(1., .55, .05, 1.)] * 26
+    return lines, colors, [2.] * 3 + [3.] * 29
+
+
+class SensorMonitor:
+    """Optional selected-environment GUI using only already sampled task data.
+
+    The environment's OBB visualizer owns the single render callback and DebugDraw
+    interface. This object creates no USD prims, sensor views or subscriptions and
+    never calls SensorReader/get_task_state. Disabled/headless training pays no
+    sampling, host transfer, geometry or UI work.
+    """
+
+    has_debug_vis_implementation = True
+
+    def __init__(self, env):
+        import weakref
+
+        self._env = weakref.proxy(env)
+        self.cfg = env.cfg
+        self.debug_vis = bool(getattr(env.cfg, "sensor_monitor_debug_vis", False))
+        self.env_index = int(getattr(getattr(env.cfg, "viewer", None), "env_index", 0))
+        self._vis_frame = None
+        self._ui_ready = False
+        self._last_ui_time = 0.
+        self._last_elapsed = None
+        self._last_reset_count = None
+        self._plots = []
+        self._pads = []
+        self._pad_backgrounds = []
+        self._bars = []
+        self._status = None
+
+    def set_debug_vis(self, debug_vis):
+        self.debug_vis = self.cfg.sensor_monitor_debug_vis = bool(debug_vis)
+        if self._vis_frame is not None:
+            self._vis_frame.visible = self.debug_vis
+            if self.debug_vis and not self._ui_ready:
+                self._vis_frame.rebuild()
+        self._clear_history()
+        owner = getattr(self._env, "_role_obb_visualizer", None)
+        if owner is not None:
+            owner._refresh_debug_vis()
+        return True
+
+    def set_env_selection(self, env_index):
+        self.env_index = max(0, min(int(env_index), self._env.num_envs - 1))
+        self._clear_history()
+        return True
+
+    def set_vis_frame(self, frame):
+        self._vis_frame = frame
+        frame.visible = self.debug_vis
+        frame.set_build_fn(self._build_ui)
+        if self.debug_vis:
+            frame.rebuild()
+        return True
+
+    def _clear_history(self):
+        self._last_elapsed = None
+        self._last_reset_count = None
+        self._last_ui_time = 0.
+        for plot in self._plots:
+            plot.clear()
+
+    def _build_ui(self):
+        if not self.debug_vis:
+            return
+        import omni.ui as ui
+        from isaaclab.ui.widgets import LiveLinePlot
+
+        self._pads, self._pad_backgrounds = [None] * 17, [None] * 17
+        self._bars, self._plots = [], []
+        axis_colors = (0xff5555ff, 0xff55dd55, 0xffff9955)
+        with ui.VStack(spacing=4, height=0):
+            self._status = ui.Label("Waiting for the first completed sensor sample", height=22, word_wrap=True)
+            ui.Label("TACTILE | green: contact  gray: clear  amber: unavailable", height=20,
+                     style={"font_size": 12})
+            with ui.HStack(spacing=3, height=116):
+                for name, indices in (("Thumb", range(1, 5)), ("Index", range(5, 8)),
+                                      ("Middle", range(8, 11)), ("Ring", range(11, 14)),
+                                      ("Little", range(14, 17))):
+                    with ui.VStack(spacing=2):
+                        ui.Label(name, height=18, alignment=ui.Alignment.CENTER)
+                        for pad, index in enumerate(indices, 1):
+                            with ui.ZStack(height=21):
+                                self._pad_backgrounds[index] = ui.Rectangle(
+                                    style={"background_color": 0xff333333})
+                                self._pads[index] = ui.Label(f"{pad}  --", alignment=ui.Alignment.CENTER,
+                                                           style={"color": 0xffdddddd})
+            with ui.ZStack(height=25):
+                self._pad_backgrounds[0] = ui.Rectangle(style={"background_color": 0xff333333})
+                self._pads[0] = ui.Label("Palm  --", alignment=ui.Alignment.CENTER,
+                                         style={"color": 0xffdddddd})
+            ui.Label("Contact is any-object binary; threshold matches the observation.",
+                     height=22, word_wrap=True, style={"font_size": 11, "color": 0xffbbbbbb})
+            for title, unit, limit, names in (("FORCE", "N", 20., ("Fx", "Fy", "Fz")),
+                                             ("TORQUE", "N m", 1., ("Tx", "Ty", "Tz"))):
+                ui.Label(f"{title} [{unit}] | sensor axes | zero at center", height=22)
+                for axis, color in zip(names, axis_colors):
+                    with ui.HStack(height=20, spacing=4):
+                        ui.Label(axis, width=24, style={"color": color})
+                        with ui.ZStack():
+                            ui.Rectangle(style={"background_color": 0xff303030})
+                            with ui.HStack(spacing=0):
+                                with ui.HStack(width=ui.Percent(50), spacing=0):
+                                    negative_space = ui.Spacer(width=ui.Percent(100))
+                                    negative = ui.Rectangle(width=ui.Percent(0),
+                                        style={"background_color": color})
+                                with ui.HStack(width=ui.Percent(50), spacing=0):
+                                    positive = ui.Rectangle(width=ui.Percent(0),
+                                        style={"background_color": color})
+                                    positive_space = ui.Spacer(width=ui.Percent(100))
+                            with ui.HStack(spacing=0):
+                                ui.Spacer(width=ui.Percent(50))
+                                ui.Rectangle(width=1, style={"background_color": 0xffeeeeee})
+                                ui.Spacer()
+                        value = ui.Label("--", width=92, alignment=ui.Alignment.RIGHT_CENTER)
+                        self._bars.append((negative_space, negative, positive, positive_space, value))
+                plot = LiveLinePlot(y_data=[[], [], []], y_min=-limit, y_max=limit,
+                                    legends=list(names), plot_height=105, max_datapoints=199)
+                # Native LiveLinePlot's autoscale model is the same UI checkbox
+                # users control. Begin zoomed in to ordinary hand loads; users
+                # can enable native Autoscale. Bars retain the full SI limits.
+                plot._autoscale_model.set_value(False)
+                self._plots.append(plot)
+            ui.Label("SI-200-8 measured reaction; includes hand gravity and inertia.\n"
+                     "Viewport: RGB sensor axes, cyan force (1 cm/N; 25 cm cap), "
+                     "orange right-hand torque (6 cm radius; 1 N m = 288 deg, capped).",
+                     height=62, word_wrap=True, style={"font_size": 11, "color": 0xffbbbbbb})
+        self._ui_ready = True
+
+    def _update_ui(self, values):
+        if self._vis_frame is None or not self._ui_ready:
+            return
+        import time
+        import omni.ui as ui
+        from .observations import SI_200_8_RANGES
+
+        elapsed = values[-1]
+        reset_count = values[-2]
+        if ((self._last_elapsed is not None and elapsed < self._last_elapsed)
+                or (self._last_reset_count is not None and reset_count != self._last_reset_count)):
+            self._clear_history()
+        self._last_elapsed = elapsed
+        self._last_reset_count = reset_count
+        now = time.monotonic()
+        if now - self._last_ui_time < .05:
+            return
+        self._last_ui_time = now
+        contact, valid, wrench, ft_valid = values[:17], values[17:34], values[34:40], bool(values[40])
+        self._status.text = (f"env_{self.env_index} (GUI {self.env_index + 1}) | {sum(contact):.0f}/17 pads touching | "
+                             f"F/T {'valid' if ft_valid else 'unavailable'}")
+        for index, tile in enumerate(self._pads):
+            color = 0xff40aa40 if contact[index] else 0xff444444
+            label = "CONTACT" if contact[index] else "clear"
+            if not valid[index]:
+                color, label = 0xff2080c0, "--"
+            name = "Palm" if index == 0 else tile.text.split()[0]
+            tile.text = f"{name} {label}"
+            self._pad_backgrounds[index].style = {"background_color": color}
+            tile.style = {"color": 0xffffffff, "font_size": 11}
+        for value, limit, bar in zip(wrench, SI_200_8_RANGES, self._bars):
+            negative_space, negative, positive, positive_space, label = bar
+            percentage = max(-100., min(100., value / limit * 100.)) if ft_valid else 0.
+            negative.width, negative_space.width = ui.Percent(max(-percentage, 0.)), ui.Percent(100. - max(-percentage, 0.))
+            positive.width, positive_space.width = ui.Percent(max(percentage, 0.)), ui.Percent(100. - max(percentage, 0.))
+            label.text = f"{value:+.2f} ({abs(value / limit) * 100:.0f}%)" if ft_valid else "--"
+        if ft_valid:
+            self._plots[0].add_datapoint(wrench[:3])
+            self._plots[1].add_datapoint(wrench[3:])
+
+    @torch.no_grad()
+    def render_geometry(self):
+        if not self.debug_vis:
+            return None
+        env = self._env
+        reader, state = getattr(env, "task_sensor_reader", None), getattr(env, "_contact_mdp", None)
+        if reader is None or state is None:
+            return None
+        binding = getattr(env, "_tactile_reward_geometry", None)
+        if binding is None:
+            from .rewards import tactile_pad_points
+
+            tactile_pad_points(env)  # One-time contact-surface offsets, shared with Distance.
+            binding = env._tactile_reward_geometry
+        robot, indices, offsets = binding
+        row, batch = self.env_index, reader.batch
+        pose = robot.data
+        pad_position = pose.body_link_pos_w[row].index_select(0, indices)
+        pad_rotation = pose.body_link_quat_w[row].index_select(0, indices)
+        sensor_position = pose.body_link_pos_w[row, reader.body_index]
+        sensor_rotation = pose.body_link_quat_w[row, reader.body_index]
+        pad_pose_valid = (torch.isfinite(pad_position).all(-1) & torch.isfinite(pad_rotation).all(-1)
+                          & (torch.linalg.vector_norm(pad_rotation, dim=-1) > 1.e-8))
+        sensor_pose_valid = (torch.isfinite(sensor_position).all() & torch.isfinite(sensor_rotation).all()
+                             & (torch.linalg.vector_norm(sensor_rotation) > 1.e-8))
+        contact, valid, wrench, ft_valid = sensor_monitor_snapshot(
+            batch.tactile_force[row], batch.tactile_valid[row] & pad_pose_valid, state.previous_wrench[row],
+            batch.wrench_valid[row] & sensor_pose_valid, env.cfg.mdp.tactile_threshold)
+        elapsed = getattr(state, "elapsed_time", None)
+        elapsed = wrench.new_zeros(1) if elapsed is None else elapsed[row:row + 1]
+        reset_counts = getattr(getattr(env, "_episode_reset", None), "reset_counts", None)
+        reset_count = wrench.new_zeros(1) if reset_counts is None else reset_counts[row:row + 1].to(wrench.dtype)
+        # Only this selected environment crosses to the host. No contact view,
+        # incoming-joint-wrench read or MDP transition is triggered by the GUI.
+        values = torch.cat((contact.to(wrench.dtype), valid.to(wrench.dtype), wrench,
+                            ft_valid.reshape(1).to(wrench.dtype), sensor_pose_valid.reshape(1).to(wrench.dtype),
+                            pad_pose_valid.to(wrench.dtype), reset_count, elapsed)).cpu().tolist()
+        self._update_ui(values)
+        points = torch.nan_to_num(pad_position + quat_apply(pad_rotation, offsets),
+                                  nan=0., posinf=0., neginf=0.)
+        if values[41]:
+            lines, colors, widths = sensor_monitor_wrench_lines(sensor_position, sensor_rotation, wrench)
+        else:
+            lines, colors, widths = points.new_empty((0, 2, 3)), [], []
+        point_colors = [(1., .55, .05, 1.) if not values[17 + index]
+                        else ((.1, 1., .2, 1.) if values[index] else (.45, .45, .45, 1.))
+                        for index in range(17)]
+        point_sizes = [(10. if values[index] else 6.) if values[42 + index] else 0.
+                       for index in range(17)]
+        return lines, colors, widths, points, point_colors, point_sizes
+
+    def close(self):
+        self.debug_vis = False
+        if self._vis_frame is not None:
+            self._vis_frame.visible = False
+        for plot in self._plots:
+            plot.cleanup()
+        self._plots.clear()
+        self._vis_frame = None
+
+
 # Native classes are imported only by the scene configuration after AppLauncher.
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import ContactSensor, ContactSensorCfg

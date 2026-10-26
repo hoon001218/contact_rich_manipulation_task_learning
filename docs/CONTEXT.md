@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-10-25, Asia/Seoul**.
+최종 갱신: **2026-10-26, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-10-25
+## 최신 진입점 — 2026-10-26
 
 현재 개발·학습 대상은 **`src/contact_manipulation`**,
 `Isaac-Contact-Manipulation-UR5e-v0`다. 아래 1절은 별도로 보존한 이전
@@ -18,6 +18,71 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-26 사용자 승인으로 reward weight와 민감도를 함께 조정했다. Clearance12·decay2,
+  Distance1·decay15, Shelf−2·Object−1, Action-rate/Joint-velocity각−.01, Stability1이다.
+  Hold.2·F/T각−.03·Singularity.3·성공250과 기존 gate/종료는 유지한다.
+  Time은 custom 양의 `time_reward`를 제거하고 공식 `is_alive`에 weight−2를 주는
+  `time_penalty`로 교체했다. 100Hz 일반step−.02, 성공/실패 마지막step0, timeout과 장면 교체
+  truncation step−.02다. 8초 timeout의 할인 전 Time합은−16이며 새 센서·history·파일은 없다.
+  기존 증가형과 달리 처음부터 일정−2/s이고, 실패로도 잔여 비용을 피할 수 있다는 한계가 있다.
+  CPU91개 통과·CUDA전용3개 skip이며 simulation·재학습은 미실행이다. TRAINING_LOG78절 참조.
+- 2026-10-26 GUI의 Scene Debug Visualization에 기본 OFF인 **Tactile / F/T monitor**를
+  추가했다. Environment Index로 선택한 환경의17개 pad를 접촉 초록/미접촉 회색/invalid 주황으로
+  표시하고, 센서 frame의 F/T를 방향 화살표·토크 원호·축별 양방향 막대·native LiveLinePlot으로
+  보여준다. 기존 OBB와 하나의 DebugDraw callback을 공유하며 물리 prim·sensor view는 추가하지
+  않는다. 이미 계산된 any-object tactile binary와 SI-200-8 측정값(자중·관성 포함)만 읽는다.
+  UI 최대20Hz, reset/선택 변경 시 이력 초기화, OFF/headless 추가 샘플링·연산 없음이다.
+  관련 CPU22개 검사 통과이며 실제 Kit GUI/GPU 렌더링은 미검증이다. TRAINING_LOG77절 참조.
+- 2026-10-26 최신 저장 실행 `2026-10-25_18-57-11`의17183회까지를 읽기 전용으로 분석했다.
+  해당 실행은 **기존 음의 Time penalty**와17개 pad별 Distance exp 평균을 사용했다. 현재 코드의
+  양의 `time_reward` 효과를 검증한 결과는 아니다. 최신1000회에서 weighted episode/8초 로그 평균은
+  Clearance+.1081·Distance+.4952·Hold+.04975·Action-rate−.1313·Joint-velocity−.05496이며,
+  C/D/H 중 Distance 기여는75.8%다. C/H는 초기보다 증가했으나 누적 성공은약.08198%로 드물다.
+  Hold가 작게 실현된 것만으로 weight 부족을 단정하지 않으며 손등 밀기의 원인도 현재 로그로
+  확정하지 않는다. 기존 Time은 초기2초의 비용률이 작았다. 행동·모델 코드와 설정은 변경하지
+  않았고 GPU·simulation은 실행하지 않았다. 단위·종료 snapshot 주의사항은 TRAINING_LOG76절 참조.
+- 2026-10-26 사용자 선택에 따라 Time을 매 step 초반에 크고 점차 작아지는 양의 보상으로
+  전환했다. 기준 곡선은 `exp(-0.7*t)`, `RewardsCfg.time_reward`의 weight1·decay.7이며
+  완료 control 구간 평균에 native dt를 곱한다. 8초 할인 전 누적은+1.423289다.
+  성공 여부와 무관하게 지급하므로 episode가 길수록 누적 Time 보상 자체는 증가한다.
+  기존 `time_penalty` 함수·term·MdpCfg scale/growth 필드는 제거했다. 기존 elapsed clock과
+  부분 reset을 재사용하며 물리/정책100Hz·Terminal250·다른 항과 종료조건은 유지했다.
+  CPU 관련검사32개 통과·simulation/학습 미실행이다. TRAINING_LOG75절 참조.
+- 2026-10-25 장면 생성 FFT에서 명시적인 CUDA OOM이 발생했다. 첨부 로그는 별도 PID858212의
+  11.98GiB와 학습 process 전체10.85GiB를 보고하며, GPU23.55GiB 중 free50.75MiB였다.
+  배치 seed의 FP64 커널 캐시가 마지막 사용 후 즉시 해제되도록 하고 큰 중간 tensor도
+  variant 평가 후 해제했다. 생성 규칙·0.5mm grid·정밀도·물리/정책100Hz는 유지한다.
+  CPU 기존/수정4사례의 배치·기존진단값 일치,44개 고유 커널 입력에서 캐시 peak2개,
+  관련검사12pass·CUDA5skip을 확인했다. GPU peak 감소·단독학습 재현은 미측정이다.
+  다른 PID의 프로그램·현재 점유는 확인하지 못했으며 종료하지 않았다. TRAINING_LOG74절 참조.
+- 2026-10-25 사용자 요청으로 정책을 **100Hz(decimation1)**로 복원했다. 물리·OSC100Hz,
+  γ=.98과 action scale, Distance의17개 pad별 exp 평균은 유지한다. 성공.5초=50sample,
+  episode8초=800step, rollout36=.36초다. 아래50Hz 설정은 직전 비교 설정의 기록이며
+  현재 기본값은 아니다. 상세 변경은 TRAINING_LOG73절을 따른다.
+- 2026-10-25 후속 실험 설정: Distance를 최소 pad 거리에서 **17개 pad별 exp 품질의 평균**으로
+  변경했다. `V_T * mean_i(exp(-10*d_i))`이며 weight3·Target gate는 유지한다. Invalid pad는
+  0점이고 분모는17이다. 접촉 유지 보상은 기존17개 binary 합산을 유지한다.
+  정책은 **50Hz(decimation2)**, 물리·OSC는100Hz(dt.01), γ=.98과 action scale은 유지한다.
+  성공.5초=25sample, episode8초=400step, rollout36=.72초다. Action-rate·F/T 증가량 제곱은
+  주기 불변이 아니므로 이전100Hz 결과와 비교할 때 구분한다. CPU 검사46pass·CUDA2skip이며
+  simulation·새 학습은 실행하지 않았다. 상세 변경은 TRAINING_LOG72절을 따른다.
+- 2026-10-25 `02-40-51` run의 CUDA 오류와 느린 로봇 동작·적은 Hand 움직임을 분리해 분석했다.
+  사용자 표현의 속도는 iteration 시간이 아니라 play의 실제 동작이다. 실제 설정은 OSC 위치.03m/
+  회전.15rad·Hand scale.5·팔만3rad/s 종료, C8/D3(decay10)/Hold.2·F/T각−.03이다.
+  마지막15497회까지 누적 성공3036/1,303,568≈.2329%이며 후반 양의 dense 기여의81.4%가
+  Distance다. 접근 보상은17개 pad의 최소거리만 보므로 손가락 추가 접촉·Blocker 이동을 직접
+  유도하지 않는다. Hand std는.710–.841로 소멸하지 않았지만 play는 deterministic mean을 쓴다.
+  γ=.98·100Hz의 할인 반감기는.343초여서 접근 유지와 지연된 성공의 균형도 검토해야 한다.
+  CUDA 직전 value/std와 checkpoint는 finite였고 최초 실패 kernel은 미확정이다. 다음 비교는
+  진단 전용 단계별 sync·compile/graph 분리와 action→target→실제 관절속도 확인이다.
+  Reward/PPO/제어는 수정하지 않았으며 제안과 scene별 편차·한계는 TRAINING_LOG71절을 따른다.
+- 2026-10-25 사용자 요청으로 **Hand를 `hand_velocity` 종료에서 제외**했다. 공식
+  `joint_vel_out_of_manual_limit`은 UR5e 팔6개만 검사하며 **|qdot|>3rad/s** 조건은 유지한다.
+  Joint velocity reward는 팔6개+Hand 독립6개를 그대로 평가한다. Native 원인 로그·속도 실패의
+  성공 보상 차단은 유지한다. 사용자가 직접 조정한 OSC position/orientation scale과 Hand scale
+  **각0.5**, 초기 Gaussian std1은 변경하지 않는다. URDF·actuator·reward·PPO·reset/IK도
+  변경하지 않는다. 아래67–69절 당시의12관절 종료 기록보다 이 결정이 우선하며 상세는
+  TRAINING_LOG70절을 따른다.
 - 2026-10-25 속도 종료 후 즉시 reset·연산 증가를 실제 로그로 확인했다. 임계값3rad/s의
   `2026-10-24_23-33-13`은 초기 episode1.4–1.7step,302회에도약4step이며 성공/raw goal은0이다.
   초기 collection 중앙값15.07초 대 이전2.65초, 마지막10회도6.53초다. 부분 reset마다 공통 배치·

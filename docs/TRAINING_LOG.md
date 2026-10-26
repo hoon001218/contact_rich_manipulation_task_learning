@@ -1,12 +1,16 @@
 # Contact Manipulation 학습 기록과 수정 과제
 
-작성·검토: **2026-10-23, Asia/Seoul**. 현재 프로젝트는
+작성·검토: **2026-10-26, Asia/Seoul**. 현재 프로젝트는
 `src/contact_manipulation`, task는 `Isaac-Contact-Manipulation-UR5e-v0`다.
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
 [프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
 
-**최신 적용:** 학습 종료 후 Patch 용량262,144·관측64×48과 GUI 관측 OBB를 적용했다.
-변경·검증은 **48절**에 기록한다. 아래 보상 변경과 기존 학습 파일은 유지한다.
+**최신 적용:** reward weight·Clearance/Distance 민감도를 함께 조정하고, 공식 `is_alive`
+weight−2를 사용하는 일정 시간 비용을 적용했다. 변경·한계·검증은 **78절**에 기록한다.
+직전 GUI tactile/F/T 모니터는 **77절**, 최근 저장 실행 분석은 **76절**을 따른다.
+
+**이전 물리·관측 적용:** Patch 용량262,144·관측64×48과 GUI 관측 OBB의 변경·검증은
+**48절**에 기록한다. 아래 과거 학습 기록은 당시 설정이며 현재 값은78절과 README를 따른다.
 
 **직전 적용:** 2026-10-21_23-26-39 분석의1차 후보를 사용자 승인으로 적용했다.
 Hold .05→.10·Stability2→3·Success100→250이며 민감도와 나머지 설정은 유지한다.
@@ -5651,3 +5655,446 @@ value loss1,961→.0016, std1→.478은 과제 성공의 증거가 아니다. �
 PPO std를 임의 변경하거나 유예 시간만 늘려 문제를 숨기는 수정은 하지 않았다.
 이번 작업은 저장 로그·코드의 읽기 전용 분석과 문서 기록이며 runtime·테스트·GUI 수정이나
 새 학습·GPU/Kit simulation은 실행하지 않았다. 최초 물리 원인과 단계별 시간은 미확정이다.
+
+
+## 70. 2026-10-25 — Hand를 관절 속도 종료에서 제외
+
+사용자 요청으로 `hand_velocity`의 검사 관절을 팔6개+Hand 독립6개에서 **UR5e 팔6개만**으로
+변경했다. UR5e specialization의 종료용 `SceneEntityCfg.joint_names`만 팔 action의 관절 이름에
+맞춘다. 공식 `joint_vel_out_of_manual_limit`, 임계값3rad/s와 즉시 종료 방식은 유지한다.
+따라서 팔의 어느 관절이든 `abs(qdot)>3.0`이면 종료하고 정확히±3.0은 통과한다.
+Hand·mimic/passive 관절 속도는 이 종료를 유발하지 않는다.
+
+**Joint velocity reward는 변경하지 않았다.** 팔6개+Hand 독립6개의 실제 관절 속도 제곱합과
+기존 weight를 유지한다. Native `Episode_Termination/hand_velocity` 원인 로그와 resolved
+manager cfg를 사용한 성공·terminal 동시 지급 차단도 동일하다. Hand를 제외하는 것은
+손가락의 물리 속도·관절 범위·mimic 제약을 제거하는 변경이 아니다.
+
+사용자가 최신 코드에서 직접 조정한 **OSC position scale0.5·orientation scale0.5·Hand scale0.5**는
+그대로 둔다. 초기 Gaussian std1, 다른 PPO 설정·action/controller·URDF·actuator 한계·reward·
+reset/IK는 변경하지 않는다. 67–69절은 당시12관절 종료의 기록으로 보존하며 현재 검사 범위는
+이70절의 팔6개가 우선한다. 새 파일은 만들지 않았다.
+
+### 검증
+
+CPU 집중 검사 **41개가1.055초에 통과**했다. 팔±3rad/s 경계 통과·양방향 초과 종료,
+Hand 독립관절/mimic 초과의 종료 제외, joint velocity reward의12관절 이름 유지를 검사했다.
+Hand 초과만으로 이 속도 term이 성공을 차단하지 않는 것과 native 원인 로그·부분 reset 보존도
+확인했다. 변경한 Python3개 AST 문법 검사와 `git diff --check`가 통과했다.
+실제 GPU/Kit·물리 simulation·학습은 실행하지 않았다.
+
+
+## 71. 2026-10-25 — 02-40-51 학습의 접근 편향·느린 실제 동작과 CUDA 오류 검토
+
+사용자는 play에서 로봇이 느리고 Hand 움직임이 적으며 접근 후 치우지 않는 경향을 관찰했다.
+여기서 속도는 **로봇의 실제 동작**이며 collection/iteration 시간 문제가 아니다.
+`2026-10-25_02-40-51`의 저장 env/agent cfg·git snapshot·TensorBoard를 확인했다.
+마지막 기록은15497회, 마지막 checkpoint는15450회다. 실행 기준은 commit
+`2d559f2b0f76dd1c04c43f28f1634ce853b37b23`과 저장된 dirty diff이며 현재 HEAD만으로 추정하지 않았다.
+
+### 실제 설정과 reward 기여
+
+OSC 위치 scale.03m·회전.15rad, Hand scale.5, 팔6개만3rad/s 종료다. 초기 std1·무clip,
+100Hz·episode8초·γ=.98이며 C8/D3(decay10)/Hold.2, Action-rate/Joint-velocity/F/T각−.03이다.
+특히 이전 Torque−60·Distance decay6.931·12관절 종료 설정은 이번 run에 적용되지 않는다.
+성공 보상+250과 기존 Target gate·안정 유지.5초는 유지됐다.
+
+| 구간 | Clearance 평균 | Distance 평균 | Contact 평균 | 양의 dense 합 중 Distance |
+|---|---:|---:|---:|---:|
+| 100–999 | .01537 | .77293 | .01042 | 96.77% |
+| 1000–3999 | .07067 | .75910 | .01910 | 89.42% |
+| 8000–11999 | .10549 | .73926 | .03727 | 83.81% |
+| 12000–15497 | .11262 | .70816 | .04958 | 81.36% |
+
+위 값은 weight를 포함한 `Episode_Reward`의 callback 평균으로, 개별 step raw값이나 균등한
+episode 평균이 아니다. Native manager는 episode 누적을 최대8초로 나누고 runner가 callback을
+평균한다. 후반 각 중앙값은 C .01721/D .54559/H .01223으로 D/C가약31.7배다.
+후반 평균 비용은 Action-rate−.16795, Time−.07285, Force−.02836, Joint velocity−.01667,
+Object−.01353, Torque−.000424다. 현재는 Torque보다 Action-rate가 가장 큰 dense 비용이며,
+Clearance·Contact가 개선되면서도 접근 상태의 수익이 크다. 아직 학습 초반이라는 점도 고려한다.
+
+Distance는17pad의 OBB까지 **최소거리**이므로 한 pad만 가까워도 되고, 추가 손가락을 닫는
+효과나 Blocker 이동량은 직접 평가하지 않는다. Contact hold도 기존 접촉 유지이며 첫 접촉이나
+진행 자체는 아니다. Action-rate는 물리 scale 전18D 전체, Joint velocity는 Hand 포함12관절에
+비용을 준다. 같은 관절 이동량Θ를 시간T에 수행하면 속도 제곱 적분은Θ²/T여서 느릴수록 저렴하다.
+동일한 정규화 위치 target 변화에 Hand scale.5는1보다 raw action 차이가2배, 제곱 비용은4배다.
+이는 같은 동작을 지시할 때의 비교이고 실속도를 측정한 결과는 아니다. 최종 Hand std는.710–.841,
+평균.781로 사라지지 않았으나 play는 deterministic mean을 쓴다. Std만으로 손가락을 닫는 mean이나
+추종 여부는 판단하지 않는다. Joint velocity 비용 저하도 episode 길이·scene의 영향을 받으므로
+그대로 실제 속도 저하율로 바꾸지 않는다.
+
+γ=.98·100Hz의 할인 반감기는약.343초다.3초/4초 뒤 성공250의 현재 가치는약.583/.0773이다.
+2cm 접근 상태의 Distance는3exp(−.2)=2.456/s를 유지할 수 있다. 이는 목적함수 편향의 계산이며
+실제 전체 return을 비교한 결과는 아니다. γ=.995의 반감기는약1.383초여서 비교 후보지만,
+γ만 바꿔도 접근 상태의 정기 지급 문제가 해결되는 것은 아니다.
+
+### 성공은 드물고 scene별 편차가 크다
+
+최종 누적은 완료1,303,568·성공3,036으로약.2329%다. Raw goal을 본 episode는25,668이고
+성공/Raw goal은11.83%의 episode 전환율 대리 지표이며 transition 확률은 아니다.
+Unsupported goal10,671과 goal-and-failure11,447은 겹칠 수 있어 합산하지 않는다.
+12944–13443의500회 구간은 counter 차이 성공1163/완료34962≈3.33%였지만,
+14500–15497은7/약90627≈.00772%,15000–15497은1/약53242≈.00188%다.
+구간 차이는 callback 평균 counter에 근거한 근사이고 공통 scene 난이도·종류 편차를 포함한다.
+13376회의 성공 snapshot .39947도 전체 성공률이 아니다. 직후만 보고 policy 붕괴로 단정하지 않는다.
+
+후반 episode 길이 중앙값은136.705step/1.367초, 마지막1000회는146.905step/1.469초다.
+후반 마지막 원인 snapshot 평균은 속도.2852/timeout .6892/singularity .00353/선반 변위0이므로
+선반 회피만으로 설명하기 어렵다. Snapshot은 실제 새 종료 원인 비율이 아니며 timeout에는 공통
+scene 갱신도 포함된다. 성공 기회가 부족한 상황과 속도 종료의 영향은 나누어 검증한다.
+
+### CUDA 오류에서 확인한 사실과 미확정 부분
+
+저장 scalar681,912개는 모두 finite다. 직전 value loss .003764·std .7208로 이전 run의 극단적
+비용·Inf 연발은 없다. Value 최대721.2인13370회는 성공 bonus가 집중된 구간으로 과거1e30급
+발산과 다르다.0/1000/5000/7750/10000/15000/15450 checkpoint의 Actor/Critic·Adam은
+finite였으나 마지막 실패 transition과 GPU 내부 상태의 정상성을 보장하는 증거는 아니다.
+
+Traceback의 `value_loss.item()`은 native PPO의 optimizer.step 후 CPU 읽기로, 선행한 비동기
+CUDA 실패가 그곳에서 드러날 수 있다. 최초 실패 kernel을 특정하는 증거는 아니다.
+[PyTorch 공식 비동기 실행 설명](https://docs.pytorch.org/docs/stable/notes/cuda.html#asynchronous-execution)
+처럼 오류가 드러난 동기화 위치와 원인을 구별한다. Patch capacity는 이미262144이고 이번 제시
+로그에는 overflow가 없다. Warp/CUDA graph의 범위 밖 참조나 race도 확인된 원인이 아니다.
+사용자는 headless 학습이며 제시한 오류가 보유한 로그의 전부라고 확인했다. 추가 선행 로그가
+있다고 가정하지 않으며, 현재 자료만으로 최초 실패 연산이나 렌더링과의 관련성을 특정하지 않는다.
+
+### 다음 비교 방향과 변경 범위
+
+Distance는 접근 개선량에 지급해 정지 중 추가 보상이 생기지 않도록 하는 안을 우선 검토하며,
+Clearance를 주목적으로 유지한다. 접촉 직후 Distance만 끄는 단순 gate는 경계 밖에 머무는
+유인을 만들 수 있으므로 그대로 적용하지 않는다. 개선량 지급으로 바꾸면 native dt에 따른
+크기도 다시 정해야 한다. Hold만 올리면 접촉한 채 정지하는 보상이 될 수 있다.
+Play에서 arm pose/Kp/Hand별 raw action→처리 target→실제 관절 위치·속도를 먼저 확인한다.
+위치 scale·속도 기준·std를 일괄 높이지 않으며, 물리 비용 변경도 mean 동작 진단 후 비교한다.
+
+CUDA는 진단 실행에서만 physics→MDP→reset→PPO 경계에 동기화를 넣어 최초 실패 구간을 기록한다.
+그 뒤 native cfg의 `compile_model=False`와 task graph/eager를 하나씩 비교한다. Warp CUDA
+검증과 graph capture의 비호환도 고려하며 상시 동기화를 본 학습의 기본으로 만들지 않는다.
+이번 작업은 읽기·CPU 분석·문서 기록뿐이다. Runtime·reward/PPO/제어는 변경하지 않았고,
+새 GPU/Kit simulation·학습·오류 재현도 실행하지 않았다.
+
+## 72. 2026-10-25 — Distance의 전체 pad 반영과 정책 50 Hz 비교 설정
+
+사용자는 한 pad의 최소거리 대신 모든 pad를 평가하고, γ 변경에 앞서 정책 50 Hz로
+비교하기로 했다. `mdp/rewards.py`와 공통 `ShelfManipulationEnvCfg`에 반영했다.
+
+Distance는 각 pad 표면 대표점에서 현재 Blocker OBB까지 거리 $d_i$를 구한 뒤 평가한다.
+
+$$
+r_D=\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_i).
+$$
+
+거리의 평균을 exp에 넣는 식이 아니라 각 pad 품질을 평균한다. 모든 pad가 같은 거리라면
+기존 exp 점수와 같고 범위는0–1이다. 한 pad만 거리0이고 나머지가 매우 멀면 약1/17이며,
+다른 pad도 접근할 때 추가 기여가 생긴다. Invalid pad는0점으로 두고 분모17은 고정한다.
+계산 중 비유한 거리가 나온 pad도0점으로 처리한다. Helper의 두 번째 반환값은 평균 거리이며,
+invalid pad가 있으면 inf다. Production은 품질만 사용한다. Weight3·decay10·Target gate는
+유지했고 초기 대비/직전 대비 개선량 reward로 바꾸지는 않았다. Contact hold는 기존17개
+Blocker binary의 직전·현재 AND 합산을 유지한다. 새 loop나 CPU 전송은 추가하지 않았다.
+
+| 항목 | 이전 | 이번 비교 |
+|---|---:|---:|
+| 물리 dt / 주파수 | .01초 / 100Hz | 동일 |
+| Decimation / policy | 1 / 100Hz | 2 / 50Hz |
+| OSC torque 재계산 | 100Hz | 동일 |
+| 상대 목표 갱신·previous 간격 | 10ms | 20ms |
+| 최대 episode / 공통 scene round | 8초 / 800step | 8초 / 400step |
+| 성공 연속 유지 | .5초 / 50sample | .5초 / 25sample |
+| 전도 / 지지 상실 지속시간 | .2초 / .1초 | 동일, 10 / 5sample |
+| Rollout36의 simulation 시간 | .36초 | .72초 |
+| γ | .98 | 동일 |
+
+Native 환경은 `step_dt=sim.dt*decimation`을 사용하므로 지속시간·round 경계는 자동 반영된다.
+OSC 목표는20ms 동안 유지하고 물리 substep마다 토크를 재계산한다. Scale(.03m/.15rad,
+Hand.5), actuator·종료 기준·reward weight·PPO 설정은 바꾸지 않았다. 같은 상대 action을
+유지하면 목표 갱신 빈도 감소로 실제 이동이 느려질 수도 있어 속도 개선을 보장하는 변경은 아니다.
+γ=.98의 할인 반감기는약.343→.686초다. Action-rate·F/T 증가량 제곱은 policy sample 간격에
+의존하므로 그 비용이 주기 불변이라고 해석하지 않는다. Contact hold도20ms 간격의 두 sample을
+사용하며 두 sample 사이의 모든 순간 접촉을 검사하는 것은 아니다.
+
+**검증:** 기존 contact 검사5개가 수정 전 통과하는 것을 확인했다. 수정 후 contact·reward·
+termination·support 검사48개 중46개 통과, CUDA 전용2개는 GPU 부재로 skip했다. 개별 pad
+추가 접근, 평균 exp와 exp(평균거리)의 구분, 회전 OBB, Target gate, invalid pad,1,024환경의
+dtype/host scalar read 금지,50Hz 성공.5초·전도.2초·고정 Terminal 지급을 포함한다.
+기존 config 검사에 남은 Distance weight1 기대값도 현재 사용자가 설정한3에 맞췄다.
+실제 simulation·새 학습·GPU 성능 측정은 실행하지 않았다. README와 이 문서에 변경을 기록했다.
+
+## 73. 2026-10-25 — 정책 주기 100 Hz 복원
+
+사용자 요청으로 `ShelfManipulationEnvCfg.decimation`을2에서1로 되돌렸다.
+물리 dt.01초·OSC100Hz는 유지하므로 정책도100Hz가 된다. GUI render interval은 native
+설정의 `self.decimation`에 따라1로 연동된다. 성공 유지.5초=50sample, 최대 episode와
+공통 scene round8초=800step, rollout36=.36초다. Distance의17개 pad별 exp 평균,
+weight3·decay10·Target gate, γ=.98·action scale·그 외 reward/termination은 유지한다.
+README와 CONTEXT의 현재 기본값을 갱신했다. 학습·simulation은 실행하지 않았다.
+
+## 74. 2026-10-25 — 배치 생성 FFT의 CUDA OOM과 커널 수명 축소
+
+첨부 traceback은 `_clutter_gpu_seed`의 `torch.fft.rfft2`에서12MiB 할당을 실패한 명시적인
+`torch.OutOfMemoryError`다. 이전 PhysX719의 최초 원인이 증명된 것으로 해석하지 않는다.
+
+| 첨부 OOM 시점의 항목 | 보고값 |
+|---|---:|
+| GPU 전체 / free | 23.55GiB / 50.75MiB |
+| 별도 PID858212 | 11.98GiB |
+| 실패한 학습 process 전체, native 포함 | 10.85GiB |
+| 학습 process PyTorch allocated | 1.92GiB |
+| PyTorch reserved 중 unallocated | 957.81MiB |
+| 위 allocated 중 private pool | 121.41MiB |
+
+PyTorch allocator는 자신의 PID에만 `this process`, 다른 NVML PID에 `Process <pid>`를
+출력한다. 따라서11.98GiB와10.85GiB는 같은 process를 중복 집계한 수치가 아니다.
+[공식 allocator 소스](https://raw.githubusercontent.com/pytorch/pytorch/v2.7.0/c10/cuda/CUDACachingAllocator.cpp)
+에서 이 분기를 확인했다. 다른 process와 합22.83GiB가 사용된 상황이며, PID858212의 프로그램과
+현재 생존 여부는 확인하지 못했다. 현재 작업 환경에서는 NVIDIA driver 접근이 되지 않아
+실시간 NVML 조회나 GPU 재현은 불가능했다. Process 종료는 하지 않았다.
+
+Reserved 중 unallocated957.81MiB는 전부 즉시 반환 가능한 VRAM이라는 뜻이 아니다.
+Fragmentation 여부는 단일 로그로 확정하지 않으며, `expandable_segments:True`도 다른 process의
+점유를 해소하지는 않는다. 매 reset `empty_cache()`나 allocator 환경변수 변경은 추가하지 않았다.
+[공식 메모리 관리 문서](https://docs.pytorch.org/docs/2.7/notes/cuda.html#memory-management)를 따른다.
+
+코드에서는 형상별 전체-grid `complex128` FFT2개를 함수 종료까지 유지했다.
+기존 `clutter_mixing_20261022/native_clutter_reset_1024_probe.json`의 FFT shape756×1782와
+고유 커널43개를 기준으로 spectrum pair당약20.58MiB, 총약884.92MiB다. 이는 기존 자료에
+대한 산술 추산이며 이번 OOM의 정확한 cache 크기를 실측한 값은 아니다. 함수 local cache여서
+정상 반환 후에도 지속되는 누수라고 단정하지 않는다. 이전 variant의 큰 중간 tensor가 다음
+body의 scene FFT 생성까지 참조된 점도 peak 사용량을 높이는 구조였다.
+
+수정은 `mdp/events.py`의 해당 함수에 한정했다. 실제 처리 순서에서 각 kernel의 마지막
+사용 위치를 미리 구하고 마지막 사용이 끝난 행에서 cache 참조를 제거한다. 재사용이 남으면
+유지하므로 추가 FFT 계산은 없다. 선택 결과에는 작은 bool mask와 origin만 남기고,
+counts/rounded/free/contact/score 및 scene spectrum은 사용 직후 해제한다. 기존 고유 커널
+진단값은 총 생성 개수로 유지하고 `peak_cached_shape_kernels`를 추가했다. 이 peak가 모든
+입력에서2로 고정되는 것은 아니며 향후 재사용 패턴에 따라 달라진다.
+
+배치 규칙·FP64·0.5mm raster·argmax 순서·난수 사용·최종 좌표·물리/정책100Hz·reward·
+termination은 바꾸지 않았다. CPU fallback이나 OOM 후 다른 장면 재추첨도 추가하지 않았다.
+
+**검증:** 수정 전 함수를 임시 보존해 CPU allocator를 사용한 동일 FFT 수치 경로로4사례
+(44고유 커널, 반복2커널, optional 실패, mandatory 실패)를 비교했다. 좌표·variant IDs와
+모든 기존 provenance 값이 정확히 같았다. 새 회귀 검사는 weak reference로 spectrum 수명,
+44고유 커널 입력의 cache peak2,반복 커널 재사용과 FFT 횟수 유지,독립 polygon 간격을 확인한다.
+관련17검사 중12통과·실제 CUDA가 필요한5개는 skip했다. `git diff --check`도 통과했다.
+이는 CPU 수치·수명 검증이며 실제 GPU peak·throughput·장시간 OOM 해결을 보장하는 측정은 아니다.
+
+## 75. 2026-10-26 — Time을 매 step 양의 감소형 보상으로 전환
+
+사용자는 Time을 penalty에서 reward로 바꾸고, 성공 시 일회 지급 대신 **매 step 초반에 크고
+시간이 지날수록 작은 양의 보상**을 선택했다. 이에 따라 현재 episode의 경과 시간 $t$에 대해
+기준 품질 $q_T(t)=\exp(-0.7t)$를 사용한다. Weight는1이며 decay0.7은 공통 env cfg의
+`RewardsCfg.time_reward.params`에서 조정한다.
+
+$$
+\bar q_{T,k}=\exp[-\beta(t_k-\Delta t)]
+\frac{1-\exp(-\beta\Delta t)}{\beta\Delta t},\qquad
+r_{T,k}=w_T\bar q_{T,k}\Delta t,\quad \beta=0.7,\quad w_T=1.
+$$
+
+함수는 control 구간 평균을 반환하고 공식 RewardManager가 weight·dt를 한 번 적용한다.
+초기 곡선값은1,1초약.496585,4초약.060810,8초약.003698이다. Reset 직후 완료 transition이
+없으면 지급0이며100Hz의 첫 지급은약+.009965다. 8초 할인 전 누적은
+$(1-\exp(-5.6))/0.7\approx+1.423289$다. 기존−7.537897의 부호만 바꾼 것이 아니라,
+증가하는 음의 비용률을 감소하는 양의 품질로 바꾼 것이다.
+
+`mdp/rewards.py`에서 기존 `time_penalty`를 `time_reward`로 교체했다. 구형 MdpCfg의
+`time_penalty_scale`·`time_penalty_growth_rate`와 validation 예외도 제거했으며 호환 alias를
+추가하지 않았다. Console/TensorBoard term 이름은 `Episode_Reward/time_reward`다.
+기존 실행의 old term/구형 parameter override와는 구분한다. 별도 캐시나 새 파일 없이 기존
+GPU elapsed tensor를 재사용한다. 새 연산은 환경별 exp와곱셈이며 CPU tensor 복사/동기화는 없다.
+
+경과 시간은 native randomized episode counter가 아니라 실제 완료 transition의 누적 시간이다.
+반복 조회는 시계를 늘리지 않고 부분 reset은 선택 행만 초기화한다. 물리/정책100Hz·γ=.98·
+Terminal250과 다른 reward·종료 조건·gate는 바꾸지 않았다. 성공 여부에 따른 새 지급 gate도 없다.
+이 선택에서는 계속 생존할수록 양의 Time 누적합 자체는 늘어난다. 따라서 빠른 성공의
+직접적인 진행 보상으로 해석하지 않으며, 그 학습 효과는 다른 항들과 함께 관찰해야 한다.
+
+**검증:** RewardTests·TerminationTests의 CPU32검사가 모두 통과했다. 양수·단조 감소,
+.01/.02/.1초 partition의 같은 구간 적분, reset0·선택행 clock 복구,decay 유효성,
+host scalar/CPU전송 금지,기존 성공250 지급·종료 판정 유지가 포함된다. `git diff --check`도
+통과했다. 실제 GPU simulation·새 학습·정책 성능 검증은 실행하지 않았다.
+
+## 76. 2026-10-26 — 접근 후 정지·손등 밀기 관찰과 최신 실행의 보상 기여 분석
+
+사용자는 play에서 손등으로 미는 듯한 동작과 Blocker를 조금 민 뒤 멈추는 경향을 관찰했다.
+Clearance·Contact hold의 영향과 빠른 조작을 유도하는 Time의 역할을 검토하기 위해 최신 저장 실행
+`2026-10-25_18-57-11`의 **iteration17183까지**를 CPU에서 읽었다. TensorBoard의
+`Train/*/time` 마지막 step57091은 시간축이며 iteration57091로 해석하지 않는다.
+
+**실행 설정과 현재 코드의 구분:** 저장 env는100Hz(dt.01·decimation1), γ=.98,
+OSC 위치/회전 scale.03m/.15rad·Hand scale.5다. Clearance8·Distance3(decay10)·Hold.2,
+Action-rate·Joint-velocity·Force-growth·Torque-growth는 각각−.03이다. 저장 git diff에서
+Distance는 이미 `mean_i(exp(-10*d_i))`의17개 pad 평균이었다. Time은 **기존 음의
+`time_penalty`**, scale.02·growth.7이다. 따라서 이 실행을75절에서 변경한 현재 양의
+`time_reward`의 실험 결과로 해석하지 않는다.75절의 구현과 사용자 선택은 이번 분석에서
+변경하지 않았다.
+
+| Weighted `Episode_Reward` 항 | 최신1000회 평균,16184–17183 |
+|---|---:|
+| Clearance | +.108105 |
+| Distance | +.495214 |
+| Blocker contact hold | +.049747 |
+| Action rate | −.131306 |
+| Joint velocity | −.054964 |
+| Force growth | −.015432 |
+| Torque growth | −.000382 |
+| 기존 Time penalty | −.064176 |
+
+이 값은 native RewardManager의 **weighted episode 누적합을 최대 episode 길이8초로 나눈
+로그**를 reset callback/iteration에서 평균한 값이다. 실제 매 step 값이나 같은 수의 episode를
+직접 평균한 비용률이 아니며, 항의 기여를 비교하는 지표로 사용한다. C+D+Hold의 평균 합에서
+Distance가약75.83%,Clearance16.55%,Hold7.62%다. Terminal은 이 비중 계산에서 제외한다.
+
+초기0–999회의 C/D/H 평균은 .0145/.4592/.0144였다. 최신1000회에는 .1081/.4952/.04975로,
+Clearance와 Hold도 실제로 증가했다. 따라서 이 항들이 전혀 작동하지 않는다거나 학습 전체가
+붕괴했다고 단정할 수는 없다. 다만 접근 보상이 여전히 가장 크게 실현된다. Hold의 낮은 실현값은
+작은 weight뿐 아니라 접촉 자체가 드물거나 짧아도 발생하므로, 이 값만으로 weight 부족을
+확정하지 않는다. 손등 동작도 action·pad별 접촉·손 자세 trajectory가 기록되지 않아 현재
+집계 로그로 원인을 특정할 수 없다.
+
+누적 완료 counter는약1,885,772,유효 성공1546으로약.08198%다. 최신1000회의 counter 차이는
+완료약149,192.875·성공218,약.1461%다. Counter는 rollout 내 여러 reset extras의 평균을
+통해 기록되어 window 경계에 소수가 생길 수 있으므로 이 비율은 근사다.1000회 구간 성공은
+11000–11999에서약.3326%,16000–16999에서약.1657% 등 장면별 변동이 있다. 성공은 증가한
+구간도 있으나 아직 드물며, 같은 배치에서 정책이 멈추는 원인을 분리한 실험은 아니다.
+
+최신1000회 native 종료 snapshot 평균은 팔 속도44.06%,timeout50.85%,전도4.71%,
+선반 변위0이다. 이는 각 환경의 마지막 종료 원인 snapshot을 평균한 것이므로 해당 구간에서
+새로 종료한 episode의 원인별 비율로 해석하지 않는다. 팔 속도 종료가 여전히 관찰되지만
+그 사실만으로 play에서 멈추는 행동의 직접 원인이라고 단정하지 않는다.
+
+기존 음의 Time 비용률 `.02*(exp(.7*t)-1)`은 .5초에약.00838/s,1초.02028/s,
+2초.06110/s,4초.30889/s다. 최신1000회의 `Train/mean_episode_length` 평균은약202.17step
+(100Hz에서약2.02초)로, 초기1–2초 동안에는 시간 비용이 작고 뒤쪽에서 가팔라지는 구조였다.
+이는 초반 빠른 조작을 우대하는 신호가 약할 가능성을 보여주지만 계수 변경의 충분조건은 아니다.
+현재 양의 Time은 생존할수록 자체 누적 보상이 증가한다는75절의 성질과 구분해 논의한다.
+
+이번 작업은 기존 로그·저장 cfg·git diff의 읽기 전용 분석이다. 행동·모델 코드, reward·종료
+설정은 변경하지 않았고 학습·simulation·GPU 연산을 실행하지 않았다. 새로운 프로젝트 파일은
+추가하지 않았다. 향후 비교에서는 같은 유효 조작의 완료 시간·pad별 Blocker 접촉·누적 항별
+return을 함께 확인해 시간 유인 부족,접촉 부족,접촉 방향 문제를 구분해야 한다.
+
+코드상 Distance는 pad 노출면 대표점의 **위치**만 사용하고 면 법선이 Blocker를 향하는지는
+평가하지 않는다. 손등이 앞을 향해도 pad 점들이 OBB에 가까우면 점수를 받을 수 있다.
+Hold는17개 tactile body의 Blocker-only force norm으로 평가하므로 별도 손등/하우징만의
+접촉에는 직접 지급하지 않지만, pad의 앞/옆/뒷면은 구분하지 않는다. 손등으로 보이는 순간에도
+pad가 함께 닿는지 확인하지 않으면 높은 weight가 필요한지,접촉 방향 정의가 필요한지 모른다.
+Clearance와 Hold 모두 정지 상태에서도 기존 개선/접촉이 유지되면 계속 지급한다.
+예시로 초기 가림비율.5→.45의 작은 개선을 유지하면 Clearance는약+.24878/s,
+pad 하나 유지접촉은+.2/s다. 기존 Time의1초 비용률은−.02028/s에 불과하다. 이는 실제 play의
+상태를 측정한 것이 아니라 현재 수식이 소폭 개선 후 정지에도 수익을 남길 수 있음을 보인 계산이다.
+따라서 Contact/Clearance weight 부족을 확정하거나 무조건 높이기보다 Time 초반 역할과
+정지/진행/손등/패드 접촉 구간의 항별 return을 비교한다. 사용자가 유지하기로 한 다른 항과
+제어·종료 조건은 이번 분석에서 변경하지 않았다.
+
+## 77. 2026-10-26 — GUI tactile·F/T 시각 모니터
+
+사용자 요청에 따라 기존 OBB 토글과 같은 **IsaacLab → Scene Debug Visualization**에
+**Tactile / F/T monitor**를 추가했다. 기본 OFF이며 기존 Environment Index로 선택한 환경만
+읽는다. GUI1은 `env_0`이다. 기존 `sensors.py`의 SensorMonitor가 표시를 담당하고,
+`events.py`의 OBB visualizer가 하나의 render callback과 DebugDraw 선·점 버퍼를 관리한다.
+별도 프로젝트 파일·USD prim·rigid body·collision shape·contact view는 추가하지 않았다.
+
+- Tactile:17개 pad의 노출면 대표점을 손 위에 표시하고, Palm·Thumb·Index·Middle·Ring·Little
+  타일로 채널별 상태를 보여준다. 접촉은 초록색, 미접촉은 회색, invalid는 주황색이다.
+  Observation과 같은 threshold의 **any-object binary**이며 Blocker 구분을 새로 계산하지 않는다.
+- F/T:물리 센서 frame의 RGB축과 청록색 힘 화살표, 오른손 법칙의 주황색 토크 원호를 표시한다.
+  힘1cm/N·길이상한25cm, 토크반경6cm·1N·m당288°·각도상한288°다.
+  축별 양방향 막대는 SI-200-8 한계200/200/360N·8/8/8N·m에 정규화한다.
+  공식 `LiveLinePlot` 두 개에 Force[N]와 Torque[N·m]의 최대200개 sample을 유지한다.
+  초기 plot 범위는±20N/±1N·m이고 native Autoscale checkbox로 변경할 수 있다.
+- Data:기존 `task_sensor_reader.batch`와 현재 `TaskState.previous_wrench`만 읽는다.
+  표시값은 SI-200-8 보정·양자화된 측정 반력으로 Hand 자중·관성을 포함한다. GUI에서
+  SensorReader·get_task_state·reward를 실행하지 않으며 물리/MDP 상태를 변경하지 않는다.
+- Lifetime:패널 최대20Hz 갱신, 환경 선택·episode reset 시 그래프 초기화, invalid 값은
+  미접촉/정상0값과 구분한다. 비유한 body pose는 DebugDraw에 보내지 않는다.
+  Monitor OFF에서는 센서 조회·기하 연산·CPU 전송·UI 갱신이 없고, Headless에서는 monitor와
+  UI 자체를 생성하지 않는다. 다른 OBB 표시가 ON이면 기존 callback은 유지한다.
+
+CPU에서 신규 monitor10개·기존 sensor6개·OBB6개, **총22개 검사 통과**를 확인했다.
+채널 순서·선택 환경17점·센서축 회전 공변성·부호 막대·invalid 안전 처리·캐시 읽기 전용·
+OFF/headless 무동작·OBB 공존·종료 정리·STOP 시 PhysX 무조회를 검증했다.
+Fake UI에서 실제 panel build와17개 Rectangle 배경 타일·native plot 설정도 확인했다.
+실제 Kit GUI 레이아웃·GPU 렌더링 및
+실제 센서 접촉 장면은 실행 검증하지 않았다. Reward·termination·학습 설정은 이번 작업에서
+변경하지 않았다.
+
+## 78. 2026-10-26 — Reward weight·exp 민감도 동시 조정과 일정 Time 비용
+
+사용자는 Time만 조정하는 대신 전체 reward의 상대 관계와 exp 내부 계수를 함께 검토한 뒤
+제안한 실험 설정을 적용하도록 승인했다. 접근·유지 상태의 수익을 줄이고 Clearance 개선의
+민감도를 높이며, 움직임 비용은 완화하고 주변 물체·선반 교란 비용은 강화했다.
+
+| 항 | 직전 값 | 적용 값 |
+|---|---:|---:|
+| Clearance weight / decay | 8 / 1 | 12 / 2 |
+| Distance weight / decay | 3 / 10 | 1 / 15 |
+| Contact hold | .2 | .2 유지 |
+| Shelf collision | −.5 | −2 |
+| Object collision | −.5 | −1 |
+| Action rate / Joint velocity | 각각−.03 | 각각−.01 |
+| Force growth / Torque growth | 각각−.03 | 유지 |
+| Singularity | .3 | 유지 |
+| Object stability | .5 | 1 |
+| Time | 양의 exp 감소형, weight1 | 공식 is_alive, weight−2 |
+| Terminal | 성공+250 | 유지 |
+
+설정은 `RewardsCfg`와 `MdpCfg.clearance_decay`에서 수정했다. Clearance는 여전히 초기 대비
+품질 차이이며, 양의 부분에 대한 Target 보호·지지 유효성 gate는 유지한다. Distance는17개
+pad 품질 평균, Hold는 같은 pad의 직전·현재 Blocker 접촉 binary 합이다. 둘의 Target gate,
+모든 termination, action/관측/모델·PPO·정책/물리100Hz와 물체 생성 규칙은 변경하지 않았다.
+F/T의 오래된 주석·README에 남아 있던−.15/−60 설명을 실제−.03/−.03 값에 맞췄으며,
+같은 숫자라도 N²와(N·m)²에서 같은 민감도를 뜻하지 않는다고 명시했다.
+
+**민감도:** weighted exp의 기울기 크기는 `w*a*exp(-a*x)`다. Clearance는 가림비율.5에서
+4.85225→8.82911로약82% 커지며,0~1 전체에서 개선 기울기가 커진다. 가림비율.5→.45의
+보상률은+.248780→+.464283, .5→0이면+3.147755→+7.585447이다. 계수만2로 올리고
+weight8을 유지하면 큰 가림에서는 기울기가 약해지므로 두 값을 함께 바꿨다.
+Distance의 반감거리는6.93→4.62cm다. 모든 pad가10cm일 때 weighted rate는
+3*exp(-1)=1.103638에서exp(-1.5)=.223130으로 줄어든다. 가까운 영역에 상대적으로 집중하되
+접근 자체의 절대 기울기도 감소하므로 새 학습에서 접근 신호가 유지되는지 확인해야 한다.
+Stability의 거리/기울기 계수와 Singularity 계수는 유지했다. Stability weight1이면 다른
+위험이 없을 때45°기울기나20mm지지 오차의 비용은−.5/s다.
+
+**Time 구현과 지급:** custom `mdp.rewards.time_reward` 함수·export·cfg term을 제거하고,
+공식 `isaaclab.envs.mdp.is_alive`를 `time_penalty`의 함수로 직접 설정했다. 별도의 wrapper나
+새 파일은 없다. 공식 함수는 `(~env.termination_manager.terminated).float()`를 반환한다.
+Native RewardManager가 weight·dt를 한 번 곱한다.
+
+$$
+f_{T,k}=\mathbf1[\neg\mathrm{terminated}_k],\qquad
+r_{T,k}=-2\Delta t\,f_{T,k}.
+$$
+
+일반 step에서는100Hz의dt=.01이므로−.02다. 초기부터 비용률이 일정−2/s이며 exp 계수나
+T_ref, elapsed clock·누적 이력은 없다. 기존 exp 구간 적분도 필요 없다. 동작 여부·접촉 여부와
+무관하게 시간이 흐르면 비용이 발생하고, 성공이 빨리 끝나면 남은 비용을 피한다. 모든 step이
+과금되는1/2/4/8초의 할인 전 합은−2/−4/−8/−16이다. dt와 weight를 함께 고려하므로
+이 항만 보면50Hz에서−.04/step이어도 같은 실제1초 비용은−2지만, 정책 주기는 변경하지 않았다.
+
+공식 env 순서는 termination 계산 → reward 계산 → reset이다. 성공·실패 종료 step에는
+`terminated=True`여서 Time 비용0이다. Timeout 또는 공통 장면 교체 truncation만 있으면
+`terminated=False`이므로 해당 마지막 step도−.02다. 동시에 성공/실패가 있으면 Time0이다.
+따라서2초째200번째step에서 성공한 episode의 Time합은−3.98,4초 성공은−7.98,
+8초 timeout800step은−16이다. 성공 Terminal+250은 별도로 한 번 지급한다. Reset 자체에는
+과금하지 않으며 새 episode의 첫 정상 step부터−.02다. 부분 reset에 복구할 Time history는 없다.
+센서·PhysX 추가 조회나 host scalar 읽기 없이 기존 termination tensor만 사용한다.
+
+**해석과 한계:** 비용은 성공뿐 아니라 실패로도 더 이상 발생하지 않는다. 큰 음의 Time이
+조기 실패를 유리하게 만들 수 있어 실제 종료 원인 counter와 성공률을 함께 확인해야 한다.
+γ=.98·100Hz의 할인반감기는약.343초다. Time 보상열 자체의 할인합은1초−.86738,
+2초−.98241,8초약−1이며 무할인 누적값과 다르다. Timeout에서는 PPO가 다음 가치도
+bootstrap하므로 이 숫자는 전체 학습 return이 아니다. γ와 PPO 설정은 이번에 변경하지 않았다.
+
+정상 지지·Target 보호 상태에서4개 pad 접촉,나머지13개5cm,가림비율.5→.45로 정체하면
+다른 비용0 가정의 새C+D+Hold+Time 합은−.139202/s다. 같은 기하에서가림비율.3이면
++1.567702/s,0이면+6.981962/s다. 실제 trajectory 측정이 아닌 수식 예시다. 유지접촉6개면
+작은 개선 상태도+.322873/s이므로 weight만으로 모든 정체 상태를 제거하지는 못한다.
+손등 방향을 평가하는 수식도 새로 추가하지 않았다. GUI pad monitor와 접촉 후 Clearance
+변화·정체 시간, 유효 성공과 실제 종료 원인별 counter로 새 학습 효과를 확인한다.
+
+**검증:** Reward·Contact·SceneMotion·Singularity·State·Termination·ObjectSupportValidity의
+총94개 검사 중 **CPU91개 통과, CUDA전용3개 skip**. 실제 공식 `is_alive`와
+`RewardManager.compute()`를 사용해 일반/timeout/성공/실패의 비용,dt별8초−16 누적을
+검증했다. 전체 설정·Clearance 새 계수와 초기 품질·부분 reset·기존 성공250/gate도 확인했다.
+이는 수식·CPU manager 검증이며 simulation·학습·새 정책 성능은 실행 검증하지 않았다.

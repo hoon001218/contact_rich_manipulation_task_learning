@@ -7,7 +7,7 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs.mdp import joint_vel_out_of_manual_limit
+from isaaclab.envs.mdp import is_alive, joint_vel_out_of_manual_limit
 from isaaclab.envs.ui import ManagerBasedRLEnvWindow
 from isaaclab.managers import ActionTermCfg, EventTermCfg, ObservationGroupCfg, ObservationTermCfg, RewardTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -91,13 +91,13 @@ class EventCfg:
 class RewardsCfg:
     """Raw task scores/costs, integrated by the native RewardManager."""
 
-    clearance = RewardTermCfg(func=mdp.clearance, weight=8.0)
+    clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
+        func=mdp.blocker_distance, weight=1.0, params={"decay": 15.0},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
     shelf_collision = RewardTermCfg(
-        func=mdp.shelf_collision, weight=-0.5,
+        func=mdp.shelf_collision, weight=-2.0,
         params={
             "asset_cfg": SceneEntityCfg("shelf"),
             "translation_threshold": 0.005,
@@ -106,20 +106,21 @@ class RewardsCfg:
             "angular_velocity_threshold": 0.05,
         },
     )
-    object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
+    object_collision = RewardTermCfg(func=mdp.object_collision, weight=-1.0)
     # Command variation and actual speed are different control objectives.
-    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
+    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.01)
     motion_joint_velocity = RewardTermCfg(
-        func=mdp.motion_joint_velocity, weight=-0.03,
+        func=mdp.motion_joint_velocity, weight=-0.01,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
     )
-    # Initial separate SI coefficients: +1 N and +0.05 N*m each cost 0.15 reward/s.
-    # These per-step increments are squared directly, without rate conversion or exp.
+    # Separate SI costs: +1 N costs 0.03 reward/s; +0.05 N*m costs 0.000075 reward/s.
+    # Per-step norm increases are squared directly, without rate conversion or exp.
     motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.03)
     motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.03)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
-    object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.50)
-    time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=1.0)
+    object_stability = RewardTermCfg(func=mdp.object_stability, weight=1.0)
+    # Native alive cost: -2 reward/s; terminal success/failure steps are exempt.
+    time_penalty = RewardTermCfg(func=is_alive, weight=-2.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
@@ -134,7 +135,7 @@ class TerminationsCfg:
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
-    # Match min's Inspire threshold; include our independent arm and hand joints.
+    # Match min's Inspire threshold; the UR5e config selects only the six arm joints.
     hand_velocity = TerminationTermCfg(
         func=joint_vel_out_of_manual_limit,
         params={"max_velocity": 3.0, "asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
@@ -142,15 +143,23 @@ class TerminationsCfg:
 
 
 class ShelfManipulationEnvWindow(ManagerBasedRLEnvWindow):
-    """Extend the native debug panel with physical and observed OBB toggles."""
+    """Extend the native debug panel with OBB toggles and sensor monitoring."""
 
     def __init__(self, env, window_name="IsaacLab"):
+        import omni.ui as ui
+
         super().__init__(env, window_name)
         with self.ui_window_elements["main_vstack"]:
             with self.ui_window_elements["debug_frame"]:
                 with self.ui_window_elements["debug_vstack"]:
                     self._create_debug_vis_ui_element("Target / Blocker OBB", env._role_obb_visualizer)
                     self._create_debug_vis_ui_element("Observed objects OBB", env._observation_obb_visualizer)
+                    self._create_debug_vis_ui_element("Tactile / F/T monitor", env._sensor_monitor)
+                    frame = ui.Frame(width=ui.Fraction(1), height=0, visible=env._sensor_monitor.debug_vis)
+                    self.ui_window_elements["sensor_monitor_panel"] = frame
+                    env._sensor_monitor.set_vis_frame(frame)
+                    env._sensor_monitor.set_env_selection(env.cfg.viewer.env_index)
+                    self._ui_listeners.append(env._sensor_monitor)
 
 
 @configclass
@@ -176,12 +185,13 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     blocker_asset: str | None = None
     role_obb_debug_vis: bool = True
     observation_obb_debug_vis: bool = True
+    sensor_monitor_debug_vis: bool = False
 
     decimation: int = 1
     episode_length_s: float = 8.0
 
     def __post_init__(self):
-        # Policy and physics both run at 100 Hz.
+        # Policy, physics and OSC all run at 100 Hz.
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
         self.sim.physx.bounce_threshold_velocity = 0.05
