@@ -18,6 +18,15 @@
 현재 코드 구조·MDP·모델은 [프로젝트 README](../src/contact_manipulation/README.md),
 본 학습 기록·정책 행동의 문제·수정 과제는 **[TRAINING_LOG.md](TRAINING_LOG.md)**를 먼저 읽는다.
 
+- 2026-10-26 조기 실패로 잔여 Time/Motion 비용을 피하는 현상을 줄이기 위해 기존 Terminal에
+  **일회 실패−5**를 추가했다. `MdpCfg.failure_penalty=5`는 양의 비용 크기다. 성공+250,
+  일반 진행/timeout 단독0이며 실패가 성공·timeout과 겹치면 실패가 우선한다. 여러 원인을
+  합산하지 않고 기존 aggregate failure와 paid flag로 한 번 지급하며 부분 reset은 선택 행만
+  복구한다. native dt 후 실제−5이며 원인별 로그·termination·Time 함수는 유지한다.
+  당시 사용자 실험의 Time−1·Distance3/decay10·Object/Shelf−.5·Action/Joint-velocity−.03 등은
+  변경하지 않았다. 최신 두 짧은 실험에서 episode 약2step·속도 종료 우세·성공0이 관찰됐으나
+  새 실패 비용의 학습 효과는 아직 미측정이다. CPU102개 통과·CUDA전용1개 skip.
+  구현·근거·한계는 TRAINING_LOG79절을 따른다.
 - 2026-10-26 사용자 승인으로 reward weight와 민감도를 함께 조정했다. Clearance12·decay2,
   Distance1·decay15, Shelf−2·Object−1, Action-rate/Joint-velocity각−.01, Stability1이다.
   Hold.2·F/T각−.03·Singularity.3·성공250과 기존 gate/종료는 유지한다.

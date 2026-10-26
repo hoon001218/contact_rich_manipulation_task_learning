@@ -33,13 +33,14 @@ def scene_time_out(env):
 
 
 def terminal_transition(success_candidate, failure, stable_count, paid, cfg, *, success_enabled=True, step_dt=0.01):
-    """Confirm a settled success for the configured duration; enabled failure wins."""
+    """Pay success or an aggregate failure once; enabled failure takes priority."""
     if not math.isfinite(step_dt) or step_dt <= 0:
         raise ValueError("step_dt must be finite and positive.")
     stable_steps = max(1, math.ceil(cfg.success_duration / step_dt - 1.e-9))
     successful = success_candidate & (stable_count >= stable_steps) & ~failure
     completed = successful & success_enabled
     payment = torch.where(completed, cfg.success_reward, 0.0)
+    payment = torch.where(failure, -cfg.failure_penalty, payment)
     payment = torch.where(paid, 0.0, payment)
     return successful, payment, paid | completed | failure
 
@@ -300,8 +301,8 @@ def success(env):
 def failure(env, reason: str | None = None):
     """Read an aggregate failure or one cached cause for native termination logs.
 
-    Several causes may be true in the same environment. The termination manager
-    combines them with OR; failure alone does not produce a terminal payment.
+    Several causes may be true in the same environment. Native cause logs stay
+    separate; the shared terminal transition pays their aggregate failure once.
     """
     from .events import get_task_state
 

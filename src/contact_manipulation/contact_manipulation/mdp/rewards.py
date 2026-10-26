@@ -339,7 +339,7 @@ def motion_singularity(env):
 
 
 def terminal(env):
-    """One-time success bonus converted to a native reward rate."""
+    """One-time success/failure payment converted to a native reward rate."""
     from .events import get_task_state
 
     return get_task_state(env).terminal_reward / env.step_dt

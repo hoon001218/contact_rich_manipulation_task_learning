@@ -48,8 +48,9 @@ class MdpCfg:
     motion_singularity_threshold: float = 0.07
     motion_singularity_decay: float = math.log(2.0) / 0.03**2
     singularity_termination_threshold: float = 0.005
-    # One-time bonus for the enabled success termination.
+    # One-time terminal payments; failure_penalty is a positive cost magnitude.
     success_reward: float = 250.0
+    failure_penalty: float = 5.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15

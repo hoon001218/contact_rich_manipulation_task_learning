@@ -521,21 +521,22 @@ class RewardTests(unittest.TestCase):
         torch.testing.assert_close(actual, -.01 * .01 * torch.tensor([30., 12., 18.]))
         self.assertTrue(torch.isfinite(manager._step_reward).all())
 
-    def test_dense_terms_use_native_manager_dt_but_success_bonus_remains_250(self):
+    def test_dense_terms_use_native_manager_dt_but_terminal_success_and_failure_are_one_off_payments(self):
         # Execute the installed manager's actual arithmetic, not a mirrored sum.
         compute = native_reward_compute()
-        state = SimpleNamespace(clearance_quality=torch.tensor([.8, .2]), initial_clearance_quality=torch.tensor([.5, .5]),
-                                clearance_progress_valid=torch.ones(2, dtype=torch.bool),
-                                force_growth=torch.tensor([2., 0.]), torque_growth=torch.tensor([.5, 0.]),
-                                terminal_reward=torch.tensor([250., 0.]))
+        state = SimpleNamespace(clearance_quality=torch.tensor([.8, .2, .5]),
+                                initial_clearance_quality=torch.full((3,), .5),
+                                clearance_progress_valid=torch.ones(3, dtype=torch.bool),
+                                force_growth=torch.tensor([2., 0., 0.]), torque_growth=torch.tensor([.5, 0., 0.]),
+                                terminal_reward=torch.tensor([250., -5., 0.]))
         for dt in (.01, .02, .1):
             env = SimpleNamespace(step_dt=dt)
             configs = [SimpleNamespace(func=fn, weight=w, params={}) for fn, w in
                        ((rewards.clearance, 12.), (rewards.motion_force_growth, -.03),
                         (rewards.motion_torque_growth, -.03), (rewards.terminal, 1.))]
             manager = SimpleNamespace(_env=env, _term_names=['clear', 'force', 'torque', 'terminal'], _term_cfgs=configs,
-                                      _reward_buf=torch.zeros(2), _step_reward=torch.zeros(2, 4),
-                                      _episode_sums={name: torch.zeros(2) for name in ['clear', 'force', 'torque', 'terminal']})
+                                      _reward_buf=torch.zeros(3), _step_reward=torch.zeros(3, 4),
+                                      _episode_sums={name: torch.zeros(3) for name in ['clear', 'force', 'torque', 'terminal']})
             with patch.object(task, 'get_task_state', return_value=state):
                 actual = compute(manager, dt)
             expected = 12 * (state.clearance_quality - .5) * dt
@@ -576,25 +577,22 @@ class RewardTests(unittest.TestCase):
                          ('object_collision', 'object_collision'), ('shelf_collision', 'shelf_collision')):
             self.assertEqual(terms[name][0], fn)
             self.assertLess(terms[name][1], 0.)
-        self.assertEqual(terms['clearance'], ('clearance', 12.))
-        self.assertEqual(terms['blocker_distance'], ('blocker_distance', 1.))
-        self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', .2))
-        self.assertEqual(terms['object_collision'], ('object_collision', -1.))
-        self.assertEqual(terms['shelf_collision'], ('shelf_collision', -2.))
-        self.assertEqual(terms['motion_action_rate'], ('motion_action_rate', -.01))
-        self.assertEqual(terms['motion_joint_velocity'], ('motion_joint_velocity', -.01))
-        self.assertEqual(terms['motion_force_growth'], ('motion_force_growth', -.03))
-        self.assertEqual(terms['motion_torque_growth'], ('motion_torque_growth', -.03))
-        self.assertEqual(terms['motion_singularity'], ('motion_singularity', .3))
-        self.assertEqual(terms['object_stability'], ('object_stability', 1.))
-        self.assertEqual(terms['time_penalty'], ('is_alive', -2.))
+        # Research weights/decays are experiment parameters. Check the public
+        # function wiring and cost signs without freezing one experiment's values.
+        for name, fn in (('clearance', 'clearance'), ('blocker_distance', 'blocker_distance'),
+                         ('blocker_contact_hold', 'BlockerContactHold'),
+                         ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
+            self.assertEqual(terms[name][0], fn)
+            self.assertGreaterEqual(terms[name][1], 0.)
+        self.assertEqual(terms['time_penalty'][0], 'is_alive')
+        self.assertLess(terms['time_penalty'][1], 0.)
         self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
         distance = next(n for n in definition.body if isinstance(n, ast.Assign)
                         and n.targets[0].id == 'blocker_distance')
         params = next(item.value for item in distance.value.keywords if item.arg == 'params')
-        self.assertEqual(ast.literal_eval(params), {'decay': 15.})
-        self.assertEqual(settings().clearance_decay, 2.)
+        self.assertGreater(ast.literal_eval(params)['decay'], 0.)
+        self.assertGreater(settings().clearance_decay, 0.)
         for removed in ('reward_components', 'corner_path_increment', 'rearrangement', 'time_penalty', 'time_reward'):
             self.assertFalse(hasattr(rewards, removed))
 
@@ -967,14 +965,14 @@ class TerminationTests(unittest.TestCase):
     def test_terminal_pays_success_once_and_enabled_failure_always_suppresses_success(self):
         cfg = task.MdpCfg()
         self.assertEqual(cfg.success_reward, 250.)
-        self.assertFalse(hasattr(cfg, 'failure_penalty'))
+        self.assertEqual(cfg.failure_penalty, 5.)
         candidate = torch.tensor([True, True, False, False, True])
         failed = torch.tensor([False, True, True, False, False])
         stable = torch.tensor([success_steps(cfg), success_steps(cfg), 0, 0, success_steps(cfg) - 1])
         paid = torch.zeros(5, dtype=torch.bool)
         successful, terminal, paid = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
         self.assertEqual(successful.tolist(), [True, False, False, False, False])
-        self.assertEqual(terminal.tolist(), [250., 0., 0., 0., 0.])
+        self.assertEqual(terminal.tolist(), [250., -5., -5., 0., 0.])
         self.assertEqual(paid.tolist(), [True, True, True, False, False])
         state = SimpleNamespace(terminal_reward=torch.zeros(5))
         state.terminal_reward = terminal
@@ -984,6 +982,34 @@ class TerminationTests(unittest.TestCase):
                 torch.testing.assert_close(rewards.terminal(env) * step_dt, terminal)
         _, repeated, _ = terminations.terminal_transition(candidate, failed, stable, paid, cfg)
         torch.testing.assert_close(repeated, torch.zeros_like(repeated))
+
+    def test_failure_payment_is_configurable_and_survives_disabled_success_without_host_reads(self):
+        cfg = task.MdpCfg(failure_penalty=7.)
+        candidate = torch.tensor([True, True, False, False])
+        failed = torch.tensor([True, False, True, False])
+        stable = torch.full((4,), success_steps(cfg))
+        paid = torch.zeros(4, dtype=torch.bool)
+        with patch.object(torch.Tensor, 'item', side_effect=AssertionError('Tensor scalar read')), \
+             patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('Tensor condition read')), \
+             patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('CPU transfer')):
+            successful, payment, paid = terminations.terminal_transition(
+                candidate, failed, stable, paid, cfg, success_enabled=False)
+        self.assertEqual(successful.tolist(), [False, True, False, False])
+        self.assertEqual(payment.tolist(), [-7., 0., -7., 0.])
+        self.assertEqual(paid.tolist(), [True, False, True, False])
+
+    def test_normal_and_timeout_only_rows_do_not_pay_or_consume_terminal_payment(self):
+        cfg = task.MdpCfg()
+        # Timeouts are handled by native truncation terms, not aggregate failure.
+        for time_out in (False, True):
+            env = SimpleNamespace(termination_manager=SimpleNamespace(
+                time_outs=torch.tensor([time_out]), terminated=torch.tensor([False])))
+            successful, payment, paid = terminations.terminal_transition(
+                torch.tensor([False]), env.termination_manager.terminated, torch.tensor([0]),
+                torch.tensor([False]), cfg)
+            self.assertFalse(successful.any())
+            self.assertFalse(payment.any())
+            self.assertFalse(paid.any())
 
     def test_target_blocker_and_all_object_velocity_gate_success(self):
         data = physical_inputs(5)
@@ -1683,7 +1709,7 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             state.advance(batch, 1, hand_velocity=violation)
         torch.testing.assert_close(state.failure, violation)
         torch.testing.assert_close(state.success, ~violation)
-        torch.testing.assert_close(state.terminal_reward, batch.center.new_tensor([0., 250., 0.]))
+        torch.testing.assert_close(state.terminal_reward, batch.center.new_tensor([-5., 250., -5.]))
         torch.testing.assert_close(state.stable_count[violation], torch.zeros(2, dtype=torch.long))
         self.assertFalse(state.clearance_progress_valid[violation].any())
         self.assertEqual(tuple(state.failure_reasons.shape), (3, 5))
@@ -2632,7 +2658,7 @@ class StateTests(unittest.TestCase):
         batch.state_valid[0] = False
         state.advance(batch, 1)
         self.assertTrue(state.failure[0])
-        self.assertEqual(state.terminal_reward[0].item(), 0.)
+        self.assertEqual(state.terminal_reward[0].item(), -state.cfg.failure_penalty)
         self.assertTrue(torch.isfinite(state.clearance_quality).all() and torch.isfinite(state.terminal_reward).all())
         self.assertTrue(torch.isfinite(state.history).all())
 
@@ -2765,7 +2791,7 @@ class NativeAdapterTests(unittest.TestCase):
         env.common_step_counter = 1
         return env
 
-    def test_named_failures_are_cached_independent_and_pay_zero_when_causes_overlap(self):
+    def test_named_failures_are_cached_independent_and_pay_once_when_causes_overlap(self):
         env = self.failure_fixture()
         names = terminations.FAILURE_REASON_NAMES
         expected = torch.zeros(9, len(names), dtype=torch.bool)
@@ -2779,7 +2805,8 @@ class NativeAdapterTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected)
             torch.testing.assert_close(terminations.failure(env), expected.any(-1))
             self.assertFalse(terminations.success(env).any())
-            torch.testing.assert_close(rewards.terminal(env) * env.step_dt, torch.zeros(9))
+            torch.testing.assert_close(rewards.terminal(env) * env.step_dt,
+                                       -env.cfg.mdp.failure_penalty * expected.any(-1).float())
             obs.current_robot_sample(env)
             self.assertEqual(read.call_count, 1)
             self.assertEqual(conditions.call_count, 1)
@@ -2847,14 +2874,17 @@ class NativeAdapterTests(unittest.TestCase):
             env.scene['object_collection'].data.object_link_pose_w[:, 0, 0] = .8
             env.scene['robot'].data.joint_vel[0, 0] = 3.01
             env.scene['robot'].data.joint_vel[1, 11] = -3.01
+            total_payment = torch.zeros(3)
             for step in range(1, success_steps(env.cfg.mdp, env.step_dt) + 1):
                 env.common_step_counter = step
                 state = task.get_task_state(env)
+                total_payment += state.terminal_reward
             expected_failure = torch.tensor([enabled, False, False])
             torch.testing.assert_close(state.failure, expected_failure)
             torch.testing.assert_close(state.success, ~expected_failure)
             torch.testing.assert_close(state.terminal_reward,
                                        torch.where(expected_failure, 0., 250.))
+            torch.testing.assert_close(total_payment, torch.where(expected_failure, -5., 250.))
             self.assertFalse(state.failure_reasons.any())
             self.assertTrue(env.extras['terminated'].all())
             # Every reader at the same counter sees the cached failure/success decision.
@@ -3449,7 +3479,7 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertTrue(env.extras["terminated"][1])
         self.assertEqual(final_observation.shape, (3, 244))
         self.assertEqual(env.extras["terminal_env_ids"].numel(), 0)
-        self.assertEqual(float(state.terminal_reward[1]), 0.)
+        self.assertEqual(float(state.terminal_reward[1]), -state.cfg.failure_penalty)
         untouched = torch.tensor([0, 2])
         snapshot = {key: value[untouched].clone() for key, value in vars(state).items()
                     if isinstance(value, torch.Tensor) and value.shape[:1] == (env.num_envs,)}
@@ -3462,10 +3492,17 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(int(state.history[1, 1].count_nonzero()), 0)
         self.assertEqual(int(state.history[1, 0, 54:].count_nonzero()), 0)
         self.assertFalse(state.failure[1])
+        self.assertFalse(state.terminal_paid[1])
+        self.assertEqual(float(state.terminal_reward[1]), 0.)
         env.common_step_counter = 2
         task.get_task_state(env)
         self.assertEqual(env.extras["terminal_env_ids"].numel(), 0)
         torch.testing.assert_close(state.elapsed_time, torch.tensor([.2, .1, .2], dtype=state.elapsed_time.dtype))
+        # The reset row may pay again in its next episode; untouched rows stay cached.
+        action.applied_torque[1, 0] = math.nan
+        env.common_step_counter = 3
+        task.get_task_state(env)
+        torch.testing.assert_close(state.terminal_reward, state.terminal_reward.new_tensor([0., -5., 0.]))
 
     def test_current_object_ground_truth_changes_rewards_but_not_frozen_actor_geometry(self):
         env, _, _ = native_fixture()
@@ -3497,7 +3534,7 @@ class NativeAdapterTests(unittest.TestCase):
         env.common_step_counter = 1
         state = task.get_task_state(env)
         torch.testing.assert_close(state.failure, torch.tensor([False, True, True, False]))
-        torch.testing.assert_close(state.terminal_reward, torch.zeros(4))
+        torch.testing.assert_close(state.terminal_reward, state.terminal_reward.new_tensor([0., -5., -5., 0.]))
         self.assertTrue(torch.isfinite(env.extras["terminal_observation"]).all())
 
     def test_shelf_reference_changes_only_on_selected_reset(self):

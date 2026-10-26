@@ -5,12 +5,13 @@
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
 [프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
 
-**최신 적용:** reward weight·Clearance/Distance 민감도를 함께 조정하고, 공식 `is_alive`
-weight−2를 사용하는 일정 시간 비용을 적용했다. 변경·한계·검증은 **78절**에 기록한다.
-직전 GUI tactile/F/T 모니터는 **77절**, 최근 저장 실행 분석은 **76절**을 따른다.
+**최신 적용:** 기존 Terminal에 일회 실패−5를 추가했다. 성공+250·일반/timeout0이며,
+현재 사용자 실험의 다른 weight는 유지한다. 변경·근거·검증은 **79절**에 기록한다.
+직전 reward 조정 이력은 **78절**, GUI tactile/F/T 모니터는 **77절**, 저장 실행 분석은
+**76절**을 따른다.
 
 **이전 물리·관측 적용:** Patch 용량262,144·관측64×48과 GUI 관측 OBB의 변경·검증은
-**48절**에 기록한다. 아래 과거 학습 기록은 당시 설정이며 현재 값은78절과 README를 따른다.
+**48절**에 기록한다. 아래 과거 학습 기록은 당시 설정이며 현재 값은79절과 README를 따른다.
 
 **직전 적용:** 2026-10-21_23-26-39 분석의1차 후보를 사용자 승인으로 적용했다.
 Hold .05→.10·Stability2→3·Success100→250이며 민감도와 나머지 설정은 유지한다.
@@ -6098,3 +6099,65 @@ bootstrap하므로 이 숫자는 전체 학습 return이 아니다. γ와 PPO �
 `RewardManager.compute()`를 사용해 일반/timeout/성공/실패의 비용,dt별8초−16 누적을
 검증했다. 전체 설정·Clearance 새 계수와 초기 품질·부분 reset·기존 성공250/gate도 확인했다.
 이는 수식·CPU manager 검증이며 simulation·학습·새 정책 성능은 실행 검증하지 않았다.
+
+## 79. 2026-10-26 — 조기 실패 회피에 대한 일회 Terminal 비용
+
+사용자는 여러 조합의 짧은 학습에서 빠르게 실패 종료하여 Time 비용을 피하는 방향이
+학습되는 것 같다고 보고했다. 아래 로그를 읽기 전용으로 확인한 뒤, 실패와 일반 진행·
+timeout의 의미 및 보상 차이를 논의했고 성공+250·실패−5·그 외0 적용을 승인했다.
+
+| 실행 | 저장 Time weight | 확인한 마지막 iteration | 평균 episode 길이 | 평균 reward |
+|---|---:|---:|---:|---:|
+| 2026-10-26_15-51-06 | −2 | 109 | 1.87step | −.0621 |
+| 2026-10-26_16-06-39 | −1 | 104 | 2.34step | −.0317 |
+
+두 초기 실험의 확인 구간에서 성공은0이었다. `hand_velocity` 종료 snapshot은 각각약.99962,
+.99984로 최근 종료 원인이 팔 속도 초과인 경향이 강했다. 이는 전체 전이의 정확한 종료 확률이
+아니며 짧은 실험으로 장기 성능을 단정하지 않는다. 두 번째 실행의 평균 reward는 초기−.6618에서
+−.0317로 높아져 episode 단축과 비용 회피 가설을 강하게 뒷받침했다. 저장 reward 전체가 동일한
+대조 실험이라고 주장하지 않는다.
+
+핵심은 실패step의 작은 Time 면제보다 true terminal 이후 남은 음의 return이 사라지는데
+실패 지급이0이었던 점이다. 현재 Time−1·dt.01·γ.98의 순수 Time 보상열 할인합은 최대약−.5다.
+즉시 실패는 이를 피할 수 있고 미래 Motion 비용도 피한다. 마지막step에−.01을 추가하는
+수정만으로는 이 이득을 제거하지 못한다. Timeout은 truncation이며 기존 PPO bootstrap을 유지한다.
+
+**구현:** 기존 `terminal_transition`에 실패 분기를 추가했다. 새로운 reward term이나 파일은
+추가하지 않았다. `MdpCfg.failure_penalty=5`는 양의 비용 크기이며 기존 유한·비음수 cfg 검증을
+따른다. 기존 `state.failure`에는 활성 물체 지지 상실·전도·선반 변위·invalid·singularity와
+공식 `hand_velocity`의 결과가 OR되어 있다. 따라서 여러 실패가 겹쳐도−5 한 번만 지급한다.
+
+$$
+P_k=(1-\mathrm{paid}_{k-1})
+\begin{cases}
+-5,&\text{활성 실패},\\
+250,&\text{실패 없이 활성 성공 확정},\\
+0,&\text{일반 진행 또는 timeout 단독}.
+\end{cases}
+$$
+
+실패가 성공 및 timeout보다 우선한다. 성공 termination을 꺼도 실패 비용은 독립적으로 남으며,
+비활성화한 실패 조건은 기존 mask 규칙대로 비용을 발생시키지 않는다. 기존 paid flag는 성공·
+실패 지급 후 켜지고 부분 reset에서 선택 행만 비워 다음 episode에서 다시 평가한다.
+RewardManager가 계산하기 전 이미 종료 판정이 확정되므로 별도의 센서·PhysX 조회는 필요 없다.
+기존 terminal 함수가 `P_k/dt`를 반환하고 native weight1·dt를 적용하여 실제 일회−5/+250이
+유지된다. 예를 들어100Hz raw−500에dt.01이 곱해져−5다. Bool에단순weight−5를주어 실제−.05가
+되는 방식은 사용하지 않았다. 첫step 실패로 Time0이어도 Terminal−5를 지급한다.
+
+사용자가 시험 중인 다른 수치는 유지했다. 변경 당시 실제 cfg는 Clearance12/decay2,
+Distance3/decay10,Hold.2,Object/Shelf−.5,Action/Joint-velocity각−.03,F/T각−.03,
+Singularity.3,Stability1,Time−1,Terminalweight1이었다. 78절의 이전 제안값으로 복구하지 않았다.
+현재 README 표와 Time 예시를 이 사용자 설정에 맞췄고, cfg Time 주석의 고정−2 표현만 제거했다.
+기존 termination 원인별 로그·Time의 공식is_alive 동작·정책/물리100Hz·모델·관측·PPO는 유지한다.
+
+**검증:** Reward·Termination·NativeVelocityTermination·State·NativeAdapter의 총103개 검사 중
+**CPU102개 통과·CUDA전용1개 skip**. 성공/실패 우선·지급 반복0·일반/timeout0·실패비용설정5→7·
+성공term비활성시실패·중복원인1회·팔속도/invalid실패·부분reset재지급을 확인했다.
+실제 native RewardManager의dt=.01/.02/.1에서 일회 금액이−5/+250인지 검증했다.
+실험용 weight의 정확값을 고정하던 cfg 검사는 공식 함수 연결·비용/보상 부호·양의 decay·
+Terminalweight1 등 구조를 확인하도록 정리하여 유효한 사용자 조합을 허용한다.
+
+이는 첫 실패 비용 실험값이며 새 학습 효과는 아직 미측정이다. 즉시 속도 종료가 줄었는지에
+더해 접촉 후 Clearance 개선·유효 성공이 함께 늘었는지 확인해야 한다. 정지·timeout으로만
+바뀌어도 성공으로 보지 않는다. 무동작에서도 초기 속도 종료가 난다면 reset·제어 문제를
+별도로 확인해야 한다. Simulation·새 학습은 실행하지 않았다.

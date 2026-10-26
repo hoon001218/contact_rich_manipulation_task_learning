@@ -93,11 +93,11 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=1.0, params={"decay": 15.0},
+        func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
     shelf_collision = RewardTermCfg(
-        func=mdp.shelf_collision, weight=-2.0,
+        func=mdp.shelf_collision, weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("shelf"),
             "translation_threshold": 0.005,
@@ -106,11 +106,11 @@ class RewardsCfg:
             "angular_velocity_threshold": 0.05,
         },
     )
-    object_collision = RewardTermCfg(func=mdp.object_collision, weight=-1.0)
+    object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
     # Command variation and actual speed are different control objectives.
-    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.01)
+    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
     motion_joint_velocity = RewardTermCfg(
-        func=mdp.motion_joint_velocity, weight=-0.01,
+        func=mdp.motion_joint_velocity, weight=-0.03,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
     )
     # Separate SI costs: +1 N costs 0.03 reward/s; +0.05 N*m costs 0.000075 reward/s.
@@ -119,8 +119,8 @@ class RewardsCfg:
     motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.03)
     motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=1.0)
-    # Native alive cost: -2 reward/s; terminal success/failure steps are exempt.
-    time_penalty = RewardTermCfg(func=is_alive, weight=-2.0)
+    # Native alive cost; terminal success/failure steps are exempt.
+    time_penalty = RewardTermCfg(func=is_alive, weight=-1.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
