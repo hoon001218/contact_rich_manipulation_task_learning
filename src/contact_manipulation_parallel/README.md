@@ -132,6 +132,34 @@ Train resume와 Play는 공식 `runner.load()`를 사용한다.
 GNN/Attention checkpoint는 입력 구조와 state dict가 다르므로 이 MLP 프로젝트에서
 이어 학습하지 않고 새로 시작한다.
 
+### 첫 장면의 IK 실패 진단
+
+초기 장면의 로봇 자세는 기존 위치 27개·방향 9개·IK branch 4개의 고정 후보에서 찾는다.
+정상 경로에서 유효 후보가 없을 때만 **같은 장면·같은 후보·같은 48회 IK iteration**을
+기존 tensor 방식의 eager 경로로 한 번 더 검사한다. 사용자 정의 CUDA graph와 통합
+IK/clearance kernel을 우회하고, 재검사 중에만 TF32를 끈 뒤 원래 설정을 복원한다.
+충돌·elbow-up·forearm·특이점·시작 영역 기준은 낮추지 않는다.
+재검사에서 찾은 후보도 기존의 실제 articulation FK 검사를 통과해야 초기화에 사용한다.
+정상 초기화나 일반 부분 reset에서는 이 진단을 실행하지 않는다.
+
+실패 전용 콘솔 메시지 `[Initial IK replay]`와 다음 JSONL 파일에 결과를 남긴다.
+
+```text
+logs/rsl_rl/contact_manipulation_parallel/<실행 시각>/initial_robot_start_diagnostics.jsonl
+```
+
+`independent_pass`는 각 조건을 독립적으로 통과한 후보 수이며,
+`cumulative_pass`는 유한 값 → IK 수렴 → 특이점 → elbow → forearm → 바닥 → 장면 충돌 →
+자기충돌 → TCP 영역 순서로 누적 통과한 수다. 이 통계는 **eager 재검사 결과**이며
+실패한 CUDA graph 실행의 내부 통계를 의미하지 않는다.
+`evaluated`는 실제 검사한 후보 수다. 통과 후보를 찾으면 해당 행의 검사를 마치므로
+항상 전체 972개와 같지는 않다. 최소 위치·회전 오차는 서로 다른 후보에서 나왔을 수 있다.
+
+파일에는 실제 배치, 로봇·충돌 형상과 joint frame, 코드 fingerprint, seed, 규칙,
+PyTorch·CUDA·Warp·Isaac Sim·SciPy 버전도 저장한다. 모델이 아직 생성되지 않은 첫 reset
+오류에서도 두 PC의 입력을 비교할 수 있다. 재검사도 실패하면 초기화를 중단하며,
+검사되지 않은 default 자세로 통과시키거나 물체 배치를 다시 생성하지 않는다.
+
 ## 다른 PC 설치와 실행
 
 | 구분 | 값 |
@@ -140,7 +168,7 @@ GNN/Attention checkpoint는 입력 구조와 state dict가 다르므로 이 MLP 
 | 설치 패키지 | `contact-manipulation-parallel` |
 | Gym 환경 ID | `Isaac-Contact-Manipulation-Parallel-UR5e-v0` |
 | 로그 | `logs/rsl_rl/contact_manipulation_parallel/<실행 시각>/` |
-| 기본 배치 캐시 | `src/outputs/contact_manipulation_parallel/parameter_domains/` |
+| 기본 배치 캐시 | `outputs/contact_manipulation_parallel/parameter_domains/` |
 | 환경변수 접두어 | `CONTACT_MANIPULATION_PARALLEL_` |
 
 저장소 루트에 `IsaacLab/`, `assets/robots/Roas_provided_inspire_urdf/`,
@@ -163,8 +191,46 @@ Isaac Lab checkout은 `d6a18c1fb4f317f765788cebea6b4513d1e32906`이다.
 다른 PC에서도 서버에 접근하거나 `CONTACT_MANIPULATION_PARALLEL_NUCLEUS_ROOT` 및
 개별 `CONTACT_MANIPULATION_PARALLEL_*_USD_PATH`로 위치를 지정해야 한다.
 Hand 경로는 `CONTACT_MANIPULATION_PARALLEL_HAND_URDF_PATH`로 바꿀 수 있다.
-원본 로그·checkpoint·배치/Python/JIT 캐시는 복사하지 않았으며, 첫 실행에서 필요한
-캐시를 생성한다. `assets/`의 URDF·mesh는 저장소 공통 자산이다.
+원본 로그·checkpoint·Python/JIT 캐시는 복사하지 않았다. `assets/`의 URDF·mesh는
+저장소 공통 자산이다. 기존 PC의 초기 배치·가시성 카탈로그는 아래와 같이 Git에 포함한다.
+
+### Git push·pull로 초기 카탈로그 전달
+
+다른 PC에서는 저장소를 pull한 뒤 기존 명령으로 실행한다. 별도의 캐시 전송·압축 해제나
+Git LFS 설치는 필요 없다.
+
+```bash
+git pull --ff-only
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_parallel/scripts/train.py \
+  --num_envs 1024 --headless --seed 42
+```
+
+`contact_manipulation_parallel/data/initial_scene_catalog/`에 원본 PC의 완성된 카탈로그와
+참조 가시성 JSON 6,592개를 포함한다. 재컴파일용 중간 파일은 제외했다.
+총 6,593개 파일(약580MiB)을 약153MiB로 압축해 40MiB 이하의 네 조각과
+`manifest.json`으로 일반 Git에서 관리한다. setuptools 설치에도 이 데이터를 포함한다.
+
+처리는 학습 시작 시 한 번만 수행한다.
+
+1. 현재 물체 형상·배치·vision 설정의 지문이 번들 지문과 일치하면 번들을 선택한다.
+   같은 지문의 기존 로컬 생성 캐시보다 번들을 우선해 PC별 재계산 차이를 제외한다.
+2. 최초 사용 시 조각·전체 SHA-256과 압축 내용의 경로·크기·개수를 검사한 뒤,
+   `outputs/contact_manipulation_parallel/parameter_domains/bundled_<archive SHA>/`에
+   원자적으로 복원한다. 중간에 실패한 내용을 완성된 캐시로 사용하지 않는다.
+3. 이후에는 복원된 디렉터리를 재사용한다. `[Scene grammar] using Git-bundled catalog`로
+   선택 여부를 확인할 수 있다. 복원이나 번들 카탈로그 검증 실패 시 재컴파일하지 않는다.
+
+번들 출처는 2026-10-27에 읽은 원본 PC의 캐시다. 원본 캐시는 수정하지 않았다.
+입력 지문은 `b29c25582cca0b352970065b46ecd3f341f56c72159c6ad94f0abdaa71c10e08`,
+전체 압축 SHA-256은 `18eba4c7e98625839d03dcc05776ccc3971313c702d3daa32e00e4f71afef3fc`다.
+
+물체·설정을 바꿔 입력 지문이 달라지면 기존 생성 경로를 사용한다. 동일 입력인지 강제로
+비교하려면 `env.initial_catalog_fingerprint=b29c25582cca0b352970065b46ecd3f341f56c72159c6ad94f0abdaa71c10e08`를
+실행 명령에 추가한다. 이때 지문이 다르면 첫 장면 생성 전에 명시적으로 중단한다.
+`env.spawn_rules.parameter_cache_directory=...`를 직접 지정하면 그 디렉터리를 사용한다.
+
+이 처리는 초기 카탈로그를 통일하며 전체 배치의 bitwise 동일성이나 IK 성공을 보장하지는
+않는다. 이후 GPU 배치 계산과 IK의 차이는 실패 시 생성되는 진단 기록으로 구분한다.
 
 새 MLP checkpoint를 GUI에서 재생하려면 다음과 같이 실행한다.
 

@@ -10215,5 +10215,420 @@ class ClutterJointDomainTests(unittest.TestCase):
         self.assertEqual(stats['role_translation'][1], .01)
 
 
+class InitialRobotStartDiagnosticsTests(unittest.TestCase):
+    """Failure replay must preserve strict acceptance and all unaffected rows."""
+
+    @classmethod
+    def setUpClass(cls):
+        BatchedRobotKinematicsTests.setUpClass()
+
+    def fixture(self, log_dir=None):
+        model = BatchedRobotKinematicsTests().model()
+        model.shelf_boxes = []
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry,
+            spawn_rules=task.SpawnRules(x_range=(-.8, -.4)), device='cpu',
+            cfg=SimpleNamespace(robot_start=task.RobotStartRules(ik_batch_size=32), seed=42, log_dir=log_dir))
+        return env, sample, task._episode_proposals([sample], 2, 'cpu', torch.float32)
+
+    def preserve_tf32(self):
+        old = torch.backends.cuda.matmul.allow_tf32
+        self.addCleanup(setattr, torch.backends.cuda.matmul, 'allow_tf32', old)
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    def test_real_clearance_reports_separate_ground_scene_self_and_posture_rejections(self):
+        n = 7
+        frames = torch.eye(4).expand(n, 2, 4, 4).clone()
+        frames[:, :, :3, 3] = torch.tensor([[.15, 0., 1.1], [-.15, 0., 1.1]])
+        joints = torch.eye(4).expand(n, 4, 4, 4).clone()
+        joints[:, 1:4, 2, 3] = torch.tensor([1., 1.4, 1.])
+        joints[:, 2, 0, 3], joints[:, 3, 0, 3] = .15, -.1
+        constants = dict(collider_owners=torch.arange(2), collider_offsets=torch.eye(4).expand(2, 4, 4),
+                         collider_half=torch.full((2, 3), .025), self_pairs=torch.tensor([[0, 1]]))
+        model = SimpleNamespace(_tensor_constants=lambda *_: constants)
+        env = SimpleNamespace(robot_pose_model=model, cfg=SimpleNamespace(robot_start=task.RobotStartRules()))
+        centers = torch.tensor([0., 3., 1.1]).expand(n, 1, 3).clone()
+        rotations = torch.eye(3).expand(n, 1, 3, 3)
+        half, active = torch.full((n, 1, 3), .025), torch.ones(n, 1, dtype=torch.bool)
+        frames[1, 0, 2, 3] = .02  # Ground.
+        centers[2, 0] = frames[2, 0, :3, 3]  # Scene collision.
+        frames[3, 1, :3, 3] = frames[3, 0, :3, 3]  # Self collision.
+        joints[4, 2, 2, 3] = .99  # Elbow down.
+        joints[5, 2, 0, 3] = -.3  # Folded forearm.
+        frames[6, 0, 0, 0] = math.nan
+        details = {}
+        args = (env, frames, joints, frames[:, 0], centers, rotations, half, active)
+        valid, heights = task._robot_candidate_clearance_eager(*args, details=details)
+        plain, plain_heights = task._robot_candidate_clearance_eager(*args)
+        torch.testing.assert_close(valid, torch.tensor([True, False, False, False, False, False, False]))
+        torch.testing.assert_close(valid, plain)
+        torch.testing.assert_close(heights, plain_heights)
+        for row, name in enumerate(('ground_clear', 'scene_clear', 'self_clear', 'elbow_up',
+                                    'forearm_forward', 'finite'), start=1):
+            self.assertTrue(details[name][0])
+            self.assertFalse(details[name][row], (row, name))
+
+    def test_successful_rows_do_not_replay_or_create_diagnostic_directory(self):
+        env, sample, proposals = self.fixture('/must-not-be-created-by-success')
+        starts = [object(), object()]
+        with patch.object(task, '_sample_robot_starts', side_effect=AssertionError('unexpected replay')), \
+             patch.object(Path, 'mkdir', side_effect=AssertionError('unexpected filesystem write')):
+            actual, reports = task._recover_initial_robot_starts(env, [sample]*2, [17, 18], starts, proposals)
+        self.assertIs(actual, starts)
+        self.assertEqual(reports, {})
+
+    def test_only_failed_rows_replay_identical_proposals_and_seeds_and_write_json(self):
+        import json
+        from tempfile import TemporaryDirectory
+        self.preserve_tf32()
+        with TemporaryDirectory() as directory:
+            env, sample, singleton = self.fixture(directory)
+            proposals = tuple(value.expand(4, *value.shape[1:]).clone() for value in singleton)
+            proposals[0][:, :, 0] += torch.arange(4)[:, None]
+            starts = [object(), None, object(), None]
+            replacements = [object(), object()]
+            def replay(actual_env, samples, seeds, *, proposals, diagnostics):
+                self.assertIs(actual_env, env)
+                self.assertEqual(samples, [sample, sample])
+                self.assertEqual(seeds, [18, 20])
+                self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+                for actual, source in zip(proposals, selected):
+                    torch.testing.assert_close(actual, source, rtol=0, atol=0)
+                diagnostics.update(backend='torch_eager_fp32', ik_iterations=48, candidate_budget=972,
+                                   rows=[dict(evaluated=32, recovered=True)]*2)
+                return replacements
+            selected = tuple(value[[1, 3]].clone() for value in proposals)
+            with patch.object(task, '_sample_robot_starts', side_effect=replay) as sampler, patch('builtins.print'):
+                actual, reports = task._recover_initial_robot_starts(
+                    env, [sample]*4, [17, 18, 19, 20], starts, proposals)
+            sampler.assert_called_once()
+            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+            self.assertIs(actual[0], starts[0])
+            self.assertIs(actual[2], starts[2])
+            self.assertIs(actual[1], replacements[0])
+            self.assertIs(actual[3], replacements[1])
+            self.assertEqual(set(reports), {1, 3})
+            self.assertEqual(starts[1::2], [None, None])
+            records = [json.loads(line) for line in
+                       (Path(directory) / 'initial_robot_start_diagnostics.jsonl').read_text().splitlines()]
+            self.assertEqual(len(records), 2)
+            self.assertEqual([record['ik_seed'] for record in records], [18, 20])
+            self.assertNotEqual(records[0]['scene_sha256'], records[1]['scene_sha256'])
+            for record in records:
+                self.assertEqual(len(record['model_sha256']), 64)
+                self.assertEqual(record['model']['joint_names'], list(env.robot_pose_model.joint_names))
+                self.assertEqual(len(record['model']['colliders']), len(env.robot_pose_model.colliders))
+                self.assertEqual(len(record['source_sha256']), 2)
+                self.assertFalse(record['tf32_replay'])
+                self.assertTrue(record['tf32_before'])
+                self.assertTrue(record['recovered_candidate'])
+
+    def test_replay_exception_restores_tf32_and_preserves_failed_pose(self):
+        self.preserve_tf32()
+        env, sample, proposals = self.fixture()
+        def fail(*args, **kwargs):
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            raise RuntimeError('diagnostic solver failed')
+        with patch.object(task, '_sample_robot_starts', side_effect=fail), patch('builtins.print'):
+            actual, reports = task._recover_initial_robot_starts(env, [sample], [17], [None], proposals)
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        self.assertEqual(actual, [None])
+        self.assertFalse(reports[0]['recovered_candidate'])
+        self.assertIn('diagnostic solver failed', reports[0]['replay_error'])
+
+    def test_unsafe_replay_never_substitutes_an_unchecked_default_pose(self):
+        env, sample, proposals = self.fixture()
+        def reject(*args, diagnostics, **kwargs):
+            diagnostics.update(backend='torch_eager_fp32', ik_iterations=48, candidate_budget=972,
+                rows=[dict(evaluated=972, cumulative_pass={'scene_clear': 0}, recovered=False)])
+            return [None]
+        with patch.object(task, '_sample_robot_starts', side_effect=reject), patch('builtins.print'):
+            actual, reports = task._recover_initial_robot_starts(env, [sample], [17], [None], proposals)
+        self.assertEqual(actual, [None])
+        self.assertFalse(reports[0]['recovered_candidate'])
+        self.assertEqual(reports[0]['replay']['cumulative_pass']['scene_clear'], 0)
+
+    def test_diagnostic_sampler_keeps_all_972_candidates_and_counts_independent_and_cumulative_masks(self):
+        env, sample, proposals = self.fixture()
+        model = env.robot_pose_model
+        normal_inputs, replay_inputs = [], []
+        counters = {'normal': 0, 'replay': 0}
+        def solve(kind, positions, rotations, seeds):
+            saved = normal_inputs if kind == 'normal' else replay_inputs
+            saved.append(torch.cat((positions, rotations.flatten(1), seeds), -1).clone())
+            begin = counters[kind]
+            counters[kind] += len(seeds)
+            indices = torch.arange(begin, counters[kind])
+            tcp = torch.eye(4).expand(len(seeds), -1, -1).clone()
+            tcp[:, :3, 3], tcp[:, :3, :3] = positions, rotations
+            q = torch.zeros((len(seeds), len(model.joint_names)))
+            frames = torch.zeros((len(seeds), 7, 4, 4))
+            joints = torch.zeros((len(seeds), 6, 4, 4))
+            frames[:, 0, 0, 0] = indices
+            return q, indices % 2 == 0, frames, joints, tcp
+        def clear(_env, frames, *_args, details):
+            indices = frames[:, 0, 0, 0].long()
+            ones = torch.ones(len(frames), dtype=torch.bool)
+            ground, scene_clear = indices % 3 != 0, indices % 6 == 0
+            details.update(finite=ones.clone(), elbow_up=ones.clone(), forearm_forward=ones.clone(),
+                           ground_clear=ground, scene_clear=scene_clear, self_clear=ones.clone())
+            return ground & scene_clear, torch.full((len(frames),), .1)
+        with patch.object(model, 'solve_batch', side_effect=lambda *args: solve('normal', *args)), \
+             patch.object(task, '_robot_candidate_clearance',
+                          side_effect=lambda _env, frames, *_args: (torch.zeros(len(frames), dtype=torch.bool),
+                                                                  torch.full((len(frames),), .1))):
+            self.assertEqual(task._sample_robot_starts(env, [sample], [17], proposals=proposals), [None])
+        diagnostics = {}
+        with patch.object(model, 'solve_batch', side_effect=AssertionError('fused dispatch called')), \
+             patch.object(model, '_solve_batch_eager', side_effect=lambda *args: solve('replay', *args)), \
+             patch.object(task, '_robot_candidate_clearance', side_effect=AssertionError('fused clearance called')), \
+             patch.object(task, '_robot_candidate_clearance_eager', side_effect=clear):
+            self.assertEqual(task._sample_robot_starts(
+                env, [sample], [17], proposals=proposals, diagnostics=diagnostics), [None])
+        torch.testing.assert_close(torch.cat(replay_inputs), torch.cat(normal_inputs), rtol=0, atol=0)
+        self.assertEqual(counters, {'normal': 972, 'replay': 972})
+        self.assertEqual(diagnostics['backend'], 'torch_eager_fp32')
+        self.assertEqual(diagnostics['ik_iterations'], 48)
+        self.assertEqual(diagnostics['candidate_budget'], 972)
+        row = diagnostics['rows'][0]
+        self.assertEqual(row['evaluated'], 972)
+        self.assertEqual(row['independent_pass']['ik'], 486)
+        self.assertEqual(row['independent_pass']['ground_clear'], 648)
+        self.assertEqual(row['independent_pass']['scene_clear'], 162)
+        self.assertEqual(row['independent_pass']['tcp_bounds'], 972)
+        self.assertEqual(row['cumulative_pass']['ground_clear'], 324)
+        self.assertEqual(row['cumulative_pass']['scene_clear'], 0)
+        self.assertEqual(row['cumulative_pass']['tcp_bounds'], 0)
+        self.assertEqual(row['minimum_position_error_m'], 0.)
+        self.assertLess(row['minimum_rotation_error_rad'], 1.e-5)
+        self.assertFalse(row['recovered'])
+        self.assertEqual(row['selected_candidate'], 0)
+
+
+class InitialCatalogFingerprintTests(unittest.TestCase):
+    """A pinned startup domain must load identically or fail before compilation."""
+
+    def fixture(self):
+        import hashlib
+        import json
+        from unittest.mock import Mock
+        source = {'version': 'test_catalog', 'geometry': ['target', 'blocker']}
+        fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+        env = SimpleNamespace(cfg=SimpleNamespace(initial_catalog_fingerprint=fingerprint))
+        loader = Mock()
+        runtime = SimpleNamespace(vision=SimpleNamespace(_load_translation_cache=loader))
+        return source, fingerprint, env, runtime, loader
+
+    def test_mismatched_fingerprint_rejects_before_cache_load_or_compilation(self):
+        source, _, env, runtime, loader = self.fixture()
+        env.cfg.initial_catalog_fingerprint = '0' * 64
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, \
+             self.assertRaisesRegex((ValueError, RuntimeError), '(?i)fingerprint|catalog'):
+            task.initialize_certified_catalog(env, runtime, '/unused/parameter_domains')
+        loader.assert_not_called()
+        compile_capacity.assert_not_called()
+
+    def test_pinned_unreadable_cache_does_not_fall_back_to_compilation(self):
+        source, fingerprint, env, runtime, loader = self.fixture()
+        loader.return_value = None
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, \
+             self.assertRaisesRegex((ValueError, RuntimeError), '(?i)cache|catalog'):
+            task.initialize_certified_catalog(env, runtime, '/unused/parameter_domains')
+        loader.assert_called_once_with(
+            Path('/unused/parameter_domains') / f'catalog_{fingerprint}.json', fingerprint)
+        compile_capacity.assert_not_called()
+
+    def test_matched_fingerprint_uses_existing_manifest_and_catalog_validation(self):
+        source, fingerprint, env, runtime, loader = self.fixture()
+        manifest, catalog = {'fingerprint': fingerprint, 'pairs': ['unchanged']}, object()
+        loader.return_value = manifest
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, 'CertifiedSceneCatalog', return_value=catalog) as constructor, \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, patch('builtins.print'):
+            result = task.initialize_certified_catalog(env, runtime, '/unused/parameter_domains')
+        self.assertIs(result, catalog)
+        loader.assert_called_once_with(
+            Path('/unused/parameter_domains') / f'catalog_{fingerprint}.json', fingerprint)
+        constructor.assert_called_once_with(manifest, runtime.vision, Path('/unused/parameter_domains'))
+        compile_capacity.assert_not_called()
+
+    def test_default_cache_prefers_matching_bundle_over_an_existing_local_catalog(self):
+        source, fingerprint, env, runtime, loader = self.fixture()
+        env.spawn_rules = SimpleNamespace(parameter_cache_directory='')
+        manifest, catalog = {'fingerprint': fingerprint, 'pairs': ['bundle']}, object()
+        loader.return_value = manifest
+        bundled = Path('/unused/bundled_verified_archive')
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, '_bundled_catalog_directory', return_value=bundled) as restore, \
+             patch.object(task, 'CertifiedSceneCatalog', return_value=catalog) as constructor, \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, patch('builtins.print'):
+            actual = task.initialize_certified_catalog(env, runtime, '/unused/parameter_domains')
+        self.assertIs(actual, catalog)
+        restore.assert_called_once_with(fingerprint, Path('/unused/parameter_domains'))
+        loader.assert_called_once_with(bundled/f'catalog_{fingerprint}.json', fingerprint)
+        constructor.assert_called_once_with(manifest, runtime.vision, bundled)
+        compile_capacity.assert_not_called()
+
+    def test_explicit_cache_directory_bypasses_bundled_catalog(self):
+        source, fingerprint, env, runtime, loader = self.fixture()
+        env.spawn_rules = SimpleNamespace(parameter_cache_directory='/unused/explicit_cache')
+        manifest, catalog = {'fingerprint': fingerprint, 'pairs': ['explicit']}, object()
+        loader.return_value = manifest
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, '_bundled_catalog_directory', side_effect=AssertionError('explicit cache ignored')), \
+             patch.object(task, 'CertifiedSceneCatalog', return_value=catalog) as constructor, \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, patch('builtins.print'):
+            actual = task.initialize_certified_catalog(env, runtime, '/unused/explicit_cache')
+        self.assertIs(actual, catalog)
+        loader.assert_called_once_with(Path('/unused/explicit_cache')/f'catalog_{fingerprint}.json', fingerprint)
+        constructor.assert_called_once_with(manifest, runtime.vision, Path('/unused/explicit_cache'))
+        compile_capacity.assert_not_called()
+
+    def test_corrupt_bundled_native_catalog_never_recompiles_even_without_explicit_pin(self):
+        source, fingerprint, env, runtime, loader = self.fixture()
+        env.cfg.initial_catalog_fingerprint = None
+        env.spawn_rules = SimpleNamespace(parameter_cache_directory='')
+        loader.return_value = None
+        bundled = Path('/unused/bundled_verified_archive')
+        with patch.object(task, '_certified_catalog_source', return_value=source), \
+             patch.object(task, '_bundled_catalog_directory', return_value=bundled), \
+             patch.object(task, 'CertifiedSceneCatalog') as constructor, \
+             patch.object(task, 'certified_catalog_capacity') as compile_capacity, patch('builtins.print'), \
+             self.assertRaisesRegex(RuntimeError, '(?i)missing|invalid'):
+            task.initialize_certified_catalog(env, runtime, '/unused/parameter_domains')
+        loader.assert_called_once_with(bundled/f'catalog_{fingerprint}.json', fingerprint)
+        constructor.assert_not_called()
+        compile_capacity.assert_not_called()
+
+
+class BundledCatalogTransferTests(unittest.TestCase):
+    """A repository bundle installs atomically without trusting archive paths."""
+
+    def bundle_fixture(self, root, *, unsafe_member=None):
+        import hashlib
+        import io
+        import json
+        import tarfile
+        root = Path(root)
+        bundle = root / 'repository_bundle'
+        bundle.mkdir()
+        cache = root / 'local_cache'
+        cache.mkdir()
+        (cache / 'existing_user_cache.json').write_text('{"preserved": true}')
+        source = {'version': 'tiny-transfer-fixture'}
+        fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+        domain = {'source': source, 'fingerprint': fingerprint, 'pairs': []}
+        payload = hashlib.sha256(json.dumps(domain, sort_keys=True).encode()).hexdigest()
+        files = {f'catalog_{fingerprint}.json': json.dumps(
+            {'domain': domain, 'payload_sha256': payload}, sort_keys=True).encode(),
+            'a'*64+'.json': b'{"domain": {"fixture": "visibility"}}'}
+        if unsafe_member is not None:
+            files[unsafe_member] = files.pop('a'*64+'.json')
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode='w:gz') as archive:
+            for name, content in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+        compressed = data.getvalue()
+        split = len(compressed)//2
+        parts = []
+        for index, content in enumerate((compressed[:split], compressed[split:])):
+            name = f'catalog.tar.gz.part{index:03d}'
+            (bundle/name).write_bytes(content)
+            parts.append(dict(name=name, size=len(content), sha256=hashlib.sha256(content).hexdigest()))
+        manifest = dict(schema=1, fingerprint=fingerprint, payload_sha256=payload,
+            file_count=len(files), unpacked_bytes=sum(map(len, files.values())),
+            archive_sha256=hashlib.sha256(compressed).hexdigest(), parts=parts)
+        (bundle/'manifest.json').write_text(json.dumps(manifest))
+        return bundle, cache, fingerprint, files, manifest
+
+    def test_install_exact_bytes_preserves_existing_cache_and_reuses_verified_marker(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle, cache, fingerprint, files, manifest = self.bundle_fixture(directory)
+            result = task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+            expected = cache/f"bundled_{manifest['archive_sha256']}"
+            self.assertEqual(result, expected)
+            for name, content in files.items():
+                self.assertEqual((result/name).read_bytes(), content)
+            self.assertEqual((result/'.bundle.sha256').read_text(), manifest['archive_sha256']+'\n')
+            self.assertEqual((cache/'existing_user_cache.json').read_text(), '{"preserved": true}')
+            # A verified installation must not read/decompress its chunks again.
+            # Same-length corruption preserves stat metadata checks while making
+            # any attempted content validation fail deterministically.
+            for part in manifest['parts']:
+                path = bundle/part['name']
+                content = path.read_bytes()
+                path.write_bytes(bytes([content[0]^0xff])+content[1:])
+            again = task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+            self.assertEqual(again, result)
+            for name, content in files.items():
+                self.assertEqual((again/name).read_bytes(), content)
+
+    def test_unrelated_fingerprint_does_not_read_chunks_or_change_cache(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle, cache, _, _, manifest = self.bundle_fixture(directory)
+            for part in manifest['parts']:
+                (bundle/part['name']).unlink()
+            self.assertIsNone(task._bundled_catalog_directory('b'*64, cache, bundle_directory=bundle))
+            self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+    def test_corrupt_chunk_rejects_bundle_without_publishing_partial_install(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle, cache, fingerprint, _, manifest = self.bundle_fixture(directory)
+            part = bundle/manifest['parts'][0]['name']
+            data = part.read_bytes()
+            part.write_bytes(bytes([data[0]^0xff])+data[1:])
+            with self.assertRaises(RuntimeError):
+                task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+            self.assertFalse((cache/f"bundled_{manifest['archive_sha256']}").exists())
+            self.assertEqual((cache/'existing_user_cache.json').read_text(), '{"preserved": true}')
+            self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+    def test_archive_checksum_is_checked_in_addition_to_individual_chunks(self):
+        import json
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle, cache, fingerprint, _, manifest = self.bundle_fixture(directory)
+            manifest['archive_sha256'] = '0'*64
+            (bundle/'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaises(RuntimeError):
+                task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+            self.assertFalse((cache/f"bundled_{manifest['archive_sha256']}").exists())
+            self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+    def test_traversal_member_is_rejected_without_writing_outside_staging(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bundle, cache, fingerprint, _, manifest = self.bundle_fixture(
+                directory, unsafe_member='../../escaped.json')
+            with self.assertRaises(RuntimeError):
+                task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+            self.assertFalse((Path(directory)/'escaped.json').exists())
+            self.assertFalse((cache/'escaped.json').exists())
+            self.assertFalse((cache/f"bundled_{manifest['archive_sha256']}").exists())
+            self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+    def test_declared_member_count_and_unpacked_size_are_both_enforced(self):
+        import json
+        from tempfile import TemporaryDirectory
+        for key in ('file_count', 'unpacked_bytes'):
+            with self.subTest(field=key), TemporaryDirectory() as directory:
+                bundle, cache, fingerprint, _, manifest = self.bundle_fixture(directory)
+                manifest[key] += 1
+                (bundle/'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaises(RuntimeError):
+                    task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
+                self.assertFalse((cache/f"bundled_{manifest['archive_sha256']}").exists())
+                self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -181,6 +181,8 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     )
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
+    # Optional cross-PC comparison: require the transferred catalog instead of rebuilding it.
+    initial_catalog_fingerprint: str | None = None
     # Reset-only swaps of neighboring image-ordered distractors; roles stay 0/1.
     observation_adjacent_swap_probability: float = 0.2
     target_asset: str | None = None

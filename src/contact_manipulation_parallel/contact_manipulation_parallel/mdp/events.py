@@ -13,6 +13,9 @@ import random
 import json
 import os
 import hashlib
+import shutil
+import tarfile
+import tempfile
 from itertools import combinations
 from pathlib import Path
 from typing import Sequence
@@ -5240,7 +5243,7 @@ def _robot_candidate_clearance(env, frames, joints, tcp, obstacle_centers, obsta
 
 
 def _robot_candidate_clearance_eager(env, frames, joints, tcp, obstacle_centers, obstacle_rotations, obstacle_half,
-                                     obstacle_valid):
+                                     obstacle_valid, *, details=None):
     """Evaluate all authored colliders and high-elbow geometry on the device."""
     model, rules = env.robot_pose_model, env.cfg.robot_start
     constants = model._tensor_constants(frames.device, frames.dtype)
@@ -5248,22 +5251,31 @@ def _robot_candidate_clearance_eager(env, frames, joints, tcp, obstacle_centers,
     centers, rotations = colliders[..., :3, 3], colliders[..., :3, :3]
     half = constants["collider_half"]
     bottom = centers[..., 2] - (rotations[..., 2, :].abs() * half).sum(-1)
-    valid = (bottom >= rules.collision_clearance).all(-1)
+    ground_clear = (bottom >= rules.collision_clearance).all(-1)
     separated = oriented_boxes_separated_batch(
         centers[:, :, None], rotations[:, :, None], half[None, :, None],
         obstacle_centers[:, None], obstacle_rotations[:, None], obstacle_half[:, None], rules.collision_clearance)
-    valid &= (separated | ~obstacle_valid[:, None]).all((-2, -1))
+    scene_clear = (separated | ~obstacle_valid[:, None]).all((-2, -1))
+    valid = ground_clear & scene_clear
     pairs = constants["self_pairs"]
     if pairs.shape[0]:
-        valid &= oriented_boxes_separated_batch(
+        self_clear = oriented_boxes_separated_batch(
             centers[:, pairs[:, 0]], rotations[:, pairs[:, 0]], half[pairs[:, 0]],
             centers[:, pairs[:, 1]], rotations[:, pairs[:, 1]], half[pairs[:, 1]], .002).all(-1)
+        valid &= self_clear
+    elif details is not None:
+        self_clear = torch.ones_like(valid)
     shoulder, elbow, wrist = joints[:, 1, :3, 3], joints[:, 2, :3, 3], joints[:, 3, :3, 3]
     chord = wrist - shoulder
     fraction = ((elbow - shoulder) * chord).sum(-1) / chord.square().sum(-1).clamp_min(1.e-18)
     height = elbow[:, 2] - shoulder[:, 2] - fraction.clamp(0, 1) * chord[:, 2]
-    valid &= (height >= rules.min_elbow_height) & torch.isfinite(colliders).all((-3, -2, -1))
-    valid &= elbow[:, 0] - wrist[:, 0] >= rules.min_forearm_forward
+    finite = torch.isfinite(colliders).all((-3, -2, -1))
+    elbow_up = height >= rules.min_elbow_height
+    forearm_forward = elbow[:, 0] - wrist[:, 0] >= rules.min_forearm_forward
+    valid &= elbow_up & finite & forearm_forward
+    if details is not None:
+        details.update(finite=finite, elbow_up=elbow_up, forearm_forward=forearm_forward,
+                       ground_clear=ground_clear, scene_clear=scene_clear, self_clear=self_clear)
     return valid, height
 
 
@@ -5374,7 +5386,7 @@ def _robot_start_nonsingular(model, frames, joints, settings):
 
 @torch.no_grad()
 def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=None, return_tensors=False,
-                         recovery=False, max_attempts=None):
+                         recovery=False, max_attempts=None, diagnostics=None):
     """Find a scene anchor, or sample continuous starts around its valid pose.
 
     A new scene uses a fixed 3x3x3 TCP grid at 5/50/95% of its existing bounds,
@@ -5385,6 +5397,8 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
     Explicit max_attempts can truncate the fixed domain for diagnostic calls.
     CUDA keeps acceptance masks on-device across fixed candidate chunks. No
     layout redraw or live physics trial is used in either path.
+    A diagnostics dictionary requests a failure-only eager replay of these same
+    candidates, bypassing the CUDA graph and fused IK/clearance implementations.
     """
     if len(samples) != len(seeds):
         raise ValueError("Every scene requires one reproducible robot-start seed.")
@@ -5507,7 +5521,7 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
         noise = torch.as_tensor(np.stack([np.random.default_rng(int(seed) ^ 0x5D2EA91C).random(
             (attempts_limit, 12), dtype=np.float32) for seed in seeds]), device=device)
     result = torch.zeros((count, len(model.joint_names) + 5), device=device, dtype=dtype)
-    if torch.device(device).type == "cuda":
+    if torch.device(device).type == "cuda" and diagnostics is None:
         # Keep capture buffers and PyTorch generator bookkeeping ordinary
         # tensors even when an RSL-RL rollout calls reset in InferenceMode.
         # They can then be replayed safely from either execution mode.
@@ -5603,6 +5617,12 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
             return [(result[row, :-5], regions[row], result[row, -5:-2], result[row, -2], result[row, -1])
                     if attempt else None for row, attempt in enumerate(attempts)]
     accepted = [False] * count
+    if diagnostics is not None:
+        diagnostic_names = ("finite", "ik", "nonsingular", "elbow_up", "forearm_forward",
+                            "ground_clear", "scene_clear", "self_clear", "tcp_bounds")
+        diagnostic_counts = torch.zeros((count, len(diagnostic_names), 2), device=device, dtype=torch.long)
+        evaluated = torch.zeros(count, device=device, dtype=torch.long)
+        minimum_errors = torch.full((count, 2), float("inf"), device=device)
     # Small asynchronous resets benefit from processing more candidates per
     # launch; full resets already have enough rows to fill the GPU. Keep the
     # same total scratch cap and the absolute candidate random streams.
@@ -5617,16 +5637,43 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
             rows = torch.tensor(pending, device=device, dtype=torch.long)
             target, target_rotation, arm = candidate_inputs(
                 noise[rows], lower[rows], upper[rows], nominal_rotation[rows], anchor_arm[rows], offset, width)
-            q, valid, frames, joints, tcp = model.solve_batch(
-                target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3), arm.reshape(-1, 6))
+            if diagnostics is None:
+                q, valid, frames, joints, tcp = model.solve_batch(
+                    target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3), arm.reshape(-1, 6))
+            else:
+                q, valid, frames, joints, tcp = model._solve_batch_eager(
+                    target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3), arm.reshape(-1, 6))
+                ik_valid = valid.clone()
+            nonsingular = None
             if singularity_settings is not None:
-                valid &= _robot_start_nonsingular(model, frames, joints, singularity_settings)
+                nonsingular = _robot_start_nonsingular(model, frames, joints, singularity_settings)
+                valid &= nonsingular
             obstacle_rows = rows.repeat_interleave(width)
-            clear, heights = _robot_candidate_clearance(
-                env, frames, joints, tcp, centers[obstacle_rows],rotations[obstacle_rows],
-                half[obstacle_rows], obstacle_valid[obstacle_rows])
+            if diagnostics is None:
+                clear, heights = _robot_candidate_clearance(
+                    env, frames, joints, tcp, centers[obstacle_rows],rotations[obstacle_rows],
+                    half[obstacle_rows], obstacle_valid[obstacle_rows])
+            else:
+                predicates = {}
+                clear, heights = _robot_candidate_clearance_eager(
+                    env, frames, joints, tcp, centers[obstacle_rows], rotations[obstacle_rows],
+                    half[obstacle_rows], obstacle_valid[obstacle_rows], details=predicates)
             actual = tcp[:, :3, 3] - origin
-            valid &= clear & (actual >= lower[obstacle_rows]).all(-1) & (actual <= upper[obstacle_rows]).all(-1)
+            in_bounds = (actual >= lower[obstacle_rows]).all(-1) & (actual <= upper[obstacle_rows]).all(-1)
+            valid &= clear & in_bounds
+            if diagnostics is not None:
+                predicates["finite"] &= torch.isfinite(q).all(-1)
+                predicates.update(ik=ik_valid, nonsingular=(torch.ones_like(valid) if nonsingular is None
+                                                          else nonsingular), tcp_bounds=in_bounds)
+                masks = torch.stack([predicates[name] for name in diagnostic_names], -1)
+                cumulative = masks.long().cumprod(-1).bool()
+                diagnostic_counts[rows] += torch.stack((masks, cumulative), -1).reshape(
+                    len(rows), width, len(diagnostic_names), 2).sum(1)
+                evaluated[rows] += width
+                errors = torch.stack(((target.reshape(-1, 3) - tcp[:, :3, 3]).norm(dim=-1),
+                    model._rotation_error_batch(target_rotation.reshape(-1, 3, 3), tcp[:, :3, :3]).norm(dim=-1)), -1)
+                best = torch.nan_to_num(errors, nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
+                minimum_errors[rows] = torch.minimum(minimum_errors[rows], best.reshape(len(rows), width, 2).amin(1))
             valid = valid.reshape(len(pending), width)
             first = torch.where(valid, torch.arange(width, device=device), width).amin(-1)
             indices = first.cpu().tolist()  # One bounded acceptance transfer per proposal batch.
@@ -5642,10 +5689,107 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
                 for index in selected:
                     accepted[pending[index]] = True
             pending = [row for row in pending if not accepted[row]]
+    if diagnostics is not None:
+        counts_host, evaluated_host = diagnostic_counts.cpu().tolist(), evaluated.cpu().tolist()
+        errors_host = minimum_errors.cpu().tolist()
+        regions_host = regions.cpu().tolist()
+        diagnostics.update(backend="torch_eager_fp32", ik_iterations=48, candidate_budget=attempts_limit,
+            rows=[dict(evaluated=evaluated_host[row], tcp_region_xyz=regions_host[row],
+                independent_pass=dict(zip(diagnostic_names, [item[0] for item in counts_host[row]])),
+                cumulative_pass=dict(zip(diagnostic_names, [item[1] for item in counts_host[row]])),
+                minimum_position_error_m=errors_host[row][0] if math.isfinite(errors_host[row][0]) else None,
+                minimum_rotation_error_rad=errors_host[row][1] if math.isfinite(errors_host[row][1]) else None,
+                recovered=accepted[row], selected_candidate=int(result[row, -1])) for row in range(count)])
     if return_tensors:
         return result, regions
     return [(result[row, :-5],regions[row],result[row, -5:-2],result[row, -2],result[row, -1])
             if accepted[row] else None for row in range(count)]
+
+
+def _recover_initial_robot_starts(env, samples, seeds, starts, proposals):
+    """Replay failed anchors once, with identical poses and strict predicates.
+
+    This runs only after the normal initial search fails. Eager tensor IK and
+    clearance bypass CUDA graph/fused implementations, with TF32 disabled for
+    the replay and restored even on failure. Successful anchors still undergo
+    the existing physical-articulation FK check in the episode builder.
+    """
+    failed = [index for index, start in enumerate(starts) if start is None]
+    if not failed:
+        return starts, {}
+    rows = torch.tensor(failed, device=env.device, dtype=torch.long)
+    selected_proposals = tuple(value[rows] for value in proposals)
+    diagnostics, recovered = {}, [None] * len(failed)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        recovered = _sample_robot_starts(
+            env, [samples[index] for index in failed], [seeds[index] for index in failed],
+            proposals=selected_proposals, diagnostics=diagnostics)
+    except Exception as error:
+        # Retain the original failed-anchor error if diagnostics cannot run.
+        # Never accept an unchecked/default pose to hide an initialization error.
+        diagnostics["replay_error"] = f"{type(error).__name__}: {error}"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    from importlib.metadata import PackageNotFoundError, version
+    versions = {"torch": str(torch.__version__), "torch_cuda": torch.version.cuda}
+    for package in ("warp-lang", "isaacsim", "scipy"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    model = env.robot_pose_model
+    model_data = {name: np.asarray(getattr(model, name, ())).tolist() for name in
+                  ("base_origin", "root_transform", "arm_limits", "default_joint_positions")}
+    model_data.update(joint_names=list(getattr(model, "joint_names", ())),
+        body_names=list(getattr(model, "body_names", ())), tcp_body_name=getattr(model, "tcp_body_name", None),
+        native_body_com=getattr(model, "_native_body_com_offsets", {}),
+        joints=[dict(name=joint.name, parent=joint.parent, child=joint.child, axis=np.asarray(joint.axis).tolist(),
+                     frame0=np.asarray(joint.frame0).tolist(), frame1_inverse=np.asarray(joint.frame1_inverse).tolist(),
+                     index=joint.index, reverse=joint.reverse) for joint in getattr(model, "joints", ())],
+        colliders=[dict(body=box.body_name, center=np.asarray(box.center_local).tolist(),
+                        half=np.asarray(box.half_extents).tolist(),
+                        rotation=np.asarray(box.rotation_local).tolist()) for box in getattr(model, "colliders", ())],
+        shelf_boxes=[dict(center=np.asarray(box.center).tolist(), half=np.asarray(box.half_extents).tolist(),
+                          rotation=np.asarray(box.rotation).tolist()) for box in getattr(model, "shelf_boxes", ())])
+    model_hash = hashlib.sha256(json.dumps(model_data, sort_keys=True).encode()).hexdigest()
+    source_files = (Path(__file__), Path(__file__).parents[1] / "config/ur5e/scene.py")
+    source_hashes = {str(path.relative_to(Path(__file__).parents[1])):
+                     hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+    poses = selected_proposals[0].detach().cpu().tolist()
+    log_dir = getattr(env.cfg, "log_dir", None)
+    log_path = None if not log_dir else Path(log_dir) / "initial_robot_start_diagnostics.jsonl"
+    reports, updated = {}, list(starts)
+    for slot, index in enumerate(failed):
+        sample = samples[index]
+        scene = dict(active_ids=list(sample.active_ids), target_id=sample.target_id, blocker_id=sample.blocker_id,
+                     poses={str(obj): poses[slot][obj] for obj in sample.active_ids})
+        report = dict(schema=1, scene=scene,
+            scene_sha256=hashlib.sha256(json.dumps(scene, sort_keys=True).encode()).hexdigest(),
+            model_sha256=model_hash, model=model_data, source_sha256=source_hashes,
+            versions=versions, device=str(env.device), env_seed=getattr(env.cfg, "seed", None),
+            ik_seed=seeds[index], robot_start_rules=vars(env.cfg.robot_start),
+            spawn_rules=vars(env.spawn_rules), tf32_before=previous_tf32, tf32_replay=False,
+            backend=diagnostics.get("backend"), ik_iterations=diagnostics.get("ik_iterations"),
+            candidate_budget=diagnostics.get("candidate_budget"),
+            replay=diagnostics.get("rows", [{}] * len(failed))[slot],
+            replay_error=diagnostics.get("replay_error"), recovered_candidate=recovered[slot] is not None)
+        if torch.device(env.device).type == "cuda":
+            report["gpu"] = torch.cuda.get_device_name(env.device)
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(report, ensure_ascii=False, allow_nan=False) + "\n")
+        summary = {name: report[name] for name in ("backend", "candidate_budget", "replay",
+                                                  "replay_error", "recovered_candidate")}
+        if log_path is not None:
+            summary["diagnostic_file"] = str(log_path)
+        print("[Initial IK replay] " + json.dumps(summary, ensure_ascii=False, allow_nan=False), flush=True)
+        reports[index] = summary
+        if recovered[slot] is not None:
+            updated[index] = recovered[slot]
+    return updated, reports
 
 
 @torch.no_grad()
@@ -6856,6 +7000,76 @@ def _certified_catalog_source(env, runtime, *, reference_count=None):
                 target_asset=env.cfg.target_asset, blocker_asset=env.cfg.blocker_asset)
 
 
+def _bundled_catalog_directory(fingerprint, cache_directory, *, bundle_directory=None):
+    """Restore the Git-tracked catalog once, without replacing generated caches."""
+    bundle = (Path(bundle_directory) if bundle_directory is not None
+              else Path(__file__).resolve().parents[1] / "data/initial_scene_catalog")
+    try:
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        if manifest['schema'] != 1:
+            raise ValueError("Unsupported bundle schema.")
+        if manifest['fingerprint'] != fingerprint:
+            return None  # Changed research settings retain the normal compiler path.
+        checksum = manifest['archive_sha256']
+        if len(checksum) != 64 or any(c not in '0123456789abcdef' for c in checksum):
+            raise ValueError("Invalid bundle checksum.")
+        directory = Path(cache_directory) / f"bundled_{checksum}"
+        marker = directory / '.bundle.sha256'
+        if marker.is_file() and marker.read_text().strip() == checksum:
+            return directory
+        print("[Scene grammar] restoring Git-bundled initial catalog (first use only)", flush=True)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.restore-', dir=directory.parent) as temporary:
+            temporary = Path(temporary)
+            archive, digest = temporary / 'catalog.tar.gz', hashlib.sha256()
+            with archive.open('wb') as output:
+                for part in manifest['parts']:
+                    name, part_digest, size = part['name'], hashlib.sha256(), 0
+                    if Path(name).name != name:
+                        raise ValueError("Bundle part must be a basename.")
+                    with (bundle / name).open('rb') as source:
+                        while block := source.read(1024 * 1024):
+                            part_digest.update(block)
+                            digest.update(block)
+                            size += len(block)
+                            output.write(block)
+                    if size != part['size'] or part_digest.hexdigest() != part['sha256']:
+                        raise ValueError(f"Bundle part checksum mismatch: {name}")
+            if digest.hexdigest() != checksum:
+                raise ValueError("Bundle archive checksum mismatch.")
+            staged = temporary / 'parameter_domains'
+            staged.mkdir()
+            names, unpacked = set(), 0
+            catalog_name = f'catalog_{fingerprint}.json'
+            with tarfile.open(archive, mode='r|gz') as stream:
+                for member in stream:
+                    name = member.name
+                    is_domain = (len(name) == 69 and name.endswith('.json')
+                                 and all(c in '0123456789abcdef' for c in name[:-5]))
+                    if (not member.isfile() or Path(name).name != name or name in names
+                            or not (name == catalog_name or is_domain)):
+                        raise ValueError(f"Invalid bundled cache member: {name}")
+                    names.add(name)
+                    unpacked += member.size
+                    if len(names) > manifest['file_count'] or unpacked > manifest['unpacked_bytes']:
+                        raise ValueError("Bundle exceeds its declared file count or size.")
+                    with stream.extractfile(member) as source, (staged / name).open('wb') as output:
+                        shutil.copyfileobj(source, output)
+            if (catalog_name not in names or len(names) != manifest['file_count']
+                    or unpacked != manifest['unpacked_bytes']):
+                raise ValueError("Bundle is missing declared cache files.")
+            (staged / marker.name).write_text(checksum + '\n')
+            try:
+                staged.rename(directory)
+            except OSError:
+                if not marker.is_file() or marker.read_text().strip() != checksum:
+                    raise  # Another process may have finished the same restore.
+        return directory
+    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
+        raise RuntimeError(f"Git-bundled initial catalog could not be restored: {error}. "
+                           "Update the complete parallel project with git pull.") from error
+
+
 def initialize_certified_catalog(env, runtime, cache_directory, *, reference_count=None):
     """Build/load the continuous grammar before the first episode is sampled.
 
@@ -6867,9 +7081,25 @@ def initialize_certified_catalog(env, runtime, cache_directory, *, reference_cou
     directory = Path(cache_directory)
     source = _certified_catalog_source(env, runtime, reference_count=reference_count)
     fingerprint = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+    expected = getattr(env.cfg, "initial_catalog_fingerprint", None)
+    if expected is not None and fingerprint != expected:
+        raise RuntimeError(
+            f"Initial catalog inputs differ between PCs: expected {expected}, computed {fingerprint}. "
+            "Object geometry, asset composition or scene/vision settings differ; no catalog was rebuilt.")
+    bundled = None
+    if not getattr(getattr(env, 'spawn_rules', None), 'parameter_cache_directory', ''):
+        bundled = _bundled_catalog_directory(fingerprint, directory)
+        if bundled is not None:
+            directory = bundled
+            print(f"[Scene grammar] using Git-bundled catalog {fingerprint}", flush=True)
     path = directory / f'catalog_{fingerprint}.json'
     manifest = runtime.vision._load_translation_cache(path, fingerprint)
+    if (expected is not None or bundled is not None) and manifest is None:
+        raise RuntimeError(f"Required transferred initial catalog is missing or invalid: {path}. "
+                           "No catalog was rebuilt; check the bundled or explicitly selected cache.")
     if manifest is not None:
+        if expected is not None:
+            print(f"[Scene grammar] matched transferred catalog {fingerprint} at {path}", flush=True)
         return CertifiedSceneCatalog(manifest, runtime.vision, directory)
     geoms, rules, sensor = env.spawn_geometries, env.spawn_rules, runtime.vision
     if reference_count is not None:
@@ -7454,10 +7684,15 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                 snapshots = [snapshots[index] for index in visible]
                 starts = _sample_robot_starts(env, samples, [seeds[row] + 7_919 * (attempt + 1) for row in candidates],
                                               proposals=proposed)
+                replay_reports = {}
+                if any(start is None for start in starts):
+                    starts, replay_reports = _recover_initial_robot_starts(
+                        env, samples, [seeds[row] + 7_919 * (attempt + 1) for row in candidates], starts, proposed)
                 feasible = [index for index, start in enumerate(starts) if start is not None]
-                for row, start in zip(candidates, starts):
+                for index, (row, start) in enumerate(zip(candidates, starts)):
                     if start is None:
-                        errors[row] = "No collision-free elbow-up pose in the bounded batched IK search."
+                        errors[row] = ("No collision-free elbow-up pose in the bounded batched IK search. "
+                                       f"Initial replay diagnostics: {replay_reports.get(index)}")
                 if not feasible:
                     continue
                 if scene_generation is not None and not constructive:
