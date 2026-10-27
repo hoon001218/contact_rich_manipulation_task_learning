@@ -5206,6 +5206,8 @@ class EpisodeResetTests(unittest.TestCase):
         ):
             setattr(robot.data, field, value)
         robot.root_physx_view = SimpleNamespace(get_link_transforms=Mock(return_value=torch.zeros(5, 1, 7)))
+        robot.data.body_link_pose_w = torch.zeros(5, 1, 7)
+        robot.data.body_link_pose_w[..., 3] = 1.
         env.cfg = SimpleNamespace(seed=73, target_asset=None, blocker_asset=None,
                                   initial_vision=SimpleNamespace(max_layout_attempts=2),
                                   robot_start=task.RobotStartRules(), mdp=SimpleNamespace(max_objects=10))
@@ -5242,6 +5244,43 @@ class EpisodeResetTests(unittest.TestCase):
             )
 
         return env, sample_scene, sample_robot_start, snapshot
+
+    def test_builder_reads_refreshed_public_link_poses_after_joint_write_without_raw_view(self):
+        env, sample_scene, sample_robot_start, snapshot = self.builder_fixture()
+        robot, reads = env.scene['robot'], []
+        ids = torch.tensor([4, 1])
+        native = torch.zeros(5, 1, 7)
+        native[:, 0, 0] = torch.arange(5)
+        native[..., 3], native[..., 6] = math.sqrt(.5), math.sqrt(.5)
+        native_before = native.clone()
+        class PublicPoseData(SimpleNamespace):
+            @property
+            def body_link_pose_w(self):
+                reads.append(robot.position.clone())
+                return native
+        robot.data = PublicPoseData(**vars(robot.data))
+        robot.root_physx_view.get_link_transforms.side_effect = AssertionError('stale raw transform read')
+        env._episode_reset.vision.capture_batch.side_effect = lambda requests, object_poses, root_poses: [
+            snapshot(request['env_id'], pose) for request, pose in zip(requests, object_poses)]
+        def check(actual_env, samples, starts, poses, origins, *, details):
+            self.assertIs(actual_env, env)
+            expected = native[ids].clone()
+            expected[..., 3:] = expected[..., [4, 5, 6, 3]]
+            torch.testing.assert_close(poses, expected)
+            torch.testing.assert_close(origins, env.scene.env_origins[ids])
+            self.assertEqual(len(reads), 1)
+            torch.testing.assert_close(reads[0][ids], torch.stack([
+                torch.as_tensor(start[0], dtype=robot.position.dtype) for start in starts]))
+            return torch.ones(len(samples), dtype=torch.bool)
+        with patch.object(task, 'sample_scene', side_effect=sample_scene), \
+             patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
+             patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
+             patch.object(task, '_check_physical_robot_starts', side_effect=check):
+            result = task._build_episode_batch(env, env._episode_reset, ids)
+        self.assertEqual(result.object_state.shape[0], 2)
+        self.assertEqual(len(reads), 1)
+        robot.root_physx_view.get_link_transforms.assert_not_called()
+        torch.testing.assert_close(native, native_before, rtol=0, atol=0)
 
     def test_packing_applies_upright_once_corrects_off_center_roots_and_clears_all_velocity(self):
         default = torch.zeros(4, 13)
@@ -5689,12 +5728,12 @@ class EpisodeResetTests(unittest.TestCase):
         with patch.object(task, 'sample_scene', side_effect=sample_scene) as propose, \
              patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
              patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
-             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
+             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a,**kwargs: torch.ones(len(samples),dtype=torch.bool)):
             episodes = task._build_episode_batch(env, env._episode_reset, ids)
         self.assertEqual(captures, [4, 1, 1])
         self.assertEqual(propose.call_count, 3)
         self.assertEqual(objects.writes, 0)
-        self.assertEqual(env.scene['robot'].root_physx_view.get_link_transforms.call_count, 2)
+        env.scene['robot'].root_physx_view.get_link_transforms.assert_not_called()
         torch.testing.assert_close(episodes.geometry_b[0], accepted_geometry[4])
         torch.testing.assert_close(episodes.geometry_b[1], accepted_geometry[1])
         torch.testing.assert_close(episodes.geometry_b[:, :4, :3], episodes.object_state[:, :, :3])
@@ -5804,7 +5843,7 @@ class EpisodeResetTests(unittest.TestCase):
         self.assertEqual(objects.operations, [])
         self.assertEqual(objects.activity_calls, [])
         self.assertEqual(objects.writes, 0)
-        self.assertEqual(robot.root_physx_view.get_link_transforms.call_count, 1)
+        robot.root_physx_view.get_link_transforms.assert_not_called()
 
     def test_constructive_shared_builder_still_rejects_physical_invalid_anchor_and_rolls_back(self):
         env, propose, starts, snapshot = self.builder_fixture()
@@ -5938,7 +5977,7 @@ class EpisodeResetTests(unittest.TestCase):
         with patch.object(task, 'sample_scene', side_effect=sample_scene), \
              patch.object(task, 'sample_scenes', side_effect=self.batch_fixture), \
              patch.object(task, '_sample_robot_starts', side_effect=sample_robot_start), \
-             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a: torch.ones(len(samples),dtype=torch.bool)):
+             patch.object(task, '_check_physical_robot_starts', side_effect=lambda env,samples,*a,**kwargs: torch.ones(len(samples),dtype=torch.bool)):
             with self.assertRaisesRegex(RuntimeError, 'Independent episode preparation exhausted retries'):
                 task._build_episode_batch(env, env._episode_reset, ids)
         self.assertEqual(captures, [4, 1, 1])
@@ -10503,6 +10542,97 @@ class InitialCatalogFingerprintTests(unittest.TestCase):
         loader.assert_called_once_with(bundled/f'catalog_{fingerprint}.json', fingerprint)
         constructor.assert_not_called()
         compile_capacity.assert_not_called()
+
+
+class RobotKinematicsPrecisionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        BatchedRobotKinematicsTests.setUpClass()
+
+    def setUp(self):
+        previous = torch.backends.cuda.matmul.allow_tf32
+        self.addCleanup(setattr, torch.backends.cuda.matmul, 'allow_tf32', previous)
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    def test_precision_context_restores_nested_state_and_exception_without_changing_global_policy(self):
+        with task._robot_kinematics_precision():
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            with task._robot_kinematics_precision():
+                self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        with self.assertRaisesRegex(RuntimeError, 'probe failure'):
+            with task._robot_kinematics_precision():
+                self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+                raise RuntimeError('probe failure')
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        with task._robot_kinematics_precision():
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+        self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+
+    def test_robot_start_sampler_scopes_precision_and_restores_it_after_preparation_error(self):
+        env = SimpleNamespace(robot_pose_model=object(), device='cpu',
+                              cfg=SimpleNamespace(robot_start=task.RobotStartRules()))
+        def fail_inside_sampler(_env):
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            raise RuntimeError('preparation probe failure')
+        with patch.object(task, '_robot_start_singularity_settings', side_effect=fail_inside_sampler), \
+             self.assertRaisesRegex(RuntimeError, 'preparation probe failure'):
+            task._sample_robot_starts(env, [object()], [17])
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+
+    def physical_fixture(self):
+        model = BatchedRobotKinematicsTests().model()
+        q = torch.tensor(np.tile(model.default_joint_positions, (2, 1)), dtype=torch.float32)
+        q[1, :6] += .03
+        reference = model.forward_batch(q.double())
+        origins = torch.tensor([[0., 0., 0.], [5., -3., 0.]], dtype=torch.float32)
+        poses = torch.zeros(2, len(model.body_names), 7)
+        poses[..., :3] = reference[..., :3, 3].float()+origins[:, None]
+        poses[..., 3:] = torch.tensor(Rotation.from_matrix(
+            reference[..., :3, :3].numpy().reshape(-1, 3, 3)).as_quat(),
+            dtype=torch.float32).reshape(2, len(model.body_names), 4)
+        starts = [(row.clone(), None, None, None, None) for row in q]
+        return model, starts, poses, origins
+
+    def test_physical_fk_uses_float64_and_reports_only_the_corrupt_link_without_loosening_tolerances(self):
+        model, starts, poses, origins = self.physical_fixture()
+        poses[1, -1, 0] += .001
+        forward = model.forward_batch
+        calls = []
+        def independent_reference(q):
+            self.assertEqual(q.dtype, torch.float64)
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            calls.append(q.clone())
+            return forward(q)
+        details = {}
+        with patch.object(model, 'forward_batch', side_effect=independent_reference):
+            actual = task._check_physical_robot_starts(
+                SimpleNamespace(robot_pose_model=model), [None]*2, starts, poses, origins, details=details)
+        torch.testing.assert_close(actual, torch.tensor([True, False]))
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(details['rows'][0])
+        bad = details['rows'][1]
+        self.assertEqual(bad['reference_dtype'], 'float64')
+        self.assertEqual(bad['link'], model.body_names[-1])
+        self.assertGreater(bad['maximum_position_error_m'], .0009)
+        self.assertGreater(bad['position_error_m'], .0009)
+        self.assertLess(bad['maximum_rotation_matrix_error'], 3.e-4)
+        self.assertAlmostEqual(bad['actual_position'][0]-bad['expected_position'][0], .001, places=5)
+
+    def test_physical_fk_reference_exception_also_restores_precision(self):
+        model, starts, poses, origins = self.physical_fixture()
+        def fail(q):
+            self.assertEqual(q.dtype, torch.float64)
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            raise RuntimeError('independent reference failed')
+        with patch.object(model, 'forward_batch', side_effect=fail), \
+             self.assertRaisesRegex(RuntimeError, 'independent reference failed'):
+            task._check_physical_robot_starts(SimpleNamespace(robot_pose_model=model),
+                                             [None]*2, starts, poses, origins)
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
 
 
 class BundledCatalogTransferTests(unittest.TestCase):

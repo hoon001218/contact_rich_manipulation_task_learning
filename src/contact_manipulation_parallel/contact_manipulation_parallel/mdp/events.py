@@ -7,6 +7,7 @@ independent of manager call order. Only selected rows change on partial reset.
 
 from dataclasses import dataclass, field, fields, replace
 from collections.abc import Mapping
+from contextlib import contextmanager
 from functools import lru_cache
 import math
 import random
@@ -5384,7 +5385,19 @@ def _robot_start_nonsingular(model, frames, joints, settings):
     return torch.isfinite(margin) & (margin > threshold)
 
 
+@contextmanager
+def _robot_kinematics_precision():
+    """Use FP32 matmul for geometric tolerances, then restore policy settings."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 @torch.no_grad()
+@_robot_kinematics_precision()
 def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=None, return_tensors=False,
                          recovery=False, max_attempts=None, diagnostics=None):
     """Find a scene anchor, or sample continuous starts around its valid pose.
@@ -5793,7 +5806,8 @@ def _recover_initial_robot_starts(env, samples, seeds, starts, proposals):
 
 
 @torch.no_grad()
-def _check_physical_robot_starts(env, samples, starts, poses, origins):
+@_robot_kinematics_precision()
+def _check_physical_robot_starts(env, samples, starts, poses, origins, *, details=None):
     """Verify every physical link against already collision-checked GPU FK.
 
     PhysX link quaternions use xyzw here. Checking the entire articulation
@@ -5805,16 +5819,36 @@ def _check_physical_robot_starts(env, samples, starts, poses, origins):
         return torch.empty(0, device=poses.device, dtype=torch.bool)
     model = env.robot_pose_model
     output = []
+    if details is not None:
+        details['rows'] = [None] * len(starts)
     for begin in range(0, len(starts), 128):
         selected = starts[begin:begin + 128]
-        q = torch.stack([torch.as_tensor(start[0],device=poses.device,dtype=poses.dtype) for start in selected])
+        # This startup-only check is an independent reference for the FP32 IK
+        # result. TF32 rounding must not decide a 0.2 mm collision invariant.
+        q = torch.stack([torch.as_tensor(start[0],device=poses.device,dtype=torch.float64) for start in selected])
         expected = model.forward_batch(q)
-        actual = poses[begin:begin + len(selected)]
-        positions = actual[..., :3] - origins[begin:begin + len(selected), None] + poses.new_tensor(model.base_origin)
+        actual = poses[begin:begin + len(selected)].to(torch.float64)
+        positions = (actual[..., :3] - origins[begin:begin + len(selected), None].to(torch.float64)
+                     + actual.new_tensor(model.base_origin))
         rotations = matrix_from_quat(convert_quat(actual[..., 3:], to="wxyz"))
-        match = ((positions - expected[..., :3, 3]).norm(dim=-1) <= 2.e-4).all(-1)
-        match &= ((rotations - expected[..., :3, :3]).norm(dim=(-2, -1)) <= 3.e-4).all(-1)
-        output.append(match & torch.isfinite(actual).all((-2, -1)))
+        position_error = (positions - expected[..., :3, 3]).norm(dim=-1)
+        rotation_error = (rotations - expected[..., :3, :3]).norm(dim=(-2, -1))
+        match = ((position_error <= 2.e-4).all(-1) & (rotation_error <= 3.e-4).all(-1)
+                 & torch.isfinite(actual).all((-2, -1)))
+        output.append(match)
+        if details is not None:
+            for row in (~match).nonzero().flatten().cpu().tolist():
+                score = torch.nan_to_num(torch.maximum(position_error[row] / 2.e-4,
+                                                       rotation_error[row] / 3.e-4), nan=float('inf'))
+                link = int(score.argmax())
+                details['rows'][begin + row] = dict(
+                    link=model.body_names[link], reference_dtype='float64',
+                    maximum_position_error_m=float(position_error[row].amax()),
+                    maximum_rotation_matrix_error=float(rotation_error[row].amax()),
+                    position_error_m=float(position_error[row, link]),
+                    rotation_matrix_error=float(rotation_error[row, link]),
+                    actual_position=positions[row, link].cpu().tolist(),
+                    expected_position=expected[row, link, :3, 3].cpu().tolist())
     return torch.cat(output)
 
 
@@ -7732,15 +7766,21 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                 robot_staged = True
                 _write_robot_reset(env, candidate_ids, positions)
                 env.sim.forward()  # FK only; no physics integration or neighboring state changes.
-                link_poses = robot.root_physx_view.get_link_transforms()[candidate_ids]
-                physical_valid = _check_physical_robot_starts(env, samples, starts, link_poses, origins[rows]).tolist()
+                # The public getter refreshes articulation FK even without
+                # Fabric; a raw PhysX view read may still contain the old pose.
+                link_poses = robot.data.body_link_pose_w[candidate_ids].clone()
+                link_poses[..., 3:] = convert_quat(link_poses[..., 3:], to="xyzw")
+                physical_details = {}
+                physical_valid = _check_physical_robot_starts(
+                    env, samples, starts, link_poses, origins[rows], details=physical_details).tolist()
                 accepted_rows, accepted_snapshots = [], []
-                for row, snapshot, valid in zip(candidates, snapshots, physical_valid):
+                for index, (row, snapshot, valid) in enumerate(zip(candidates, snapshots, physical_valid)):
                     if valid:
                         accepted_rows.append(row)
                         accepted_snapshots.append(snapshot)
                     else:
-                        errors[row] = "Physical articulation differs from collision-checked batch FK."
+                        detail = physical_details.get('rows', [None] * len(starts))[index]
+                        errors[row] = f"Physical articulation differs from collision-checked batch FK: {detail}"
                 accepted = set(accepted_rows)
                 if accepted_rows:
                     accepted_ids = torch.tensor(accepted_rows, device=env.device, dtype=torch.long)
