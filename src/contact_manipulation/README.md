@@ -1417,12 +1417,59 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 ```
 
 1,024개 병렬 환경 학습은 다음과 같이 실행한다. 에셋 복제·JIT·초기 IK 준비가 필요하다.
-`parameterized`의 cache가 없으면 앞서 설명한 최초 연속 영역 계산 시간도 추가된다.
+기본 설정은 Git에 포함한 초기 카탈로그를 복원해 사용한다. 입력 설정이 번들과 다르거나
+별도 cache 경로를 지정한 경우에는 최초 연속 영역 계산 시간이 추가될 수 있다.
 한 iteration만 점검하려면 `--max_iterations 1`을 붙인다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name independent_critic
 ```
+
+### 다른 PC의 초기 카탈로그와 IK
+
+다른 PC의 GNN 프로젝트에서 첫 reset에 `No collision-free elbow-up pose in the bounded
+batched IK search`가 발생한 사례를 확인했다. 이 시점은 학습 시작 전이며, 오류는 정해진
+후보에서 모든 초기 자세 조건을 함께 만족한 해를 찾지 못했다는 뜻이다. 이 메시지만으로
+GPU 모델이나 설치 오류를 원인으로 확정할 수는 없다. 앞서 parallel에만 적용했던 초기화
+이식성 보완을 이 GNN 프로젝트에도 적용했다.
+
+현재 코드를 Git으로 전달한 뒤 기존 GNN 명령을 사용한다.
+
+```bash
+git pull --ff-only
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless
+```
+
+`contact_manipulation/data/initial_scene_catalog/`에 기본 입력용 카탈로그를 일반 Git 파일
+네 조각과 manifest로 포함한다. Git LFS나 별도 수동 cache 복사는 필요 없다. 현재 물체 형상·
+배치·vision 입력 지문이 일치하면 기존 로컬 생성 cache보다 번들을 우선한다. 최초 한 번
+SHA-256·경로·파일 개수·크기를 검사하고
+`outputs/contact_manipulation/parameter_domains/bundled_<archive SHA>/`에 원자적으로 복원한다.
+이후에는 복원본을 재사용하며 `[Scene grammar] using Git-bundled catalog` 메시지로
+선택 여부를 확인한다. setuptools 설치에도 번들을 포함하고 parallel package를 import하지 않는다.
+
+입력이 달라지면 기존 생성 경로를 사용한다. 입력 일치를 강제 확인하려면
+`env.initial_catalog_fingerprint=b29c25582cca0b352970065b46ecd3f341f56c72159c6ad94f0abdaa71c10e08`를
+명령에 추가한다. `env.spawn_rules.parameter_cache_directory=...`를 명시하면 해당 경로를
+사용한다. 번들은 초기 입력을 통일하며, 이후 GPU 계산의 완전한 동일성이나 IK 성공을
+보장하는 장치는 아니다.
+
+초기 자세 생성·기하 검사는 해당 범위에서만 TF32를 끄고 완료 후 원래 설정을 복원한다.
+첫 장면의 기준 자세 탐색은 기존 위치27개·방향9개·branch4개의 고정 후보를 유지한다.
+정상 탐색이 실패할 때만 같은 후보·같은48회 IK iteration을 tensor eager 경로로 재검사한다.
+후보 수나 재시도 budget을 늘리거나 충돌·elbow-up·forearm·시작 영역·특이점 조건을
+완화하지 않는다. 실제 articulation은 공식 `robot.data.body_link_pose_w`로 갱신된 링크
+자세를 읽고 Float64 기준 FK와 비교한다. 위치0.2mm·회전 행렬 오차0.0003 기준을 유지한다.
+
+실패 전용 `[Initial IK replay]` 메시지와 다음 파일에서 조건별 통과 수·입력·버전을 확인한다.
+일반 reset에는 이 진단 파일 쓰기를 추가하지 않는다.
+
+```text
+logs/rsl_rl/contact_manipulation/<실행 시각>/initial_robot_start_diagnostics.jsonl
+```
+
+이 보완은 GNN·attention·관측 순서·reward·termination을 변경하지 않는다. 이번 반영은
+정적 코드 검토만 수행했으며 다른 PC의 실행 성공은 아직 확인하지 않았다.
 
 위 명령은 `parameterized` 경로와 기본 cache를 사용한다. Cache 경로와 한 번의 IK 후보 수 상한은
 native Hydra 설정으로 명시할 수 있다.

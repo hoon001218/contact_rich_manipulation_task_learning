@@ -13,6 +13,9 @@ dependencies = ["gymnasium", "numba>=0.59", "trimesh", "warp-lang"]
 [tool.setuptools.packages.find]
 include = ["contact_manipulation*"]
 
+[tool.setuptools.package-data]
+contact_manipulation = ["data/initial_scene_catalog/*"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

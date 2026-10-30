@@ -6237,3 +6237,54 @@ GNN·attention, Actor/Critic 관측, action·물리·reset 생성 구조·PPO는
 **검토 범위:** 소스·설정·호출부의 정적 비교만 수행했다. 사용자 요청대로 학습·simulation·
 play·테스트를 실행하지 않았으며, 이번 변경에 대한 실행 성공이나 학습 성능 개선은 미검증이다.
 80절의 CPU 검사 결과는 이전 parallel 변경의 기록으로만 유지한다.
+
+## 82. 2026-10-30 — GNN 프로젝트의 다른 PC 초기 IK 실패와 이식성 보완
+
+다른 PC에서 원본 `src/contact_manipulation/scripts/train.py` 실행 시 첫 `env.reset()`의
+`_build_episode_batch`가 `No collision-free elbow-up pose in the bounded batched IK search`
+오류로 중단되었다. 이는 PPO 학습 전의 초기 로봇 자세 준비 실패이며, 이번 로그만으로
+GPU 차이·설치 문제·특정 충돌 조건을 직접 원인으로 확정할 수는 없다.
+
+**확인한 누락:** 앞서 다른 PC 실행을 위해 parallel에 넣었던 초기 카탈로그 번들·제한된
+TF32 비활성화·실패 전용 eager 재검사·실제 articulation FK 조회 보완이 원본 GNN에는
+적용되지 않았다. Reward·termination 동기화와 별개의 초기화 경로 차이였다.
+이번에는 해당 보완을 원본에도 독립적으로 반영하고 parallel package를 import하지 않는다.
+
+- 같은 기본 초기 카탈로그를 manifest와 일반 Git 압축 조각4개로 원본 package에 포함했다.
+  setuptools package-data에도 등록한다. 입력 지문이 일치하면 PC별 로컬 생성 cache보다
+  번들을 우선하고, SHA-256·경로·파일 수·크기를 검사한 뒤
+  `outputs/contact_manipulation/parameter_domains/bundled_<archive SHA>/`에 원자적으로 복원한다.
+  복원본은 재사용한다. 명시한 cache 경로와 변경된 입력의 기존 생성 경로는 유지한다.
+- 초기 로봇 자세 생성·기하 검사의 FP32 행렬 연산은 해당 범위에서만 TF32를 끈다.
+  완료 후 기존 학습 설정으로 복원하며, 정책의 전역 정밀도를 변경하지 않는다.
+- 첫 장면의 고정 위치27개×방향9개×branch4개에서 정상 탐색이 실패할 때만 같은 후보를
+  기존 tensor eager 경로로 재검사한다. CUDA graph·통합 IK/clearance kernel을 우회하지만
+  IK iteration48회와 후보 budget은 유지한다. 충돌·elbow-up·forearm·TCP 범위·특이점 조건을
+  완화하지 않고 새 배치를 뽑아 우회하지 않는다.
+- 실제 관절값 적용 후 공식 `robot.data.body_link_pose_w`로 FK가 갱신된 링크 자세를 읽어
+  Float64 기준 FK와 비교한다. 위치0.2mm·회전 행렬 오차0.0003 기준은 유지하고, 불일치 시
+  가장 크게 어긋난 링크와 실제/예상 위치·오차를 메시지에 남긴다.
+
+기본 입력 지문은
+`b29c25582cca0b352970065b46ecd3f341f56c72159c6ad94f0abdaa71c10e08`,
+압축 전체 SHA-256은
+`18eba4c7e98625839d03dcc05776ccc3971313c702d3daa32e00e4f71afef3fc`다.
+필요하면 `env.initial_catalog_fingerprint=<위 입력 지문>`으로 입력 일치를 강제 확인한다.
+번들은 초기 입력을 통일하지만 GPU 계산의 완전한 동일성이나 IK 성공을 보장하지 않는다.
+
+실패 전용 `[Initial IK replay]` 메시지와
+`logs/rsl_rl/contact_manipulation/<실행 시각>/initial_robot_start_diagnostics.jsonl`에
+eager 재검사의 독립/누적 조건별 통과 수·실제 배치·로봇 형상·joint frame·fingerprint·seed·
+라이브러리 버전을 기록한다. 정상 reset에는 이 파일 쓰기를 추가하지 않는다.
+
+다른 PC에는 이 변경을 Git push/pull로 전달한 뒤 기존 명령을 사용한다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless
+```
+
+**범위와 검증:** GNN·attention·Actor/Critic observation·물체 순서·action·reward·termination은
+변경하지 않았다. 사용자 요청대로 학습·simulation·play·테스트를 실행하지 않고 소스와 설정을
+정적으로 대조했다. 누락 반영은 확인했지만, 이번 변경이 원격 PC의 실패를 해결했는지는
+재실행 결과로 확인해야 한다. 같은 실패가 나면 위 JSONL로 어느 조건이 후보를 배제했는지
+구분한다. 이전 parallel CPU 검사 결과를 이번 원본 변경의 실행 검증으로 사용하지 않는다.
