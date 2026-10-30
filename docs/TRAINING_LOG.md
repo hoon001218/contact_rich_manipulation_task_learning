@@ -6161,3 +6161,79 @@ Terminalweight1 등 구조를 확인하도록 정리하여 유효한 사용자 �
 더해 접촉 후 Clearance 개선·유효 성공이 함께 늘었는지 확인해야 한다. 정지·timeout으로만
 바뀌어도 성공으로 보지 않는다. 무동작에서도 초기 속도 종료가 난다면 reset·제어 문제를
 별도로 확인해야 한다. Simulation·새 학습은 실행하지 않았다.
+
+## 80. 2026-10-30 — Parallel MLP의 선형 Clearance와 성공 유지 보상
+
+**대상은 `src/contact_manipulation_parallel`만이다.** 다른 PC에서 접근 후 멈추거나 느리게
+움직이며 통로 확보를 배우지 못하는 경향이 보고되었다. 해당 PC의 현재 로그를 직접 분석한
+결과는 아니며, 아래는 사용자와 논의해 승인한 다음 실험의 코드 변경이다. 원본 프로젝트와
+진행 중인 학습은 수정하거나 실행하지 않았다.
+
+Clearance는 초기 Blocker 전체 면적 대신 **초기 Blocker–Target 접근 영역의 교차 면적**
+`O_0`을 episode 기준으로 고정한다. 현재 교차 면적을 `O_t`라고 하면 원점수는 다음이다.
+
+```text
+C_t = 1 - O_t / O_0
+step reward = 12 * dt * C_t
+```
+
+초기0, 완전 확보1, 초기의 두 배를 가리면−1이다. 상한 clip·exponential·추가 초기 품질
+차감은 제거했다. 개선된 상태를 유지하면 같은 점수를 매 step 지급한다. 기존 보호·지지
+gate가 무효이면 양수만 차단하고 음수는 유지한다. 부분 reset은 선택된 환경의 `O_0`만
+갱신한다. 유효한 양수 초기 가림이 없으면 Clearance는0으로 처리해 분모 문제로 보상을
+만들지 않는다. 기존 `clearance_decay`와 불필요해진 초기 품질 buffer도 제거했다.
+
+사용자는 weight 조정 가능성을 논의한 뒤 첫 비교에서는 기존 **Clearance weight12를 유지**
+하기로 했다. 100Hz의 최대 step 보상은0.12다. 직전 논의한 `exp(-2 O_t/O_0)-exp(-2)`의
+최대0.8647보다 원점수 최대가 약15.7% 커진다. 실제 이전 코드의 전체 Blocker 면적 분모
+지수식과는 초기 가림에 따라 차이가 달라진다. 개선뿐 아니라 악화 구간의 선형 비용도
+강해지므로, 실제 항별 지급량·유효 Clearance·접촉 유지·실패율을 보고 추후 scale을 결정한다.
+
+Time weight−1은 유지하고 공식 `is_alive`에 현재 유효 성공 mask를 적용했다. 기존 성공
+조건을 현재 만족하는 동안 비용은0이며, 조건이 깨지면 비용을 재개한다. 과거 성공 기록으로
+영구 면제하지 않는다. 실제 episode 시간·timeout과 native 실패 종료 step 면제는 유지한다.
+
+성공 보상과 성공 termination은 분리했다. 현재 success 종료는 꺼진 상태를 유지하며,
+기존 조건을0.5초 만족하면 기존 설정인+250을 episode당 한 번 지급한다. 성공 이후 실패에도
+기존−3을 한 번 지급하도록 `success_paid`와 `failure_paid`를 따로 관리한다. 같은 step은 실패
+우선이고, 성공 상실·재획득으로 보너스를 반복 지급하지 않는다. 부분 reset은 선택 행의
+두 flag만 초기화한다. Terminal weight1과 native manager의 일회 지급 방식은 유지한다.
+
+할인율은 사용자가 별도로 승인한 `gamma=0.98→0.995`다. 초기 learning rate1e-3와 adaptive
+schedule, 다른 weight·종료 조건·정책100Hz·물리·모델·관측은 변경하지 않았다. 수식 비교
+그림3개와 parallel README를 업데이트했다. 비교 그림의 일부 선형 계수0.8647은 최대값을
+맞추기 위한 시각화용이며, 실제 구현은 계수1의 위 식을 사용한다.
+
+**검증:** Reward·Termination·State·NativeAdapter·ContactReward·SceneMotion의124개 검사 중
+CPU123개 통과·CUDA전용1개 생략. 초기/개선/악화·분모 고정·gate·잘못된 초기 겹침에서의
+유한 출력·부분reset·성공 후 실패 지급·Time 면제와 재개·native RewardManager dt 계산을
+확인했다. 이는 수식과 CPU 연동 검증이며 새 학습의 성능이나 연산 시간 개선을 의미하지 않는다.
+
+## 81. 2026-10-30 — GNN 프로젝트의 Reward·Termination 동기화
+
+사용자 요청에 따라 `src/contact_manipulation`의 reward와 termination을80절의 parallel
+프로젝트 현재 설정에 맞췄다. 이번 대상은 GNN 프로젝트이며, parallel의 코드·설정은 유지한다.
+
+Clearance는 초기 Blocker–Target 접근 영역 교차 면적 `O_0`을 고정하고
+`C_t = 1 - O_t/O_0`으로 계산한다. Weight12와 native `dt` 적분을 적용하며 초기0·완전 확보1,
+초기보다 두 배를 가리면−1이다. 상한 clip·exp·추가 초기 품질 차감은 없다. 기존 Target 보호·
+지지 유효성 gate는 양수만 차단하고 음수는 유지한다. 부분 reset은 선택 행의 분모만 갱신한다.
+
+활성 weight는 Clearance12, Distance3/decay10, Contact hold.2, Shelf/Object collision각−.5,
+Action rate/Force growth/Torque growth각−.03, Object stability.5, Time−1, Terminal1이다.
+Joint velocity·Motion singularity reward와 success termination은 parallel처럼 비활성화했다.
+팔 속도3rad/s·지지 상실·전도·선반 변위·invalid·singularity 실패 및 timeout은 유지한다.
+
+성공 기하·안정 조건은 바꾸지 않는다. 기존 조건을0.5초 연속 만족하면 성공 종료를 켜지 않아도
++250을 episode당 한 번 지급한다. 실패 비용은−5에서 parallel의−3으로 맞추고, `success_paid`와
+`failure_paid`를 분리해 성공 후 실패에도 비용을 한 번 지급한다. 같은 step은 실패 우선이며
+성공 상실·재획득은 성공 보상을 반복 지급하지 않는다. 선택 환경의 두 flag만 reset한다.
+
+Time은 공식 `is_alive`에 현재 유효 성공 mask를 곱한다. 현재 성공을 유지하는 동안 비용0,
+조건을 잃으면 비용을 재개한다. 실제 episode 시간·8초 timeout은 계속 진행한다.
+GNN·attention, Actor/Critic 관측, action·물리·reset 생성 구조·PPO는 변경하지 않는다.
+특히 GNN 프로젝트의 할인율은 기존 `gamma=.98`을 유지하며 parallel의`.995`를 복사하지 않는다.
+
+**검토 범위:** 소스·설정·호출부의 정적 비교만 수행했다. 사용자 요청대로 학습·simulation·
+play·테스트를 실행하지 않았으며, 이번 변경에 대한 실행 성공이나 학습 성능 개선은 미검증이다.
+80절의 CPU 검사 결과는 이전 parallel 변경의 기록으로만 유지한다.

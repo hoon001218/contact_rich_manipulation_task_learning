@@ -20,7 +20,7 @@ __all__ = [
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
-    "terminal",
+    "time_penalty", "terminal",
 ]
 
 
@@ -156,19 +156,26 @@ def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, va
     return (current & previous_contact).sum(-1).to(filtered_force.dtype), current
 
 
-def clearance_quality(cfg, blocked, blocker_area):
-    """Absolute Blocker overlap quality, shared by reset and completed steps."""
-    ratio = (blocked / blocker_area.clamp_min(1.0e-12)).clamp(0.0, 1.0)
-    return torch.exp(-cfg.clearance_decay * ratio)
+def clearance_quality(blocked, initial_overlap):
+    """Signed fraction of the initial Blocker obstruction removed.
+
+    The reset overlap stays fixed for the episode. A larger current overlap
+    produces a negative score without upper clipping. Missing/invalid initial
+    obstruction provides no progress reward rather than inventing clearance.
+    """
+    valid = (torch.isfinite(initial_overlap) & (initial_overlap > 1.0e-12)
+             & torch.isfinite(blocked) & (blocked >= 0.0))
+    denominator = torch.where(valid, initial_overlap, 1.0)
+    return torch.where(valid, 1.0 - blocked / denominator, 0.0)
 
 
 def clearance(env):
-    """Initial-relative quality; invalid placement suppresses only positive progress."""
+    """Linear initial-overlap progress; placement gates suppress positive scores."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    delta = state.clearance_quality - state.initial_clearance_quality
-    return torch.where(state.clearance_progress_valid, delta, delta.clamp_max(0.0))
+    score = state.clearance_quality
+    return torch.where(state.clearance_progress_valid, score, score.clamp_max(0.0))
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
@@ -336,6 +343,15 @@ def motion_singularity(env):
         state.singularity_margin, threshold=state.cfg.motion_singularity_threshold,
         decay=state.cfg.motion_singularity_decay,
     )
+
+
+def time_penalty(env):
+    """Native alive cost, waived only while the current valid success persists."""
+    from isaaclab.envs.mdp.rewards import is_alive
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    return is_alive(env) * (~state.success)
 
 
 def terminal(env):

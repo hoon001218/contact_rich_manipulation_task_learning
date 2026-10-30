@@ -4,9 +4,9 @@
 Isaac Lab의 공식 `RslRlMLPModelCfg`와 RSL-RL의 기본 `MLPModel`을 사용한다.
 GNN, Attention, 별도의 observation encoder, 사용자 모델 subclass는 없다.
 
-원본의 MDP·물체 자세 갱신·제어·물리·배치 생성·PPO 설정을 유지하고,
-**모델을 기본 MLP로 교체하고 초기 물체 슬롯 순서만 변경한 비교 실험**이다.
-원본 패키지를 import하지 않는다.
+원본의 물체 자세 갱신·제어·물리·배치 생성을 기준으로 독립 복사한 MLP 실험이다.
+모델과 초기 물체 슬롯 순서를 변경했으며, 2026-10-30에는 아래의 Clearance·Time·성공
+지급 방식과 할인율을 별도로 조정했다. 원본 패키지를 import하지 않는다.
 
 ## 모델
 
@@ -92,11 +92,49 @@ Mask나 역할 ID를 observation에 추가하지 않는다.
 | 물체 수 | 15–25개, 관측 용량 10개 |
 | Reset | 기존 공통 clutter 장면과 환경별 로봇 초기 자세 randomization |
 | Tactile | 17개 binary, 기존 전체 접촉 관측과 Blocker 접촉 유지 보상 |
-| Reward·종료 조건 | 복사 시점 원본과 동일 |
-| PPO | Rollout 36, epochs 8, minibatches 4, γ=0.98, λ=0.95 |
+| Reward | 선형 Clearance, 현재 성공 중 Time 면제, 성공 보상과 종료 분리 |
+| 성공 종료 | 비활성화; 실패 종료·timeout은 현재 설정 유지 |
+| PPO | Rollout 36, epochs 8, minibatches 4, γ=0.995, λ=0.95 |
+| Learning rate | 초기 `1e-3`, `adaptive` 유지 |
 
-원본의 거리·Clearance·접촉 유지·안정성·움직임 비용·Time·성공/실패 수식과
-weight는 변경하지 않았다. 상세 설계의 기준 기록은
+### 2026-10-30 Reward 변경
+
+일반 reward는 raw score를 반환하고 공식 `RewardManager`가 weight와 `dt`를 곱한다.
+기존 weight는 유지했다.
+
+| 항목 | 계산 | Weight |
+|---|---|---:|
+| Clearance | `1 - current_overlap / initial_overlap` | 12 |
+| Time | 공식 `is_alive` 비용, 현재 유효 성공 상태에서는 0 | −1 |
+| Terminal | 성공 +250 / 실패 −3을 각각 episode당 한 번 지급 | 1 |
+
+Clearance의 분모는 초기 Blocker 전체 면적이 아니라 **초기 Blocker와 Target 접근 영역의
+겹침 면적**이다. 초기에는 0, 완전 확보 시 1, 초기의 두 배를 가리면 −1이다.
+진행률 상한 clip·exponential·추가 초기 점수 차감은 없다. 개선 상태를 유지하면 같은
+양의 점수를 계속 지급한다. Target 보호·지지·실패 gate는 기존과 같고, 무효인 동안
+양수만 차단하며 음수 비용은 유지한다. 유효한 양수 초기 겹침이 없는 경우에는
+Clearance를 0으로 처리한다. 부분 reset은 선택된 환경의 기준 면적만 갱신한다.
+
+Time은 기존 성공 조건(유효 배치·Target 보호·통로 확보·0.5초 안정화)을 현재 만족하는
+동안 비용을 지급하지 않는다. 조건이 깨지면 비용을 재개한다. 과거 성공 보너스 지급
+여부로 면제하지 않으며, episode 시간과 8초 timeout은 계속 진행한다. 공식 `is_alive`의
+실패 종료 step 면제는 유지한다.
+
+성공 보너스는 성공 termination을 꺼도 지급한다. 성공과 실패의 지급 기록을 따로 두어
+성공→조건 상실→재성공 시 중복 보너스를 막고, 성공 후 실패에도 실패 비용을 지급한다.
+같은 step에서는 실패가 우선한다. `terminal`은 금액을 `dt`로 나눠 반환하므로 native
+manager 적용 후 실제 일회 지급액은 +250/−3이다. 거리·접촉 유지·나머지 비용·종료
+기준과 활성/비활성 선택은 변경하지 않았다.
+
+위의 선형식은 원점수 기준이다. 100Hz에서 Clearance step 보상은 `0.12 * score`이며,
+완전 확보 시 0.12다. 직전 논의한 초기 겹침 분모 지수안의 최대 점수 0.8647보다
+약15.7% 커지지만 첫 비교에서는 weight12를 유지한다. 이전 수식과의 비교 자료는
+[`분모·초기 기준값`](../../docs/figures/clearance_reward_comparison.png),
+[`초기 겹침 분모`](../../docs/figures/clearance_overlap_normalization.png),
+[`선형·지수식의 개선/악화`](../../docs/figures/clearance_linear_comparison.png)에 있다.
+마지막 그림의 선형 계수0.8647은 최대값을 맞춘 비교용이며 실제 구현에는 적용하지 않는다.
+
+상세 설계의 이전 기준 기록은
 [원본 README](../contact_manipulation/README.md), [개발 맥락](../../docs/CONTEXT.md),
 [배치 규칙](../../docs/SPAWN_RULES.md), [학습 기록](../../docs/TRAINING_LOG.md)에 있다.
 이 기록들은 이번 MLP 변형의 새 학습 결과를 의미하지 않는다.

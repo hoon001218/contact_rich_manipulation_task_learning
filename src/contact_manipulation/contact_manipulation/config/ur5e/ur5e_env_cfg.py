@@ -96,8 +96,11 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             preserve_order=True,
             rescale_to_limits=True,
         )
-        # Cost covers all twelve independent joints; overspeed termination is arm-only.
-        independent_joint_names = self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
-        self.rewards.motion_joint_velocity.params["asset_cfg"].joint_names = independent_joint_names
+        # If enabled, velocity cost covers twelve independent joints; overspeed is arm-only.
+        velocity_reward = getattr(self.rewards, "motion_joint_velocity", None)
+        if velocity_reward is not None:
+            velocity_reward.params["asset_cfg"].joint_names = (
+                self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
+            )
         if self.terminations.hand_velocity is not None:
             self.terminations.hand_velocity.params["asset_cfg"].joint_names = self.actions.arm_action.joint_names

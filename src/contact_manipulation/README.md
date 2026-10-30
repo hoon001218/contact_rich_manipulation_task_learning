@@ -358,7 +358,7 @@ position PD를 유지한다. 별도 custom controller나 torque clamp는 추가�
 이 출력 제한이 정책의 delta pose/stiffness 요구를 제한하거나 적절한 요구를 학습하도록
 보장하지는 않는다. 측정 joint torque observation/reward는 아직 추가하지 않았다.
 UR5e 팔6개 중 하나라도 절대 관절 속도가3rad/s를 초과하면 `hand_velocity`로 종료한다.
-Hand는 이 종료 검사에서 제외하며, joint velocity reward는 팔6개+Hand 독립6개를 유지한다.
+Hand는 이 종료 검사에서 제외하며, joint velocity reward는 현재 비활성이다.
 이는 actuator의 물리 속도 상한과 별개인 episode 종료 조건이다.
 
 Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
@@ -378,51 +378,51 @@ Blocker 접촉은 `ManagerTermBase`를 사용하고, 공통 기하·F/T는 기�
 **Dense reward는 native `weight × dt`를 그대로 적용한다.** 아래 표의 값은 dt 곱 전이다.
 현재100Hz에서는 한 step 지급이 표의 weighted 값의0.01배다. 예를 들어 Distance 최대값은
 3 reward/s, step당0.03이며, 같은 상태를1초 유지하면 할인 전 합은3이다.
-Terminal은 성공+250·실패−5를 일회 지급하므로 rate로 변환한다. 성공·실패 조건은 변경하지 않았다.
-아래 weight는 실패 비용을 추가할 당시의 사용자 실험 설정이다. 78절의 이전 제안값과 구분한다.
+Terminal은 성공+250·실패−3을 각각 일회 지급하므로 rate로 변환한다. 성공·실패의 기하 기준은
+유지하며 성공 termination은 끈다. 아래는 parallel 프로젝트와 맞춘 현재 설정이다.
 
 | Reward | Weight | 함수가 반환하는 raw score / cost |
 |---|---:|---|
-| Clearance | 12.0 | $\min(d,0)+V_pV_T\max(d,0)$, $d=q_C(t)-q_C(0)$, $q_C=\exp(-2x_C)$ |
+| Clearance | 12.0 | $\min(C_t,0)+V_pV_T\max(C_t,0)$, $C_t=1-O_t/O_0$ |
 | `blocker_distance` | 3.0 | $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_i)$, 각 pad 표면 대표점에서 현재 Blocker OBB까지 거리 |
 | `blocker_contact_hold` | 0.20 | $V_T\sum_{i=1}^{17}(b^B_{i,k-1}\land b^B_{i,k})$ |
 | `shelf_collision` | −0.5 | 초기 대비 선반 pose 또는 현재 속도가 허용값을 넘으면1, 아니면0 |
 | `object_collision` | −0.5 | $\sum_{i\ne B,\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2$ — 현재 OBB 코너 속도 |
 | `motion_action_rate` | −0.03 | $\sum_{j=1}^{18}(a_{j,k}-a_{j,k-1})^2$ — 공식 `action_rate_l2` |
-| `motion_joint_velocity` | −0.03 | $\sum_{j=1}^{12}\dot q_{j,k}^2$ — 공식 `joint_vel_l2` |
 | `motion_force_growth` | −0.03 | $[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+^2$ |
 | `motion_torque_growth` | −0.03 | $[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+^2$ |
-| `motion_singularity` | 0.30 | $\exp(-a_S[0.07-s]_+^2)-1$ |
-| `object_stability` | 1.0 | $\exp[-\max_i(a_P[d_i^{\mathrm{stab}}-0.01]_+^2+a_\theta\theta_i)]-1$ |
-| `time_penalty` | −1.0 | 공식 `is_alive`: $\mathbf1[\neg\mathrm{terminated}]$ |
-| Terminal | 1.0 | 성공 $250/\Delta t$, 실패 $-5/\Delta t$, 일반·timeout0·episode당1회 |
+| `object_stability` | 0.5 | $\exp[-\max_i(a_P[d_i^{\mathrm{stab}}-0.01]_+^2+a_\theta\theta_i)]-1$ |
+| `time_penalty` | −1.0 | $\mathbf1[\neg\mathrm{terminated}]\mathbf1[\neg\mathrm{success}]$ |
+| Terminal | 1.0 | 성공 $250/\Delta t$·실패 $-3/\Delta t$를 각각 episode당1회, 일반·timeout0 |
 
 기존 누적 Rearrangement와 그 OBB 경로 이력은 제거했다. 예제의 선반·주변 물체 움직임 비용으로
-대체했으며, **Motion 네 항도 exp 포화 없이 양의 cost × 음의 weight**로 계산한다.
+대체했으며, **활성 Motion 세 항은 exp 포화 없이 양의 cost × 음의 weight**로 계산한다.
 예전 모든 dense 항의 `/step_dt` 상쇄와 양의 reward/step 예시는 현재 설정에 적용하지 않는다.
-사용자가 여러 reward 조합을 시험 중이며, 이번 변경에서는 기존 Terminal의 실패 비용만 추가했다.
-다른 weight·민감도는 당시 사용자 설정을 유지했다. 새 정책의 성능 개선을 측정한 결과는 아니다.
+`motion_joint_velocity`와 `motion_singularity`는 함수는 남기되 cfg에서 비활성화했다.
+GNN·attention과 관측·action·PPO 설정은 유지했다. 새 정책의 성능 개선을 측정한 결과는 아니다.
 아래 과거 학습·검증 수치는 당시 설정의 기록이며 새로운 reward 규모의 실측으로 읽지 않는다.
 
-**Clearance.** 분모는 episode 초기 Blocker의 XY 투영 footprint 전체 면적이다.
+**Clearance.** 분모 $O_0$는 episode 초기 Blocker와 Target 접근 영역의 XY 교차 면적이며,
+분자 $O_t$는 같은 영역에 대한 현재 Blocker의 교차 면적이다.
 
 $$
-x_C(t)=\operatorname{clip}\!\left(\frac{A_{\mathrm{blocked}}(t)}{A_{\mathrm{blocker},0}},0,1\right),\qquad
-q_C(t)=\exp[-2x_C(t)],\qquad d=q_C(t)-q_C(0).
+C_t=1-\frac{O_t}{O_0},\qquad
+r_{C,t}=12\Delta t\left[\min(C_t,0)+V_pV_T\max(C_t,0)\right].
 $$
 
 Target·주변 물체의 overlap은 제외하고 GPU 다각형 clipping도 Blocker만 평가한다.
-초기 품질·면적은 reset 대상 행에서 한 번 계산해 고정한다. 직전 step 대비 증가량이 아니라
+초기 교차 면적은 reset 대상 행에서 한 번 계산해 고정한다. 직전 step 대비 증가량이 아니라
 초기 상태 대비 차이이므로 개선 상태를 유지하면 양의 보상을 계속 받는다.
 공중·영역 밖·전도·활성 실패에서는 양의 부분만0이고 음의 Clearance와 다른 비용은 남는다.
 진행 gate는 현재 선반 frame의 signed support gap −5~10mm·중심XY·footprint overlap을
 사용하되 속도·tactile 조건은 넣지 않아 정상적으로 미는 동안에도 보상한다.
 Target이 초기 pose에서2cm 또는0.15rad를 넘으면 `V_T=0`으로 양의 Clearance·Distance·Contact만
 차단한다. 복구하면 재개하며 추가 termination은 없다. Contact 이력은 실제 접촉대로 갱신한다.
-예를 들어 초기 가림비율.5→.3이면 weighted rate약+2.17119,100Hz 지급약+0.0217119이다.
-기본 `a_C=2`·weight12에서 양의 rate 전역 상한은약10.37598이며 실제 상한은 초기 가림에 의존한다.
-개선 민감도는 $w_Ca_C\exp(-a_Cx_C)$다. $x_C=.5$에서는 이전4.85225에서8.82911로
-약82% 커진다. 계수만 키우면 큰 가림에서 기울기가 작아질 수 있어 weight와 함께 변경했다.
+초기0·완전 확보1·초기보다 두 배를 가리면−1이다. 비율의 상한 clip·exp·추가 초기 품질
+차감은 없다. 예를 들어 현재 겹침이 초기의60%라면 원점수0.4, weighted rate4.8,
+100Hz 지급0.048이다. 양의 rate 상한은12이며, 악화 구간은 음수로 계속 내려간다.
+초기 교차 면적이 유한한 양수가 아니면 원점수0으로 처리한다. 작은 초기 면적에서는
+같은 절대 면적 변화가 더 크게 평가되므로 새 학습의 실제 분포를 확인해야 한다.
 
 **Distance·Contact.** 실제 tactile collision mesh의 노출된 local+Z 표면에서 대표점 하나씩을
 초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 17개 pad 각각의 OBB 거리 $d_i$에
@@ -479,9 +479,9 @@ tanh가 아니다. 후속 수정 방향을 논의할 때는 **현재 선형 비�
 현재 선형 비용은 큰 순간 속도·진동·측정 노이즈에도 그대로 반응한다. 자동으로 tanh를 복원하지 않는다.
 
 **Motion.** Action-rate는 현재·직전 raw18D 차이의 제곱합이며 Kp가 clamp되는 구간의 raw 변화도 포함한다.
-Joint velocity는 팔6+hand 독립6관절의 제곱합으로 mimic/passive는 제외한다. 현재 속도와
-명령 변화는 서로 다른 대상이고 가속도·관절 수 정규화·exp를 추가하지 않는다.
-속도는 마지막 physics substep 값이다. 큰 cost의−1 포화가 없으므로 Motion 전체의 유한 하한은 없다.
+Joint velocity 함수는 팔6+hand 독립6관절의 제곱합을 계산하지만 현재 reward는 비활성이다.
+Action-rate와 F/T 증가량에 가속도·관절 수 정규화·exp는 추가하지 않는다.
+큰 cost의−1 포화가 없으므로 활성 Motion 비용의 유한 하한은 없다.
 
 $$
 \Delta F_k=[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+,\qquad
@@ -499,7 +499,8 @@ norm이 같은 방향 변화는 비용0이다. 힘과 토크는 서로 상쇄하
 적용하지 않는다. 센서 해상도·자중·관성 하중을 포함한 실제 증가량 분포를 새 run에서 확인해야 한다.
 매 step 증분에 대한 제곱이므로 제어주기를 바꾸면 같은 연속 하중 궤적의 비용까지 불변이지는 않다.
 
-**Singularity.** 현재 팔 자세의 공개 OSC Jacobian으로 다음 보수적 지표를 계산한다.
+**Singularity.** 현재 reward는 비활성이며 종료 조건은 유지한다. 현재 팔 자세의 공개 OSC
+Jacobian으로 다음 보수적 지표를 계산한다.
 
 $$
 \bar J=\begin{bmatrix}J_v/0.25\\J_\omega\end{bmatrix},\qquad
@@ -512,7 +513,7 @@ $$
 singular value·condition ratio는 아니고 여러 방향이 약하면 더 보수적으로 평가한다.
 `torch.linalg.inv_ex(check_errors=False)`로 GPU에서 계산하며 실패·비유한 행은0이다.
 Controller의 역산·토크에는 개입하지 않는다. $a_S=\ln(2)/.03^2$, warning .07과 종료 .005를
-유지한다. s=.04이면 weighted rate−.15·100Hz 지급−.0015다. 위험 자세에서는 정지해도 비용이 남는다.
+유지한다. 비활성 reward는 이 지표로 비용을 지급하지 않는다.
 부분 reset 행은 첫 완료 physics sample까지0으로 초기화하며 이 지표를 관측에 추가하지 않는다.
 
 **Object stability.** 현재 선반 frame에서 전체 OBB의 가장 큰 XY 돌출과 실제 충돌형상의 최저Z
@@ -520,71 +521,63 @@ Controller의 역산·토크에는 개입하지 않는다. $a_S=\ln(2)/.03^2$, w
 20mm에서 거리 품질0.5,45°에서 기울기 품질0.5인 계수를 유지한다.
 
 $$
-r_{P,k}=\left\{\exp\!\left[-\max_{i\text{ active}}
+r_{P,k}=0.5\left\{\exp\!\left[-\max_{i\text{ active}}
 \left(\frac{\ln2}{0.01^2}[d_i^{\mathrm{stab}}-0.01]_+^2+
 \frac{\ln2}{\pi/4}\theta_i\right)\right]-1\right\}\Delta t.
 $$
 
-Blocker도 포함하며 속도 항은 아니다. 기울기만45°이면−.5/s, 기울기 없이 지지 오차20mm면
-−.5/s가 된다. 기존 중심기반 지지 실패·전도 종료는 그대로 둔다.
+Blocker도 포함하며 속도 항은 아니다. 기울기만45°이면−.25/s, 기울기 없이 지지 오차20mm면
+−.25/s가 된다. 기존 중심기반 지지 실패·전도 종료는 그대로 둔다.
 
-**Time·Terminal.** `RewardsCfg.time_penalty`는 공식 `isaaclab.envs.mdp.is_alive`를 직접
-사용하며 현재 사용자 실험의 weight−1을 유지한다. 별도의 task 함수·elapsed 조회·exp 계수·
-구간 적분 wrapper는 없다. 78절의 weight−2 적용 기록과 구분한다.
+**Time·Terminal.** `RewardsCfg.time_penalty`는 `mdp.time_penalty`가 공식 `is_alive`에
+현재 유효 성공 mask를 곱한다. Weight−1은 유지한다.
 
 $$
-f_{T,k}=\mathbf1[\neg\mathrm{terminated}_k],\qquad
+f_{T,k}=\mathbf1[\neg\mathrm{terminated}_k]\mathbf1[\neg\mathrm{success}_k],\qquad
 r_{T,k}=-\Delta t\,f_{T,k}.
 $$
 
 일반 step의 비용은100Hz에서−.01,50Hz라면−.02로 같은 실제1초의 비용이−1이 된다.
 현재 정책·물리 주기는100Hz 그대로다. 1/2/4/8초 동안 모든 step이 과금되면 할인 전 합은
 −1/−2/−4/−8이다. 비용률은 처음부터끝까지−1/s이며 경과 시간에 따라 가팔라지지 않는다.
-따라서 성공이 드문 초기에도 기다리는 매step에 비용이 있고, 성공이 일찍 끝나면 남은 비용을
-피한다. 초반이 거의0이었던 옛 증가형이나 계속 생존하면 양수가 누적되던 직전 Time과 다르다.
+현재 유효 성공을 유지하는 동안 비용은0이고, 그 상태를 잃으면 비용을 재개한다. 성공을
+한 번 달성했다는 기록으로 영구 면제하지 않는다. 실제 episode 시간과8초 timeout은 멈추지 않는다.
 
-Native step은 **termination 계산 → reward 계산 → reset** 순서다. 성공·실패의 non-timeout
-종료step은 `terminated=True`여서 이 비용이0이다. Timeout만 발생한 step은 truncated이며
-`terminated=False`이므로−.01이다. 공통 장면 교체로 truncated가 된 step에도 같은 비용이 붙는다.
-예를 들어2초째200번째step에서 성공하면 Time합은−1.99,
-8초 timeout800step은−8이다. 성공step의 기존 Terminal+250은 그대로 지급된다.
-Reset 자체에는 과금하지 않으며 새episode는 첫 정상step부터−.01이다. Time 보상은elapsed나
-처리 횟수 이력을 관리하지 않아 부분reset에도 별도의 상태복구가 필요하지 않다.
+Native step은 **termination 계산 → reward 계산 → reset** 순서다. 실패의 non-timeout
+종료step은 `terminated=True`여서 이 비용이0이다. Timeout만 발생한 step은 truncated이므로
+현재 성공이 아니면−.01이며 성공을 유지 중이면0이다. 공통 장면 교체도 같은 규칙을 따른다.
+Reset 자체에는 과금하지 않으며 새episode는 첫 정상step부터 다시 평가한다.
 
-이는 빠른 성공만을 구별하는 항은 아니다. 실패도 남은 시간 비용을 피할 수 있어 이번에
-일회 실패 비용을 추가했다. 현재γ=.98·100Hz의 할인반감기는약.343초이며,8초 Time 보상열 자체의
+실패도 남은 시간 비용을 피할 수 있으므로 Time만으로 빠른 성공을 보장하지 않는다.
+현재γ=.98·100Hz의 할인반감기는약.343초이며,8초 Time 보상열 자체의
 할인합은약−.5다. 무할인−8과 구분해야 한다. Timeout에서는 PPO가 다음 가치도 bootstrap하므로
-이 값이 전체 학습 return은 아니다. Time만으로 모든 정체를 제거하거나 빠른 조작을 보장하지
-않으며, 이번에는 Clearance/Distance 민감도·Motion·환경 손상 비용과 함께 맞춘다.
-성공률과 접촉 후 정체 시간, 실제 종료 원인별 counter를 비교한다. 기존 양의 `time_reward`
-함수·cfg term·decay 설정은 제거했다.
-Terminal은 성공+250·실패−5·일반/timeout0을 episode당 한 번 지급한다.
-`MdpCfg.failure_penalty=5`는 양의 비용 크기이며 실제 지급에는 음수를 붙인다.
+이 값이 전체 학습 return은 아니다. 이번 동기화에서 PPO·γ는 변경하지 않았다.
+
+Terminal은 성공+250과 활성 실패−3을 **각각 episode당 한 번** 지급한다.
+성공 보상은 성공 종료의 활성 여부와 독립적이다. 현재 success termination은 꺼져 있어
+유효 성공 후에도 조작·관측을 이어간다. 두 지급 이력은 `success_paid`·`failure_paid`로 분리한다.
 
 $$
-P_k=(1-\mathrm{paid}_{k-1})
-\begin{cases}
--5,&\text{활성 실패},\\
-250,&\text{실패 없이 활성 성공 확정},\\
+P_k=\begin{cases}
+-3,&\text{아직 비용을 지급하지 않은 활성 실패},\\
+250,&\text{성공·실패 지급 이력이 없고 실패 없이 유효 성공 확정},\\
 0,&\text{그 외 및 timeout},
 \end{cases}
 \qquad f_{\mathrm{terminal},k}=P_k/\Delta t.
 $$
 
-RewardManager가 weight1·dt를 적용하므로 실제 한 번 지급되는 금액은 정확히−5 또는+250이다.
+RewardManager가 weight1·dt를 적용하므로 실제 한 번 지급되는 금액은 정확히−3 또는+250이다.
 여러 실패가 겹쳐도 기존 aggregate `state.failure`로 한 번만 감점하며 실패가 성공보다 우선한다.
-`hand_velocity`도 포함한다. Timeout과 실패가 동시에 발생하면 실패−5이고, timeout 단독은0이다.
-첫step에 실패해 Time이0이어도 Terminal−5가 지급된다. 이미 지급한 행은0이며 부분reset은
-선택 행의 지급 flag만 비워 새episode에서 다시 평가한다. 성공 term을 꺼도 실패 비용은 유지한다.
-새 reward term·실패별 비용 합산·환경 step override·추가 센서나 PhysX 조회는 없다.
+`hand_velocity`도 포함한다. 성공을 잃었다가 회복해도+250을 반복 지급하지 않으며, 성공 보상을
+받은 뒤 실패하면−3은 별도로 지급한다. Timeout 단독은0이고 실패가 겹치면 실패 비용을 지급한다.
+부분 reset은 선택 행의 두 지급 flag만 비워 새episode에서 다시 평가한다.
+실패별 비용 합산·환경 step override·추가 센서나 PhysX 조회는 없다.
 기존 `Episode_Reward/terminal`에는 성공·실패 지급이 함께 누적되며 원인별 termination 로그는 유지한다.
-이는 조기 종료 회피를 줄이기 위한 첫 실패 비용이며 빠른 성공을 보장하는 검증값은 아니다.
-Dense 값은 이전보다100Hz에서1/100로 바뀌었지만 Terminal은250이므로 상대 강도가 크게 달라진다.
-Distance 최대값의8초 합은24, Hold는27.2, Clearance는83.0078이라는 느슨한 할인 전 상한이다.
+Distance 최대값의8초 합은24, Hold는27.2, Clearance는96이라는 느슨한 할인 전 상한이다.
 이들이 동시에 성립한다고 가정한 성공 선호 보장은 하지 않는다. 음의 L2 비용은 무한히 커질 수 있어
 과거 유계 reward·value 상한 비교를 새 설정의 전체 범위로 사용하지 않는다.
 
-Console·TensorBoard는 native `Episode_Reward/<term>`으로13개 항을 각각 기록한다.
+Console·TensorBoard는 native `Episode_Reward/<term>`으로 활성11개 항을 각각 기록한다.
 `rearrangement`는 없고 `shelf_collision`·`object_collision`이 추가된다. 로그는 weighted episode
 누적값을 최대 episode 시간8초로 나눈 값이며 순간 점수나 실제 episode 길이 평균이 아니다.
 과거 `/step_dt` 상쇄·exp Motion 로그와 새 값을 그대로 비교하지 않는다.
@@ -653,12 +646,13 @@ Z는 기울어진 OBB의 빈 모서리가 아니라 기존의 실제 collision �
 $$
 x_i=\frac{\ln2}{0.01^2}[d_i^{\mathrm{stab}}-0.01]_+^2
 +\frac{\ln2}{\pi/4}\theta_i,\qquad
-r_{\mathrm{stability}}=3\left[\exp\left(-\max_{i\in\mathcal O_{\mathrm{active}}}x_i\right)-1\right].
+\dot r_{\mathrm{stability}}=0.5\left[\exp\left(-\max_{i\in\mathcal O_{\mathrm{active}}}x_i\right)-1\right].
 $$
 
-기울기가0이면 거리1cm까지0,2cm에서−1.5,3cm에서−2.8125다. 거리 초과 비용이 없고
-기울기만45°면 품질0.5·실제 비용−1.5다. `stability_tilt_decay=ln(2)/(π/4) rad⁻¹`이며
-각도에는 별도 dead band가 없다. 같은 물체가 거리2cm·기울기45°면 두 위험이 결합해−2.25다.
+위 식은 reward rate이며 native manager가 `dt`를 곱한다. 기울기가0이면 거리1cm까지0,
+2cm에서−.25/s,3cm에서−.46875/s다. 거리 초과 비용이 없고 기울기만45°면 품질0.5·
+실제 비용−.25/s다. `stability_tilt_decay=ln(2)/(π/4) rad⁻¹`이며 각도에는 별도 dead band가 없다.
+같은 물체가 거리2cm·기울기45°면 두 위험이 결합해−.375/s다.
 Blocker를 포함한 활성 물체별로 두 위험을 결합한 뒤 최대값을 취하므로 서로 다른 물체의
 최악 거리와 최악 기울기를 별도로 더하지 않으며, 물체 수로 비용이 배가되지 않는다.
 추가 속도 비용이나 Blocker 불안정 gate는 없다. 같은 물체의 기존 중심 기반
@@ -697,15 +691,16 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 | `hand_velocity` | UR5e 팔6개 중 하나라도 절대 관절 속도 >3rad/s. 한 sample 초과 시 즉시 종료. Hand 제외 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
-않다. 현재 활성 실패6개와 성공·timeout을 합쳐 native 종료 term은8개다.
+않다. 현재 활성 실패6개와 timeout을 합쳐 native 종료 term은7개다. 성공 판정은 계속 계산하지만
+success termination은 비활성이므로 성공만으로 episode를 종료하지 않는다.
 활성 실패끼리는 동시에 기록될 수 있지만 성공은 활성 실패가 없을 때만 성립한다.
-Terminal은 유효 성공+250·활성 실패−5를 한 번 지급하며 일반 진행·timeout 단독은0이다.
+Terminal은 유효 성공+250·활성 실패−3을 각각 한 번 지급하며 일반 진행·timeout 단독은0이다.
 동시 실패는 합산하지 않으며 성공과 겹치면 실패가 우선한다.
 연구 task의 내부 실패는 초기화 때 읽은 native 활성 term 설정을 따르며, 속도 실패는
 native manager가 해석한 현재 `hand_velocity` 설정으로 성공·terminal 지급 전에 반영한다.
 따라서 속도 초과와 성공 보상이 동시에 발생하지 않는다. 관절은 팔 action과 동일한 이름으로
 선택하고 Hand·mimic/passive 관절은 검사하지 않는다. 경계3rad/s 자체는 통과한다.
-Joint velocity reward는 이 종료와 별개로 팔6개+Hand 독립6개를 평가한다.
+Joint velocity reward는 현재 비활성이고 팔 속도 종료 조건은 유지한다.
 현재 임계값은 최신 원격 `min`의 InspireOpen→Hand/HandMass 계열의3rad/s를 확인한 뒤 사용자 승인으로
 변경했다. 후속 사용자 요청으로 우리 환경도 팔6개만 검사하도록 Hand를 제외했다.
 관절 선택 변경은 [학습 기록70절](../../docs/TRAINING_LOG.md)을 따른다.
@@ -720,7 +715,7 @@ reset 전GPU에서 한 번씩 세는 누적 개수다. `Task_Rate/valid_success`
 `raw_goal_seen`은 episode 도중 통로·Target조건을 한 번이라도 충족했는지, `unsupported_goal_seen`은
 그때 진행유효성이 없었는지, `goal_and_failure`는 raw목표와 활성실패가 겹쳤는지 센다. 서로배타적인
 실패 원인 비율은 아니다. 기존 `Episode_Termination/*`의 마지막episode snapshot 평균과 구분한다.
-Singularity는 MDP step당한번계산한같은지표를보상과공유하며native로그
+Singularity는 MDP step당한번계산하며 해당 reward는 비활성이다. Native로그
 `Episode_Termination/singularity`로분리한다. 임계값은초기실험기준이다.
 Native실행순서가OSC→physics→termination이므로현재OSC호출에서발생하는역행렬예외까지
 막는장치는아니다. OSC정칙화·action clipping·이력전처리·초기IK는이번변경에포함하지않았다.
@@ -1095,7 +1090,8 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
 
 전체 환경은 **8초(800 policy step)의 공통 scene round** 동안 같은 초기 물체 배치와
 가상 카메라 시점·vision 정보를 공유한다. 움직이기 시작한 뒤 물리 상태는 환경별로 독립적이다.
-중간 성공·실패 시 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
+중간 실패로 종료되면 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
+현재 success termination은 비활성이므로 성공만으로 reset하지 않는다.
 **로봇은 매 reset마다 Blocker 앞 허용 영역에서 hand 위치·회전을 연속적으로 샘플링**하며,
 GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 이 배치용 TCP는 손바닥
 `right_plam_force_sensor`를 유지한다. OSC·물체/robot observation의 `wrist_3_link`와

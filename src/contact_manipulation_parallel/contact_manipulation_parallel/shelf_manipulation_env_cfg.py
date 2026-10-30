@@ -12,7 +12,7 @@ from isaaclab.assets import (
     RigidObjectCollectionCfg,
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs.mdp import is_alive, joint_vel_out_of_manual_limit
+from isaaclab.envs.mdp import joint_vel_out_of_manual_limit
 from isaaclab.envs.ui import ManagerBasedRLEnvWindow
 from isaaclab.managers import (
     ActionTermCfg,
@@ -139,8 +139,8 @@ class RewardsCfg:
     motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.03)
     # motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.5)
-    # Native alive cost; terminal success/failure steps are exempt.
-    time_penalty = RewardTermCfg(func=is_alive, weight=-1.0)
+    # Keep the native alive cost, but stop charging while valid success persists.
+    time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=-1.0)
     terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 

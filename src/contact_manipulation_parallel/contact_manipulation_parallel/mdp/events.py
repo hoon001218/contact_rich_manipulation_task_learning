@@ -46,7 +46,6 @@ _DEFAULT_MAX_OBJECTS = 10  # Policy slots; physical scene count is configured se
 @dataclass
 class MdpCfg:
     max_objects: int = _DEFAULT_MAX_OBJECTS
-    clearance_decay: float = 2.0
     # Geometric warning/hard margins; initial tuning, not certified safety limits.
     # L matches the existing IK angular weighting; s is inverse-Frobenius margin.
     singularity_characteristic_length: float = 0.25
@@ -399,8 +398,7 @@ class TaskState:
         self.support_error = None
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
-        self.initial_clearance_quality = zeros(n)
-        self.initial_blocker_area = zeros(n)
+        self.initial_blocker_overlap = zeros(n)
         self.previous_wrench = zeros(n, 6)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
@@ -420,7 +418,8 @@ class TaskState:
         self.completed_totals = zeros(5, kind=torch.long)
         self.success = zeros(n, kind=torch.bool)
         self.failure = zeros(n, kind=torch.bool)
-        self.terminal_paid = zeros(n, kind=torch.bool)
+        self.success_paid = zeros(n, kind=torch.bool)
+        self.failure_paid = zeros(n, kind=torch.bool)
         self.failure_reasons = zeros(n, len(FAILURE_REASON_NAMES), kind=torch.bool)
         self.failure_mask, self.success_enabled = configured_terminations(termination_cfg, device=device)
         self.invalid_reason_index = FAILURE_REASON_NAMES.index("invalid_state")
@@ -500,20 +499,16 @@ class TaskState:
                      "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
                      "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
-                     "success", "failure", "terminal_paid", "failure_reasons", "clearance_quality",
+                     "success", "failure", "success_paid", "failure_paid", "failure_reasons", "clearance_quality",
                      "force_growth", "torque_growth", "terminal_reward", "blocker_overlap"):
             getattr(self, name)[ids] = 0
         # One batched geometry query for reset rows only. The initial reference
         # stays fixed until those environments start another episode.
-        areas, overlap = projected_areas(batch.corners[rows], blocker[rows] & active[rows], access_region[rows])
-        self.initial_blocker_area[ids] = areas.sum(-1)
-        initial_quality = torch.nan_to_num(
-            clearance_quality(self.cfg, overlap.sum(-1), self.initial_blocker_area[ids]),
-            nan=0.0, posinf=0.0, neginf=0.0,
-        )
-        self.initial_clearance_quality[ids] = initial_quality
+        _, overlap = projected_areas(batch.corners[rows], blocker[rows] & active[rows], access_region[rows])
+        initial_overlap = overlap.sum(-1)
+        self.initial_blocker_overlap[ids] = initial_overlap
         self.target_protected[ids] = True
-        self.clearance_quality[ids] = initial_quality
+        self.clearance_quality[ids] = clearance_quality(initial_overlap, initial_overlap)
         # No completed physics sample yet; reset rows start with zero warning cost.
         self.singularity_margin[ids] = self.cfg.motion_singularity_threshold
         self.ready = True
@@ -571,7 +566,7 @@ class TaskState:
         blocked = overlap.sum(-1)
         self.blocker_overlap.copy_(blocked)
         self.clearance_quality.copy_(torch.nan_to_num(
-            clearance_quality(self.cfg, blocked, self.initial_blocker_area),
+            clearance_quality(blocked, self.initial_blocker_overlap),
             nan=0.0, posinf=0.0, neginf=0.0,
         ))
         # Force/torque norms are rotation-invariant. Keep the current sensor
@@ -610,9 +605,9 @@ class TaskState:
             failed = failed | hand_velocity
             candidate = candidate & ~hand_velocity
             stable = torch.where(hand_velocity, 0, stable)
-        successful, payment, paid = terminal_transition(
-            candidate, failed, stable, self.terminal_paid, self.cfg, step_dt=self.dt,
-            success_enabled=self.success_enabled,
+        successful, payment, success_paid, failure_paid = terminal_transition(
+            candidate, failed, stable, self.success_paid, self.failure_paid, self.cfg,
+            step_dt=self.dt,
         )
         self.clearance_progress_valid.copy_(support.progress_valid & self.target_protected
                                            & ~failed & ~reasons[:, self.invalid_reason_index])
@@ -629,7 +624,8 @@ class TaskState:
         self.tilt_count.copy_(tilted)
         self.success.copy_(successful)
         self.failure.copy_(failed)
-        self.terminal_paid.copy_(paid)
+        self.success_paid.copy_(success_paid)
+        self.failure_paid.copy_(failure_paid)
         self.failure_reasons.copy_(reasons)
         self.history[:, 1].copy_(self.history[:, 0])
         self.history[:, 0].copy_(torch.nan_to_num(batch.sample, nan=0.0, posinf=0.0, neginf=0.0))
