@@ -119,13 +119,47 @@ class NativeMlpTests(unittest.TestCase):
                 self.assertTrue(load_cfg["actor"] and load_cfg["critic"])
                 self.assertFalse(load_cfg["optimizer"])
 
-    def test_ppo_settings_match_original_project(self):
-        original = PROJECT.parent / "contact_manipulation" / "contact_manipulation" / CONFIG_SUFFIX
-        if not original.is_file():
-            self.skipTest("Original project is absent in this standalone copy.")
-        baseline = declarations(original)
-        for name in ("algorithm", "num_steps_per_env", "max_iterations", "save_interval", "obs_groups", "clip_actions"):
-            self.assertEqual(ast.dump(self.cfg[name]), ast.dump(baseline[name]), name)
+    def test_ppo_settings_match_final_parallel_spec(self):
+        expected_runner = {
+            "num_steps_per_env": 36,
+            "max_iterations": 90000,
+            "save_interval": 50,
+            "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
+            "clip_actions": None,
+        }
+        for name, expected in expected_runner.items():
+            with self.subTest(setting=name):
+                self.assertEqual(ast.literal_eval(self.cfg[name]), expected)
+
+        algorithm = self.cfg["algorithm"]
+        self.assertIsInstance(algorithm, ast.Call)
+        self.assertEqual(ast.unparse(algorithm.func), "RslRlPpoAlgorithmCfg")
+        self.assertFalse(algorithm.args)
+        self.assertTrue(all(item.arg is not None for item in algorithm.keywords))
+        actual_algorithm = {item.arg: ast.literal_eval(item.value) for item in algorithm.keywords}
+        self.assertEqual(actual_algorithm, {
+            "class_name": "PPO",
+            "value_loss_coef": 1.0,
+            "use_clipped_value_loss": True,
+            "clip_param": 0.2,
+            "entropy_coef": 0.005,
+            "num_learning_epochs": 8,
+            "num_mini_batches": 4,
+            "learning_rate": 1.0e-3,
+            "schedule": "adaptive",
+            "gamma": 0.999,
+            "lam": 0.95,
+            "desired_kl": 0.02,
+            "max_grad_norm": 1.0,
+        })
+
+        for role in ("actor", "critic"):
+            with self.subTest(model=role):
+                settings = model_kwargs(self.cfg[role])
+                self.assertEqual(settings["class_name"], "MLPModel")
+                self.assertEqual(settings["hidden_dims"], [256, 128])
+                self.assertEqual(settings["activation"], "relu")
+                self.assertFalse(settings["obs_normalization"])
 
 
 if __name__ == "__main__":

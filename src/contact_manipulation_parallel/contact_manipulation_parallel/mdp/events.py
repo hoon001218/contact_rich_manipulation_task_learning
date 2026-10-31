@@ -54,7 +54,7 @@ class MdpCfg:
     singularity_termination_threshold: float = 0.005
     # One-time terminal payments; failure_penalty is a positive cost magnitude.
     success_reward: float = 250.0
-    failure_penalty: float = 3.0
+    failure_penalty: float = 10.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15

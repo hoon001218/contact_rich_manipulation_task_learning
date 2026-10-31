@@ -6288,3 +6288,75 @@ eager 재검사의 독립/누적 조건별 통과 수·실제 배치·로봇 형
 정적으로 대조했다. 누락 반영은 확인했지만, 이번 변경이 원격 PC의 실패를 해결했는지는
 재실행 결과로 확인해야 한다. 같은 실패가 나면 위 JSONL로 어느 조건이 후보를 배제했는지
 구분한다. 이전 parallel CPU 검사 결과를 이번 원본 변경의 실행 검증으로 사용하지 않는다.
+
+## 83. 2026-10-31 — Parallel 다음 학습 최종 명세 반영
+
+사용자가 [다음 학습 최종 명세 — Codex 구현 기준](https://app.notion.com/p/40a4968094ee813ba809e044a2db975a)의
+구현을 요청했다. 페이지 최종 수정 시각은 2026-10-31 09:16:51 UTC이며, 작업 시작 HEAD는 명세의
+기준과 같은 `563e3760728049879e4451e5b713faa5cb03c0cf`, 작업트리는 깨끗했다.
+강제 checkout은 하지 않았다. 수정 대상은 `src/contact_manipulation_parallel`과 이 기록뿐이다.
+
+### 실제 코드 변경
+
+| 파일·키 | 이전 | 다음 학습 |
+|---|---:|---:|
+| `config/ur5e/agents/rsl_rl_ppo_cfg.py` · `algorithm.gamma` | 0.995 | 0.999 |
+| `shelf_manipulation_env_cfg.py` · `motion_action_rate.weight` | −0.03 | −0.003 |
+| 같은 파일 · `motion_force_growth.weight` | −0.03 | −0.01 |
+| 같은 파일 · `motion_torque_growth.weight` | −0.03 | −0.01 |
+| 같은 파일 · `TerminationsCfg.success` | 비활성 | 기존 `mdp.success` 활성 |
+| `mdp/events.py` · `MdpCfg.failure_penalty` | 3 | 10 |
+
+Production 변경은 위 세 파일의 설정과 비용 주석뿐이다. `rewards.py`, `terminations.py`,
+`sensors.py`, `observations.py`, `scripts/train.py`는 수정하지 않았다. 초기 카탈로그·배치 생성·
+로봇 시작 영역·IK·물리 설정과 Original `contact_manipulation`, Isaac Lab 및 RSL-RL도 유지했다.
+Parallel은 자체 상대 import와 자체 cfg를 사용한다. Original과 알고리즘 AST를 같게 강제하던
+`tests/test_learning.py` 검사는 Parallel의 최종 기대값을 명시적으로 검사하도록 교체했다.
+
+기존 단일 MLP actor/critic은 각각 256→128·ReLU·독립 파라미터다. 관측은 Actor의 초기 장면과
+로봇/센서 현재·직전 sample, Critic의 최초 인식 ID에 대한 현재 GT 정보를 유지한다.
+100Hz·8초 truncation·rollout36·epoch8·minibatch4·LR0.001/adaptive·KL0.02·λ0.95·clip0.2·
+entropy0.005·max-grad-norm1을 유지하며 curriculum·새 Target 비용·정규화·cap은 추가하지 않았다.
+
+성공 조건·gate·50회 연속 카운터·기존 이벤트 latch를 재작성하지 않고 native success term만
+연결했다. 실패가 없고 기존 조건을 연속 0.5초 만족하는 첫 transition에 +250을 한 번 지급한 뒤
+non-timeout 종료한다. 실패는 −10이며 동시 성공보다 우선한다. 순수 timeout은 실패 비용 없이
+기존 truncation/bootstrap을 따른다. `terminal_reward / dt`, terminal weight1, manager의 dt 곱은
+유지하여 실제 이벤트가 +250/−10이 된다. 기존 alive/success Time mask도 유지했다.
+
+### 검증 결과
+
+CUDA를 숨기고 CPU thread를 1로 제한하여 기존 사용자 프로젝트 테스트를 실행했다.
+`test_learning.NativeMlpTests` 6개 통과, 아래 MDP 12개 class의 159개 중 156개 통과·CUDA 전용
+3개 생략으로 **총 165개 중 162개 통과·3개 생략**이다. 초기 검증에서 확인된 혼합 batch의
+mock manager 누락과 비활성 velocity reward에 대한 오래된 테스트 가정은 테스트에서 수정했다.
+이 때문에 production 동작이나 native 라이브러리를 수정하지 않았다.
+
+MDP 실행 class는 `RewardTests`, `TerminationTests`, `StateTests`, `NativeAdapterTests`,
+`ContactRewardTests`, `BlockerContactManagerTests`, `NativeVelocityTerminationTests`,
+`ObjectSupportValidityTests`, `SceneMotionRewardTests`, `ImageOrderedObservationTests`,
+`DynamicObservationTests`, `WrenchTests`다. CPU 실행에는 `CUDA_VISIBLE_DEVICES=''`,
+`PYTHONDONTWRITEBYTECODE=1`, `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`,
+`MKL_NUM_THREADS=1`과 `env_isaaclab/bin/python -B -m unittest`를 사용했다.
+
+| 명세 acceptance 항목 | 결과·근거 |
+|---|---|
+| 최종 설정 | 통과 — Parallel 전용 PPO 기대값과 모든 활성 reward weight·decay·성공 term 확인 |
+| dt·단위 | 통과 — 실제 native RewardManager 산술에서 C/D/H=1이면 +0.12/+0.03/+0.002; raw action/F/T cost=1이면 −0.00003/−0.0001/−0.0001; 이벤트 +250/−10 |
+| Clearance 악화·분모 | 통과 — A=1.2A0에서 −0.2, 무효 gate에서도 음수 유지, finite 초기 threshold·초기 active Blocker overlap·분모 고정 |
+| 기존 gate | 통과 — Target 보호 및 support/retention gate, 이동 중 진행 허용·속도는 성공 정착에만 사용 |
+| Palmar hold | 통과(CPU) — 기존 canonical 17 pad·Blocker 필터·동일 pad의 연속 접촉 합, 단일 sample/교대 pad 제외·동일 step 중복 갱신 방지 |
+| 연속 성공 50회 | 통과 — 49회 무지급, 조건 해제 시 0, 새 50회에 최초 +250·success; 기존 pose/support/velocity 조건 유지 |
+| 혼합 vector batch | 통과 — 한 transition의 진행/성공/실패/순수 timeout 및 원인 mask·일회 이벤트·Time·Clearance 지급 확인 |
+| F/T growth | 통과 — 일정 norm의 방향 변화·감소는 0, 양의 norm 증가분만 제곱·매 step 이전 wrench 갱신 |
+| Reset 격리 | 통과 — 선택 행의 stable/latch/wrench/contact history만 초기화, 다른 행 보존 |
+| 이벤트 배타성 | 통과 — 성공·실패 동시 −10만, 이후 반복 지급 없음·성공 보상과 종료 연결 중복 없음 |
+| ARM6 과속 | 통과 — interleaved 관절 ID에서도 팔 abs(qdot)>3만 종료, Hand·mimic 제외·경계 3 허용 |
+| 보존 범위 | 통과(정적 diff 및 관련 회귀 검사) — Original·기본 PPO/래퍼·reset 분포·관측·함수·hard failure predicate 불변 |
+
+생략된 세 검사는 `StateTests`의 support replay cache와 `ObjectSupportValidityTests`의
+collision-support reduction/CUDA graph다. 실제 PhysX의 손바닥 접촉, GPU 동작·처리량,
+학습 수렴·clearance/성공률 개선은 **미실행·미검증**이다. Canonical pad 검출은 접촉력의
+방향이나 F/T 안전성을 증명하는 것으로 해석하지 않는다. 학습·simulation·play·commit·push 및
+Notion 페이지 쓰기는 실행하지 않았다. −10 이벤트만으로 모든 조기 실패 유인이 제거되거나,
+γ 변경만으로 빠른 조작이 학습된다고 판단하지 않는다.

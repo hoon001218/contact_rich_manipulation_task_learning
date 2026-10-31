@@ -128,15 +128,15 @@ class RewardsCfg:
     )
     object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
     # Command variation and actual speed are different control objectives.
-    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
+    motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.003)
     # motion_joint_velocity = RewardTermCfg(
     #     func=mdp.motion_joint_velocity, weight=-0.03,
     #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
     # )
-    # Separate SI costs: +1 N costs 0.03 reward/s; +0.05 N*m costs 0.000075 reward/s.
+    # Separate SI costs: +1 N costs 0.01 reward/s; +0.05 N*m costs 0.000025 reward/s.
     # Per-step norm increases are squared directly, without rate conversion or exp.
-    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.03)
-    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.03)
+    motion_force_growth = RewardTermCfg(func=mdp.motion_force_growth, weight=-0.01)
+    motion_torque_growth = RewardTermCfg(func=mdp.motion_torque_growth, weight=-0.01)
     # motion_singularity = RewardTermCfg(func=mdp.motion_singularity, weight=0.30)
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.5)
     # Keep the native alive cost, but stop charging while valid success persists.
@@ -149,7 +149,7 @@ class TerminationsCfg:
     """Native cause-specific termination logs over the cached task predicates."""
 
     time_out = TerminationTermCfg(func=mdp.scene_time_out, time_out=True)
-    # success = TerminationTermCfg(func=mdp.success)
+    success = TerminationTermCfg(func=mdp.success)
     object_support_lost = TerminationTermCfg(
         func=mdp.failure, params={"reason": "object_support_lost"}
     )
