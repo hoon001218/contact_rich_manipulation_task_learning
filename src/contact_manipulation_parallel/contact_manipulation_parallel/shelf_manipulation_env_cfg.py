@@ -62,11 +62,11 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Separate 244D actor/critic groups with identical history and tracked IDs."""
+    """Separate 244D actor/critic scene inputs with the same robot history."""
 
     @configclass
     class PolicyCfg(ObservationGroupCfg):
-        """Ordered terms: initial scene 100D, current sample 72D, previous sample 72D."""
+        """Ordered terms: cached vision 100D, current sample 72D, previous sample 72D."""
 
         initial_scene = ObservationTermCfg(func=mdp.initial_scene_geometry)
         current = ObservationTermCfg(func=mdp.current_robot_sample)
@@ -225,6 +225,8 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     )
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
+    # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
+    actor_vision_update_interval: int = 10
     # Optional cross-PC comparison: require the transferred catalog instead of rebuilding it.
     initial_catalog_fingerprint: str | None = None
     # Reset-only swaps of neighboring image-ordered distractors; roles stay 0/1.
@@ -239,6 +241,10 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     episode_length_s: float = 8.0
 
     def __post_init__(self):
+        if (isinstance(self.actor_vision_update_interval, bool)
+                or not isinstance(self.actor_vision_update_interval, int)
+                or self.actor_vision_update_interval < 0):
+            raise ValueError("actor_vision_update_interval must be a nonnegative integer.")
         # Policy, physics and OSC all run at 100 Hz.
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation

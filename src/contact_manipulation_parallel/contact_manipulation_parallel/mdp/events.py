@@ -353,13 +353,16 @@ def collision_support_minimum(vertices_catalog, vertex_counts, object_ids, norma
 
 
 class TaskState:
-    """Cached task state with frozen actor vision and tracked-object critic geometry."""
+    """Cached actor vision and independently tracked reset-time critic objects."""
 
     def __init__(self, num_envs, device, cfg, dt, *, dtype=torch.float32, step=0, termination_cfg=None,
-                 active_capacity=None):
+                 active_capacity=None, actor_vision_update_interval=0):
         cfg.__post_init__()
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("step_dt must be finite and positive.")
+        if (isinstance(actor_vision_update_interval, bool)
+                or not isinstance(actor_vision_update_interval, int) or actor_vision_update_interval < 0):
+            raise ValueError("actor_vision_update_interval must be a nonnegative integer.")
         self.cfg, self.dt = cfg, dt
         self.last_step = step
 
@@ -377,7 +380,17 @@ class TaskState:
             return torch.zeros(shape, device=device, dtype=kind)
         self.geometry_b = zeros(n, observed, 10)
         self.geometry_valid = zeros(n, observed, kind=torch.bool)
+        # Fixed phase buckets avoid per-step nonzero()/GPU-to-host row selection.
+        self.actor_vision_update_interval = actor_vision_update_interval
+        self.actor_vision_groups = (tuple(torch.arange(phase, n, actor_vision_update_interval,
+                                                      device=device, dtype=torch.long)
+                                          for phase in range(min(n, actor_vision_update_interval)))
+                                    if actor_vision_update_interval else ())
+        self.actor_vision_step = torch.full((n,), step, device=device, dtype=torch.long)
+        self.actor_vision_last_poll_step = step
+        self.actor_vision_order = torch.arange(observed, device=device).expand(n, -1).clone()
         self.critic_geometry_b = zeros(n, observed, 10)
+        self.critic_geometry_valid = zeros(n, observed, kind=torch.bool)
         self.critic_source_indices = torch.full((n, observed), -1, dtype=torch.long, device=device)
         self.tcp_pose_b = zeros(n, 7)
         self.history = zeros(n, 2, 72)
@@ -434,7 +447,7 @@ class TaskState:
     @torch.no_grad()
     def reset(self, ids, batch, *, geometry_b, geometry_valid, active, target, blocker,
               access_region, workspace_bounds, shelf_top, ceiling, shelf_local_corners,
-              step, batch_is_selected=False, critic_source_indices=None):
+              step, batch_is_selected=False, critic_source_indices=None, actor_vision_order=None):
         """Commit selected rows after physical reset and accepted initial vision.
 
         By default all inputs have a full-environment leading dimension. With
@@ -474,6 +487,12 @@ class TaskState:
             batch.center[rows], batch.corners[rows], batch.velocity[rows], self.active[ids], self.blocker[ids],
         )
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
+        self.critic_geometry_valid[ids] = geometry_valid[rows]
+        self.actor_vision_step[ids] = step
+        self.actor_vision_order[ids] = (torch.arange(self.geometry_b.shape[1], device=ids.device)
+                                       if actor_vision_order is None else actor_vision_order[rows])
+        if ids.numel() == self.history.shape[0]:
+            self.actor_vision_last_poll_step = step
         if critic_source_indices is None:
             # Numerical callers without an ID association never invent GT slots.
             self.critic_source_indices[ids] = -1
@@ -540,7 +559,7 @@ class TaskState:
             position = quat_apply(inverse_root, position - root_position[:, None])
             orientation = quat_mul(inverse_root, orientation)
         geometry = torch.cat((position, orientation, self.critic_geometry_b[rows, :, 7:]), dim=-1)
-        valid = self.geometry_valid[rows] & (source >= 0)
+        valid = self.critic_geometry_valid[rows] & (source >= 0)
         self.critic_geometry_b[rows] = torch.where(valid[..., None], torch.nan_to_num(
             geometry, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
         self.critic_observation = None
@@ -908,7 +927,8 @@ def _ensure_state(env):
         env._contact_mdp = TaskState(env.num_envs, env.device, env.cfg.mdp, float(env.step_dt),
                                      step=env.common_step_counter,
                                      termination_cfg=getattr(env.cfg, "terminations", None),
-                                     active_capacity=_active_object_capacity(env))
+                                     active_capacity=_active_object_capacity(env),
+                                     actor_vision_update_interval=getattr(env.cfg, "actor_vision_update_interval", 0))
     return env._contact_mdp
 
 
@@ -1249,7 +1269,7 @@ def reset_task(env, env_ids=None):
     valid = valid.gather(1, order)
     critic_sources = expand(prepared.critic_source_indices).gather(1, order)
     state.reset(ids, initial, geometry_b=geometry, geometry_valid=valid,
-                critic_source_indices=critic_sources,
+                critic_source_indices=critic_sources, actor_vision_order=order,
                 active=expand(prepared.active), target=expand(prepared.target), blocker=expand(prepared.blocker),
                 access_region=scene.access_region[ids],
                 workspace_bounds=scene.workspace_bounds[ids], shelf_top=scene.shelf_top[ids],
@@ -1259,6 +1279,61 @@ def reset_task(env, env_ids=None):
         # Reuse IDs already computed by native auto-reset; the learner can skip
         # timeout value inference without a second GPU nonzero()/scalar read.
         env.extras["terminal_env_ids"] = ids
+
+
+@torch.no_grad()
+def refresh_actor_vision(env, state):
+    """Refresh one phase of current visible surfaces after native auto-reset.
+
+    The initial snapshot is immediate; fixed env-ID phases spread subsequent
+    captures across the interval, including asynchronous episode resets. A
+    reset row keeps its just-created snapshot for this transition. Masking its
+    ray inputs avoids a dynamic nonzero()/host synchronization. No viewpoint
+    search, visibility rejection, privileged completion or Critic rebind runs.
+    """
+    interval, step = state.actor_vision_update_interval, env.common_step_counter
+    if not interval or not state.ready or state.actor_vision_last_poll_step == step:
+        return
+    phase = (step - 1) % interval
+    if phase >= len(state.actor_vision_groups):
+        state.actor_vision_last_poll_step = step
+        return
+    ids = state.actor_vision_groups[phase]
+    runtime = getattr(env, "_episode_reset", None)
+    if runtime is None or not hasattr(runtime, "camera_pose"):
+        raise RuntimeError("Periodic Actor vision requires the episode camera and initialized ray sensor.")
+    eligible = state.actor_vision_step[ids] != step
+    manager = getattr(env, "termination_manager", None)
+    dones = getattr(manager, "dones", None)
+    if dones is not None:
+        # Native recorders may ask for observations before auto-reset. Do not
+        # ray-query a finished/invalid scene; its reset snapshot arrives next.
+        eligible = eligible & ~dones[ids]
+    b, scene = state.bindings, env.task_scene_data
+    # Disabled rows have an empty active prefix: their ray kernels return no
+    # hits immediately, while the fixed batch size remains graph/GPU friendly.
+    active_ids = torch.where(eligible[:, None], b.object_ids[ids], -1)
+    roles = torch.stack((scene.target_id[ids], scene.blocker_id[ids]), -1)
+    data = b.robot.data
+    roots = torch.cat((data.root_pos_w[ids], data.root_quat_w[ids]), -1)
+    geometry, valid, _ = runtime.vision.observe_tensors(
+        ids, active_ids, roles, runtime.camera_pose[ids],
+        object_poses=b.objects.data.object_link_pose_w[ids], root_poses=roots)
+    # Keep the reset-time neighboring swap pattern without drawing new noise.
+    # If either slot disappeared, leave both in image order rather than moving
+    # a valid object into a padding slot. Roles never participate in swaps.
+    order = state.actor_vision_order[ids]
+    order = torch.where(valid & valid.gather(1, order), order,
+                        torch.arange(valid.shape[1], device=ids.device))
+    geometry = geometry.gather(1, order[..., None].expand(-1, -1, 10))
+    valid = valid.gather(1, order)
+    state.geometry_b[ids] = torch.where(eligible[:, None, None], geometry, state.geometry_b[ids])
+    state.geometry_valid[ids] = torch.where(eligible[:, None], valid, state.geometry_valid[ids])
+    state.actor_vision_step[ids] = torch.where(eligible, step, state.actor_vision_step[ids])
+    state.actor_vision_last_poll_step = step
+    # get_task_state has already packed the completed transition. Replace the
+    # Actor cache; extras['terminal_observation'] must keep its original tensor.
+    state.observation = None
 
 
 @torch.no_grad()

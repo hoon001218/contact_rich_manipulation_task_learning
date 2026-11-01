@@ -7,7 +7,8 @@ GNN, Attention, 별도의 observation encoder, 사용자 모델 subclass는 없�
 원본의 물체 자세 갱신·제어·물리·배치 생성을 기준으로 독립 복사한 MLP 실험이다.
 모델과 초기 물체 슬롯 순서를 변경했으며, 현재 학습 설정은
 [다음 학습 최종 명세 — Codex 구현 기준](https://app.notion.com/p/40a4968094ee813ba809e044a2db975a)에
-맞췄다(2026-10-31). 원본 패키지를 import하지 않는다.
+맞췄다(2026-10-31). 이후 사용자 요청으로 Actor 비전을 10step마다 갱신하도록 확장했다
+(2026-11-01). 원본 패키지를 import하지 않는다.
 
 ## 모델
 
@@ -38,11 +39,11 @@ Mask나 역할 ID를 observation에 추가하지 않는다.
 |---|---|
 | 0 | Target |
 | 1 | Blocker |
-| 2–9 | 초기 ray cast에서 인식된 나머지 물체, 화면 좌→우 순서 |
+| 2–9 | Actor는 최근 ray cast의 주변 물체, Critic은 초기 인식 물체의 고정 ID |
 
 순서는 다음과 같이 결정한다.
 
-1. 실제 ray first-hit label과 보이는 표면으로 초기 OBB를 만든다. 보이지 않은 물체를
+1. 실제 ray first-hit label과 보이는 표면으로 OBB를 만든다. 보이지 않은 물체를
    실제 pose로 채우지 않는다.
 2. 10개보다 많은 물체가 인식되면 기존처럼 Target·Blocker를 포함하고, 두 역할 물체의
    관측 중심 중 더 가까운 쪽까지의 거리가 작은 주변 물체 8개를 고른다.
@@ -52,7 +53,9 @@ Mask나 역할 ID를 observation에 추가하지 않는다.
    각 유효 이웃쌍의 실제 교환 확률은 20%이며, 한 물체는 최대 한 슬롯만 이동한다.
    Target·Blocker와 padding은 교환하지 않는다.
 5. 같은 permutation을 Actor의 초기 OBB와 Critic의 추적 물체 ID에 적용한다.
-   이후 해당 episode 동안 슬롯 순서를 다시 정렬하거나 교환하지 않는다.
+   Actor의 후속 프레임은 현재 보이는 물체를 다시 선택·정렬하고 같은 swap 패턴을 재사용한다.
+   새 난수는 뽑지 않으며, 두 슬롯이 모두 보일 때만 교환하여 padding 이동을 막는다.
+   Critic의 물체 ID·순서는 reset 때 정한 그대로 유지한다.
 
 겹치는 이웃쌍을 동시에 교환하지 않도록 매 reset에서 짝수/홀수 이웃쌍 그룹을 무작위로
 선택하고, 선택된 그룹에서 40% 확률로 교환한다. 따라서 각 유효 이웃쌍의 최종 확률은
@@ -69,23 +72,46 @@ Mask나 역할 ID를 observation에 추가하지 않는다.
 
 좌우 정렬은 GPU tensor의 scatter reduction·argsort·gather로 수행한다.
 픽셀×물체 크기의 비교 tensor나 환경·물체별 Python 반복문을 추가하지 않는다.
-이웃 교환도 reset 행만 tensor로 처리하며 추가 ray cast를 실행하지 않는다.
+교환 패턴의 추첨은 reset 행만 tensor로 처리하며, 교환 때문에 ray cast를 추가하지 않는다.
 
-### 물체 자세 갱신은 기존과 동일
+### Actor 비전 10step 갱신과 Critic GT
 
-- **Actor:** 초기 visible-surface OBB의 장면 좌표를 고정한다. 매 step 현재 UR5e 말단
-  EEF frame으로 변환하며, 물체가 움직였다는 이유로 초기 vision을 갱신하지 않는다.
+- **Actor:** 고정된 episode 시점에서 10step마다 현재 물체에 실제 메시 ray casting을 수행한다.
+  보이는 표면에서만 OBB를 추정하며, 새로 보이는 물체를 넣고 가려진 물체는 zero padding한다.
+  중간 step에는 최근 ray snapshot을 유지하면서 현재 UR5e 말단 EEF frame으로 변환한다.
 - **Critic:** 초기 Actor가 인식한 동일 물체 ID의 현재 실제 중심·회전·전체 OBB 정보를
   갱신하고, 현재 EEF frame으로 표현한다. 처음 보이지 않았던 물체를 새로 추가하거나
-  사라진 물체를 제거하지 않는다.
-- **공통:** 물체 ID·slot·padding은 episode 동안 고정이다. 현재·직전 로봇·센서·행동
+  사라진 물체를 제거하지 않는다. Actor와 별도 valid mask를 유지한다.
+- **공통:** Target·Blocker는 0·1번 슬롯을 유지하고 관측 차원은 244D다. 현재·직전 로봇·센서·행동
   144D는 기존과 동일하다. 초기 reset의 직전 sample은 0이다. F/T는 센서 frame을 사용한다.
+
+100Hz 정책에서 10step은 0.1초, 비전은 10Hz다. 초기 reset snapshot은 즉시 제공하고,
+env ID별 phase를 나눠 첫 정기 갱신은 reset 후 1–10step 안에 수행한다. 이후 각 환경은
+10step 간격이다. 1024개 환경이면 매 step 102–103개씩 처리해 한 step의 급격한 부하를 줄인다.
+Reset 직후 및 종료 행은 같은 step의 추가 ray를 건너뛰며, 같은 step의 중복 관측도 재촬영하지 않는다.
+
+기존 64×48 observation grid·메시 BVH를 재사용하고, 32개 view씩 나눠 GPU에서 처리한다.
+Online 경로에는 실루엣 분모·가시성 조건 검사·시점 탐색·재시도·CPU 요청 dict·이미지 저장을
+추가하지 않는다. 카메라 prim이나 render product도 생성하지 않는다. Phase 분산은 총 ray 수를
+줄이는 방식은 아니며, 실제 GPU iteration 시간 증가는 아직 측정하지 않았다.
+Critic·로봇 history 접근만으로는 Actor ray를 실행하지 않는다. 갱신된 관측 OBB GUI는 같은
+Actor cache를 표시하고, 종료 전 관측 tensor는 갱신·부분 reset으로 수정되지 않는다.
+
+기본값은 `env.actor_vision_update_interval=10`이다. 0이면 기존 reset-only Actor 비전으로 돌아간다.
+관련 CPU 검증은 188개 중 185개 통과·CUDA 전용 3개 생략이며, 실제 메시 ray 결과와 주기·reset
+격리를 확인했다. 실제 GPU 처리 시간과 학습 효과는 미측정이다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_parallel/scripts/train.py \
+  --num_envs 1024 --headless env.actor_vision_update_interval=0
+```
 
 ## MDP와 실행 주기
 
 | 항목 | 설정 |
 |---|---|
 | 물리·정책 주기 | 100 Hz / 100 Hz (`dt=0.01`, `decimation=1`) |
+| Actor 비전 주기 | 10step / 10Hz, 환경별 phase 분산 |
 | Episode | 최대 8초 |
 | Action | UR5e 상대 pose 6D + 가변 stiffness 6D + Hand 6관절 = 18D |
 | Arm 제어 | 공식 OSC, UR5e 말단 EEF/task frame, gravity compensation |
@@ -155,7 +181,7 @@ bootstrap·로깅·reset 분포·Actor/Critic 관측은 유지한다. Original �
 [배치 규칙](../../docs/SPAWN_RULES.md), [학습 기록](../../docs/TRAINING_LOG.md)에 있다.
 이 기록들은 이번 MLP 변형의 새 학습 결과를 의미하지 않는다.
 
-최종 명세에 대한 CPU 검증은 165개 중 162개 통과, CUDA 전용 3개 생략이다.
+2026-10-31 보상·PPO 최종 명세에 대한 CPU 검증은 165개 중 162개 통과, CUDA 전용 3개 생략이다.
 설정·native dt 지급·연속 성공·혼합 batch·부분 reset·접촉 이력을 확인했으며,
 실제 학습·PhysX simulation·성능 측정은 실행하지 않았다.
 [학습 기록 83절](../../docs/TRAINING_LOG.md#83-2026-10-31--parallel-다음-학습-최종-명세-반영)에 검증 범위를 둔다.

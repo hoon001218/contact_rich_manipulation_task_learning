@@ -1,4 +1,4 @@
-"""Native F/T/contact sensors and renderer-free, reset-only geometric perception.
+"""Native F/T/contact sensors and renderer-free geometric perception.
 
 The virtual viewpoint queries shared surface meshes; only visible first-hit
 points enter policy geometry. No camera or reference prim is spawned.
@@ -994,11 +994,12 @@ def _visual_triangles(root, world_to_body, *, reference_frame=None):
 
 
 class InitialVisionSensor:
-    """Reset-only geometric visibility using shared mesh BVHs and batched rays.
+    """Geometric visibility using shared mesh BVHs and batched first-hit rays.
 
     True poses position surfaces for the simulated sensor, but policy geometry
     is fitted exclusively to visible first hits. Constructive layouts evaluate
-    their complete fixed view domain once; adaptive search is legacy-only.
+    their complete fixed view domain once; periodic observations reuse the
+    episode camera without any visibility selection or viewpoint search.
     """
 
     def __init__(self, env):
@@ -1147,6 +1148,76 @@ class InitialVisionSensor:
             (labels[row, :, None] == roles[row]).reshape(height, width, 2) if retain_images else None,
             cameras[row], intrinsics.clone(), None, None, 1) for row in range(len(ids))]
 
+    @torch.no_grad()
+    def observe_tensors(self, env_ids, active_ids, roles, camera_poses, *, object_poses=None, root_poses=None):
+        """Read current visible geometry at fixed world camera poses, on-device.
+
+        Inputs are selected rows: environment IDs [M], compact active pool IDs
+        [M,A] followed by -1 padding, Target/Blocker pool IDs [M,2], and camera
+        world xyz+wxyz [M,7]. Optional object [M,P,7] and robot-root [M,7] poses
+        are also world xyz+wxyz; public asset poses supply omitted inputs.
+        No input pose is modified. Only first-hit surfaces enter the OBB fit.
+
+        Returns robot-base geometry [M,slots,10], visibility [M,slots], and pool
+        IDs [M,slots]. Target/Blocker keep slots 0/1; unseen roles remain zero,
+        false and -1. Other visible objects are selected near visible roles and
+        ordered by image column. The caller manages cadence and associations.
+        """
+        if env_ids.ndim != 1 or env_ids.dtype != torch.long:
+            raise ValueError('Environment IDs must be a torch.long tensor [M].')
+        count = env_ids.shape[0]
+        if active_ids.ndim != 2 or active_ids.shape[0] != count or active_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError('Active pool IDs must be an integer tensor [M,A].')
+        if roles.shape != (count, 2) or roles.dtype not in (torch.int32, torch.int64):
+            raise ValueError('Target/Blocker pool IDs must be an integer tensor [M,2].')
+        if camera_poses.shape != (count, 7):
+            raise ValueError('Camera poses must contain world xyz+wxyz [M,7].')
+        env = self.env
+        origins = env.scene.env_origins
+        device = origins.device
+        if (env_ids.device != device or active_ids.device != device or roles.device != device
+                or camera_poses.device != device):
+            raise ValueError('Periodic vision inputs must already be on the environment device.')
+        slots = env.cfg.mdp.max_objects
+        geometry = torch.zeros((count, slots, 10), device=device, dtype=torch.float32)
+        valid = torch.zeros((count, slots), device=device, dtype=torch.bool)
+        observed = torch.full((count, slots), -1, device=device, dtype=torch.long)
+        if count == 0 or active_ids.shape[1] == 0:
+            return geometry, valid, observed
+
+        objects = (env.scene['object_collection'].data.object_link_pose_w[env_ids]
+                   if object_poses is None else object_poses)
+        if objects.shape != (count, self.object_count, 7) or objects.device != device:
+            raise ValueError('Object poses must contain all pool bodies on-device [M,P,7].')
+        origins = origins[env_ids].to(dtype=torch.float32)
+        objects = objects.to(dtype=torch.float32).clone()
+        objects[..., :3] -= origins[:, None]
+        if root_poses is None:
+            robot = env.scene['robot'].data
+            root_positions, root_rotations = robot.root_pos_w[env_ids], robot.root_quat_w[env_ids]
+        else:
+            if root_poses.shape != (count, 7) or root_poses.device != device:
+                raise ValueError('Robot-root poses must contain world xyz+wxyz on-device [M,7].')
+            root_positions, root_rotations = root_poses[:, :3], root_poses[:, 3:]
+        roots = root_positions.to(dtype=torch.float32) - origins
+        inverse = quat_conjugate(root_rotations.to(dtype=torch.float32))
+        cameras = camera_poses.to(dtype=torch.float32)
+        eyes, rotations = cameras[:, :3] - origins, cameras[:, 3:]
+        active = active_ids.to(dtype=torch.int32).contiguous()
+        roles = roles.to(dtype=torch.int32).contiguous()
+        _, crop_directions, _ = self._observation_grid(device)
+        for begin in range(0, count, self.capacity):
+            selection = slice(begin, begin + self.capacity)
+            depth, labels = self._trace(objects[selection], active[selection], eyes[selection], rotations[selection],
+                                        roles[selection], observation_only=True)
+            points = quat_apply(rotations[selection, None], depth[..., None] * crop_directions) + eyes[selection, None]
+            points = quat_apply(inverse[selection, None], points - roots[selection, None])
+            geometry[selection], valid[selection], observed[selection] = self._fit_observation(
+                points, labels, active[selection], roles[selection],
+                min_depth_pixels=self.cfg.observation_min_depth_pixels,
+                image_width=self.cfg.observation_ray_width)
+        return geometry, valid, observed
+
     def _compact_labels(self, labels, active_ids, capacity):
         """Map pool IDs to active slots before reducing visible points.
 
@@ -1176,7 +1247,8 @@ class InitialVisionSensor:
         compact, native_ids = self._compact_labels(labels, active_ids, width)
         minimum = self.cfg.min_depth_pixels if min_depth_pixels is None else min_depth_pixels
         geometry, valid = fit_visible_obbs(points, compact, width, minimum)
-        role_slots = (native_ids[..., None] == roles[:, None]).long().argmax(1)
+        role_matches = (native_ids[..., None] == roles[:, None]) & (roles[:, None] >= 0)
+        role_slots = torch.where(role_matches.any(1), role_matches.long().argmax(1), -1)
         image_x = (None if image_width is None else
                    visible_object_image_x(compact, width, image_width, dtype=geometry.dtype))
         selected, selected_valid = select_initial_geometry_indices(

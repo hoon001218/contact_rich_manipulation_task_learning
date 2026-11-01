@@ -6360,3 +6360,63 @@ collision-support reduction/CUDA graph다. 실제 PhysX의 손바닥 접촉, GPU
 방향이나 F/T 안전성을 증명하는 것으로 해석하지 않는다. 학습·simulation·play·commit·push 및
 Notion 페이지 쓰기는 실행하지 않았다. −10 이벤트만으로 모든 조기 실패 유인이 제거되거나,
 γ 변경만으로 빠른 조작이 학습된다고 판단하지 않는다.
+
+## 84. 2026-11-01 — Actor 비전의 10step 실제 ray 갱신
+
+사용자가 `contact_manipulation_parallel`의 Actor 비전을 10step마다 갱신하도록 요청했다.
+10월31일 명세의 초기 비전 고정 방식에서 변경한 별도 후속 요청이다. 이번 변경은 parallel에만
+적용하며 Original GNN·reward·termination·PPO·제어·물리·reset 분포는 수정하지 않았다.
+
+**관측:** `actor_vision_update_interval=10`을 기본값으로 추가했다. 현재100Hz에서 비전은10Hz다.
+초기 reset에는 기존 초기 ray snapshot을 즉시 넣고, 이후 현재 물체의 실제 visual mesh에
+ray casting하여 보이는 first-hit 표면에서 OBB를 다시 추정한다. GT pose는 센서의 표면 위치를
+놓는 데만 사용하고, 보이지 않는 물체의 실제 중심·크기로 Actor 슬롯을 채우지 않는다.
+새로 보이는 물체를 넣고 가려진 물체는 zero padding한다. Target·Blocker는0·1번이고 나머지는
+보이는 역할 물체와의 거리로 선택한 뒤 현재 ray 이미지의 좌→우 순서로 정렬한다.
+
+Episode 초기의 인접 swap 패턴은 새 RNG 없이 재사용한다. 두 슬롯이 현재 모두 유효할 때만
+교환하여 padding으로 물체가 밀려나지 않게 한다. 중간9step에는 최근 ray snapshot의 base-frame
+좌표를 고정하고 현재 EEF frame으로 재표현한다. 로봇·F/T·tactile의 현재/직전144D는 매step 유지하고
+전체 관측은244D다. GUI의 observed-object OBB도 같은 최신 Actor cache를 읽는다.
+
+**Critic:** 최초 인식 ID와 slot을 유지하여 현재 GT를 갱신하는 기존 계약을 보존했다. Actor의
+가시성 변경이 Critic에 섞이지 않도록 `critic_geometry_valid`를 reset 때 별도로 저장한다.
+Critic의 장면·공유 current/previous 접근만으로는 Actor ray를 실행하지 않는다.
+
+**연산 구조:** env ID를10개 phase로 나눈 고정 GPU index bucket을 초기화 때 한 번 만든다.
+1024환경은 매step102개 또는103개씩 처리하고 각 환경은10step 간격으로 갱신한다. 초기 snapshot
+이후 첫 정기 갱신은 해당 phase에 따라1–10step 안에 온다. 부분 reset도 같은 phase를 유지한다.
+이는 매10step1024개를 동시에 처리하는 방식과 총 ray 수는 같고, 순간 부하를 분산하는 방식이다.
+
+- 기존64×48 observation grid와 shared mesh BVH를 재사용하고 view32개씩 처리한다.
+  정기 query는 step당약31.3–31.6만 image ray다. 실루엣 분모·가시성 합격 검사·시점 탐색·재시도는
+  실행하지 않는다. 물체만 기존 규칙대로 검사하며 새 카메라 prim/render product는 만들지 않는다.
+- `InitialVisionSensor.observe_tensors`가 environment/active/role/camera tensor를 직접 받고
+  OBB·valid·pool ID tensor를 반환한다. CPU 요청 dict·환경별 Snapshot list·진단 파일·이미지 저장이
+  hot path에 없으며, 새 scheduling의 GPU `nonzero()`·tensor scalar 조회·CPU 복사도 없다.
+  Python 반복은 초기 phase bucket 구성과 고정 크기 ray chunk launch에만 있다.
+- 같은 native counter의 반복 관측은 ray를 중복 실행하지 않는다. 새 reset 행과 recorder의
+  pre-reset 종료 행은 active ID를−1로 마스킹해 실제 물체 ray query를 차단하고 해당 cache를 유지한다.
+  고정 batch 모양을 유지하므로 미갱신 행을 찾기 위한 GPU→CPU 동기화를 추가하지 않는다.
+- 갱신 후 Actor packed cache는 새 tensor로 만든다. 기존 `extras.terminal_observation`과
+  reset하지 않은 환경의 history·Critic ID·mask는 수정하지 않는다. 최신 물체 pose 조회는 기존
+  native asset cache를 재사용한다.
+
+설정값0은 기존 reset-only Actor 비전이고 양의 정수는 policy step 간격이다. 기존 수치 단독
+호출의 `TaskState`는 기본값0을 유지하며 실제 환경 cfg의 기본값만10이다. 카메라 pose는 해당
+episode 초기 world pose를 재사용하고, ray 결과는 robot-base에 저장한 뒤 현재 EEF로 변환한다.
+
+**검증:** `CUDA_VISIBLE_DEVICES=''` 및 CPU thread1에서 관련13개 test class의188개 중
+**185개 통과·CUDA 전용3개 생략**. 새 검사는 실제 Warp CPU 메시 ray와 기존 fixed-view API의
+결과 일치, world/root 좌표 및 unsorted env ID,32+3 view chunk·64×48 image-only query,
+가려짐/재노출·GT 미보충·입력 pose 불변을 확인한다. Scheduling은1024행의 균등 phase와 각10step
+간격·중복 호출·동기화 없는 tensor 처리·reset/종료 행 마스크를 검증했다. 별도 Critic mask/ID,
+현재 EEF 변환, 기존 terminal 관측 보존, 부분 reset·stored swap/padding도 확인했다.
+
+관련 class는 `PeriodicActorVisionTests`, `GeometricVisionTests`, `ImageOrderedObservationTests`,
+`InitialGeometryTests`, `DynamicObservationTests`, `StateTests`, `NativeAdapterTests`,
+`ObservationObbVisualizationTests`, `PhysicalStateCapacityTests`, `ObservationCapacityTests`,
+`RewardTests`, `TerminationTests`, `BlockerContactManagerTests`다. 생략된3개는 GPU ray parity·
+visible-point CUDA reduction·support replay cache다. 실제 GPU 처리 시간·메모리 증가·학습 효과는
+**미측정**이며, phase 분산만으로 평균 연산량이 줄었다고 해석하지 않는다. 학습·PhysX simulation·
+play·commit·push는 실행하지 않았다. `git diff --check`와 보존 경로의 diff도 확인했다.
