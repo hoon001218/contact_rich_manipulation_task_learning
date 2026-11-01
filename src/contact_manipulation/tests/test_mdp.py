@@ -2190,6 +2190,186 @@ def native_fixture(n=3):
     return env, action, external
 
 
+class PeriodicActorVisionTests(unittest.TestCase):
+    """Staggered actor ray observations leave critic associations and resets local."""
+
+    def fixture(self, count=3, interval=10):
+        env, action, _ = native_fixture(count)
+        env.cfg.actor_vision_update_interval = interval
+        task.reset_task(env)
+        state = env._contact_mdp
+        class Sensor:
+            def __init__(self):
+                self.calls = []
+                self.geometry = state.geometry_b.clone()
+                self.valid = state.geometry_valid.clone()
+                selected = state.critic_source_indices.clamp_min(0)
+                self.observed = torch.where(self.valid, state.bindings.object_ids.gather(1, selected), -1)
+
+            def observe_tensors(self, ids, active, roles, cameras, **kwargs):
+                self.calls.append((ids.clone(), active.clone(), roles.clone(), cameras.clone(), kwargs))
+                return self.geometry[ids].clone(), self.valid[ids].clone(), self.observed[ids].clone()
+        sensor = Sensor()
+        cameras = torch.cat((env.scene.env_origins.clone(), identity(count).float()), -1)
+        env._episode_reset = SimpleNamespace(vision=sensor, camera_pose=cameras)
+        return env, state, sensor, action
+
+    def test_interval_validation_and_reset_only_or_unavailable_runtime_require_no_rays(self):
+        for invalid in (-1, True, 1.5):
+            with self.subTest(interval=invalid), self.assertRaises((TypeError, ValueError)):
+                task.TaskState(2, 'cpu', task.MdpCfg(), .01, actor_vision_update_interval=invalid)
+        env, state, sensor, _ = self.fixture(interval=0)
+        initial = state.geometry_b.clone()
+        for step in (0, 1, 2):
+            env.common_step_counter = step
+            obs.initial_scene_geometry(env)
+        self.assertFalse(sensor.calls)
+        torch.testing.assert_close(state.geometry_b, initial)
+        del env._episode_reset
+        env.common_step_counter = 3
+        obs.initial_scene_geometry(env)  # Reset-only mode does not require a live ray sensor.
+        env, state, _, _ = self.fixture(interval=10)
+        del env._episode_reset
+        env.common_step_counter = 1
+        with self.assertRaisesRegex(RuntimeError, 'camera|ray sensor'):
+            obs.initial_scene_geometry(env)
+        fresh = task.TaskState(2, 'cpu', task.MdpCfg(), .01, actor_vision_update_interval=10)
+        task.refresh_actor_vision(env, fresh)  # Shape probing cannot invent a scene or trace.
+        self.assertFalse(fresh.ready)
+
+    def test_1024_rows_refresh_in_balanced_groups_once_per_step_and_every_ten_steps(self):
+        env, state, sensor, _ = self.fixture(count=1024, interval=10)
+        obs.initial_scene_geometry(env)
+        self.assertFalse(sensor.calls)  # The reset snapshot is already current.
+        counts = torch.zeros(1024, dtype=torch.long)
+        visits = [[] for _ in range(1024)]
+        def reject(*_args, **_kwargs):
+            raise AssertionError('Periodic scheduling must not read host scalars or compact device rows')
+        for step in range(1, 21):
+            env.common_step_counter = state.last_step = step
+            # Isolate the actual refresh scheduler from unrelated physics/MDP
+            # costs; no synthetic visibility or full reset occurs here.
+            with patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, '__bool__', reject), \
+                 patch.object(torch.Tensor, 'cpu', reject), patch.object(torch.Tensor, 'nonzero', reject), \
+                 patch.object(torch, 'nonzero', reject):
+                task.refresh_actor_vision(env, state)
+                task.refresh_actor_vision(env, state)
+            self.assertEqual(len(sensor.calls), step)
+            ids, active, roles, cameras, kwargs = sensor.calls[-1]
+            expected = torch.arange((step - 1) % 10, 1024, 10)
+            torch.testing.assert_close(ids, expected)
+            self.assertIn(len(ids), (102, 103))
+            torch.testing.assert_close(active, state.bindings.object_ids[ids])
+            torch.testing.assert_close(roles, torch.stack((env.task_scene_data.target_id[ids],
+                                                          env.task_scene_data.blocker_id[ids]), -1))
+            torch.testing.assert_close(cameras, env._episode_reset.camera_pose[ids])
+            torch.testing.assert_close(kwargs['object_poses'],
+                                       env.scene['object_collection'].data.object_link_pose_w[ids])
+            counts[ids] += 1
+            for index in ids.tolist():
+                visits[index].append(step)
+        torch.testing.assert_close(counts, torch.full_like(counts, 2))
+        self.assertTrue(all(times[1] - times[0] == 10 for times in visits))
+
+    def test_actor_visibility_changes_preserve_initial_critic_mask_and_current_eef_axes(self):
+        env, state, sensor, _ = self.fixture(interval=1)
+        initial_mask = state.geometry_valid.clone()
+        initial_sources = state.critic_source_indices.clone()
+        sensor.valid[:, 0] = False  # The Target becomes hidden.
+        sensor.geometry[:, 0] = 0.
+        sensor.observed[:, 0] = -1
+        sensor.valid[:, 3] = True  # A newly visible object had no initial critic slot.
+        sensor.geometry[:, 3] = sensor.geometry[:, 1]
+        sensor.geometry[:, 3, 0] = .7
+        sensor.observed[:, 3] = 1
+        env.scene['object_collection'].data.object_link_pose_w[:, 3, 0] += .03
+        robot = env.scene['robot'].data
+        robot.body_link_pos_w[:, 1, 0] += .1
+        robot.body_link_quat_w[:, 1] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        env.common_step_counter = 1
+        critic = obs.critic_scene_geometry(env).clone()
+        obs.current_robot_sample(env)
+        obs.previous_robot_sample(env)
+        self.assertFalse(sensor.calls)  # Critic/history access alone is not a camera update.
+        terminal = env.extras['terminal_observation']
+        saved_terminal = terminal.clone()
+        actor = obs.initial_scene_geometry(env).reshape(3, 10, 10)
+        self.assertEqual(len(sensor.calls), 1)
+        torch.testing.assert_close(state.geometry_valid, sensor.valid)
+        torch.testing.assert_close(state.geometry_b, sensor.geometry)
+        torch.testing.assert_close(actor, obs.geometry_in_eef_frame(
+            sensor.geometry, sensor.valid, state.tcp_pose_b))
+        self.assertFalse(actor[:, 0].any())
+        self.assertTrue(actor[:, 3].any())
+        from contact_manipulation.config.ur5e.agents.model import ModelCfg, build_policy_masks
+        actor_masks = build_policy_masks(obs.policy_observation(env), ModelCfg())
+        critic_masks = build_policy_masks(obs.critic_observation(env), ModelCfg())
+        torch.testing.assert_close(actor_masks.object_valid, sensor.valid)
+        torch.testing.assert_close(critic_masks.object_valid, initial_mask)
+        self.assertFalse(actor_masks.roles[..., 0].any())
+        self.assertTrue(actor_masks.roles[:, 1, 1].all())
+        self.assertTrue(actor_masks.object_valid[:, 3].all())
+        torch.testing.assert_close(state.critic_geometry_valid, initial_mask)
+        torch.testing.assert_close(state.critic_source_indices, initial_sources)
+        torch.testing.assert_close(obs.critic_scene_geometry(env), critic)
+        torch.testing.assert_close(terminal, saved_terminal)
+        self.assertIsNot(state.observation, terminal)
+        obs.initial_scene_geometry(env)
+        self.assertEqual(len(sensor.calls), 1)
+        # Missing geometry returns to zero padding without an MLP-style
+        # neighboring permutation; the sensor's nearest-role order is retained.
+        sensor.valid[:, 3] = False
+        sensor.geometry[:, 3] = 0.
+        sensor.observed[:, 3] = -1
+        env.common_step_counter = 2
+        updated = obs.initial_scene_geometry(env).reshape(3, 10, 10)
+        self.assertTrue(state.geometry_valid[:, 2].all())
+        self.assertFalse(state.geometry_valid[:, 3].any())
+        self.assertFalse(updated[:, 3].any())
+        torch.testing.assert_close(state.critic_geometry_valid, initial_mask)
+        torch.testing.assert_close(state.critic_source_indices, initial_sources)
+
+    def test_partial_reset_skips_current_snapshot_and_preserves_other_histories_and_terminal_frame(self):
+        env, state, sensor, _ = self.fixture(count=4, interval=2)
+        sensor.geometry[..., 0] += sensor.valid.float()
+        env.common_step_counter = 1
+        obs.initial_scene_geometry(env)
+        env.common_step_counter = 2
+        task.get_task_state(env)
+        terminal = env.extras['terminal_observation'].clone()
+        ids, untouched = torch.tensor([1]), torch.tensor([0, 2, 3])
+        histories = state.history[untouched].clone()
+        task.reset_task(env, ids)
+        reset_geometry = state.geometry_b[ids].clone()
+        before = state.geometry_b.clone()
+        obs.initial_scene_geometry(env)
+        self.assertEqual(len(sensor.calls), 2)
+        selected, active, *_ = sensor.calls[-1]
+        torch.testing.assert_close(selected, torch.tensor([1, 3]))
+        self.assertTrue((active[0] == -1).all())
+        torch.testing.assert_close(state.geometry_b[ids], reset_geometry)
+        torch.testing.assert_close(state.geometry_b[[0, 2]], before[[0, 2]])
+        torch.testing.assert_close(state.geometry_b[3], sensor.geometry[3])
+        torch.testing.assert_close(state.history[untouched], histories)
+        torch.testing.assert_close(env.extras['terminal_observation'], terminal)
+        self.assertEqual(state.actor_vision_step[1].item(), 2)
+        obs.initial_scene_geometry(env)
+        self.assertEqual(len(sensor.calls), 2)
+        # A recorder may request observations between termination and auto-reset.
+        # Such rows must not receive an additional ray frame of the old episode.
+        env.termination_manager = SimpleNamespace(active_terms=[],
+                                                  dones=torch.tensor([False, False, True, False]))
+        before = state.geometry_b.clone()
+        sensor.geometry[..., 0] += sensor.valid.float() * .1
+        env.common_step_counter = 3
+        obs.initial_scene_geometry(env)
+        selected, active, *_ = sensor.calls[-1]
+        torch.testing.assert_close(selected, torch.tensor([0, 2]))
+        self.assertTrue((active[1] == -1).all())
+        torch.testing.assert_close(state.geometry_b[2], before[2])
+        torch.testing.assert_close(state.geometry_b[0], sensor.geometry[0])
+
+
 class GeometryTests(unittest.TestCase):
     def test_random_roll_pitch_yaw_obb_hull_and_overlap_match_scipy(self):
         rng = np.random.default_rng(33)
@@ -7947,6 +8127,83 @@ class GeometricVisionTests(unittest.TestCase):
         self.assertFalse(missing[1].any())
         self.assertEqual(observed[1].tolist(), [[True, False, False]])
         self.assertEqual(sensor.cfg.min_depth_pixels, 16)
+
+    def test_periodic_tensor_observation_matches_current_mesh_rays_and_chunks_without_host_reads(self):
+        sensor, poses, active, eyes, rotations, roles = self.fixture(batch=35)
+        sensor.cfg = self.module.InitialVisionCfg()
+        sensor.capacity = sensor.cfg.ray_batch_size
+        poses[1::2, 1, 0] = .35
+        origins = torch.zeros(35, 3)
+        origins[:, 1] = torch.arange(35) * 3.
+        world = poses.clone()
+        world[..., :3] += origins[:, None]
+        roots = torch.cat((origins, rotations), -1)
+        roots[1, 3:] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        cameras = torch.cat((eyes + origins, rotations), -1)
+        class Scene(dict):
+            pass
+        scene_data = Scene(
+            object_collection=SimpleNamespace(data=SimpleNamespace(object_link_pose_w=world)),
+            robot=SimpleNamespace(data=SimpleNamespace(root_pos_w=roots[:, :3], root_quat_w=roots[:, 3:])))
+        scene_data.env_origins = origins
+        sensor.env = SimpleNamespace(scene=scene_data, device='cpu',
+                                     cfg=SimpleNamespace(mdp=SimpleNamespace(max_objects=10)))
+        ids = torch.arange(35)
+        original = tuple(value.clone() for value in (world, active, roles, roots, cameras))
+        def reject(*_args, **_kwargs):
+            raise AssertionError('Periodic tensor observation synchronized with the host')
+        with patch.object(sensor, '_trace', wraps=sensor._trace) as trace, \
+             patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, '__bool__', reject), \
+             patch.object(torch.Tensor, 'tolist', reject), patch.object(torch.Tensor, 'cpu', reject):
+            geometry, valid, observed = sensor.observe_tensors(ids, active, roles, cameras)
+        self.assertEqual([call.args[0].shape[0] for call in trace.call_args_list], [32, 3])
+        self.assertTrue(all(call.kwargs == {'observation_only': True} for call in trace.call_args_list))
+        self.assertEqual(geometry.shape, (35, 10, 10))
+        self.assertEqual(observed.dtype, torch.long)
+        self.assertFalse(valid[0, 0])
+        self.assertEqual(observed[0, 0].item(), -1)
+        self.assertFalse(geometry[0, 0].any())
+        self.assertTrue(valid[1, :2].all())
+        requests = [dict(env_id=index, active_ids=(0, 1), target_id=0, blocker_id=1) for index in range(35)]
+        snapshots = sensor.observe_at_viewpoint(requests, cameras)
+        torch.testing.assert_close(geometry, torch.stack([item.geometry_b for item in snapshots]))
+        torch.testing.assert_close(valid, torch.stack([item.geometry_valid for item in snapshots]))
+        torch.testing.assert_close(observed, torch.stack([item.observed_ids for item in snapshots]))
+        # The optional pose path uses selected tensor rows, including unsorted IDs.
+        selected = torch.tensor([34, 1, 0])
+        selected_result = sensor.observe_tensors(selected, active[selected], roles[selected], cameras[selected],
+                                                object_poses=world[selected], root_poses=roots[selected])
+        for actual, expected in zip(selected_result, (geometry, valid, observed)):
+            torch.testing.assert_close(actual, expected[selected])
+        for actual, before in zip((world, active, roles, roots, cameras), original):
+            torch.testing.assert_close(actual, before, rtol=0, atol=0)
+
+    def test_periodic_tensor_observation_reveals_and_hides_objects_without_ground_truth_filling(self):
+        sensor, poses, active, eyes, rotations, roles = self.fixture()
+        sensor.cfg = self.module.InitialVisionCfg()
+        class Scene(dict):
+            env_origins = torch.zeros(1, 3)
+        sensor.env = SimpleNamespace(scene=Scene(
+            object_collection=SimpleNamespace(data=SimpleNamespace(object_link_pose_w=poses)),
+            robot=SimpleNamespace(data=SimpleNamespace(root_pos_w=eyes, root_quat_w=rotations))),
+            device='cpu', cfg=SimpleNamespace(mdp=SimpleNamespace(max_objects=10)))
+        ids, cameras = torch.tensor([0]), torch.cat((eyes, rotations), -1)
+        initial = sensor.observe_tensors(ids, active, roles, cameras)
+        self.assertEqual(initial[1][0, :2].tolist(), [False, True])
+        self.assertFalse(initial[0][0, 0].any())
+        poses[:, 1, 0] = .35
+        revealed = sensor.observe_tensors(ids, active, roles, cameras)
+        self.assertTrue(revealed[1][0, :2].all())
+        self.assertEqual(revealed[2][0, :2].tolist(), [0, 1])
+        # A previously absent foreground body now occludes both role meshes.
+        poses[:, 1, 0] = 0.
+        active[:, 2] = 2
+        hidden = sensor.observe_tensors(ids, active, roles, cameras)
+        self.assertFalse(hidden[1][0, :2].any())
+        self.assertTrue((hidden[2][0, :2] == -1).all())
+        self.assertFalse(hidden[0][0, :2].any())
+        self.assertIn(2, hidden[2][0].tolist())
+
 
     def test_observation_grid_reuses_buffers_and_rebuilds_for_resolution_change(self):
         sensor, *_ = self.fixture()

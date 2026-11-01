@@ -1,10 +1,11 @@
 """Independent scene graph models with current/previous sensor history.
 
-This module deliberately has no Isaac Sim imports. The actor receives initial
-camera geometry; the critic receives current ground-truth geometry for those
-same initially observed object identities. Both reserve target/blocker slots 0/1
-and receive the same current/previous robot and sensor samples. Callers derive masks from their own
-observation before passing observation and masks separately to the model.
+This module deliberately has no Isaac Sim imports. The actor receives the latest
+cached camera geometry; the critic receives current ground-truth geometry for
+the reset-time observed object identities. Both reserve target/blocker slots 0/1
+and receive the same current/previous robot and sensor samples. Each forward
+derives masks from its own current observation before passing observation and
+masks separately to the model; scene embeddings are not cached between calls.
 Masks control padding, sensor filtering, and role selection; they are not learned features.
 Actor and critic each construct their own graph, attention, and native MLP head.
 """
@@ -412,6 +413,7 @@ class _NativeContactModel(MLPModel):
         return self.encoder(observation, masks=build_policy_masks(observation, self.cfg), history=history)
 
     def get_latent(self, obs, masks=None, hidden_state=None):
+        """Encode this observation afresh; compilation caches only the callable."""
         observation = self.get_policy_observation(obs)
         selectors = build_policy_masks(observation, self.cfg)
         history = self.encoder.history_input(observation, masks=selectors)
@@ -451,7 +453,7 @@ class _NativeContactModel(MLPModel):
 
 
 class NativeContactActor(_NativeContactModel):
-    """Graph/attention features followed by the native Gaussian action head."""
+    """Current observed graph/attention features and the native Gaussian head."""
 
     _role = "Actor"
     _architecture = "native_graph_actor_v3"

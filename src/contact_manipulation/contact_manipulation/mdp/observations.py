@@ -1,9 +1,9 @@
 """Batched policy measurements; scene roles and validity are never features.
 
-Initial camera geometry is frozen in robot-base coordinates. Only its reference
-frame changes with the measured EEF pose. Slots 0/1 are target/blocker; history
-contains the current and previous sample, newest first. The critic tracks the
-current true geometry of these same initially recognized objects. All quaternions use
+Actor camera geometry is held in robot-base coordinates between scheduled ray
+updates. Its reference frame changes with the measured EEF pose. Slots 0/1 are target/blocker; history
+contains the current and previous sample, newest first. The critic independently
+tracks current true geometry of the reset-time recognized objects. All quaternions use
 ``(w, x, y, z)``. Quaternion operations use Isaac Lab tensor utilities.
 """
 
@@ -130,7 +130,7 @@ def prepare_initial_geometry(
 def geometry_in_eef_frame(
     geometry: torch.Tensor, valid: torch.Tensor, tcp_pose_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Re-express initial OBBs in the current EEF frame; leave padding zero."""
+    """Re-express cached OBBs in the current EEF frame; leave padding zero."""
     inverse_rotation = quat_conjugate(tcp_pose_b[:, None, 3:7])
     position = quat_apply(inverse_rotation, geometry[..., :3] - tcp_pose_b[:, None, :3])
     orientation = quat_unique(quat_mul(inverse_rotation, geometry[..., 3:7]))
@@ -212,11 +212,13 @@ def calibrate_wrench(
     return measured, exceeded
 
 
-def policy_observation(env) -> torch.Tensor:
+def policy_observation(env, *, refresh_vision=True) -> torch.Tensor:
     """Shared packed snapshot for native observation terms and timeout bootstrap."""
-    from .events import get_task_state
+    from .events import get_task_state, refresh_actor_vision
 
     state = get_task_state(env)
+    if refresh_vision:
+        refresh_actor_vision(env, state)
     if state.observation is None:
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)
         state.observation = pack_policy_observation(geometry, state.history)
@@ -224,7 +226,7 @@ def policy_observation(env) -> torch.Tensor:
 
 
 def initial_scene_geometry(env) -> torch.Tensor:
-    """Initial visible geometry in the current EEF frame; target/blocker first."""
+    """Latest scheduled visible geometry in the current EEF; roles first."""
     return policy_observation(env)[:, :100]
 
 
@@ -239,7 +241,7 @@ def critic_observation(env) -> torch.Tensor:
 
     state = get_task_state(env)
     if state.critic_observation is None:
-        valid = state.geometry_valid & (state.critic_source_indices >= 0)
+        valid = state.critic_geometry_valid & (state.critic_source_indices >= 0)
         geometry = geometry_in_eef_frame(state.critic_geometry_b, valid, state.tcp_pose_b)
         state.critic_observation = pack_policy_observation(geometry, state.history)
     return state.critic_observation
@@ -252,9 +254,9 @@ def critic_scene_geometry(env) -> torch.Tensor:
 
 def current_robot_sample(env) -> torch.Tensor:
     """Current robot, SI-200-8 F/T reaction, tactile and action measurements."""
-    return policy_observation(env)[:, 100:172]
+    return policy_observation(env, refresh_vision=False)[:, 100:172]
 
 
 def previous_robot_sample(env) -> torch.Tensor:
     """Previous completed sample, zeroed for rows beginning a new episode."""
-    return policy_observation(env)[:, 172:244]
+    return policy_observation(env, refresh_vision=False)[:, 172:244]

@@ -6420,3 +6420,43 @@ episode 초기 world pose를 재사용하고, ray 결과는 robot-base에 저장
 visible-point CUDA reduction·support replay cache다. 실제 GPU 처리 시간·메모리 증가·학습 효과는
 **미측정**이며, phase 분산만으로 평균 연산량이 줄었다고 해석하지 않는다. 학습·PhysX simulation·
 play·commit·push는 실행하지 않았다. `git diff --check`와 보존 경로의 diff도 확인했다.
+
+## 85. 2026-11-01 — GNN Actor에도 10step 비전 갱신 적용
+
+사용자 후속 요청으로 Original `contact_manipulation`에도 84절의 주기적 실제 ray 관측을
+적용했다. 기본 `actor_vision_update_interval=10`이며 현재 정책100Hz에서 비전은10Hz다.
+0으로 설정하면 기존 reset-only Actor 비전으로 돌아간다. Parallel 프로젝트와 Original의
+reward·termination·PPO·제어·물리·reset 분포는 이번에 수정하지 않았다.
+
+초기 reset snapshot은 즉시 제공한다. 이후 고정 env-ID phase10개로 ray 부하를 분산하여
+1024환경 중 매step102개 또는103개를 갱신한다. 첫 갱신은 reset 후1–10step이며 이후 간격은
+10step이다. 해당 episode의 가상 카메라 pose,64×48 observation grid,shared mesh BVH와
+32view chunk를 재사용한다. 현재 물체의 보이는 first-hit 표면에서만 OBB를 추정하고,
+가려진 물체는 padding한다. 시점 재탐색·가시성 합격 검사·실루엣 분모 계산·카메라 prim·렌더링은
+추가하지 않았다. 중간 step은 최근 snapshot을 현재 UR5e 말단 EEF frame으로 재표현한다.
+
+Original GNN의 순서 규칙을 유지했다. Target·Blocker는0·1번이며 나머지는 보이는 역할 물체와
+가까운 순서로 선택한다. Parallel MLP의 이미지 좌→우 정렬·인접 swap은 가져오지 않았다.
+기존 GNN·Attention은 매 forward 현재 관측에서 mask와 scene feature를 계산하므로 모델의
+실행 구조는 바꾸지 않았다. 기존 compile cache는 실행 함수만 보관하며 장면 feature를 고정하지 않는다.
+
+Critic은 별도 reset-time valid mask를 사용하여 최초 인식 ID·slot만 유지한 채 현재 GT pose를
+갱신한다. Actor에 새 물체가 등장하거나 기존 물체가 가려져도 Critic의 목록은 바뀌지 않는다.
+Critic/robot history 조회만으로는 ray를 실행하지 않는다. 같은 step의 중복 관측,
+reset 직후 행과 종료 직후 행은 중복 ray를 막고 기존 terminal 관측 tensor를 보존한다.
+주기 query는 GPU tensor를 직접 주고받으며 CPU 요청 dict·환경별 snapshot list·GPU nonzero나
+tensor scalar 조회를 추가하지 않는다. phase bucket 초기 구성과 고정 ray chunk launch는 Python에서 수행한다.
+
+**검증:** `CUDA_VISIBLE_DEVICES=''`,CPU thread1에서 관련14개 test class의241개 중
+**236개 통과·CUDA 전용5개 생략**(8.373초). 새6개 검사는1024환경 phase/cadence·중복 호출 방지,
+실제 Warp CPU 메시 ray와 기존 fixed-view API 일치,32+3view chunk,world/root 좌표와 입력 불변,
+가려짐·재노출·GT 미보충,변경된 GNN 입력 mask와 고정 Critic mask,부분 reset 및 terminal 보존을 확인했다.
+기존 GNN/Attention·native Actor/Critic·관측·보상·종료 회귀 검사도 통과했다.
+
+검사 class는 `PeriodicActorVisionTests`, `GeometricVisionTests`, `InitialGeometryTests`,
+`DynamicObservationTests`, `StateTests`, `NativeAdapterTests`, `ObservationObbVisualizationTests`,
+`PhysicalStateCapacityTests`, `ObservationCapacityTests`, `RewardTests`, `TerminationTests`,
+`BlockerContactManagerTests`, `ModelTests`, `NativeLearningTests`다. 생략 항목은 GPU ray parity,
+visible-point CUDA reduction,support replay cache,fused edge reduction,CUDA Inductor 통합이다.
+실제 GPU 처리 시간·메모리·학습 효과는 **미측정**이다. 학습·PhysX simulation·play·commit·push는
+실행하지 않았다.

@@ -51,7 +51,7 @@ contact_manipulation/
     └── mdp/
         ├── __init__.py
         ├── events.py               # reset, 배치 상태, 공통 기하 계산
-        ├── sensors.py              # 실제 F/T·contact reader와 기하 기반 초기 vision
+        ├── sensors.py              # 실제 F/T·contact reader와 기하 기반 초기·주기 vision
         ├── observations.py         # observation 계산
         ├── rewards.py              # reward 계산
         └── terminations.py         # 성공·실패 조건
@@ -74,8 +74,9 @@ contact_manipulation/
 에셋 로딩은 예제의 `src/ur5e.py`, `src/shelf_utils.py`를 참고해 `scene.py`에 모았다.
 공통 cfg의 observation은 `initial_scene` 100D, `current` 72D, `previous` 72D 순서로
 각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총244D로 연결한다.
-Critic은 별도 `critic` 그룹에서 같은10개 슬롯의 현재 실제 물체 기하100D와 동일한
-현재·직전144D를 받는다. 초기 인식 ID·순서·padding은 reset에서 고정한다.
+Actor의 `initial_scene`이라는 term 이름은 유지하지만 내용은 기본10step마다 갱신한 ray 관측이다.
+Critic은 별도 `critic` 그룹에서 초기 인식10개 슬롯의 현재 실제 물체 기하100D와 동일한
+현재·직전144D를 받는다. Critic의 초기 인식 ID·순서·padding은 reset에서 고정한다.
 새 규약에서는 물리 활성 개수15–25와 관측 용량10을 분리한다. 인식한 물체가10개를 넘으면
 Target·Blocker를 slot0/1에 두고, 나머지는 관측된 중심에서 두 역할의 관측 중심까지 거리의
 최솟값이 작은 순서로8개를 선택한다. 보이지 않은 물체를 정답 pose로 채우지 않으며,
@@ -165,7 +166,7 @@ scripts/train.py
 Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 첫 함수가 물체·로봇의
 초기 상태와 vision을 준비하고, 두 번째가 초기 snapshot·이력·시계를 초기화한다.
 이후 reward·termination·observation은 한 control step당 한 번 갱신되는 `TaskState`를 공유한다.
-이 부분은 initial vision 고정, previous=0 reset 규칙, 센서 이력과 terminal observation을
+이 부분은 Actor vision cache, previous=0 reset 규칙, 센서 이력과 terminal observation을
 일치시키기 위한 연구 구현이다. 별도 `env.step()`이나 `_reset_idx()` override는 없다.
 
 ## 모델과 PPO
@@ -173,7 +174,7 @@ Reset은 `EventManager`가 `reset_scene → reset_task` 순서로 호출한다. 
 ```text
 Actor / Critic 각각 별도 인스턴스로 실행 (가중치 공유 없음):
 
-Actor: 초기 vision / Critic: 최초 인식 ID들의 현재 GT [N,10,10]
+Actor: 최신 ray vision / Critic: 최초 인식 ID들의 현재 GT [N,10,10]
                           └─ 2-layer GNN (64D)
                              ├─ Target / Blocker embedding
                              ├─ Target / Blocker 조건부 attention → scene 320D
@@ -198,8 +199,10 @@ reset 등 공통 인터페이스를 상속한다. 공식 `CNNModel`과 같은 �
 Actor는 `policy`, Critic은 `critic`이라는 별도244D 관측 그룹을 받는다. Critic의 물체 목록은
 reset에서 Actor의 초기 인식 ID·슬롯 순서·padding과 정확히 맞춰 고정한다. 이후 동일 물체의
 현재 실제 중심·회전·전체 OBB 크기를 제공하며, 처음 보이지 않았던 물체는 추가하지 않는다.
-가려지거나 선반 밖으로 나가도 ID는 유지한다. 추가 ray casting이나 최근접 재선택은 없다.
-Actor의 초기 추정 OBB는 유지하므로 초기에도 Critic의 실제 OBB와 값이 다를 수 있다.
+가려지거나 선반 밖으로 나가도 ID는 유지한다. Critic에는 추가 ray casting이나 최근접 재선택이 없다.
+Actor는 주기 ray 관측에 따라 보이는 물체·추정 OBB를 갱신한다. 두 모델의 valid mask는
+분리되어 있어 Actor에서 가려진 물체도 Critic은 초기 ID를 유지하며 추적한다.
+표면으로 추정한 Actor OBB와 전체 실제 형상을 쓰는 Critic OBB는 값이 다를 수 있다.
 양쪽 물체 기하는 현재 UR5e 말단 EEF frame으로 표현하고, 로봇·센서·행동144D는 동일하다.
 Critic head는 `464→256→128→1`이며 Gaussian 분포는 없다. 두 모델 모두 ReLU를 사용한다.
 공통 Python 클래스로 구조를 정의하지만, encoder·attention·
@@ -209,6 +212,8 @@ MLP·정규화 통계·compile cache는 각각 별도 인스턴스다. Critic의
 시작 로그의 모듈 목록은 PyTorch **등록 순서**라 `mlp`가 `encoder`보다 먼저 표시될 수 있다.
 실제 native forward는 `get_latent()`에서 scene encoder와 concat을 끝낸 뒤 MLP를 호출한다.
 로그의 `forward: scene encoder ... -> concat(current, previous) -> mlp`가 실행 흐름이다.
+매 forward 현재100D 장면에서 mask·GNN·attention을 다시 계산한다. Compile cache는 실행
+함수만 보관하며 이전 장면의 embedding을 재사용하지 않는다.
 
 현재 baseline은 공식 PPO의 checkpoint 형식을 사용하고 각 모델의 계약을
 native `state_dict`의 extra state에 기록한다. 새 graph Critic checkpoint의 resume는 native 방식이다.
@@ -279,7 +284,7 @@ graph Actor의 JIT/ONNX export는 구현하지 않았다.
 | 영역 | 구현 |
 |---|---|
 | Observation | Actor·Critic 각각 물체 기하 10×10 + 현재·직전 sample 2×72 = **244D** |
-| 물체 정보 | 현재 `wrist_3_link` 기준. Actor는 초기 vision 추정값 고정, Critic은 같은 초기 인식 ID들의 현재 실제 OBB 갱신 |
+| 물체 정보 | 현재 `wrist_3_link` 기준. Actor는 기본10step마다 ray OBB 갱신, Critic은 초기 인식 ID들의 현재 실제 OBB 갱신 |
 | 슬롯 | Target 0, Blocker 1, 나머지 관측 물체와 zero padding. Role ID·mask 채널 없음 |
 | 72D sample | 12관절 q/dq 24 + base에서 표현한 `wrist_3_link` pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
 | F/T | Sensor frame의 반력 → SI-200-8 축별 clipping·양자화 → full scale 정규화. 자중·관성 하중 포함 |
@@ -872,7 +877,8 @@ actor·critic·optimizer 값도 모두 유한했다. 학습 시간108.254초에�
 첫 교차 표면으로 OBB를 추정하며 가려진 부분을 정답 pose·전체 크기로 채우지 않는다.
 Target40–90%·Blocker≥95%는 startup의 실제 메시 구간에서 인증하며 reset에서 다시 승인하지 않는다.
 따라서 관측의 `visible_fractions=None`은 미측정이라는 뜻이고, cache 예측값은 별도 provenance다.
-관측 기하는 episode 동안 고정하고 매 step 현재 `wrist_3_link` frame으로 재표현한다.
+Actor 관측 기하는 기본10step마다 같은 가상 시점에서 갱신하고, 사이에는 cache를 유지하며
+매 step 현재 `wrist_3_link` frame으로 재표현한다.
 Headless 학습은 render를 호출하지 않으며 GUI·video의 native 렌더링은 별도다.
 
 구현은 [events.py](contact_manipulation/mdp/events.py)의 catalog·직접 생성·reset,
@@ -958,8 +964,28 @@ device에서 배치 처리한다. 물체·시점별 좌표 변환은 한 번 계
 Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright PCA로 추정한다. 보이지 않는
 물체는 padding으로 남기며, 물체의 정답 pose·전체 크기로 가려진 부분을 채우지 않는다.
 이상적인 교차점에는 depth outlier가 없으므로 이전 depth의 1–99% quantile 대신 표면 extrema를
-사용한다. CUDA에서는 배경 ray를 제외한 count·moment·bounds를 Warp atomic 연산으로 계산한다. 초기 기하는
-기존처럼 episode 중 고정되고 현재 EEF frame으로만 재표현한다. Actor 244D 규약은 유지한다.
+사용한다. CUDA에서는 배경 ray를 제외한 count·moment·bounds를 Warp atomic 연산으로 계산한다.
+Actor 244D 규약과 현재 EEF frame 표현은 유지한다.
+
+Actor의 기본 `actor_vision_update_interval=10`은 정책100Hz에서 **환경당10Hz** 갱신이다.
+Reset 직후에는 기존 초기 ray 관측을 즉시 사용한다. 이후 환경 ID를10개 phase로 나눠 첫
+주기 조회를1–10step에 분산하고, 각 환경은10step 간격으로 갱신한다. 1,024환경이면 한 step에
+102–103환경을 처리한다. 부분 reset 행은 같은 step의 추가 조회를 생략하고 다음 phase부터
+참여한다. `env.actor_vision_update_interval=0`이면 이전 reset-only 동작을 사용할 수 있다.
+
+`InitialVisionSensor.observe_tensors()`는 고정된 episode 카메라·64×48 격자·공유 BVH를
+재사용하고 `ray_batch_size=32` 단위로 GPU tensor·Warp 연산을 수행한다. 시점 후보 탐색이나
+가시성 승인 재시도는 하지 않는다. 모든 활성 물체가 가림 계산에 참여한 뒤 Target·Blocker를
+0/1에 두고 가까운 관측 물체8개를 선택한다. GNN의 기존 근접 순서를 유지하며 parallel MLP의
+이미지 좌우 정렬·인접 순서 교환은 추가하지 않는다. 보이지 않는 역할 슬롯은0이며, 주변
+슬롯은 현재 보이는 물체에서 다시 선택하고 부족한 수는 padding한다. 가려진 형상을 GT로
+채우지 않는다. 최신 OBB는 robot-base에 캐시해
+매 policy step 현재 EEF로 변환한다. Critic/history 관측만 읽어서는 ray 조회가 발생하지 않는다.
+
+종료·reset 행은 ray 입력을 비활성화하며, 이미 보존한 종료 관측은 갱신으로 덮지 않는다.
+GUI의 observation OBB도 이 최신 Actor cache를 표시한다. 이번 변경은 Actor의 관측 갱신만
+대상으로 하고 GNN·PPO·reward·termination 설정과 Critic의 초기 ID 추적 규약은 유지한다.
+주기 ray 갱신의 실제 GPU 처리량과 학습 효과는 아직 측정하지 않았다.
 
 이하 전체 영역 평가 설정은 사전 인증/legacy 검증 경로다. 기본 clutter reset은 새 후보
 시점을 평가하거나 재시도하지 않는다.
@@ -1085,11 +1111,13 @@ Reset event와 센서 reader가 다음 데이터를 제공한다.
   유효성과 tactile 17채널을 반환한다. 선반 pose는 native rigid-body data에서 별도로 읽는다.
 
 `EventCfg.reset_scene`에서 배치·로봇 pose·vision을 확정한 뒤 `reset_mdp`가 이 데이터를
-저장한다. 물체 pose는 reward·종료 조건에만 사용하며 초기 vision을 대신하지 않는다.
+저장한다. 실제 물체 pose는 reward·종료·Critic과 가상 센서의 메시 배치에 사용하지만,
+Actor의 OBB는 ray에서 보이는 표면으로만 계산한다.
 정적 USD 기하와 로봇 FK 모델은 최초 한 번만 검사한다.
 
 전체 환경은 **8초(800 policy step)의 공통 scene round** 동안 같은 초기 물체 배치와
-가상 카메라 시점·vision 정보를 공유한다. 움직이기 시작한 뒤 물리 상태는 환경별로 독립적이다.
+가상 카메라 시점·초기 vision을 공유한다. 움직이기 시작한 뒤 물리 상태와 주기 Actor 관측은
+환경별로 독립적이다.
 중간 실패로 종료되면 해당 환경의 물체·선반만 저장된 초기 상태로 되돌린다.
 현재 success termination은 비활성이므로 성공만으로 reset하지 않는다.
 **로봇은 매 reset마다 Blocker 앞 허용 영역에서 hand 위치·회전을 연속적으로 샘플링**하며,
@@ -1119,7 +1147,8 @@ Native 로그 `Reset/robot_start_fallback_count`, `fallback_fraction`, `fallback
 budget을 기록한다. Normal reset에는 파일 쓰기를 추가하지 않는다. Native runner의 평균 로그를
 fallback 총횟수로 합산하지 말고 누적 `fallback_total`과 JSONL을 사용한다.
 카메라 관측은 robot-base frame으로 캐시하고 각 환경의 현재 `wrist_3_link` frame으로 변환한다.
-Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세 때문에 재촬영하지 않는다.
+Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세에는 공유 초기 관측을 재사용한다.
+이후 주기 조회는 각 환경의 실제 물체 상태에서 수행한다.
 
 공통 round 경계는 `scene_time_out` termination term으로 전체 환경을 truncate한다.
 최근에 재시작한 episode도 이 경계에서 종료하며, 실패 벌점 대신 기존 timeout bootstrap을 쓴다.
@@ -1187,8 +1216,9 @@ env_0의 완성된 rigid body 기하를 임시 USD에 저장하고 instance로 �
 물체 기하·vision 정렬도 선택 행만 계산하며 reset snapshot에서 F/T는 초기값0을 사용한다.
 공통 장면의 작은 CPU 기하 계산과 reset 시 metadata 전송은 남아 있다. 환경별 SciPy IK는 GPU 배치로 대체했고,
 초기 관측의 렌더링 경로는 제거했다. 이 탐색·기하 조회·CPU/GPU 동기화는 매 step에 실행하지 않는다.
-Ray 및 IK 임시 텐서 크기는 전체 환경 수와 별개로 제한한다. 배치/vision 생성은 공통 round당
-한 장면에 대해서만 수행하며, IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
+Ray 및 IK 임시 텐서 크기는 chunk로 제한한다. 배치·초기 vision 생성은 공통 round당
+한 장면에 대해서만 수행한다. 학습 중 Actor ray 조회는 위10개 phase로 분산하며,
+IK 비용과 물리 상태 쓰기는 reset 환경 수에 따라 증가한다.
 물체 local COM은 고정 asset 값으로 캐시하므로 향후 COM randomization을 추가하면 이 캐시도 갱신해야 한다.
 
 Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에 보존한다.
@@ -1197,6 +1227,11 @@ Auto-reset 전 마지막 관측은 진단용 `extras["terminal_observation"]`에
 `init_at_random_ep_len=True`이며 공통 장면 교체와 부분 reset은 연구 MDP에서 관리한다.
 
 ## 검증과 남은 구현
+
+2026-11-01 Actor 주기 vision 변경 뒤 MDP12개·모델2개 클래스의 CPU 회귀 검사241개 중
+**236개 통과, CUDA 전용5개 skip**이었다. 갱신 분산·가림 변화·좌표 변환·종료 관측 보존·
+부분 reset·Critic 초기 ID 유지와 GNN 입력 연결을 확인했다. GPU·simulation·학습은 실행하지
+않았으므로 실제 처리량이나 학습 성능의 검증 결과는 아니다. 상세는 [학습 기록85절](../../docs/TRAINING_LOG.md)을 따른다.
 
 2026-10-25 `hand_velocity`에서 Hand를 제외한 뒤 CPU 집중 검사 **41개가 통과**했다.
 팔3rad/s 경계와 초과·Hand/mimic 제외·12관절 velocity reward 유지·성공 차단·native 로그·부분 reset을
@@ -1554,5 +1589,5 @@ GUI 없이 지정한 step까지만 확인하려면 `--headless --max_steps 260`�
   --num_envs 1 --headless --video --video_length 300
 ```
 
-영상 저장에만 렌더링을 활성화하며 정책의 초기 vision은 계속 GPU mesh ray casting을 사용한다.
+영상 저장에만 렌더링을 활성화하며 정책의 초기·주기 vision은 GPU mesh ray casting을 사용한다.
 `--max_steps`와 `--video_length`를 함께 지정하면 더 짧은 길이에서 종료한다.
