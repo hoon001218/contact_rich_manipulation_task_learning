@@ -95,11 +95,20 @@ class RewardsCfg:
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
     )
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.2)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.4)
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("shelf"),
+            "translation_threshold": 0.005,
+            "rotation_threshold": math.pi / 180.0,
+            "linear_velocity_threshold": 0.005,
+            "angular_velocity_threshold": 0.05,
+        },
+    )
+    target_collision = RewardTermCfg(
+        func=mdp.target_collision, weight=-0.5,
+        params={
             "translation_threshold": 0.005,
             "rotation_threshold": math.pi / 180.0,
             "linear_velocity_threshold": 0.005,
@@ -129,16 +138,16 @@ class TerminationsCfg:
     """Native cause-specific termination logs over the cached task predicates."""
 
     time_out = TerminationTermCfg(func=mdp.scene_time_out, time_out=True)
-    # success = TerminationTermCfg(func=mdp.success)
+    success = TerminationTermCfg(func=mdp.success)
     object_support_lost = TerminationTermCfg(func=mdp.failure, params={"reason": "object_support_lost"})
     object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
-    # Match min's Inspire threshold; the UR5e config selects only the six arm joints.
+    # Actual arm overspeed; the UR5e config selects only the six arm joints.
     hand_velocity = TerminationTermCfg(
         func=joint_vel_out_of_manual_limit,
-        params={"max_velocity": 3.0, "asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
+        params={"max_velocity": 1.0, "asset_cfg": SceneEntityCfg("robot", joint_names=MISSING)},
     )
 
 

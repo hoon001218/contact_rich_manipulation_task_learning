@@ -399,8 +399,10 @@ class ContactRewardTests(unittest.TestCase):
         valid = torch.ones_like(previous)
         valid[2, [3, 9]] = False
         before = previous.clone()
-        count, current = rewards.blocker_contact_hold(force, previous, valid=valid)
+        count, new_count, current = rewards.blocker_contact_hold(force, previous, valid=valid)
         torch.testing.assert_close(count, torch.tensor([2., 0., 15.], dtype=force.dtype))
+        torch.testing.assert_close(new_count, torch.tensor([1., 1., 0.], dtype=force.dtype))
+        torch.testing.assert_close(count + new_count, current.sum(-1).to(force.dtype))
         torch.testing.assert_close(previous, before)  # History update belongs to the caller.
         self.assertTrue(current[0, 5])
         self.assertFalse(current[0, 2:5].any())
@@ -409,8 +411,9 @@ class ContactRewardTests(unittest.TestCase):
         force[0] = 0.
         force[0, [1, 7], 2] = .02
         current[2] = False
-        next_count, _ = rewards.blocker_contact_hold(force, current, valid=valid)
+        next_count, next_new, _ = rewards.blocker_contact_hold(force, current, valid=valid)
         torch.testing.assert_close(next_count, torch.tensor([1., 1., 0.], dtype=force.dtype))
+        torch.testing.assert_close(next_new, torch.tensor([1., 0., 15.], dtype=force.dtype))
 
     def test_contact_reward_helpers_preserve_dtype_and_never_read_device_scalars(self):
         def reject(*args, **kwargs):
@@ -425,26 +428,32 @@ class ContactRewardTests(unittest.TestCase):
             with patch.object(torch.Tensor, '__bool__', reject), \
                  patch.object(torch.Tensor, 'item', reject), patch.object(torch.Tensor, 'cpu', reject):
                 quality, distance = rewards.blocker_distance_quality(points, center, rotation, half)
-                count, current = rewards.blocker_contact_hold(points, previous)
+                count, new_count, current = rewards.blocker_contact_hold(points, previous)
             self.assertEqual(quality.dtype, dtype)
             self.assertEqual(distance.dtype, dtype)
             self.assertEqual(count.dtype, dtype)
+            self.assertEqual(new_count.dtype, dtype)
+            torch.testing.assert_close(new_count, torch.zeros_like(new_count))
             self.assertEqual(current.dtype, torch.bool)
             self.assertEqual(tuple(current.shape), (1024, 17))
 
 
 class RewardTests(unittest.TestCase):
-    def test_clearance_remains_initial_relative_and_masks_only_positive_progress(self):
-        quality = torch.tensor([.3, .3, -.3, -.3], dtype=torch.float64)
+    def test_clearance_pays_only_positive_initial_relative_score_without_state_gates(self):
+        quality = torch.tensor([-.2, 0., .2, .5, 1.], dtype=torch.float64)
         state = SimpleNamespace(clearance_quality=quality,
-                                clearance_progress_valid=torch.tensor([True, False, True, False]))
-        expected = torch.tensor([.3, 0., -.3, -.3], dtype=quality.dtype)
+                                clearance_progress_valid=torch.zeros(5, dtype=torch.bool),
+                                target_protected=torch.zeros(5, dtype=torch.bool),
+                                failure=torch.ones(5, dtype=torch.bool))
+        expected = torch.tensor([0., 0., .2, .5, 1.], dtype=quality.dtype)
         for dt in (.01, .02, .1):
             with patch.object(task, 'get_task_state', return_value=state):
                 torch.testing.assert_close(rewards.clearance(SimpleNamespace(step_dt=dt)), expected)
-        state.clearance_progress_valid.fill_(True)
-        with patch.object(task, 'get_task_state', return_value=state):
-            torch.testing.assert_close(rewards.clearance(SimpleNamespace(step_dt=.01)), quality)
+                for field in ('clearance_progress_valid', 'target_protected', 'failure'):
+                    getattr(state, field).logical_not_()
+                    torch.testing.assert_close(rewards.clearance(SimpleNamespace(step_dt=dt)), expected)
+        # Raw negative progress remains available for diagnostics.
+        torch.testing.assert_close(state.clearance_quality, quality)
 
     def test_clearance_is_linear_from_initial_overlap_and_worsening_is_not_clipped(self):
         initial = torch.tensor([.02, .02, .02, .02, .02], dtype=torch.float64)
@@ -462,10 +471,32 @@ class RewardTests(unittest.TestCase):
         torch.testing.assert_close(rewards.clearance_quality(torch.zeros_like(varied), varied),
                                    torch.ones_like(varied))
 
-    def test_invalid_initial_overlap_cannot_produce_a_nonfinite_clearance_reward(self):
-        initial = torch.tensor([0., -1., 1.e-12, math.nan, math.inf, .01], dtype=torch.float64)
-        actual = rewards.clearance_quality(torch.zeros_like(initial), initial)
-        torch.testing.assert_close(actual, initial.new_tensor([0., 0., 0., 0., 0., 1.]))
+    def test_native_clearance_area_table_and_failed_transition_keep_positive_payment(self):
+        initial = torch.ones(5, dtype=torch.float64)
+        raw = rewards.clearance_quality(initial.new_tensor([1.2, 1., .8, .5, 0.]), initial)
+        state = SimpleNamespace(clearance_quality=raw,
+                                clearance_progress_valid=torch.zeros(5, dtype=torch.bool),
+                                target_protected=torch.zeros(5, dtype=torch.bool),
+                                failure=torch.ones(5, dtype=torch.bool),
+                                terminal_reward=initial.new_tensor([0., 0., 0., 0., -10.]))
+        env = SimpleNamespace(step_dt=.01)
+        manager = SimpleNamespace(
+            _env=env, _term_names=['clearance', 'terminal'],
+            _term_cfgs=[SimpleNamespace(func=rewards.clearance, weight=12., params={}),
+                        SimpleNamespace(func=rewards.terminal, weight=1., params={})],
+            _reward_buf=torch.zeros_like(initial), _step_reward=initial.new_zeros(5, 2),
+            _episode_sums={'clearance': torch.zeros_like(initial), 'terminal': torch.zeros_like(initial)})
+        with patch.object(task, 'get_task_state', return_value=state):
+            total = native_reward_compute()(manager, env.step_dt)
+        torch.testing.assert_close(raw, initial.new_tensor([-.2, 0., .2, .5, 1.]))
+        torch.testing.assert_close(manager._episode_sums['clearance'], initial.new_tensor([0., 0., .024, .06, .12]))
+        torch.testing.assert_close(total, initial.new_tensor([0., 0., .024, .06, -9.88]))
+
+    def test_invalid_area_numbers_cannot_produce_a_nonfinite_clearance_reward(self):
+        initial = torch.tensor([0., -1., 1.e-12, math.nan, math.inf, .01, .01, .01, .01], dtype=torch.float64)
+        current = initial.new_tensor([0., 0., 0., 0., 0., 0., math.nan, math.inf, -.01])
+        actual = rewards.clearance_quality(current, initial)
+        torch.testing.assert_close(actual, initial.new_tensor([0., 0., 0., 0., 0., 1., 0., 0., 0.]))
         self.assertTrue(torch.isfinite(actual).all())
 
     def test_invalid_linear_clearance_references_keep_native_rollout_rewards_finite(self):
@@ -481,7 +512,7 @@ class RewardTests(unittest.TestCase):
             _episode_sums={'clearance': torch.zeros(5)})
         with patch.object(task, 'get_task_state', return_value=state):
             reward = native_reward_compute()(manager, env.step_dt)
-        torch.testing.assert_close(reward, initial.new_tensor([0., 0., 0., .06, -.12]))
+        torch.testing.assert_close(reward, initial.new_tensor([0., 0., 0., .06, 0.]))
         self.assertTrue(torch.isfinite(reward).all())
         self.assertTrue(torch.isfinite(manager._episode_sums['clearance']).all())
 
@@ -566,7 +597,7 @@ class RewardTests(unittest.TestCase):
         state = SimpleNamespace(clearance_quality=torch.tensor([.3, -.3, 0.]),
                                 clearance_progress_valid=torch.ones(3, dtype=torch.bool),
                                 force_growth=torch.tensor([2., 0., 0.]), torque_growth=torch.tensor([.5, 0., 0.]),
-                                terminal_reward=torch.tensor([250., -3., 0.]))
+                                terminal_reward=torch.tensor([250., -10., 0.]))
         for dt in (.01, .02, .1):
             env = SimpleNamespace(step_dt=dt)
             configs = [SimpleNamespace(func=fn, weight=w, params={}) for fn, w in
@@ -577,7 +608,7 @@ class RewardTests(unittest.TestCase):
                                       _episode_sums={name: torch.zeros(3) for name in ['clear', 'force', 'torque', 'terminal']})
             with patch.object(task, 'get_task_state', return_value=state):
                 actual = compute(manager, dt)
-            expected = 12 * state.clearance_quality * dt
+            expected = 12 * state.clearance_quality.clamp_min(0.) * dt
             expected -= .03 * (state.force_growth.square() + state.torque_growth.square()) * dt
             expected += state.terminal_reward
             torch.testing.assert_close(actual, expected)
@@ -630,6 +661,24 @@ class RewardTests(unittest.TestCase):
         self.assertLess(terms['time_penalty'][1], 0.)
         self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
+        self.assertEqual(terms['clearance'], ('clearance', 12.))
+        self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', .4))
+        self.assertEqual(terms['target_collision'], ('target_collision', -.5))
+        self.assertEqual(terms['object_stability'], ('object_stability', .5))
+        self.assertNotIn('motion_joint_velocity', terms)
+        self.assertNotIn('motion_singularity', terms)
+        collision_params = {}
+        for name in ('shelf_collision', 'target_collision'):
+            term = next(node for node in definition.body
+                        if isinstance(node, ast.Assign) and node.targets[0].id == name)
+            params = next(item.value for item in term.value.keywords if item.arg == 'params')
+            collision_params[name] = {
+                key.value: eval(compile(ast.Expression(value), str(source), 'eval'), {'math': math})
+                for key, value in zip(params.keys, params.values) if key.value != 'asset_cfg'}
+        self.assertEqual(collision_params['target_collision'], collision_params['shelf_collision'])
+        self.assertEqual(collision_params['target_collision'], dict(
+            translation_threshold=.005, rotation_threshold=math.pi/180,
+            linear_velocity_threshold=.005, angular_velocity_threshold=.05))
         distance = next(n for n in definition.body if isinstance(n, ast.Assign)
                         and n.targets[0].id == 'blocker_distance')
         params = next(item.value for item in distance.value.keywords if item.arg == 'params')
@@ -725,16 +774,21 @@ class RewardTests(unittest.TestCase):
             torch.testing.assert_close(rewards.time_penalty(env), previous)
 
 
-    def test_object_stability_distance_deadband_half_cost_padding_and_dt(self):
+    def test_object_stability_uses_only_selected_blocker_tilt_with_five_degree_slack(self):
         cfg = settings()
-        distance = torch.tensor([[0., .010, .009], [.020, .005, .010],
-                                 [.030, 0., 0.], [.020, .020, .020],
-                                 [.020, math.nan, math.inf]], dtype=torch.float64)
-        active = torch.ones_like(distance, dtype=torch.bool)
-        active[-1, 1:] = False
-        state = SimpleNamespace(cfg=cfg, active=active, stability_distance=distance,
-                                tilt_angle=torch.zeros_like(distance))
-        expected = torch.tensor([0., -.5, -.9375, -.5, -.5], dtype=distance.dtype)
+        angles = torch.zeros(6, 3, dtype=torch.float64)
+        active = torch.ones(6, 3, dtype=torch.bool)
+        blocker = torch.zeros_like(active)
+        columns = torch.tensor([0, 1, 2, 1, 1, 1])
+        blocker[torch.arange(6), columns] = True
+        angles[torch.arange(6), columns] = angles.new_tensor([0., 5., 8., 50., 50., math.nan]) * math.pi / 180.
+        angles[~blocker] = math.inf  # Other-object tilt cannot add dense stability cost.
+        active[-1, 1] = False  # Inactive role padding is ignored.
+        state = SimpleNamespace(cfg=cfg, active=active, blocker=blocker,
+                                stability_distance=torch.full_like(angles, math.inf), tilt_angle=angles)
+        self.assertAlmostEqual(cfg.stability_tilt_slack, math.radians(5.))
+        self.assertAlmostEqual(cfg.stability_tilt_decay, math.log(2.) / (math.pi / 4.))
+        expected = angles.new_tensor([0., 0., 2**(-1/15)-1., -.5, -.5, 0.])
         for dt in (.01, .02, .1):
             env = SimpleNamespace(step_dt=dt)
             with patch.object(task, 'get_task_state', return_value=state), \
@@ -743,38 +797,35 @@ class RewardTests(unittest.TestCase):
                  patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('host transfer')):
                 penalty = rewards.object_stability(env)
             torch.testing.assert_close(penalty, expected)
-        # Repeating a safe/risky object never multiplies the worst-object cost.
-        self.assertEqual(float(penalty[1]), float(penalty[3]))
-        # Active invalid geometry costs the bound; padding was ignored above.
+        env = SimpleNamespace(step_dt=.01)
+        manager = SimpleNamespace(_env=env, _term_names=['object_stability'],
+            _term_cfgs=[SimpleNamespace(func=rewards.object_stability, weight=.5, params={})],
+            _reward_buf=torch.zeros(6, dtype=angles.dtype), _step_reward=torch.zeros(6, 1, dtype=angles.dtype),
+            _episode_sums={'object_stability': torch.zeros(6, dtype=angles.dtype)})
+        with patch.object(task, 'get_task_state', return_value=state):
+            payment = native_reward_compute()(manager, env.step_dt)
+        torch.testing.assert_close(payment, expected * .005)
+        self.assertAlmostEqual(float(payment[3]), -.0025)
         active[-1, 1] = True
         with patch.object(task, 'get_task_state', return_value=state):
-            invalid = rewards.object_stability(SimpleNamespace(step_dt=.01))
-        self.assertEqual(float(invalid[-1]), -1.)
+            self.assertEqual(float(rewards.object_stability(env)[-1]), -1.)
 
-
-    def test_object_stability_linear_tilt_half_angle_and_same_object_combination(self):
-        cfg = settings()
-        angles = torch.tensor([[0., 0.], [math.pi / 6, 0.], [math.pi / 4, 0.],
-                               [math.pi / 2, 0.], [math.pi / 4, 0.],
-                               [0., math.pi / 4], [math.nan, 0.]], dtype=torch.float64)
-        distance = torch.zeros_like(angles)
-        distance[4:6, 0] = .02
-        active = torch.ones_like(angles, dtype=torch.bool)
-        active[-1, 0] = False
-        state = SimpleNamespace(cfg=cfg, active=active, stability_distance=distance, tilt_angle=angles)
-        self.assertAlmostEqual(cfg.stability_tilt_decay, math.log(2.) / (math.pi / 4))
-        env = SimpleNamespace(step_dt=.01)
+    def test_object_stability_keeps_raw_tilt_and_yaw_is_free_through_partial_reset(self):
+        state, batch, reset = fixture(2)
+        angles = batch.center.new_tensor([0., math.radians(8.)])
+        batch.rotation[0, 1] = batch.rotation.new_tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        batch.rotation[1, 1] = batch.rotation.new_tensor([math.cos(angles[1]/2), math.sin(angles[1]/2), 0., 0.])
+        state.advance(batch, 1)
+        torch.testing.assert_close(state.tilt_angle[:, 1], angles, atol=1.e-12, rtol=0.)
+        env = SimpleNamespace(step_dt=state.dt)
         with patch.object(task, 'get_task_state', return_value=state):
-            penalty = rewards.object_stability(env)
-        expected = torch.tensor([0., 2**(-2/3) - 1, -.5, -.75, -.75, -.5, 0.], dtype=angles.dtype)
-        torch.testing.assert_close(penalty, expected)
-        # Distance and tilt compound when affecting one object; risks on two
-        # different objects use the worst one, rather than summing their maxima.
-        self.assertLess(float(penalty[4]), float(penalty[5]))
-        active[-1, 0] = True
-        with patch.object(task, 'get_task_state', return_value=state):
-            invalid = rewards.object_stability(env)
-        self.assertEqual(float(invalid[-1]), -1.)
+            torch.testing.assert_close(rewards.object_stability(env), angles.new_tensor([0., 2**(-1/15)-1.]))
+        saved = state.tilt_angle[0].clone()
+        state.reset(torch.tensor([1]), batch, **reset, step=1)
+        torch.testing.assert_close(state.tilt_angle[0], saved)
+        self.assertFalse(state.tilt_angle[1].any())
+        state.advance(batch, 2)
+        torch.testing.assert_close(state.tilt_angle[:, 1], angles, atol=1.e-12, rtol=0.)
 
 class SceneMotionRewardTests(unittest.TestCase):
     @staticmethod
@@ -786,27 +837,29 @@ class SceneMotionRewardTests(unittest.TestCase):
         blocker[:, 1] = True
         return center, corners, data['velocity'].to(dtype), data['active'], blocker
 
-    def test_object_cost_is_per_environment_and_ignores_only_blocker_and_inactive_slots(self):
+    def test_object_cost_is_per_environment_and_excludes_target_blocker_and_inactive_slots(self):
         center, corners, velocity, active, blocker = self.motion_inputs(5, 4)
-        velocity[0, 0, :3] = velocity.new_tensor([.1, -.2, .3])  # Protected Target is included.
+        target = torch.zeros_like(active)
+        target[:, 0] = True
+        velocity[0, 0, :3] = velocity.new_tensor([.1, -.2, .3])  # Target has its own pose/speed flag.
         velocity[1, 2, 0] = .4  # A distractor need not be observed to contribute.
         center[2, 1], corners[2, 1], velocity[2, 1] = math.nan, math.inf, math.nan
         center[3, 3], corners[3, 3], velocity[3, 3] = math.nan, math.inf, math.nan
         active[3, 3] = False
         velocity[4, 2, 0] = math.nan  # Invalid state termination handles this body.
         velocity[4, 3, 0] = .25  # Valid motion in the same environment is preserved.
-        expected = velocity.new_tensor([math.sqrt(.14), .4, 0., 0., .25])
-        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker), expected)
+        expected = velocity.new_tensor([0., .4, 0., 0., .25])
+        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker, target), expected)
         # A change in one scene must not change any other scene's reward.
         velocity[1, 2, 0] = 2.
-        actual = rewards.object_motion_cost(center, corners, velocity, active, blocker)
+        actual = rewards.object_motion_cost(center, corners, velocity, active, blocker, target)
         torch.testing.assert_close(actual[[0, 2, 3, 4]], expected[[0, 2, 3, 4]])
         self.assertEqual(float(actual[1]), 2.)  # No tanh bound or clipping.
 
     def test_object_cost_does_not_round_away_small_motion(self):
         center, corners, velocity, active, blocker = self.motion_inputs(2)
         velocity[1, 2, 0] = .001
-        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker),
+        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker)),
                                    velocity.new_tensor([0., .001]))
 
     def test_invalid_active_geometry_does_not_discard_another_valid_objects_cost(self):
@@ -815,21 +868,21 @@ class SceneMotionRewardTests(unittest.TestCase):
         center[0, 0, 0] = math.nan
         corners[1, 0, 0, 1] = math.inf
         velocity[2, 0, 4] = math.inf
-        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker),
+        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker)),
                                    velocity.new_full((3,), .2))
 
     def test_translation_is_euclidean_and_sums_objects_without_counting_eight_corners(self):
         center, corners, velocity, active, blocker = self.motion_inputs(2)
         velocity[:, 0, :3] = velocity.new_tensor([3., 4., 0.])
         velocity[1, 2, :3] = velocity.new_tensor([0., 0., 2.])
-        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker),
+        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker)),
                                    velocity.new_tensor([5., 7.]))
 
     def test_pure_yaw_matches_cube_corner_radius_and_quarter_turn_path(self):
         center, corners, velocity, active, blocker = self.motion_inputs(2)
         velocity[:, 0, 5] = velocity.new_tensor([1., math.pi / 2])
         expected = velocity.new_tensor([math.sqrt(.05**2 + .05**2), math.pi * math.sqrt(.005) / 2])
-        cost = rewards.object_motion_cost(center, corners, velocity, active, blocker)
+        cost = rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker))
         torch.testing.assert_close(cost, expected)
         self.assertAlmostEqual(float(-.5 * cost[1]), -.05553603672697958)
 
@@ -840,7 +893,7 @@ class SceneMotionRewardTests(unittest.TestCase):
         velocity[0, 0, :3] = velocity.new_tensor([.05, -.05, 0.])
         velocity[0, 0, 5] = 1.
         expected = (4 * .1 + 2 * math.sqrt(.02)) / 8
-        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker),
+        torch.testing.assert_close(rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker)),
                                    velocity.new_tensor([expected]))
 
     def test_world_rotation_and_translation_preserve_rigid_body_motion_cost(self):
@@ -849,17 +902,17 @@ class SceneMotionRewardTests(unittest.TestCase):
         center += torch.randn(center.shape, dtype=center.dtype, generator=generator)
         corners = center[..., None, :] + corners - corners.mean(-2, keepdim=True)
         velocity.copy_(torch.randn(velocity.shape, dtype=velocity.dtype, generator=generator))
-        original = rewards.object_motion_cost(center, corners, velocity, active, blocker)
+        original = rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker))
         rotation = torch.tensor(Rotation.from_rotvec([.3, -.7, 1.2]).as_matrix(), dtype=center.dtype)
         origin = center.new_tensor([10., -8., 4.])
         transformed = rewards.object_motion_cost(center @ rotation.T + origin, corners @ rotation.T + origin,
-            torch.cat((velocity[..., :3] @ rotation.T, velocity[..., 3:] @ rotation.T), -1), active, blocker)
+            torch.cat((velocity[..., :3] @ rotation.T, velocity[..., 3:] @ rotation.T), -1), active, blocker, torch.zeros_like(blocker))
         torch.testing.assert_close(transformed, original)
 
     def test_reward_manager_integrates_same_translation_path_for_fast_and_slow_motion(self):
         center, corners, velocity, active, blocker = self.motion_inputs(2)
         velocity[:, 0, 0] = velocity.new_tensor([.1, 1.])
-        state = SimpleNamespace(object_motion_cost=rewards.object_motion_cost(center, corners, velocity, active, blocker))
+        state = SimpleNamespace(object_motion_cost=rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker)))
         env = SimpleNamespace()
         compute = native_reward_compute()
         config = SimpleNamespace(func=rewards.object_collision, weight=-.5, params={})
@@ -901,6 +954,62 @@ class SceneMotionRewardTests(unittest.TestCase):
             torch.testing.assert_close(rewards.shelf_collision(env, SimpleNamespace(name='shelf')),
                                        torch.tensor([1., 1., 0.]))
 
+    def test_target_flag_reuses_shelf_formula_thresholds_world_link_pose_and_units(self):
+        count = 12
+        initial = torch.cat((torch.zeros(count, 3, dtype=torch.float64), identity(count)), -1)
+        initial[:, 1] = torch.arange(count) * 3.
+        targets = torch.arange(count).remainder(2)
+        poses = initial[:, None].expand(-1, 2, -1).clone()
+        velocity = torch.zeros(count, 2, 6, dtype=initial.dtype)
+        rows = torch.arange(count)
+        poses[1:3, targets[1:3], 0] += initial.new_tensor([.005, .005001])
+        angles = initial.new_tensor([1., 1.001]) * math.pi / 180.
+        poses[3:5, targets[3:5], 3] = torch.cos(angles/2)
+        poses[3:5, targets[3:5], 6] = torch.sin(angles/2)
+        velocity[5:7, targets[5:7], 0] = initial.new_tensor([.005, .005001])
+        velocity[7:9, targets[7:9], 3] = initial.new_tensor([.05, .050001])
+        poses[9, targets[9], 0], velocity[9, targets[9]] = .02, 1.
+        poses[10, targets[10], 0] = math.nan
+        velocity[11, targets[11], 0] = math.inf
+        env = SimpleNamespace(step_dt=.01, task_scene_data=SimpleNamespace(target_id=targets), scene={
+            'object_collection': SimpleNamespace(data=SimpleNamespace(
+                object_link_pose_w=poses, object_com_vel_w=velocity))})
+        state = SimpleNamespace(initial_target_pose=initial)
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, 'shelf_motion_cost', wraps=rewards.shelf_motion_cost) as formula:
+            actual = rewards.target_collision(env)
+        expected = initial.new_tensor([0., 0., 1., 0., 1., 0., 1., 0., 1., 1., 1., 1.])
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(formula.call_args.args[0], poses[rows, targets], equal_nan=True)
+        torch.testing.assert_close(formula.call_args.args[1], velocity[rows, targets])
+        torch.testing.assert_close(formula.call_args.args[2], initial)
+        manager = SimpleNamespace(_env=env, _term_names=['target_collision'],
+            _term_cfgs=[SimpleNamespace(func=rewards.target_collision, weight=-.5, params={})],
+            _reward_buf=torch.zeros(count, dtype=initial.dtype), _step_reward=torch.zeros(count, 1, dtype=initial.dtype),
+            _episode_sums={'target_collision': torch.zeros(count, dtype=initial.dtype)})
+        with patch.object(task, 'get_task_state', return_value=state):
+            torch.testing.assert_close(native_reward_compute()(manager, env.step_dt), expected * -.005)
+
+    def test_target_reference_partial_reset_is_local_and_target_motion_leaves_surrounding_cost(self):
+        env, _, _ = native_fixture(3)
+        # An off-center OBB makes accidentally mixing its center with the native
+        # link pose visible, even while the Target remains at rest.
+        env.task_scene_data.lower[2] = torch.tensor([.01, -.03, -.05])
+        env.task_scene_data.upper[2] = torch.tensor([.07, .09, .05])
+        task.reset_task(env)
+        state = env._contact_mdp
+        poses = env.scene['object_collection'].data.object_link_pose_w
+        initial = state.initial_target_pose.clone()
+        torch.testing.assert_close(initial, poses[:, 2])
+        poses[1:, 2, 0] += .006
+        env.common_step_counter = 1
+        torch.testing.assert_close(rewards.target_collision(env), torch.tensor([0., 1., 1.]))
+        torch.testing.assert_close(state.object_motion_cost, torch.zeros(3))
+        task.reset_task(env, torch.tensor([1]))
+        torch.testing.assert_close(state.initial_target_pose[[0, 2]], initial[[0, 2]])
+        torch.testing.assert_close(state.initial_target_pose[1], poses[1, 2])
+        torch.testing.assert_close(rewards.target_collision(env), torch.tensor([0., 0., 1.]))
+
     def test_parallel_scene_costs_preserve_dtype_chunks_and_never_read_host_scalars(self):
         def reject(*args, **kwargs):
             raise AssertionError('Scene reward arithmetic must stay on the tensor device')
@@ -912,9 +1021,9 @@ class SceneMotionRewardTests(unittest.TestCase):
             pose = torch.cat((torch.zeros(1024, 3, dtype=dtype), identity(1024).to(dtype)), -1)
             with patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
                  patch.object(torch.Tensor, 'cpu', reject):
-                actual = rewards.object_motion_cost(center, corners, velocity, active, blocker)
+                actual = rewards.object_motion_cost(center, corners, velocity, active, blocker, torch.zeros_like(blocker))
                 shelf = rewards.shelf_motion_cost(pose, velocity[:, 0], pose)
-            chunked = torch.cat([rewards.object_motion_cost(c, p, v, a, b) for c, p, v, a, b in
+            chunked = torch.cat([rewards.object_motion_cost(c, p, v, a, b, torch.zeros_like(b)) for c, p, v, a, b in
                 zip(center.split(73), corners.split(73), velocity.split(73), active.split(73), blocker.split(73))])
             torch.testing.assert_close(actual, chunked)
             self.assertEqual(actual.dtype, dtype)
@@ -1012,33 +1121,39 @@ class SingularityRewardTests(unittest.TestCase):
 
 
 class TerminationTests(unittest.TestCase):
-    def test_success_requires_half_second_of_continuous_valid_completion_at_each_control_dt(self):
+    def test_success_is_immediate_without_settled_speed_but_requires_current_geometry(self):
         cfg = settings()
-        self.assertEqual(task.MdpCfg().success_duration, .5)
+        self.assertEqual(cfg.success_duration, 0.)
         for dt in (.01, .02, .03, .1):
-            data = physical_inputs()
+            data = physical_inputs(6)
             data['step_dt'] = dt
-            success_paid = torch.zeros(1, dtype=torch.bool)
-            failure_paid = torch.zeros(1, dtype=torch.bool)
-            threshold = success_steps(cfg, dt)
-            for step in range(1, threshold + 1):
-                candidate, data['stable_count'], data['tilt_count'], _, failed = terminations.task_conditions(cfg, **data)
-                successful, payment, success_paid, failure_paid = terminations.terminal_transition(
-                    candidate, failed, data['stable_count'], success_paid, failure_paid, cfg, step_dt=dt)
-                with self.subTest(dt=dt, step=step):
-                    self.assertEqual(bool(successful[0]), step == threshold)
-                    self.assertEqual(float(payment[0]), cfg.success_reward if step == threshold else 0.)
-            # Moving one neighbor breaks the whole hold window, even if the
-            # protected target and Blocker overlap still satisfy the goal.
-            data['velocity'][0, 2, 0] = cfg.stable_linear_velocity + .001
-            candidate, count, _, _, _ = terminations.task_conditions(cfg, **data)
-            self.assertFalse(candidate.any())
-            self.assertFalse(count.any())
+            for row in range(3):
+                data['velocity'][row, row, 0] = .8
+                data['velocity'][row, row, 4] = 2.
+            data['velocity'][3, 1, 0] = math.nan
+            data['center'][4, 1, 2] += .006
+            data['corners'][4, 1, :, 2] += .006
+            angle = math.radians(80.)
+            data['rotation'][5, 1] = data['rotation'].new_tensor([math.cos(angle/2), math.sin(angle/2), 0., 0.])
+            candidate, stable, tilted, reasons, failed = terminations.task_conditions(cfg, **data)
+            successful, payment, success_paid, failure_paid = terminations.terminal_transition(
+                candidate, failed, stable, torch.zeros(6, dtype=torch.bool),
+                torch.zeros(6, dtype=torch.bool), cfg, step_dt=dt)
+            torch.testing.assert_close(successful, torch.tensor([True, True, True, False, False, False]))
+            torch.testing.assert_close(stable, torch.tensor([1, 1, 1, 0, 0, 0]))
+            torch.testing.assert_close(payment, torch.tensor([250., 250., 250., -10., 0., 0.]))
+            # Neither unsupported geometry nor an 80-degree tip can succeed
+            # during the debounce period before it becomes a hard failure.
+            self.assertFalse(failed[4:].any())
+            self.assertFalse(reasons[4:].any())
+            _, repeated, _, _ = terminations.terminal_transition(
+                candidate, failed, stable, success_paid, failure_paid, cfg, step_dt=dt)
+            self.assertFalse(repeated.any())
 
     def test_terminal_pays_success_once_and_enabled_failure_always_suppresses_success(self):
         cfg = task.MdpCfg()
         self.assertEqual(cfg.success_reward, 250.)
-        self.assertEqual(cfg.failure_penalty, 3.)
+        self.assertEqual(cfg.failure_penalty, 10.)
         candidate = torch.tensor([True, True, False, False, True])
         failed = torch.tensor([False, True, True, False, False])
         stable = torch.tensor([success_steps(cfg), success_steps(cfg), 0, 0, success_steps(cfg) - 1])
@@ -1047,7 +1162,7 @@ class TerminationTests(unittest.TestCase):
         successful, terminal, success_paid, failure_paid = terminations.terminal_transition(
             candidate, failed, stable, success_paid, failure_paid, cfg)
         self.assertEqual(successful.tolist(), [True, False, False, False, False])
-        self.assertEqual(terminal.tolist(), [250., -3., -3., 0., 0.])
+        self.assertEqual(terminal.tolist(), [250., -10., -10., 0., 0.])
         self.assertEqual(success_paid.tolist(), [True, False, False, False, False])
         self.assertEqual(failure_paid.tolist(), [False, True, True, False, False])
         state = SimpleNamespace(terminal_reward=torch.zeros(5))
@@ -1082,7 +1197,7 @@ class TerminationTests(unittest.TestCase):
         yes, no = torch.tensor([True]), torch.tensor([False])
         stable = torch.tensor([success_steps(cfg)])
         success_paid, failure_paid = no.clone(), no.clone()
-        for failed, expected in ((False, 250.), (False, 0.), (True, -3.), (True, 0.), (False, 0.)):
+        for failed, expected in ((False, 250.), (False, 0.), (True, -10.), (True, 0.), (False, 0.)):
             _, payment, success_paid, failure_paid = terminations.terminal_transition(
                 yes, torch.tensor([failed]), stable, success_paid, failure_paid, cfg)
             self.assertEqual(float(payment[0]), expected)
@@ -1103,7 +1218,7 @@ class TerminationTests(unittest.TestCase):
             self.assertFalse(success_paid.any())
             self.assertFalse(failure_paid.any())
 
-    def test_target_blocker_and_all_object_velocity_gate_success(self):
+    def test_target_pose_and_blocker_overlap_gate_success_but_finite_object_velocity_does_not(self):
         data = physical_inputs(5)
         data["center"][1, 0, 0] += 0.021
         data["rotation"][2, 0] = torch.tensor([math.cos(0.08), 0., 0., math.sin(0.08)])
@@ -1111,8 +1226,8 @@ class TerminationTests(unittest.TestCase):
         data["velocity"][4, 2, 0] = 0.051
         data["stable_count"][:] = 2
         candidate, stable, _, _, failed = terminations.task_conditions(settings(), **data)
-        self.assertEqual(candidate.tolist(), [True, False, False, False, False])
-        self.assertEqual(stable.tolist(), [3, 0, 0, 0, 0])
+        self.assertEqual(candidate.tolist(), [True, False, False, False, True])
+        self.assertEqual(stable.tolist(), [3, 0, 0, 0, 3])
         self.assertFalse(failed.any())
 
     def test_each_failure_reason_and_invalid_state_is_independent(self):
@@ -1394,17 +1509,17 @@ class ObjectSupportValidityTests(unittest.TestCase):
         values.update(support_loss_count=result.support_loss_count)
         return result
 
-    def test_moving_supported_push_and_small_pivot_can_progress_but_completion_waits(self):
+    def test_moving_supported_push_and_small_pivot_can_complete_without_settling(self):
         values = self.inputs(4)
         values['velocity'][0, 1, 0] = .5
         values['velocity'][1, 2, 3] = .31
-        # A 7 mm support gap is permitted while manipulating but not settled.
+        # A 7 mm support gap still exceeds the instantaneous success tolerance.
         values['center_shelf'][2, 1, 2] += .007
         values['corners_shelf'][2, 1, :, 2] += .007
         values['upright_z'][3, 1] = math.cos(math.radians(35))
         result = self.advance(values)
         self.assertTrue(result.progress_valid.all())
-        self.assertEqual(result.completion_valid.tolist(), [False, False, False, True])
+        self.assertEqual(result.completion_valid.tolist(), [True, True, False, True])
         self.assertFalse(result.lost.any())
 
     def test_single_support_distance_unifies_ejection_flight_and_drop_with_one_timer(self):
@@ -1432,8 +1547,8 @@ class ObjectSupportValidityTests(unittest.TestCase):
 
     def test_stability_uses_outer_obb_corners_and_collision_bottom_without_changing_failure_distance(self):
         values = self.inputs(4)
-        # Both centers remain inside the finite panel, but OBB corners extend
-        # beyond its edge. The new reward sees this before support-loss failure.
+        # Keep raw support diagnostics even though the dense stability reward
+        # now uses Blocker tilt only. Corners can exit while the center is inside.
         for row, delta in ((0, (.95, 0., 0.)), (1, (.95, .96, .02))):
             offset = values['center_shelf'].new_tensor(delta)
             values['center_shelf'][row, 1] += offset
@@ -1737,23 +1852,23 @@ class NativeVelocityTerminationTests(unittest.TestCase):
         omitted = [index for index in range(18) if index not in ids + hand_ids]
         for dtype in (torch.float32, torch.float64):
             velocity = torch.zeros(1024, 18, dtype=dtype)
-            velocity[0, ids] = 3.0  # The Inspire variant uses a strict > boundary.
-            velocity[1, ids[4]] = 3.0001  # Arm.
-            velocity[2, ids[-1]] = -3.0001  # Arm, opposite direction.
+            velocity[0, ids] = 1.0  # Strict > boundary.
+            velocity[1, ids[4]] = 1.01  # Arm.
+            velocity[2, ids[-1]] = -1.01  # Arm, opposite direction.
             velocity[3, hand_ids] = 1.e8  # Independent fingers do not trigger this term.
             velocity[5, omitted] = -1.e8  # Mimic/passive joints are also excluded.
-            velocity[4, ids] = -2.0  # The former 1 rad/s cutoff no longer applies.
+            velocity[4, ids] = -.99  # Just below the new limit, opposite direction.
             env = SimpleNamespace(scene={'robot': SimpleNamespace(data=SimpleNamespace(joint_vel=velocity))})
             asset_cfg = SimpleNamespace(name='robot', joint_ids=ids)
             with patch.object(torch.Tensor, 'item', side_effect=AssertionError('Tensor scalar read')), \
                  patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('Tensor condition read')), \
                  patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('CPU transfer')):
-                actual = native(env, max_velocity=3.0, asset_cfg=asset_cfg)
+                actual = native(env, max_velocity=1.0, asset_cfg=asset_cfg)
             expected = torch.zeros(1024, dtype=torch.bool)
             expected[[1, 2]] = True
             torch.testing.assert_close(actual, expected)
 
-    def test_ur5e_configuration_keeps_twelve_reward_joints_and_only_six_arm_termination_joints(self):
+    def test_ur5e_configuration_keeps_velocity_reward_disabled_and_only_six_arm_termination_joints(self):
         source = Path(task.__file__).parent.parent / 'config/ur5e/ur5e_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'UR5eContactManipulationEnvCfg')
@@ -1767,32 +1882,35 @@ class NativeVelocityTerminationTests(unittest.TestCase):
                     action_names[target.rsplit('.', 1)[-1]] = next(
                         ast.literal_eval(keyword.value) for keyword in node.value.keywords
                         if keyword.arg == 'joint_names')
-        start = next(index for index, node in enumerate(method.body)
-                     if isinstance(node, ast.Assign)
-                     and any(isinstance(target, ast.Name) and target.id == 'independent_joint_names'
-                             for target in node.targets))
-        # Execute the original specialization's joint binding; no copied assignment formula.
-        code = compile(ast.fix_missing_locations(ast.Module(body=method.body[start:], type_ignores=[])),
+        binding = next(node for node in method.body if isinstance(node, ast.If)
+                       and ast.unparse(node.test) == 'self.terminations.hand_velocity is not None')
+        # Execute the specialization's real joint binding without enabling an
+        # inactive velocity reward merely to test the arm-only failure selection.
+        code = compile(ast.fix_missing_locations(ast.Module(body=[binding], type_ignores=[])),
                        str(source), 'exec')
-        reward_asset = SimpleNamespace(joint_names=None)
         velocity_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
         cfg = SimpleNamespace(
             actions=SimpleNamespace(**{name: SimpleNamespace(joint_names=names)
                                        for name, names in action_names.items()}),
-            rewards=SimpleNamespace(motion_joint_velocity=SimpleNamespace(params={'asset_cfg': reward_asset})),
+            rewards=SimpleNamespace(),
             terminations=SimpleNamespace(hand_velocity=SimpleNamespace(params={'asset_cfg': velocity_asset})),
         )
+        reward_source = Path(task.__file__).parent.parent / 'shelf_manipulation_env_cfg.py'
+        reward_cfg = next(node for node in ast.parse(reward_source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
+        configured_rewards = {node.targets[0].id for node in reward_cfg.body if isinstance(node, ast.Assign)}
+        self.assertNotIn('motion_joint_velocity', configured_rewards)
         exec(code, {'self': cfg})
         expected = action_names['arm_action'] + action_names['hand_action']
         self.assertEqual(len(set(expected)), 12)
-        self.assertEqual(reward_asset.joint_names, expected)
+        self.assertFalse(hasattr(cfg.rewards, 'motion_joint_velocity'))
         self.assertEqual(velocity_asset.joint_names, action_names['arm_action'])
         self.assertEqual(len(velocity_asset.joint_names), 6)
         self.assertTrue(set(velocity_asset.joint_names).isdisjoint(action_names['hand_action']))
-        self.assertIn('right_little_1_joint', reward_asset.joint_names)
+        self.assertIn('right_little_1_joint', action_names['hand_action'])
         cfg.terminations.hand_velocity = None
-        exec(code, {'self': cfg})  # Disabling only the termination keeps the velocity reward valid.
-        self.assertEqual(reward_asset.joint_names, expected)
+        exec(code, {'self': cfg})
+        self.assertFalse(hasattr(cfg.rewards, 'motion_joint_velocity'))
 
     def test_velocity_failure_wins_over_settled_success_without_adding_geometry_failure_columns(self):
         state, batch, _ = fixture(3)
@@ -1835,7 +1953,7 @@ class NativeControllerTests(unittest.TestCase):
         self.assertTrue(arm.controller_cfg.gravity_compensation)
         velocity = cfg.terminations.hand_velocity
         self.assertEqual(velocity.func.__name__, 'joint_vel_out_of_manual_limit')
-        self.assertEqual(velocity.params['max_velocity'], 3.0)
+        self.assertEqual(velocity.params['max_velocity'], 1.0)
         self.assertFalse(velocity.time_out)
         self.assertEqual(velocity.params['asset_cfg'].joint_names, arm.joint_names)
         joint_velocity_reward = getattr(cfg.rewards, 'motion_joint_velocity', None)
@@ -2461,28 +2579,52 @@ class StateTests(unittest.TestCase):
                 state.advance(batch, step)
             self.assertEqual(int(state.support_loss_count[0, 1]), min(step, 10))
             self.assertEqual(int(state.support_loss_count[1, 2]), step if step < 3 else 0)
-            self.assertFalse(state.completion_valid[2])  # Updated object velocity stays visible.
+            self.assertTrue(state.completion_valid[2])  # Finite object motion does not block success.
             if step >= 3:
                 self.assertFalse(state.completion_valid[3])  # Reset changed the support rectangle.
         self.assertEqual({key[0] for key in state._support_graphs}, {False, True})
 
-    def test_clearance_rewards_supported_moving_blocker_then_success_waits_half_second(self):
-        state, batch, _ = fixture(1)
+    def test_moving_blocker_success_is_immediate_and_failure_or_target_gate_cannot_block_clearance(self):
+        state, batch, _ = fixture(3)
         batch.center[:, 1, 0] += .4
         batch.corners[:, 1, :, 0] += .4
         batch.velocity[:, 1, 0] = .5
+        batch.center[2, 0, 0] += .021
+        batch.corners[2, 0, :, 0] += .021
+        violation = torch.tensor([False, True, False])
         env = SimpleNamespace(step_dt=state.dt)
         with patch.object(task, 'get_task_state', return_value=state):
-            state.advance(batch, 1)
-            self.assertTrue(state.clearance_progress_valid.all())
-            self.assertTrue((rewards.clearance(env) > 0).all())
-            self.assertFalse(state.success.any())
-            self.assertFalse(state.stable_count.any())
-            batch.velocity.zero_()
-            for step in range(1, success_steps(state.cfg, state.dt) + 1):
-                state.advance(batch, step + 1)
-                self.assertEqual(bool(state.success[0]), step == success_steps(state.cfg, state.dt))
-                self.assertEqual(float(state.terminal_reward[0]), 250. if state.success[0] else 0.)
+            state.advance(batch, 1, hand_velocity=violation)
+            torch.testing.assert_close(state.success, torch.tensor([True, False, False]))
+            torch.testing.assert_close(state.failure, violation)
+            torch.testing.assert_close(state.terminal_reward, batch.center.new_tensor([250., -10., 0.]))
+            torch.testing.assert_close(state.stable_count, torch.tensor([1, 0, 0]))
+            torch.testing.assert_close(state.clearance_progress_valid, torch.tensor([True, False, False]))
+            torch.testing.assert_close(rewards.clearance(env), torch.ones(3, dtype=batch.center.dtype))
+            state.advance(batch, 2, hand_velocity=violation)
+            self.assertFalse(state.terminal_reward.any())
+
+    def test_invalid_blocker_area_is_zero_but_other_invalid_objects_do_not_gate_clearance(self):
+        state, batch, _ = fixture(3)
+        state.dt = .01
+        batch.center[:, 1, 0] += .4
+        batch.corners[:, 1, :, 0] += .4
+        batch.corners[0, 1, 0, 0] = math.nan  # Blocker overlap itself is numerically invalid.
+        batch.corners[1, 2, 0, 0] = math.nan  # An ordinary object fails independently.
+        batch.corners[2, 0, 0, 0] = math.inf  # A Target failure is not a Clearance gate.
+        state.advance(batch, 1)
+        torch.testing.assert_close(state.clearance_quality, batch.center.new_tensor([0., 1., 1.]))
+        self.assertTrue(state.failure.all())
+        self.assertFalse(state.success.any())
+        env = SimpleNamespace(step_dt=.01)
+        manager = SimpleNamespace(_env=env, _term_names=['clearance', 'terminal'],
+            _term_cfgs=[SimpleNamespace(func=rewards.clearance, weight=12., params={}),
+                        SimpleNamespace(func=rewards.terminal, weight=1., params={})],
+            _reward_buf=torch.zeros(3, dtype=batch.center.dtype), _step_reward=torch.zeros(3, 2, dtype=batch.center.dtype),
+            _episode_sums={name: torch.zeros(3, dtype=batch.center.dtype) for name in ('clearance', 'terminal')})
+        with patch.object(task, 'get_task_state', return_value=state):
+            torch.testing.assert_close(native_reward_compute()(manager, env.step_dt),
+                                       batch.center.new_tensor([-10., -9.88, -9.88]))
 
     def test_support_geometry_follows_current_shelf_pose_instead_of_fixed_world_plane(self):
         state, batch, _ = fixture(2)
@@ -2552,7 +2694,7 @@ class StateTests(unittest.TestCase):
                 torch.testing.assert_close(state.clearance_quality, torch.zeros_like(expected_overlap), atol=1.e-12, rtol=0)
                 torch.testing.assert_close(rewards.clearance(env), torch.zeros_like(expected_overlap), atol=1.e-12, rtol=0)
 
-    def test_clearance_rewards_initial_improvement_penalizes_worsening_and_returns_to_zero(self):
+    def test_clearance_keeps_signed_diagnostics_but_only_pays_initial_improvement(self):
         state, batch, reset = fixture(3)
         delta = .2 - batch.center[:, 1, 0]
         batch.center[:, 1, 0] = .2
@@ -2570,7 +2712,7 @@ class StateTests(unittest.TestCase):
             for step in (1, 2):
                 state.advance(batch, step)
                 torch.testing.assert_close(state.clearance_quality, expected_payment)
-                torch.testing.assert_close(rewards.clearance(env), expected_payment)
+                torch.testing.assert_close(rewards.clearance(env), expected_payment.clamp_min(0.))
                 torch.testing.assert_close(state.initial_blocker_overlap, baseline)
             # The reference is episode-initial, not the previous step: maintaining
             # the same improved pose pays again, but returning to the start pays 0.
@@ -2855,14 +2997,14 @@ class StateTests(unittest.TestCase):
                                    torch.tensor([1., .5], dtype=batch.center.dtype))
         torch.testing.assert_close(state.success, torch.tensor([True, False]))
 
-    def test_object_motion_includes_target_and_unobserved_distractor_but_excludes_blocker(self):
+    def test_cached_object_motion_excludes_target_blocker_and_includes_unobserved_distractor(self):
         state, batch, reset = fixture(3)
         reset['geometry_valid'][:, 2] = False
         state.reset(torch.arange(3), batch, **reset, step=0)
         rows = torch.arange(3)
         batch.velocity[rows, rows, 0] = .2
         state.advance(batch, 1)
-        torch.testing.assert_close(state.object_motion_cost, batch.velocity.new_tensor([.2, 0., .2]))
+        torch.testing.assert_close(state.object_motion_cost, batch.velocity.new_tensor([0., 0., .2]))
 
     def test_blocker_linear_motion_remains_exempt_from_neighbor_cost(self):
         state, batch, _ = fixture(2)
@@ -3157,11 +3299,11 @@ class NativeAdapterTests(unittest.TestCase):
             unresolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=dataclasses.MISSING)
             resolved = SimpleNamespace(name='robot', joint_names=names, joint_ids=list(range(6)))
             term = SimpleNamespace(func=native, time_out=False,
-                                   params={'max_velocity': 3.0, 'asset_cfg': resolved})
+                                   params={'max_velocity': 1.0, 'asset_cfg': resolved})
             env.cfg.terminations = SimpleNamespace(
                 success=SimpleNamespace(func=terminations.success, params={}, time_out=False),
                 hand_velocity=SimpleNamespace(func=native, time_out=False,
-                                              params={'max_velocity': 3.0, 'asset_cfg': unresolved})
+                                              params={'max_velocity': 1.0, 'asset_cfg': unresolved})
                               if enabled else None)
             env.termination_manager = SimpleNamespace(
                 active_terms=['hand_velocity'] if enabled else [], get_term_cfg=lambda name: term)
@@ -3178,7 +3320,7 @@ class NativeAdapterTests(unittest.TestCase):
             torch.testing.assert_close(state.failure, expected_failure)
             torch.testing.assert_close(state.success, ~expected_failure)
             torch.testing.assert_close(state.terminal_reward,
-                                       torch.where(expected_failure, 0., 250.))
+                                       torch.where(expected_failure, -env.cfg.mdp.failure_penalty, 250.))
             torch.testing.assert_close(total_payment, torch.where(expected_failure, -env.cfg.mdp.failure_penalty,
                                                                   env.cfg.mdp.success_reward))
             self.assertFalse(state.failure_reasons.any())
@@ -3220,12 +3362,12 @@ class NativeAdapterTests(unittest.TestCase):
             exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
         cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
                if isinstance(value, TermCfg)}
-        expected_names = {'time_out', 'object_support_lost', 'object_tilt',
+        expected_names = {'time_out', 'success', 'object_support_lost', 'object_tilt',
                           'shelf_displacement', 'invalid_state', 'singularity', 'hand_velocity'}
         self.assertEqual(set(cfg), expected_names)
         velocity_cfg = cfg['hand_velocity']
         self.assertIs(velocity_cfg.func, namespace['joint_vel_out_of_manual_limit'])
-        self.assertEqual(velocity_cfg.params['max_velocity'], 3.0)
+        self.assertEqual(velocity_cfg.params['max_velocity'], 1.0)
         self.assertFalse(velocity_cfg.time_out)
         self.assertIs(velocity_cfg.params['asset_cfg'].joint_names, dataclasses.MISSING)
         names = list(cfg)
@@ -6256,19 +6398,20 @@ class PartialResetBatchTests(unittest.TestCase):
         env, _, _ = native_fixture(3)
         robot = env.scene['robot'].data
         objects = env.scene['object_collection'].data
-        objects.object_com_pos_b[:, 2] = torch.tensor([.03, -.04, .02])
+        objects.object_com_pos_b[:, 3] = torch.tensor([.03, -.04, .02])
         task.reset_task(env)
         state = env._contact_mdp
         robot.body_link_quat_w[:, 3] = torch.tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
-        objects.object_link_pose_w[:, 2, 3:7] = robot.body_link_quat_w[:, 3]
-        objects.object_com_vel_w[:, 2, 5] = 2.
+        objects.object_link_pose_w[:, 3, 3:7] = robot.body_link_quat_w[:, 3]
+        objects.object_com_vel_w[:, 3, 5] = 2.
         # Native world-COM buffers are deliberately stale/nonfinite. The fixed
         # local offsets must instead rotate with current link poses on device.
         robot.body_com_pos_w.fill_(math.nan)
         objects.object_com_pos_w.fill_(math.nan)
         actual = task._read_transition(env, state, torch.arange(3))
-        slot = 0  # Collection object 2 occupies the first active slot.
-        pose = objects.object_link_pose_w[:, 2, :3] - env.scene.env_origins
+        slot = 2  # Ordinary pool body 3 occupies active slot 2, outside both roles.
+        self.assertFalse((state.target[:, slot] | state.blocker[:, slot]).any())
+        pose = objects.object_link_pose_w[:, 3, :3] - env.scene.env_origins
         expected_com = pose + torch.tensor([.04, .03, .02])
         expected_velocity = torch.cross(torch.tensor([0., 0., 2.]).expand(3, -1),
                                         actual.center[:, slot] - expected_com, dim=-1)
@@ -6280,7 +6423,7 @@ class PartialResetBatchTests(unittest.TestCase):
                                        actual.corners[:, slot] - expected_com[:, None], dim=-1)
         expected_cost = torch.linalg.vector_norm(expected_corners, dim=-1).mean(-1)
         torch.testing.assert_close(rewards.object_motion_cost(actual.center, actual.corners, actual.velocity,
-                                                              state.active, state.blocker), expected_cost)
+                                                              state.active, state.blocker, state.target), expected_cost)
         self.assertTrue(actual.state_valid.all())
 
     def test_binding_and_transition_do_not_query_hand_mass_inertia_com_or_acceleration(self):
@@ -6417,7 +6560,7 @@ class BlockerContactManagerTests(unittest.TestCase):
         cls.term_type = namespace['BlockerContactHold']
         cls.names = tuple(f'pad_{i}' for i in range(17))
 
-    def fixture(self, weight=.01, *, configure=True):
+    def fixture(self, weight=.4, *, configure=True):
         canonical_names = self.names
 
         class Sensor:
@@ -6473,6 +6616,7 @@ class BlockerContactManagerTests(unittest.TestCase):
 
     def test_lazy_registration_and_single_column_native_pad_order_and_step_cache(self):
         env, sensor, _, term = self.fixture(configure=False)
+        env.step_dt = .01
         self.assertIs(env._blocker_contact_hold, term)
         self.assertEqual(sensor.enables, 0)
         term.configure_blocker(3)
@@ -6484,10 +6628,21 @@ class BlockerContactManagerTests(unittest.TestCase):
             torch.testing.assert_close(term(env), torch.zeros(3))
             self.assertEqual(sensor.reads, 0)
             env.common_step_counter = 1
-            torch.testing.assert_close(term(env), torch.zeros(3))
+            torch.testing.assert_close(term(env), torch.tensor([1., .5, .5]))
+            torch.testing.assert_close(term.held_count, torch.zeros(3))
+            torch.testing.assert_close(term.new_count, torch.tensor([2., 1., 1.]))
+            manager = SimpleNamespace(_env=env, _term_names=['contact'],
+                _term_cfgs=[SimpleNamespace(func=term, weight=term.cfg.weight, params={})],
+                _reward_buf=torch.zeros(3), _step_reward=torch.zeros(3, 1),
+                _episode_sums={'contact': torch.zeros(3)})
+            torch.testing.assert_close(native_reward_compute()(manager, env.step_dt),
+                                       torch.tensor([.004, .002, .002]))
             torch.testing.assert_close(term.previous_contact, expected)
             env.common_step_counter = 2
             torch.testing.assert_close(term(env), torch.tensor([2., 1., 1.]))
+            torch.testing.assert_close(term.new_count, torch.zeros(3))
+            torch.testing.assert_close(native_reward_compute()(manager, env.step_dt),
+                                       torch.tensor([.008, .004, .004]))
             sensor.matrix.zero_()
             torch.testing.assert_close(term(env), torch.tensor([2., 1., 1.]))
             torch.testing.assert_close(term.previous_contact, expected)
@@ -6495,6 +6650,21 @@ class BlockerContactManagerTests(unittest.TestCase):
             env.common_step_counter = 3
             torch.testing.assert_close(term(env), torch.zeros(3))
             self.assertFalse(term.previous_contact.any())
+            # New/held classifications are mutually exclusive, sum across all
+            # 17 pads, and pass through the native weight/dt exactly once.
+            term.previous_contact[0, :3] = True
+            term.previous_contact[2] = True
+            for pad in range(5):
+                sensor.contact(0, pad, 3)
+            for pad in range(17):
+                sensor.contact(1, pad, 3)
+                sensor.contact(2, pad, 3)
+            env.common_step_counter = 4
+            torch.testing.assert_close(term(env), torch.tensor([4., 8.5, 17.]))
+            torch.testing.assert_close(term.held_count, torch.tensor([3., 0., 17.]))
+            torch.testing.assert_close(term.new_count, torch.tensor([2., 17., 0.]))
+            torch.testing.assert_close(native_reward_compute()(manager, env.step_dt),
+                                       torch.tensor([.016, .034, .068]))
         self.assertEqual(sensor.enables, 1)
 
     def test_partial_reset_keeps_neighbor_history_and_never_rebinds_shared_blocker(self):
@@ -6511,11 +6681,13 @@ class BlockerContactManagerTests(unittest.TestCase):
             sensor.contact(1, 7, 3)
             torch.testing.assert_close(term.previous_contact[[0, 2]], neighbors)
             self.assertFalse(term.previous_contact[1].any())
+            self.assertEqual(float(term.new_count[1]), 0.)
+            self.assertEqual(float(term.held_count[1]), 0.)
             self.assertEqual(term.last_step, 2)
             torch.testing.assert_close(term(env), torch.tensor([2., 0., 1.]))
             self.assertEqual(sensor.reads, 2)
             env.common_step_counter = 3
-            torch.testing.assert_close(term(env), torch.tensor([2., 0., 1.]))
+            torch.testing.assert_close(term(env), torch.tensor([2., .5, 1.]))
             self.assertTrue(term.previous_contact[1, 7])
             self.assertFalse(term.previous_contact[1, 16])
             env.common_step_counter = 4
@@ -6530,7 +6702,7 @@ class BlockerContactManagerTests(unittest.TestCase):
         with patch.object(task, 'get_task_state', return_value=state), \
              patch.object(torch.Tensor, 'item', side_effect=AssertionError('host scalar')):
             env.common_step_counter = 1
-            torch.testing.assert_close(term(env), torch.zeros(3))
+            torch.testing.assert_close(term(env), torch.tensor([1., .5, .5]))
             protected[:2] = False
             env.common_step_counter = 2
             torch.testing.assert_close(term(env), torch.tensor([0., 0., 1.]))
@@ -6543,7 +6715,7 @@ class BlockerContactManagerTests(unittest.TestCase):
             protected.fill_(True)
             sensor.contact(1, 7, 3)
             env.common_step_counter = 4
-            torch.testing.assert_close(term(env), torch.tensor([2., 0., 1.]))
+            torch.testing.assert_close(term(env), torch.tensor([2., .5, 1.]))
             env.common_step_counter = 5
             torch.testing.assert_close(term(env), torch.tensor([2., 1., 1.]))
             self.assertEqual(sensor.reads, 5)
@@ -6568,10 +6740,12 @@ class BlockerContactManagerTests(unittest.TestCase):
             self.assertEqual(term.blocker_id, 2)
             self.assertEqual(sensor.enables, 2)
             self.assertFalse(term.previous_contact.any())
+            self.assertFalse(term.new_count.any())
+            self.assertFalse(term.held_count.any())
             torch.testing.assert_close(term(env), torch.zeros(3))
             self.assertEqual(sensor.reads, 2)
             env.common_step_counter = 3
-            torch.testing.assert_close(term(env), torch.zeros(3))
+            torch.testing.assert_close(term(env), torch.tensor([.5, .5, 0.]))
             self.assertTrue(term.previous_contact[0, 0])
             self.assertFalse(term.previous_contact[0, 4])  # Still touching old Blocker 3.
             self.assertFalse(term.previous_contact[2, 8])
@@ -6596,7 +6770,7 @@ class BlockerContactManagerTests(unittest.TestCase):
             sensor.contact(1, 14, 3)
             sensor.contact(2, 8, 3)
             env.common_step_counter = 2
-            torch.testing.assert_close(term(env), torch.zeros(3))
+            torch.testing.assert_close(term(env), torch.full((3,), .5))
             env.common_step_counter = 3
             torch.testing.assert_close(term(env), torch.ones(3))
             values.tactile_valid[0, 2] = False
@@ -6623,7 +6797,7 @@ class BlockerContactManagerTests(unittest.TestCase):
             self.assertEqual(sensor.reads, 2)  # No old force sample is reused.
             self.assertFalse(term.previous_contact.any())
             env.common_step_counter = 4
-            torch.testing.assert_close(term(env), torch.zeros(3))  # New first contact.
+            torch.testing.assert_close(term(env), torch.tensor([1., .5, .5]))  # New first contacts.
             env.common_step_counter = 5
             torch.testing.assert_close(term(env), torch.tensor([2., 1., 1.]))
             self.assertEqual(sensor.enables, 2)
@@ -6641,6 +6815,7 @@ class BlockerContactManagerTests(unittest.TestCase):
         self.assertEqual(sensor.enables, 0)
         self.assertFalse(torch.is_inference(term.previous_contact))
         self.assertFalse(torch.is_inference(term.held_count))
+        self.assertFalse(torch.is_inference(term.new_count))
         term.reset(torch.tensor([1]))
         term.configure_blocker(2)
         self.assertEqual(sensor.enables, 0)

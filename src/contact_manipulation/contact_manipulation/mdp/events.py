@@ -53,13 +53,13 @@ class MdpCfg:
     singularity_termination_threshold: float = 0.005
     # One-time terminal payments; failure_penalty is a positive cost magnitude.
     success_reward: float = 250.0
-    failure_penalty: float = 3.0
+    failure_penalty: float = 10.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15
     stable_linear_velocity: float = 0.05
     stable_angular_velocity: float = 0.30
-    success_duration: float = 0.50
+    success_duration: float = 0.0
     # Geometric proxies, not measured contact forces. Validate with resting
     # collider geometry; progress permits motion and small recovering pivots.
     progress_support_gap: float = 0.010
@@ -68,8 +68,9 @@ class MdpCfg:
     success_xy_tolerance: float = 0.005
     support_warning_distance: float = 0.010
     support_stability_decay: float = math.log(2.0) / 0.010**2
-    # User-selected linear tilt-angle exponent: isolated 45-degree tilt has half quality.
+    # A 45-degree tilt excess beyond the allowance has half quality.
     stability_tilt_decay: float = math.log(2.0) / (math.pi / 4.0)
+    stability_tilt_slack: float = math.radians(5.0)
     support_loss_distance: float = 0.030
     support_loss_duration: float = 0.100
     max_tilt: float = math.radians(80.0)
@@ -83,8 +84,8 @@ class MdpCfg:
     def __post_init__(self):
         if self.max_objects < 2:
             raise ValueError("Observation capacity must include distinct Target and Blocker slots.")
-        if min(self.success_duration, self.support_loss_duration) <= 0:
-            raise ValueError("Success and physical-failure durations must be positive.")
+        if self.success_duration < 0 or self.support_loss_duration <= 0:
+            raise ValueError("Success duration must be nonnegative; support-loss duration must be positive.")
         if not (self.success_support_gap <= self.progress_support_gap < self.support_loss_distance
                 and 0 <= self.support_warning_distance < self.support_loss_distance
                 and self.support_stability_decay > 0):
@@ -401,6 +402,7 @@ class TaskState:
         self.shelf_top = zeros(n)
         self.ceiling = zeros(n)
         self.initial_shelf_pose = zeros(n, 7)
+        self.initial_target_pose = zeros(n, 7)
         self.env_origins = zeros(n, 3)
         self.support_bounds = zeros(n, 4)
         self.support_height = zeros(n)
@@ -465,6 +467,14 @@ class TaskState:
                             ("shelf_top", shelf_top), ("ceiling", ceiling)):
             getattr(self, name)[ids] = value[rows]
         self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
+        self.initial_target_pose[ids] = 0
+        if self.bindings is not None and hasattr(self.bindings, "objects"):
+            target_slots = self.target[ids].long().argmax(-1)
+            pool_ids = self.bindings.object_ids[ids].gather(1, target_slots[:, None])
+            self.initial_target_pose[ids] = self.bindings.objects.data.object_link_pose_w[ids].gather(
+                1, pool_ids[..., None].expand(-1, -1, 7)).squeeze(1)
+        # Standalone numerical batches have no world body-link pose contract;
+        # leave an invalid zero pose rather than substitute their OBB centers.
         # Rules describe the measured panel in environment coordinates. Store
         # its rectangle in the shelf link frame, then follow the CURRENT shelf
         # pose at every transition. Whole-shelf bounds include posts/other tiers.
@@ -483,6 +493,7 @@ class TaskState:
         self.initial_rotation[ids] = batch.rotation[rows]
         self.object_motion_cost[ids] = object_motion_cost(
             batch.center[rows], batch.corners[rows], batch.velocity[rows], self.active[ids], self.blocker[ids],
+            self.target[ids],
         )
         self.tcp_pose_b[ids] = batch.tcp_pose_b[rows]
         self.critic_geometry_valid[ids] = geometry_valid[rows]
@@ -579,6 +590,11 @@ class TaskState:
         # Skip polygon clipping for other objects; their safety checks remain.
         _, overlap = projected_areas(safe_corners, self.blocker & self.active, self.access_region)
         blocked = overlap.sum(-1)
+        # Sanitized corners make the geometry kernel safe, but must not invent
+        # cleared area when the Blocker's original area inputs were invalid.
+        valid_area = (torch.isfinite(batch.corners).all((-2, -1))
+                      | ~(self.blocker & self.active)).all(-1)
+        blocked = torch.where(valid_area, blocked, math.nan)
         self.blocker_overlap.copy_(blocked)
         self.clearance_quality.copy_(torch.nan_to_num(
             clearance_quality(blocked, self.initial_blocker_overlap),
@@ -593,7 +609,7 @@ class TaskState:
         self.force_growth.copy_(growth[:, 0])
         self.torque_growth.copy_(growth[:, 1])
         self.object_motion_cost.copy_(object_motion_cost(
-            batch.center, batch.corners, batch.velocity, self.active, self.blocker,
+            batch.center, batch.corners, batch.velocity, self.active, self.blocker, self.target,
         ))
         support = self._support_validity(batch)
         candidate, stable, tilted, reasons, failed = task_conditions(

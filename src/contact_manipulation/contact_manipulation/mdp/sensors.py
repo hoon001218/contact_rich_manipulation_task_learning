@@ -635,7 +635,7 @@ class TaskContactSensor(ContactSensor):
 
 
 class BlockerContactHold(ManagerTermBase):
-    """Native reward term: same pad touches the Blocker in consecutive samples.
+    """Native reward term: half credit for new contact, full credit for holding.
 
     RewardManager owns episode-history resets. Observation remains the original
     any-object binary contact; only this privileged reward reads pair forces.
@@ -653,6 +653,7 @@ class BlockerContactHold(ManagerTermBase):
             self.pad_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
             self.previous_contact = torch.zeros((env.num_envs, 17), device=env.device, dtype=torch.bool)
             self.held_count = torch.zeros(env.num_envs, device=env.device)
+            self.new_count = torch.zeros(env.num_envs, device=env.device)
         self.last_step = env.common_step_counter
         self.blocker_id = None
         # The reset event supplies the committed shared Blocker as a host int.
@@ -674,6 +675,7 @@ class BlockerContactHold(ManagerTermBase):
         rows = slice(None) if env_ids is None else env_ids
         self.previous_contact[rows] = False
         self.held_count[rows] = 0
+        self.new_count[rows] = 0
         # Keep the global timestamp: resetting one row cannot advance another
         # row's contact history or re-read the previous episode's last sample.
 
@@ -690,16 +692,17 @@ class BlockerContactHold(ManagerTermBase):
             self.configure_blocker(self.blocker_id)
         if self.last_step != env.common_step_counter:
             force = self.sensor.blocker_force_w.index_select(1, self.pad_ids)
-            held, current = blocker_contact_hold(
+            held, new, current = blocker_contact_hold(
                 force, self.previous_contact, threshold=threshold,
                 valid=env.task_sensor_reader().tactile_valid,
             )
             self.held_count.copy_(held)
+            self.new_count.copy_(new)
             self.previous_contact.copy_(current)
             self.last_step = env.common_step_counter
         # Keep contact history current while gated so restoring the Target
         # resumes ordinary consecutive-sample contact evaluation.
-        return self.held_count * state.target_protected
+        return (self.held_count + 0.5 * self.new_count) * state.target_protected
 
 
 def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:

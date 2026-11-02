@@ -6460,3 +6460,90 @@ tensor scalar 조회를 추가하지 않는다. phase bucket 초기 구성과 �
 visible-point CUDA reduction,support replay cache,fused edge reduction,CUDA Inductor 통합이다.
 실제 GPU 처리 시간·메모리·학습 효과는 **미측정**이다. 학습·PhysX simulation·play·commit·push는
 실행하지 않았다.
+
+## 86. 2026-11-02 — GNN Reward·Termination 최종 명세 적용
+
+사용자 요청으로 [다음 학습 수정 명세 — Reward·Termination 최종 설정 (2026-11-02)](https://app.notion.com/p/40c4968094ee81b4aa3bf980ebbf03d3)를 읽고
+`contact_manipulation`에 확정된 A–F절을 적용했다. 페이지의 접힌 과거 검토·미확정 후보보다
+최종 구현 지침을 우선한다. 원격 문서는 수정하지 않았다.
+
+**기준 확인:** 작업 시작 HEAD는 명세의 검토 commit과 같은
+`b768449df278b84ff21782f3aae7c6474ae33ac4`였고 작업트리는 clean이었다.
+대상 task는 `Isaac-Contact-Manipulation-UR5e-v0`이다. 로컬의 최근 의미 있는 Original run은
+`logs/rsl_rl/contact_manipulation/2026-10-26_17-04-28`이며 `params/env.yaml`, `params/agent.yaml`과
+최종 `model_32750.pt`의 존재를 확인했다. 저장 run은 joint-velocity·singularity reward 활성,
+stability weight1,실패−5,success termination 활성 및 reset-only Actor 비전인 과거 설정이다.
+현재 source의 후속 변경을 이 YAML로 되돌리지 않았다. Action rate·F/T growth 각−.03,
+Distance weight3/decay10,PPO γ=.98,100Hz/8초,Actor10step ray 갱신,현재 GNN·관측·OSC·spawn 분포를
+유지했다. Parallel package와 외부 라이브러리도 변경하지 않았다.
+
+| 항목 | 변경 전 | 이번 고정 설정 |
+|---|---|---|
+| Clearance 지급 | Signed 점수,양수에 support·Target·failure gate | `max(0,1−At/A0)`,상태 gate 없음,weight12 |
+| Contact | 같은 pad 연속 접촉 count,weight.2 | Raw=`held+.5·new`,weight.4; 새 접촉.2/s·유지.4/s |
+| Target 비용 | 일반 물체 코너 속력 비용에 포함 | 기존 Shelf 함수·네 threshold 그대로,별도 weight−.5 |
+| 일반 물체 비용 | Blocker 제외 | 기존 Blocker 제외를 유지하고 Target 추가 제외 |
+| Stability dense reward | 모든 활성 물체의 worst 지지 거리+tilt | Blocker tilt만,5° 여유 후 기존 β,weight.5 |
+| Success | 물체 정착 속도·.5초 연속,종료 비활성 | 현재 기하 유효성을 충족한 첫 step +250,success 종료 활성 |
+| Failure | −3 일회 | −10 일회 |
+| ARM6 과속 종료 | 실제 abs(qdot)>3rad/s | 실제 abs(qdot)>1rad/s,Hand 제외 |
+
+Clearance의 초기 면적과 접근 영역은 reset 때만 고정하며 signed raw는 진단용으로 유지한다.
+초기보다 더 가리면 지급0,초기보다 덜 가리면 개선된 상태에 매step 반복 지급한다. 유효 면적이면
+실패 transition에도 지급하며 실패 여부·Target 이탈·다른 물체 지지는 Clearance 지급 mask가 아니다.
+Area helper의 finite·초기 면적>1e−12·현재 면적≥0 검사는 유지했다. 원래 `safe_corners`로
+비정상 Blocker 좌표가 유효한 면적0처럼 보이는 경우도 면적 입력 자체의 유효성으로 차단한다.
+다른 물체의 invalid 상태로 유효한 Blocker 면적 보상을 차단하지 않는다.
+
+Target 항은 `shelf_motion_cost`를 재사용한다. 초기·현재 pose 모두 native WORLD body-link
+origin/wxyz이며 velocity는 Shelf와 같은 native COM twist다. Reset에서 실제 pool ID로 선택한
+초기 Target pose를 기록하고 부분 reset에서는 선택 행만 갱신한다. 병진5mm·회전1°·선속력.005m/s·
+각속력.05rad/s 중 하나라도 strict 초과하면 raw1,여러 개를 위반해도1이다. 이동 후 정지해도
+초기 pose 오차가 남으면 비용이 지속된다. 일반 물체 비용은 기존 평균8개 OBB 코너 속력의 합이며
+cached reset/advance 경로 모두 Target·Blocker를 제외한다. 다른 물체의 active mask는 바꾸지 않는다.
+
+Contact는 같은 snapshot에서 pad별 `held=current&previous`, `new=current&~previous`를 계산해
+두 count를 cache한 다음 previous를 한 번 갱신한다.17개 canonical pad·Blocker-only force·.01N·
+validity와 Target gate는 유지한다. Gate가 닫혀도 history는 갱신하며 reset/Blocker 교체는 기존
+이력과 새 count를 함께 초기화한다. Native RewardManager가 weight와 dt를 한 번 곱한다.
+
+Stability는 `expm1(-β·max(θB−5°,0))`이며 β=ln2/(π/4)를 유지한다.
+Blocker 실제50°는 초과45°로 raw−.5,weight.5·dt.01 적용 시−.0025/step이다.
+일반 물체·Target의 tilt와 dense 지지 거리 비용만 제외했다. 모든 활성 물체의 raw support/tilt,
+낙하·전도 timer,물리 실패 및 성공 순간의 기하 유효성은 보존했다.
+
+Success는 지정 Blocker overlap≤1e−5m²,Target 초기 OBB 중심 이동≤2cm·회전≤.15rad,
+모든 활성 물체의 전체 OBB XY가 panel±5mm 이내·collision bottom gap[−5,+5]mm·tilt<80° 및
+finite·활성 실패 없음이 필요하다. 물체 속도의 finite 검사는 남기고 정착 속도 상한만 제거했다.
+`success_duration=0`을 허용하며 첫 candidate의 갱신 count1로 같은 step에 일회+250을 지급한다.
+물리 failure와 ARM 과속은 성공보다 우선하고−10을 한 번 지급한다. 순수 timeout은 기존 truncation이며
+실패로 바꾸지 않는다. Terminal만 기존 `/step_dt` 보정을 유지한다.
+
+별도 속도 warning·L2·중복 과속 penalty·방향성 Distance·curriculum은 추가하지 않았다.
+Spawn 수·손 시작 분포·weight schedule·외부 PPO/GAE/timeout bootstrap·네트워크는 변경하지 않았다.
+
+**검증:** `CUDA_VISIBLE_DEVICES=''`,CPU thread1에서 관련24개 class의331개 중
+**317개 통과·CUDA/AppLauncher 전용14개 생략**했다. 보상·상태·종료 집중150개는147개 통과·3개 생략,
+추가 reset·센서·vision 회귀119개는 최종110개 통과·9개 생략,기존 모델/native 학습62개는60개 통과·
+2개 생략이다. 추가 회귀에서 발견한 기존 COM 테스트의 Target 이동 비용 기대값은 일반 물체
+회전 사례로 바꾸어 COM offset·코너 속력 검증 목적을 유지했고,수정한 `PartialResetBatchTests`
+7개를 다시 실행해6개 통과·CUDA1개 생략을 확인했다.
+
+- Native RewardManager 산술: 면적 비율1.2/1/.8/.5/0의 실제 Clearance0/0/.024/.060/.120;
+  상태 gate 독립성,비정상 면적0,유효 Clearance+실패−10의 합−9.88,부분 reset 기준 격리.
+- Target의 네 strict 경계·복수 위반 시 raw1·dt−.005,Shelf 함수 재사용,off-center OBB와
+  world link origin 구분,환경별 role/pool ID와 부분 reset 기준,실제 cached 일반 물체 비용에서 Target 제외.
+- 최초 유효 step의+250·성공 일회 지급,물체 정착 속도 제거,유지 시간0,즉시 물리 유효성은
+  debounce 전부터 요구,과속·물리 실패 우선,순수 timeout 구분과 선택 행 latch 초기화.
+- ARM6의±1rad/s 경계와±1.01rad/s 초과,Hand-only 초과 제외,해석된 native joint 선택,
+  속도 실패의 terminal 연결 및 현재 GNN/PPO 설정 보존.
+- Contact 새/유지 배타적 pad 합,0→1→1→0의.002/.004/0,새2·유지3개의.016,
+  17pad·교대 pad·invalid·반복 호출·Target gate 중 이력·부분 reset·Blocker 교체.
+- Blocker0/5/8/50°와yaw-only,거리·다른 물체 tilt 무관성,기존 모든 물체 실패와 raw support 보존.
+  독립 Critic·GNN·Attention,10step 실제 메시 관측·sensor/filter·reset 회귀도 통과했다.
+
+수정 파일은 기존 `mdp/rewards.py`, `mdp/events.py`, `mdp/sensors.py`, `mdp/terminations.py`,
+`shelf_manipulation_env_cfg.py`, `tests/test_mdp.py`, README와 이 기록이다. 새 코드 파일은 없다.
+`git diff --check`와 Parallel·관측·model/PPO·UR5e/scene·scripts·IsaacLab 보존 경로의 diff를 확인했다.
+실제 GPU/PhysX·학습·play·commit·push는 실행하지 않았다. 이번 CPU 검증은 동작 계약의 검증이며,
+학습 개선·성공률·iteration 시간과 실물 운동을 검증한 결과는 아니다.

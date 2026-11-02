@@ -79,8 +79,9 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
     XY and canonical-up tilt. These do not change the existing failure timers.
 
     All object predicates, including finite checks and timers, ignore inactive
-    slots. Only final completion requires settled objects. Failure timers belong
-    to individual objects, so alternating transients do not accumulate together.
+    slots. Completion requires current geometric support without a speed cap.
+    Failure timers belong to individual objects, so alternating transients do
+    not accumulate together.
     """
     if (center_shelf.ndim != 3 or center_shelf.shape[-1] != 3
             or corners_shelf.shape != (*center_shelf.shape[:-1], 8, 3)
@@ -119,9 +120,7 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
                        & (signed_gap <= cfg.progress_support_gap))
     contained = ((xy_lo >= bound_lo - cfg.success_xy_tolerance)
                  & (xy_hi <= bound_hi + cfg.success_xy_tolerance)).all(-1)
-    settled = ((velocity[..., :3].square().sum(-1) <= cfg.stable_linear_velocity ** 2)
-               & (velocity[..., 3:].square().sum(-1) <= cfg.stable_angular_velocity ** 2))
-    complete_object = (finite & contained & upright & above_lower_limit & settled
+    complete_object = (finite & contained & upright & above_lower_limit
                        & (signed_gap <= cfg.success_support_gap))
 
     closest_xy = torch.maximum(torch.minimum(center_shelf[..., :2], bound_hi), bound_lo)
@@ -192,8 +191,9 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     ``active`` are boolean object masks. ``blocker_overlap`` is the designated
     blocker's overlap area with the target approach region, in square meters.
     Task success requires a protected Target, cleared Blocker, supported and
-    retained settled active objects, and no enabled failure. The terminal
-    transition confirms that predicate for ``success_duration`` seconds.
+    retained active objects, and no enabled failure. Zero ``success_duration``
+    confirms the first valid transition; optional positive durations retain
+    consecutive-sample confirmation without imposing an object speed cap.
 
     ``tilt_count`` tracks consecutive tipped samples separately for each object;
     recovering upright or becoming inactive clears only that object's count.
@@ -293,7 +293,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
 
 
 def success(env):
-    """Native TerminationTerm: a sustained, settled valid shelf rearrangement."""
+    """Native TerminationTerm: a valid shelf rearrangement at the current step."""
     from .events import get_task_state
 
     return get_task_state(env).success

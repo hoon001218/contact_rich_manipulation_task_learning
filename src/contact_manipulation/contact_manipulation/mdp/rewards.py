@@ -14,7 +14,7 @@ import torch
 from isaaclab.utils.math import quat_error_magnitude
 
 __all__ = [
-    "clearance_quality", "clearance", "shelf_collision", "object_collision",
+    "clearance_quality", "clearance", "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
@@ -134,7 +134,7 @@ def blocker_distance_quality(pad_points, blocker_center, blocker_rotation, block
 
 
 def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, valid=None):
-    """Count pads touching the Blocker in both policy samples; return new flags.
+    """Return disjoint held/new Blocker contact counts and current pad flags.
 
     ``filtered_force`` is the current Blocker-only normal force [N, 17, 3], never
     the any-object force used by observations. ``previous_contact`` is [N, 17]
@@ -153,7 +153,9 @@ def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, va
         torch.linalg.vector_norm(filtered_force, dim=-1) > threshold)
     if valid is not None:
         current = current & valid
-    return (current & previous_contact).sum(-1).to(filtered_force.dtype), current
+    held = current & previous_contact
+    new = current & ~previous_contact
+    return held.sum(-1).to(filtered_force.dtype), new.sum(-1).to(filtered_force.dtype), current
 
 
 def clearance_quality(blocked, initial_overlap):
@@ -170,12 +172,11 @@ def clearance_quality(blocked, initial_overlap):
 
 
 def clearance(env):
-    """Linear initial-overlap progress; placement gates suppress positive scores."""
+    """Pay positive initial-overlap progress, independently of state gates."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    score = state.clearance_quality
-    return torch.where(state.clearance_progress_valid, score, score.clamp_max(0.0))
+    return state.clearance_quality.clamp_min(0.0)
 
 
 def blocker_distance(env, decay=math.log(2.0) / 0.10):
@@ -196,8 +197,8 @@ def blocker_distance(env, decay=math.log(2.0) / 0.10):
     return torch.where(state.target_protected, quality, 0.0)
 
 
-def object_motion_cost(center, corners, velocity, active, blocker):
-    """Sum active non-Blocker mean OBB corner speeds, in meters per second.
+def object_motion_cost(center, corners, velocity, active, blocker, target):
+    """Sum surrounding-object mean OBB corner speeds, in meters per second.
 
     The linear velocity is measured at the OBB center, in the same fixed axes
     as the corners and angular velocity. Averaging the eight corners preserves
@@ -205,7 +206,7 @@ def object_motion_cost(center, corners, velocity, active, blocker):
     No saturation is applied to valid costs. Nonfinite object measurements are
     unavailable costs; the existing physical-state termination handles them.
     """
-    selected = active & ~blocker
+    selected = active & ~blocker & ~target
     twist = torch.where(selected[..., None], velocity, 0.0)
     origin = torch.where(selected[..., None], center, 0.0)
     offset = torch.where(selected[..., None, None], corners, 0.0) - origin.unsqueeze(-2)
@@ -216,7 +217,7 @@ def object_motion_cost(center, corners, velocity, active, blocker):
 
 
 def object_collision(env):
-    """Current non-Blocker corner motion, including translation and rotation."""
+    """Current non-role corner motion, including translation and rotation."""
     from .events import get_task_state
 
     state = get_task_state(env)
@@ -257,6 +258,25 @@ def shelf_collision(env, asset_cfg, *, translation_threshold=0.005,
     )
 
 
+def target_collision(env, *, translation_threshold=0.005,
+                     rotation_threshold=math.pi / 180.0, linear_velocity_threshold=0.005,
+                     angular_velocity_threshold=0.05):
+    """Apply the same shelf moved flag to the Target's world link pose/COM twist."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    data = env.scene["object_collection"].data
+    ids = env.task_scene_data.target_id[:, None, None]
+    pose = data.object_link_pose_w.gather(1, ids.expand(-1, 1, 7)).squeeze(1)
+    velocity = data.object_com_vel_w.gather(1, ids.expand(-1, 1, 6)).squeeze(1)
+    return shelf_motion_cost(
+        pose, velocity, state.initial_target_pose,
+        translation_threshold=translation_threshold, rotation_threshold=rotation_threshold,
+        linear_velocity_threshold=linear_velocity_threshold,
+        angular_velocity_threshold=angular_velocity_threshold,
+    )
+
+
 def motion_force_growth(env):
     """Squared positive force-norm increase per control step, in N squared."""
     from .events import get_task_state
@@ -286,19 +306,13 @@ def motion_joint_velocity(env, asset_cfg):
 
 
 def object_stability(env):
-    """Worst active object's tilt and OBB-XY/collision-bottom support risk.
-
-    Distance has a 10 mm slack; tilt uses the angle itself, excluding yaw.
-    Independent inverse-unit coefficients make their joint risk dimensionless.
-    Existing center-based support-loss and tilt terminations remain separate.
-    """
+    """Blocker-only shelf-relative tilt cost after a five-degree allowance."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    distance = torch.where(state.active, state.stability_distance, 0.0)
-    tilt = torch.where(state.active, state.tilt_angle, 0.0)
-    excess = (distance - state.cfg.support_warning_distance).clamp_min(0.0)
-    risk = state.cfg.support_stability_decay * excess.square() + state.cfg.stability_tilt_decay * tilt
+    tilt = torch.where(state.active & state.blocker, state.tilt_angle, 0.0)
+    excess = (tilt - state.cfg.stability_tilt_slack).clamp_min(0.0)
+    risk = state.cfg.stability_tilt_decay * excess
     risk = torch.nan_to_num(risk, nan=math.inf, posinf=math.inf, neginf=math.inf)
     return torch.expm1(-risk.amax(-1))
 
