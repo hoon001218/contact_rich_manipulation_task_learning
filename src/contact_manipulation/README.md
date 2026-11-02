@@ -84,8 +84,8 @@ Target·Blocker를 slot0/1에 두고, 나머지는 관측된 중심에서 두 �
 세 함수는 같은 step의 캐시를 조회하므로 센서 읽기·이력 갱신·기하 계산을 반복하지 않는다.
 
 새 기능도 **cfg에서 선언 → native manager가 호출 → 해당 `mdp` 함수에서 연구 계산**하는
-흐름을 따른다. `min`의 환경별 파생 cfg와 asset 설정 방식은 참고하되, 이 과제에 없는
-command/curriculum이나 별도의 environment subclass는 추가하지 않는다.
+흐름을 따른다. `min`의 환경별 파생 cfg와 asset 설정 방식을 참고한다.
+Time weight curriculum은 공식 manager를 사용한다.
 
 ## Native 기능과 연구 확장의 경계
 
@@ -153,7 +153,8 @@ scripts/train.py
 학습 설정은 `examples/Sweeping-Policy-DRL-Sim-Train`의 random 태스크가 등록한
 `rsl_rl_ppo_cfg_02.py`를 따른다. 자체 PPO subclass·microbatch 업데이트·timeout bootstrap은
 사용하지 않는다. `init_at_random_ep_len=True`도 표준 학습 스크립트와 같다.
-`commands`와 `curriculum`은 Isaac Lab 기본값인 `None`으로 두었다.
+`commands`는 Isaac Lab 기본값인 `None`이다. `curriculum`의 Time 항은 학습 entrypoint에서
+실제 runner budget에 맞춰 공식 `modify_reward_weight`로 설정한다.
 
 `min`의 실행 스크립트는 task를 등록하고 `runpy`로 Isaac Lab 스크립트를 호출한다.
 우리 스크립트는 같은 실행 순서를 직접 사용하며 다음 차이만 유지한다.
@@ -386,7 +387,7 @@ Blocker 접촉은 `ManagerTermBase`를 사용하고, 공통 기하·F/T는 기�
 Terminal은 성공+250·실패−10을 각각 일회 지급하므로 rate로 변환한다. 현재 설정은
 2026-11-02 확정 명세를 GNN `contact_manipulation`에 적용한 값이며 parallel 설정을 복사하지 않는다.
 성공은 현재 기하 조건을 처음 만족한 transition에서 지급하고 종료한다. PPO·관측·제어·spawn은
-이번 reward 변경에서 유지하며 curriculum은 추가하지 않는다.
+유지하며,후속 요청으로 Time weight만 중간 지점부터 적용하는 curriculum을 추가했다.
 
 | Reward | Weight | 함수가 반환하는 raw score / cost |
 |---|---:|---|
@@ -400,7 +401,7 @@ Terminal은 성공+250·실패−10을 각각 일회 지급하므로 rate로 변
 | `motion_force_growth` | −0.03 | $[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+^2$ |
 | `motion_torque_growth` | −0.03 | $[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+^2$ |
 | `object_stability` | 0.5 | $\exp[-\beta[\theta_B-5\pi/180]_+]-1$, $\beta=\ln(2)/(\pi/4)$ |
-| `time_penalty` | −1.0 | $\mathbf1[\neg\mathrm{terminated}]\mathbf1[\neg\mathrm{success}]$ |
+| `time_penalty` | 초반0 → 설정 계수(현재−0.3) | $\mathbf1[\neg\mathrm{terminated}]\mathbf1[\neg\mathrm{success}]$ |
 | Terminal | 1.0 | 성공 $250/\Delta t$·실패 $-10/\Delta t$를 각각 episode당1회, 일반·timeout0 |
 
 기존 누적 Rearrangement와 그 OBB 경로 이력은 제거했다. 예제의 선반·주변 물체 움직임 비용으로
@@ -551,29 +552,50 @@ Weight+0.5여도 함수값이0 이하이므로 비용이다. 계수는5° 여유
 실제 기울기50°에서−0.25/s가 된다. 속도 항이나 다른 물체의 tilt 비용은 추가하지 않는다.
 Target은 전용 교란 비용, 일반 물체는 기존 코너 속력 비용으로 평가한다.
 
-**Time·Terminal.** `RewardsCfg.time_penalty`는 `mdp.time_penalty`가 공식 `is_alive`에
-현재 유효 성공 mask를 곱한다. Weight−1은 유지한다.
+**Time·Terminal.** `mdp.time_penalty`는 공식 `is_alive`에 현재 유효 성공 mask를 곱한다.
+학습 entrypoint는 `env.time_penalty_start_fraction=0.5`에 따라 초반 weight를0으로 등록하고,
+중간 지점부터 `RewardsCfg.time_penalty.weight`의 설정값(현재−0.3)을 적용한다.
 
 $$
 f_{T,k}=\mathbf1[\neg\mathrm{terminated}_k]\mathbf1[\neg\mathrm{success}_k],\qquad
-r_{T,k}=-\Delta t\,f_{T,k}.
+r_{T,k}=w_T(k)\Delta t\,f_{T,k}.
 $$
 
-일반 step의 비용은100Hz에서−.01,50Hz라면−.02로 같은 실제1초의 비용이−1이 된다.
-현재 정책·물리 주기는100Hz 그대로다. 1/2/4/8초 동안 모든 step이 과금되면 할인 전 합은
-−1/−2/−4/−8이다. 비용률은 처음부터끝까지−1/s이며 경과 시간에 따라 가팔라지지 않는다.
+기본90,000 iteration·rollout36이면45,000 iteration,즉1,620,000 control step이 기준이다.
+`--max_iterations`·Hydra의 실제 runner 설정을 반영하며 환경 개수는 곱하지 않는다.
+공식 `modify_reward_weight`와 `CurriculumManager`를 사용하여 기준 이후 첫 reset에서
+전체 환경의 계수를 한 번에 전환한다. Native reset에서 변경하므로 해당 reset 다음 reward부터
+적용하며 점진 ramp는 없다. 기본800step 공통 scene round 때문에 reset을 기다릴 수 있다.
+초반 weight0인 항은 공식 RewardManager가 함수 계산도 건너뛴다.
+
+활성화 이후100Hz 일반 step 비용은−.003이고,실제1초에−.3이다. 1/2/4/8초 동안 모두
+과금되면 할인 전 합은−.3/−.6/−1.2/−2.4다. Policy·physics100Hz는 유지한다.
+활성화 전에는0이며,활성화 후 비용률은 일정하고 episode 경과 시간에 따라 증가하지 않는다.
 기존 alive/success mask를 유지한다. 현재 성공은 최초 유효 step에 즉시 종료되며 해당 step의
 시간 비용은0이다. 실제 episode 시간과8초 timeout은 별도 유지한다.
 
+예를 들어 `env.time_penalty_start_fraction=0.3`은 설정된 학습 길이의30%부터 적용한다.
+`env.time_penalty_start_fraction=0` 또는 `env.time_penalty_start_fraction=null`은 처음부터
+기존 설정 계수를 적용하며,null은 curriculum 자체를 끈다. `env.rewards.time_penalty.weight=-1.0`
+등의 launch override는 후반부 목표 계수로 사용한다. 항 자체가null이면 schedule도 만들지 않는다.
+
+체크포인트 재개는 저장된0-based iteration label+1을 진행량으로 삼아 남은 기준을 보정한다.
+이미 기준을 지났으면 첫 학습 step 전에 활성화한다. 환경의 `common_step_counter`·MDP·scene 시계는
+바꾸지 않는다. 기준은 현재 지정한 `max_iterations`의 비율이며,이를 바꾸면 기준도 바뀐다.
+Native runner의 resume 시 추가 iteration 실행 의미는 그대로다. `params/env.yaml`에는 초반
+reward weight0과 curriculum의 목표 weight·남은 step 기준을 함께 저장한다.
+Standalone 환경과 Play에서는 이 학습 schedule을 준비하지 않고 설정 계수를 그대로 사용한다.
+
 Native step은 **termination 계산 → reward 계산 → reset** 순서다. 실패의 non-timeout
 종료step은 `terminated=True`여서 이 비용이0이다. 성공 종료도 동일하다. Timeout만 발생한
-step은 truncated이므로 현재 성공이 아니면−.01이다. 공통 장면 교체도 같은 규칙을 따른다.
+step은 truncated이므로 활성화 이후 현재 성공이 아니면−.003이다. 공통 장면 교체도 같은 규칙을 따른다.
 Reset 자체에는 과금하지 않으며 새episode는 첫 정상step부터 다시 평가한다.
 
 실패도 남은 시간 비용을 피할 수 있으므로 Time만으로 빠른 성공을 보장하지 않는다.
-현재γ=.98·100Hz의 할인반감기는약.343초이며,8초 Time 보상열 자체의
-할인합은약−.5다. 무할인−8과 구분해야 한다. Timeout에서는 PPO가 다음 가치도 bootstrap하므로
-이 값이 전체 학습 return은 아니다. 이번 reward 변경에서 PPO·γ는 변경하지 않았다.
+할인한 비용 합은 실제γ와 episode 길이에 따라 달라진다. Timeout에서는 PPO가 다음 가치도
+bootstrap하므로 단순 비용 합을 전체 학습 return으로 해석하지 않는다. 이번 curriculum 변경에서
+사용자의 PPO·다른 reward 설정은 수정하지 않았다. 이미 실행 중인 프로세스에는 소급 적용되지
+않으며 다음 학습 실행 또는 checkpoint 재개부터 적용한다.
 
 Terminal은 성공+250과 활성 실패−10을 **각각 episode당 한 번** 지급한다.
 현재 success termination은 활성이고 최초 유효 성공에 보상과 종료가 같은 transition에서

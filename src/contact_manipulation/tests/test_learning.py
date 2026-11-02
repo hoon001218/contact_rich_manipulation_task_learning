@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -667,7 +667,7 @@ class NativeLearningTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(81)
 
-    def test_training_configuration_matches_registered_sweeping_random_example(self):
+    def test_training_configuration_matches_native_example_with_experiment_overrides(self):
         workspace = Path(__file__).resolve().parents[3]
         baseline = workspace / "examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/config/ur5e/agents/rsl_rl_ppo_cfg_02.py"
         production = Path(__file__).resolve().parents[1] / "contact_manipulation/config/ur5e/agents/rsl_rl_ppo_cfg.py"
@@ -697,6 +697,9 @@ class NativeLearningTests(unittest.TestCase):
         for name in ("num_steps_per_env", "max_iterations", "save_interval"):
             self.assertEqual(actual[name], expected[name], name)
         self.assertEqual(actual["algorithm"]["class_name"], "PPO")
+        # Existing experiment overrides predate the Time curriculum. Preserve
+        # them while checking every other native example algorithm setting.
+        expected["algorithm"].update(gamma=0.95, entropy_coef=0.01)
         self.assertEqual({key: value for key, value in actual["algorithm"].items() if key != "class_name"},
                          expected["algorithm"])
         self.assertNotIn("seed", actual)  # Inherit the same native runner default.
@@ -1413,6 +1416,222 @@ class NativeLearningTests(unittest.TestCase):
         torch.testing.assert_close(torch.get_rng_state(), random_state, atol=0, rtol=0)
         torch.testing.assert_close(actions, mean, atol=0, rtol=0)
         self.assertTrue((actions > 1.).all())
+
+
+class TimePenaltyCurriculumTests(unittest.TestCase):
+    """Exercise the training helpers and native managers without starting Kit."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.package = Path(__file__).resolve().parents[1]
+        cls.lab = cls.package.parents[1] / "IsaacLab/source/isaaclab/isaaclab"
+        cls.train_tree = ast.parse((cls.package / "scripts/train.py").read_text())
+
+        def load(path, names, namespace=None, owner=None):
+            nodes = ast.parse(path.read_text()).body
+            if owner is not None:
+                nodes = next(node for node in nodes if isinstance(node, ast.ClassDef) and node.name == owner).body
+            nodes = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+            scope = {"__name__": "time_curriculum_cpu", "torch": torch, "math": math, **(namespace or {})}
+            module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                                      *nodes], type_ignores=[])
+            exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+            return scope
+
+        class ManagerTermBase:
+            def __init__(self, cfg, env):
+                self.cfg, self._env = cfg, env
+
+        cls.native_curriculum = load(cls.lab / "envs/mdp/curriculums.py", {"modify_reward_weight"},
+                                     {"ManagerTermBase": ManagerTermBase})["modify_reward_weight"]
+        helpers = load(cls.package / "scripts/train.py", {
+            "prepare_time_penalty_curriculum", "sync_time_penalty_curriculum",
+        }, {"CurriculumTermCfg": SimpleNamespace, "modify_reward_weight": cls.native_curriculum})
+        cls.prepare = staticmethod(helpers["prepare_time_penalty_curriculum"])
+        cls.sync = staticmethod(helpers["sync_time_penalty_curriculum"])
+        cls.reward_methods = load(cls.lab / "managers/reward_manager.py", {
+            "compute", "get_term_cfg", "set_term_cfg",
+        }, owner="RewardManager")
+        cls.curriculum_compute = staticmethod(load(cls.lab / "managers/curriculum_manager.py", {"compute"},
+                                                  owner="CurriculumManager")["compute"])
+        cls.time_penalty = staticmethod(load(cls.package / "contact_manipulation/mdp/rewards.py", {
+            "time_penalty",
+        }, {"__package__": "contact_manipulation.mdp"})["time_penalty"])
+        cls.is_alive = staticmethod(load(cls.lab / "envs/mdp/rewards.py", {"is_alive"})["is_alive"])
+
+    def configs(self, *, fraction=.5, iterations=90000, rollout=36):
+        cfg = SimpleNamespace(
+            time_penalty_start_fraction=fraction, curriculum=SimpleNamespace(time_penalty=None),
+            rewards=SimpleNamespace(time_penalty=SimpleNamespace(weight=-.3, func=self.time_penalty, params={}),
+                                    blocker_distance=SimpleNamespace(weight=5.)),
+            scene=SimpleNamespace(num_envs=1024),
+        )
+        return cfg, SimpleNamespace(max_iterations=iterations, num_steps_per_env=rollout)
+
+    def native_env(self, cfg, num_envs=4):
+        env = SimpleNamespace(common_step_counter=0, episode_length_buf=torch.zeros(num_envs, dtype=torch.long),
+                              task_state=SimpleNamespace(success=torch.zeros(num_envs, dtype=torch.bool)),
+                              termination_manager=SimpleNamespace(terminated=torch.zeros(num_envs, dtype=torch.bool)))
+        env.unwrapped = env
+        reward = SimpleNamespace(_env=env, _term_names=["time_penalty"],
+                                 _term_cfgs=[deepcopy(cfg.rewards.time_penalty)],
+                                 _reward_buf=torch.zeros(num_envs), _step_reward=torch.zeros(num_envs, 1),
+                                 _episode_sums={"time_penalty": torch.zeros(num_envs)})
+        for name in ("compute", "get_term_cfg", "set_term_cfg"):
+            setattr(reward, name, MethodType(self.reward_methods[name], reward))
+        env.reward_manager = reward
+        # Native managers own a config copy; the public cfg and registered term
+        # refer to that same live term, rather than the pre-construction cfg.
+        curriculum = SimpleNamespace(_env=env, cfg=deepcopy(cfg.curriculum),
+                                     _term_names=["time_penalty"], _curriculum_state={})
+        term = curriculum.cfg.time_penalty
+        term.func = self.native_curriculum(term, env)
+        curriculum._term_cfgs = [term]
+        curriculum.compute = MethodType(self.curriculum_compute, curriculum)
+        env.curriculum_manager = curriculum
+        return env
+
+    def test_default_schedule_uses_training_budget_and_preserves_configured_rewards(self):
+        cfg, agent = self.configs()
+        self.assertEqual(self.prepare(cfg, agent), 45000)
+        self.assertEqual(cfg.curriculum.time_penalty.params, {
+            "term_name": "time_penalty", "weight": -.3, "num_steps": 1619999,
+        })
+        self.assertIs(cfg.curriculum.time_penalty.func, self.native_curriculum)
+        self.assertEqual(cfg.rewards.time_penalty.weight, 0.)
+        self.assertEqual(cfg.rewards.blocker_distance.weight, 5.)
+        tree = ast.parse((self.package / "contact_manipulation/shelf_manipulation_env_cfg.py").read_text())
+        curriculum = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CurriculumCfg")
+        self.assertIsNone(ast.literal_eval(next(node.value for node in curriculum.body if isinstance(node, ast.AnnAssign))))
+        env_cfg = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ShelfManipulationEnvCfg")
+        fraction = next(node.value for node in env_cfg.body if isinstance(node, ast.AnnAssign)
+                        and isinstance(node.target, ast.Name) and node.target.id == "time_penalty_start_fraction")
+        self.assertEqual(ast.literal_eval(fraction), .5)
+
+    def test_resolved_budget_overrides_and_env_count_change_no_episode_clock_semantics(self):
+        for iterations, rollout, expected_iteration in ((100, 8, 50), (101, 8, 51), (10, 3, 5)):
+            with self.subTest(iterations=iterations, rollout=rollout):
+                cfg, agent = self.configs(iterations=iterations, rollout=rollout)
+                cfg.scene.num_envs = 4
+                self.assertEqual(self.prepare(cfg, agent), expected_iteration)
+                self.assertEqual(cfg.curriculum.time_penalty.params["num_steps"], expected_iteration * rollout - 1)
+
+    def test_native_reset_boundary_changes_global_weight_and_zero_weight_skips_reward(self):
+        cfg, agent = self.configs(iterations=100, rollout=8)
+        self.prepare(cfg, agent)
+        cfg.rewards.time_penalty.func = lambda env: (_ for _ in ()).throw(AssertionError("zero-weight reward called"))
+        env = self.native_env(cfg)
+        self.sync(env, cfg, num_steps_per_env=8)
+        torch.testing.assert_close(env.reward_manager.compute(.01), torch.zeros(4))
+        env.common_step_counter = 399
+        env.episode_length_buf[:] = torch.tensor([0, 1000, 500, 1])
+        env.curriculum_manager.compute(env_ids=torch.tensor([2]))
+        self.assertEqual(env.reward_manager.get_term_cfg("time_penalty").weight, 0.)
+        env.common_step_counter = 400
+        # The native curriculum runs at reset, rather than every policy step.
+        self.assertEqual(env.reward_manager.get_term_cfg("time_penalty").weight, 0.)
+        env.curriculum_manager.compute(env_ids=torch.tensor([2]))
+        self.assertEqual(env.reward_manager.get_term_cfg("time_penalty").weight, -.3)
+        self.assertEqual(env.curriculum_manager._curriculum_state["time_penalty"], -.3)
+
+    def test_enabled_native_payment_keeps_current_success_and_failure_waivers(self):
+        cfg, agent = self.configs(fraction=0.)
+        self.prepare(cfg, agent)
+        env = self.native_env(cfg)
+        self.sync(env, cfg, num_steps_per_env=agent.num_steps_per_env)
+        env.task_state.success[:] = torch.tensor([False, True, False, False])
+        env.termination_manager.terminated[:] = torch.tensor([False, True, True, False])
+        env.termination_manager.time_outs = torch.tensor([False, False, False, True])
+        modules = {
+            "isaaclab.envs.mdp.rewards": SimpleNamespace(is_alive=self.is_alive),
+            "contact_manipulation.mdp.events": SimpleNamespace(get_task_state=lambda current: current.task_state),
+        }
+        with patch.dict(sys.modules, modules):
+            payment = env.reward_manager.compute(.01).clone()
+            torch.testing.assert_close(payment, torch.tensor([-.003, 0., 0., -.003]))
+            # Success can be lost again: the alive cost resumes immediately.
+            env.task_state.success[1] = False
+            env.termination_manager.terminated[1] = False
+            torch.testing.assert_close(env.reward_manager.compute(.01), torch.tensor([-.003, -.003, 0., -.003]))
+
+    def test_resume_accounts_for_completed_zero_based_rollouts_without_changing_clock(self):
+        for completed, threshold, expected_weight in ((35000, 359999, 0.), (45000, -1, -.3), (50000, -180001, -.3)):
+            with self.subTest(completed_iterations=completed):
+                cfg, agent = self.configs()
+                self.prepare(cfg, agent)
+                env = self.native_env(cfg)
+                env.episode_length_buf[:] = 321
+                self.sync(SimpleNamespace(unwrapped=env), cfg, completed_iterations=completed,
+                          num_steps_per_env=agent.num_steps_per_env)
+                self.assertEqual(env.common_step_counter, 0)
+                torch.testing.assert_close(env.episode_length_buf, torch.full((4,), 321, dtype=torch.long))
+                self.assertEqual(cfg.curriculum.time_penalty.params["num_steps"], threshold)
+                self.assertEqual(env.curriculum_manager.cfg.time_penalty.params["num_steps"], threshold)
+                self.assertEqual(env.reward_manager.get_term_cfg("time_penalty").weight, expected_weight)
+                if completed == 35000:
+                    env.common_step_counter = 360000
+                    env.curriculum_manager.compute(env_ids=torch.tensor([1]))
+                    self.assertEqual(env.reward_manager.get_term_cfg("time_penalty").weight, -.3)
+
+    def test_disabled_or_missing_time_reward_leaves_no_schedule_or_manager_requirement(self):
+        cfg, agent = self.configs(fraction=None)
+        self.assertIsNone(self.prepare(cfg, agent))
+        self.assertEqual(cfg.rewards.time_penalty.weight, -.3)
+        self.sync(SimpleNamespace(), cfg, num_steps_per_env=36)
+        cfg, agent = self.configs()
+        cfg.rewards.time_penalty = None
+        self.assertIsNone(self.prepare(cfg, agent))
+        self.assertIsNone(cfg.curriculum.time_penalty)
+        self.sync(SimpleNamespace(), cfg, num_steps_per_env=36)
+
+    def test_fraction_endpoints_use_official_strict_step_comparison(self):
+        for fraction, iteration, steps in ((0., 0, -1), (1., 100, 799)):
+            with self.subTest(fraction=fraction):
+                cfg, agent = self.configs(fraction=fraction, iterations=100, rollout=8)
+                self.assertEqual(self.prepare(cfg, agent), iteration)
+                self.assertEqual(cfg.curriculum.time_penalty.params["num_steps"], steps)
+
+    def test_invalid_fraction_budget_or_weight_is_rejected_before_environment_creation(self):
+        for value in (-.1, 1.1, float("nan"), float("inf"), True, "0.5"):
+            with self.subTest(fraction=value):
+                cfg, agent = self.configs(fraction=value)
+                with self.assertRaisesRegex(ValueError, "time_penalty_start_fraction"):
+                    self.prepare(cfg, agent)
+        for name in ("max_iterations", "num_steps_per_env"):
+            for value in (0, -1, True, 1.5):
+                with self.subTest(name=name, value=value):
+                    cfg, agent = self.configs()
+                    setattr(agent, name, value)
+                    with self.assertRaisesRegex(ValueError, name):
+                        self.prepare(cfg, agent)
+        cfg, agent = self.configs()
+        cfg.rewards.time_penalty.weight = float("nan")
+        with self.assertRaisesRegex(ValueError, "weight must be finite"):
+            self.prepare(cfg, agent)
+
+    def test_entrypoint_arms_after_overrides_and_syncs_after_checkpoint_before_native_learning(self):
+        main = next(node for node in self.train_tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        calls = {ast.unparse(node.func): node for node in ast.walk(main) if isinstance(node, ast.Call)}
+        override = next(node for node in ast.walk(main) if isinstance(node, ast.Assign)
+                        and any(ast.unparse(target) == "agent_cfg.max_iterations" for target in node.targets))
+        self.assertLess(override.lineno, calls["prepare_time_penalty_curriculum"].lineno)
+        self.assertLess(calls["prepare_time_penalty_curriculum"].lineno, calls["gym.make"].lineno)
+        self.assertLess(calls["load_checkpoint"].lineno, calls["sync_time_penalty_curriculum"].lineno)
+        self.assertLess(calls["sync_time_penalty_curriculum"].lineno, calls["runner.learn"].lineno)
+        completed = next(node.value for node in ast.walk(main) if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == "completed" for target in node.targets))
+        expression = compile(ast.Expression(completed), "checkpoint completed rollouts", "eval")
+        for label in (0, 34999, 44999):
+            self.assertEqual(eval(expression, {"runner": SimpleNamespace(current_learning_iteration=label),
+                                               "resume_path": "checkpoint.pt"}), label + 1)
+        self.assertEqual(eval(expression, {"resume_path": None}), 0)
+        learn_args = {keyword.arg: ast.unparse(keyword.value) for keyword in calls["runner.learn"].keywords}
+        self.assertEqual(learn_args, {"num_learning_iterations": "agent_cfg.max_iterations",
+                                     "init_at_random_ep_len": "True"})
+        native_tree = ast.parse((self.lab / "envs/manager_based_rl_env.py").read_text())
+        reset = next(node for node in ast.walk(native_tree) if isinstance(node, ast.FunctionDef) and node.name == "_reset_idx")
+        native_calls = {ast.unparse(node.func): node.lineno for node in ast.walk(reset) if isinstance(node, ast.Call)}
+        self.assertLess(native_calls["self.curriculum_manager.compute"], native_calls["self.event_manager.apply"])
 
 
 if __name__ == "__main__":

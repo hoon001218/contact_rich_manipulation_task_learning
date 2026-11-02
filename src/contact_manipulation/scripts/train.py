@@ -7,6 +7,7 @@ research task's vision and sensor history.
 import argparse
 from datetime import datetime
 from importlib.metadata import version
+import math
 import os
 from pathlib import Path
 import sys
@@ -53,6 +54,8 @@ import gymnasium as gym
 import torch
 from rsl_rl.runners import OnPolicyRunner
 from isaaclab.utils.io import dump_yaml
+from isaaclab.envs.mdp import modify_reward_weight
+from isaaclab.managers import CurriculumTermCfg
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -64,6 +67,42 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def prepare_time_penalty_curriculum(env_cfg, agent_cfg):
+    """Arm the official reward schedule; return its absolute starting iteration."""
+    fraction, reward = env_cfg.time_penalty_start_fraction, env_cfg.rewards.time_penalty
+    env_cfg.curriculum.time_penalty = None
+    if fraction is None or reward is None:
+        return None
+    if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0):
+        raise ValueError("time_penalty_start_fraction must be in [0, 1] or None.")
+    for name in ("max_iterations", "num_steps_per_env"):
+        value = getattr(agent_cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
+    if not math.isfinite(reward.weight):
+        raise ValueError("Time penalty weight must be finite.")
+    iteration = math.ceil(agent_cfg.max_iterations * fraction)
+    env_cfg.curriculum.time_penalty = CurriculumTermCfg(
+        func=modify_reward_weight,
+        params={"term_name": "time_penalty", "weight": reward.weight,
+                "num_steps": iteration * agent_cfg.num_steps_per_env - 1},
+    )
+    reward.weight = 0.0
+    return iteration
+
+
+def sync_time_penalty_curriculum(env, env_cfg, *, completed_iterations=0, num_steps_per_env):
+    """Apply the launch/checkpoint phase once without changing environment clocks."""
+    term = env_cfg.curriculum.time_penalty
+    if term is None:
+        return
+    term.params["num_steps"] -= completed_iterations * num_steps_per_env
+    manager = env.unwrapped.curriculum_manager
+    manager.cfg.time_penalty.params.update(term.params)
+    manager.compute()
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -82,6 +121,7 @@ def main(env_cfg, agent_cfg):
     if args_cli.headless and not args_cli.video:
         # Reset perception uses geometry queries and needs no renderer updates.
         env_cfg.sim.render_interval = 2**31 - 1
+    time_penalty_start_iteration = prepare_time_penalty_curriculum(env_cfg, agent_cfg)
 
     log_root = Path("logs/rsl_rl", agent_cfg.experiment_name).resolve()
     run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -109,6 +149,15 @@ def main(env_cfg, agent_cfg):
         if resume_path is not None:
             print(f"[INFO]: Loading model checkpoint from: {resume_path}", flush=True)
             load_checkpoint(runner, resume_path)
+        # Native checkpoint labels are zero-based: iter=0 follows one rollout.
+        completed = int(runner.current_learning_iteration) + 1 if resume_path is not None else 0
+        sync_time_penalty_curriculum(
+            env, env_cfg, completed_iterations=completed, num_steps_per_env=agent_cfg.num_steps_per_env,
+        )
+        if time_penalty_start_iteration is not None:
+            target_weight = env_cfg.curriculum.time_penalty.params["weight"]
+            print(f"[INFO] Time penalty: 0 -> {target_weight} at iteration {time_penalty_start_iteration}"
+                  f" (completed rollouts: {completed}; applied at reset).", flush=True)
         dump_yaml(str(log_dir / "params/env.yaml"), env_cfg)
         dump_yaml(str(log_dir / "params/agent.yaml"), agent_cfg)
         started = time.time()

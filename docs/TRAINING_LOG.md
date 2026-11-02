@@ -6547,3 +6547,51 @@ Spawn 수·손 시작 분포·weight schedule·외부 PPO/GAE/timeout bootstrap�
 `git diff --check`와 Parallel·관측·model/PPO·UR5e/scene·scripts·IsaacLab 보존 경로의 diff를 확인했다.
 실제 GPU/PhysX·학습·play·commit·push는 실행하지 않았다. 이번 CPU 검증은 동작 계약의 검증이며,
 학습 개선·성공률·iteration 시간과 실물 운동을 검증한 결과는 아니다.
+
+## 87. 2026-11-02 — Time penalty를 학습 중간부터 활성화
+
+후속 사용자 요청으로 `contact_manipulation`의 Time weight curriculum을 추가했다.
+86절의 curriculum 없음 결정은 이 후속 요청으로 Time 항에 한해 변경된다.
+시작 HEAD는 `73bb36e`였으며 사용자가 이미 환경 cfg를 수정한 상태였다. Distance5,
+joint-velocity reward 활성,F/T growth 비활성,Time weight−.3을 그대로 보존했다.
+PPO의 γ=.95·entropy=.01 등 현재 실험 설정도 변경하지 않았다.
+
+`env.time_penalty_start_fraction=0.5`를 기본값으로 두었다. 학습 entrypoint에서 CLI·Hydra 적용 후
+실제 `max_iterations`의 비율을 올림해 시작 iteration을 정하고 `num_steps_per_env`를 곱한다.
+기본90,000×.5=45,000 iteration,rollout36이면1,620,000 control step이다. 환경 수1024는 곱하지 않는다.
+전반부는 weight0,후반부는 launch 시 `RewardsCfg.time_penalty.weight` 값(현재−.3)을 적용한다.
+후반부100Hz 일반 step의 비용은−.003이며 기존 성공·실패 step 면제와 timeout 처리는 유지한다.
+
+공식 `CurriculumTermCfg(func=modify_reward_weight)`와 `CurriculumManager`를 사용했다.
+Native 조건이 `common_step_counter > num_steps`여서 설정값은 기준 step−1이다. Curriculum은
+reset 때 실행되므로 기준에 도달한 뒤 첫 reset에서 전체 환경의 weight를 바꾸고 다음 reward부터
+적용한다. 부분 reset 하나로도 전역 계수가 전환되며 episode 진행률 curriculum은 아니다.
+점진 ramp는 없다. Native RewardManager는 weight0인 동안 함수 계산을 건너뛴다.
+환경 step/reset override,새 module,추가 per-step tensor·host synchronization은 없다.
+
+재개 학습은 checkpoint의0-based iteration label+1을 진행량으로 삼아 남은 threshold를 줄인다.
+예를 들어 model34999는35,000회 진행으로 계산하여10,000×36=360,000 local step이 남고,
+model44999 이후라면 실제 첫 학습 step 전에 native manager를 한 번 계산해 활성화한다.
+`common_step_counter`나 MDP·scene·vision 시계는 바꾸지 않는다. 기준은 현재 지정한
+`max_iterations`에서 계산하므로 이 값을 바꾸면 기준도 바뀐다. Native runner의 resume 시
+추가 iteration 실행 의미는 수정하지 않았다.
+
+시작 비율0은 즉시 활성화,null은 curriculum 없이 기존 계수를 처음부터 사용한다.
+Time reward 자체가null이면 schedule도 생성하지 않는다. 목표 weight는 사용자 launch override를
+포함해 읽으며 `params/env.yaml`에 초반 reward weight0과 curriculum의 목표 weight·남은 기준을
+함께 기록한다. Native `Curriculum/time_penalty` 로그로 현재0/−.3을 확인할 수 있다.
+Standalone 환경·Play는 학습 schedule을 준비하지 않고 설정 계수를 사용한다. 이미 실행 중인
+학습 프로세스는 변경되지 않으며 다음 실행 또는 checkpoint 재개부터 적용된다.
+
+**검증:** CPU 전용 curriculum9개가 통과했다. 실제 checkout의 native curriculum·RewardManager
+코드를 사용해0인 동안 함수 생략,strict/reset 경계·전역 전환,dt 및 성공·실패 면제,
+CLI/Hydra budget·분수 올림·환경 수 독립성,재개 offset·중간 이후 즉시 활성화,
+환경 시계 불변·설정 유효성·기존 native main 실행 순서를 확인했다.
+기존 model·native runner 검사까지71개를 확인해 최종 **69개 통과·CUDA 전용2개 생략**이다.
+처음 발견한 기존 예제 비교 테스트의 γ=.98·entropy=.005 기대값은 사용자 현재 설정과 달라,
+해당 두 기대값만 .95/.01로 명시하고 나머지 예제 비교를 유지했다. 수정한 그 검사는 재실행해 통과했다.
+실제 PPO 설정을 예전 값으로 복구하지 않았다.
+
+기존 환경 cfg·train entrypoint·테스트·README와 이 기록만 수정했고 새 파일은 추가하지 않았다.
+`git diff --check` 및 Parallel·reward 함수·관측·model/PPO·UR5e/scene·외부 라이브러리의 보존을
+정적 diff로 확인했다. 실제 프로젝트 학습·GPU/PhysX simulation·play·commit·push는 실행하지 않았다.
