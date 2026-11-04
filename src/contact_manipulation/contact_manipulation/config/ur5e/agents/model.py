@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 
 
-ACTION_CONTRACT = "isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3"
+ACTION_CONTRACT = "isaaclab_ur5e_sensor_osc_wrench_compensated_ft_v5"
 CRITIC_OBSERVATION_CONTRACT = "tracked_initial_objects_v1"
 
 
@@ -104,9 +104,9 @@ class ModelCfg:
     max_objects: int = 10  # Policy capacity stays fixed when physical scene count changes.
     # Newest first: the current sample and the immediately preceding sample.
     history_steps: int = 2
-    action_dim: int = 18
+    action_dim: int = 12  # Sensor-frame arm wrench(6), hand joint position(6).
     node_features: int = 10
-    step_features: int = 72
+    step_features: int = 66  # Robot/sensor state(54), current action(12).
     node_dim: int = 64
     graph_layers: int = 2
     latent_dim: int = 128
@@ -120,16 +120,16 @@ class ModelCfg:
         )
         if any(type(value) is not int or value <= 0 for value in dimensions):
             raise ValueError("All model dimensions must be positive integers.")
-        if self.history_steps != 2 or self.action_dim != 18:
-            raise ValueError("The MDP contract requires current/previous history (2) and 18 action channels.")
+        if self.history_steps != 2 or self.action_dim != 12:
+            raise ValueError("The MDP contract requires current/previous history (2) and 12 action channels.")
         if self.max_objects < 2:
             raise ValueError("At least two object slots are required for target and blocker.")
         if self.observation_layout != "fixed_roles_v1":
             raise ValueError("observation_layout must use fixed_roles_v1 with target/blocker slots 0/1.")
         if self.node_features != 10:
             raise ValueError("Initial geometry must contain position(3), quaternion(4), and size(3).")
-        if self.step_features != 72:
-            raise ValueError("A history sample must contain 72 physical observation values; mask channels are not observations.")
+        if self.step_features != 66:
+            raise ValueError("A history sample must contain 66 physical observation values; mask channels are not observations.")
 
     @property
     def observation_dim(self) -> int:
@@ -276,7 +276,7 @@ class ContactManipulationEncoder(nn.Module):
         _, values = self._split(observation)
         if history is not None:
             if history.shape != (*leading, self.cfg.history_steps * self.cfg.step_features):
-                raise ValueError("Normalized history must preserve the two 72D samples.")
+                raise ValueError("Normalized history must preserve the two 66D samples.")
             values = history.reshape(-1, self.cfg.history_steps, self.cfg.step_features)
         tactile_valid = masks.tactile_valid.reshape(-1, self.cfg.history_steps, 17)
         values = torch.cat((values[..., :37],
@@ -300,7 +300,7 @@ class ContactManipulationEncoder(nn.Module):
                 raise ValueError(f"Policy masks must be Boolean tensors on the observation device with shape {shape}.")
         scene = self.scene_encoder(geometry, masks.object_valid.reshape(-1, self.cfg.max_objects),
                                    masks.roles.reshape(-1, self.cfg.max_objects, 2))
-        # Keep both 72D samples in order; there is no learned history encoder.
+        # Keep both 66D samples in order; there is no learned history encoder.
         values = self.history_input(observation, masks=masks, history=history).reshape(scene.shape[0], -1)
         return torch.cat((scene, values), dim=-1).reshape(*leading, 5 * self.cfg.node_dim + values.shape[-1])
 
@@ -310,7 +310,7 @@ class _NativeContactModel(MLPModel):
 
     As in RSL-RL's CNNModel, geometry is encoded separately from normalized 1D
     features. Masks use the raw public observation. Optional native running
-    normalization applies to the 144D robot history, never to graph geometry
+    normalization applies to the 132D robot history, never to graph geometry
     or role/padding selection. The default keeps normalization disabled.
     """
 

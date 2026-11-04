@@ -14,6 +14,7 @@ __all__ = ["FAILURE_REASON_NAMES", "ObjectSupportValidity", "object_support_vali
 # Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
 FAILURE_REASON_NAMES = (
     "object_support_lost", "object_tilt", "shelf_displacement", "invalid_state", "singularity",
+    "target_displacement",
 )
 _FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
 
@@ -203,6 +204,8 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     ``raw_goal_out`` optionally receives the protected-target/cleared-blocker
     predicate before completion validity, so diagnostics do not recompute poses.
     ``target_protected_out`` exposes the same pose predicate to reward gates.
+    Target displacement, like shelf displacement, compares the current pose to
+    the episode's initial pose with separate position/rotation tolerances.
     Inactive slots never trigger a failure, even
     when padded with NaN. state_valid optionally incorporates robot, tactile, or
     other integration-specific finite checks supplied by the environment.
@@ -236,11 +239,13 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     distance = torch.linalg.vector_norm(center - initial_center, dim=-1)
     cosine_half_angle = ((rotation * initial_rotation).sum(-1).abs()
                          / (rotation_norm * initial_norm).clamp_min(1.0e-12)).clamp(0.0, 1.0)
-    angle = 2.0 * torch.acos(cosine_half_angle)
+    # Match shelf displacement's sign-invariant cos(theta/2) comparison and
+    # reuse this exact predicate for Target protection and its failure reason.
     within_target_tolerance = ((distance <= cfg.target_translation_tolerance)
-                               & (angle <= cfg.target_rotation_tolerance)
+                               & (cosine_half_angle >= math.cos(cfg.target_rotation_tolerance / 2))
                                & (rotation_norm > 1.e-8) & (initial_norm > 1.e-8))
     target_active = target & active
+    target_displaced = (target_active & valid_objects & ~within_target_tolerance).any(-1)
     protected = ((target_active.sum(-1) == 1)
                  & (within_target_tolerance | ~target_active).all(-1))
     if target_protected_out is not None:
@@ -279,7 +284,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
             step_dt=step_dt,
         )
     reasons = torch.stack((support_validity.lost, (next_tilt_count >= tilt_steps).any(-1),
-                           displaced, invalid, singular), -1)
+                           displaced, invalid, singular, target_displaced), -1)
     failed = (reasons if failure_mask is None else reasons & failure_mask).any(-1)
     raw_goal = (blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area) & protected
     if raw_goal_out is not None:

@@ -47,11 +47,11 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Separate 244D actor/critic scene inputs with the same robot history."""
+    """Separate 232D actor/critic scene inputs with the same robot history."""
 
     @configclass
     class PolicyCfg(ObservationGroupCfg):
-        """Ordered terms: cached vision 100D, current sample 72D, previous sample 72D."""
+        """Ordered terms: cached vision 100D, current sample 66D, previous sample 66D."""
 
         initial_scene = ObservationTermCfg(func=mdp.initial_scene_geometry)
         current = ObservationTermCfg(func=mdp.current_robot_sample)
@@ -100,7 +100,7 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
+        func=mdp.blocker_min_distance, weight=5.0, params={"decay": 10.0},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.4)
     shelf_collision = RewardTermCfg(
@@ -149,6 +149,7 @@ class TerminationsCfg:
     object_support_lost = TerminationTermCfg(func=mdp.failure, params={"reason": "object_support_lost"})
     object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
+    target_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "target_displacement"})
     invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
     # Actual arm overspeed; the UR5e config selects only the six arm joints.
@@ -201,7 +202,7 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
-    actor_vision_update_interval: int = 10
+    actor_vision_update_interval: int = 0
     # Optional cross-PC comparison: require the transferred catalog instead of rebuilding it.
     initial_catalog_fingerprint: str | None = None
     target_asset: str | None = None
@@ -209,8 +210,10 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     role_obb_debug_vis: bool = True
     observation_obb_debug_vis: bool = True
     sensor_monitor_debug_vis: bool = False
+    # Training-only TensorBoard diagnostics; uses the native runner's writer.
+    tensorboard_sensor_monitor: bool = True
 
-    decimation: int = 1
+    decimation: int = 2
     episode_length_s: float = 8.0
 
     def __post_init__(self):

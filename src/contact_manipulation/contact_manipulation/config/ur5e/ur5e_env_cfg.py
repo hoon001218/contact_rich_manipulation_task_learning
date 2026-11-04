@@ -2,19 +2,58 @@
 
 import os
 
+import torch
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers import OperationalSpaceControllerCfg
 from isaaclab.envs.mdp import JointPositionToLimitsActionCfg, OperationalSpaceControllerActionCfg
+from isaaclab.envs.mdp.actions.task_space_actions import OperationalSpaceControllerAction
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply_inverse
 
 from ...shelf_manipulation_env_cfg import ShelfManipulationEnvCfg, ShelfManipulationSceneCfg
 from ...mdp.sensors import make_tactile_contact_cfg
+from ...mdp.observations import wrench_action_limits
 from .scene import (
-    DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES,
+    DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES, FORCE_TORQUE_BODY_NAME,
     make_object_collection_cfg, make_ur5e_hand_cfg, spawn_shelf, SharedGeometryCfg,
 )
+
+
+class SensorFrameWrenchAction(OperationalSpaceControllerAction):
+    """Native OSC with sensor-origin wrench inputs, without replacing its controller.
+
+    Native OSC transforms a task wrench's moment to the root origin before
+    multiplying the COM geometric Jacobian. Adapt only that reference point:
+    after its native transform the moment must instead be about the sensor
+    body's COM. Scaling, gravity compensation, effort submission and actuator
+    limits remain native. Sensor-range clipping precedes native scaling and
+    moment conversion. The authored COM and raw bounds are cached once.
+    """
+
+    def __init__(self, cfg, env):
+        if (list(cfg.controller_cfg.target_types) != ["wrench_abs"]
+                or cfg.controller_cfg.impedance_mode != "fixed"
+                or cfg.body_offset is not None
+                or cfg.task_frame_rel_path != f"Robot/{cfg.body_name}"):
+            raise ValueError("Sensor wrench actions require fixed pure wrench control at the sensor body/frame.")
+        raw_limits = wrench_action_limits(cfg.wrench_scale)
+        super().__init__(cfg, env)
+        self._raw_wrench_limits = self.raw_actions.new_tensor(raw_limits)
+        self._sensor_com_offset = self._asset.data.body_com_pos_b[:, self._ee_body_idx].clone()
+
+    def _preprocess_actions(self, actions):
+        # Keep the policy sample and ActionManager history intact for PPO.
+        # Native OSC does not implement ActionCfg.clip for wrench commands.
+        super()._preprocess_actions(actions.clamp(-self._raw_wrench_limits, self._raw_wrench_limits))
+        # In sensor axes, p_COM/root = R^T p_sensor/root + c_COM/sensor.
+        # Native OSC subsequently adds p_sensor/root x F_root. This subtraction
+        # leaves tau_COM = R tau_sensor + (p_sensor - p_COM) x F_root.
+        lever = (quat_apply_inverse(self._ee_pose_b[:, 3:7], self._ee_pose_b[:, :3])
+                 + self._sensor_com_offset)
+        self.processed_actions[:, 3:6] -= torch.cross(lever, self.processed_actions[:, :3], dim=-1)
 
 
 @configclass
@@ -37,7 +76,7 @@ class UR5eContactSceneCfg(ShelfManipulationSceneCfg):
     ee_frame = FrameTransformerCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_link", debug_vis=False,
         target_frames=[FrameTransformerCfg.FrameCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/wrist_3_link", name="end_effector",
+            prim_path=f"{{ENV_REGEX_NS}}/Robot/{FORCE_TORQUE_BODY_NAME}", name="end_effector",
         )],
     )
     tactile_contact = make_tactile_contact_cfg(TACTILE_BODY_NAMES)
@@ -60,28 +99,25 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
         self.scene.robot.actuators["arm"].stiffness = 0.0
         self.scene.robot.actuators["arm"].damping = 0.0
         self.actions.arm_action = OperationalSpaceControllerActionCfg(
+            class_type=SensorFrameWrenchAction,
             asset_name="robot",
             joint_names=[
                 "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                 "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
             ],
-            body_name="wrist_3_link",
-            # Use the UR5e terminal link, before the sensor/hand, for action and observation.
-            task_frame_rel_path="Robot/wrist_3_link",
-            position_scale=0.03,
-            orientation_scale=0.15,
-            stiffness_scale=100.0,
+            body_name=FORCE_TORQUE_BODY_NAME,
+            # The load-cell center defines control axes and all EEF observations.
+            task_frame_rel_path=f"Robot/{FORCE_TORQUE_BODY_NAME}",
+            wrench_scale=(10.0, 10.0, 10.0, 1.0, 1.0, 1.0),
             controller_cfg=OperationalSpaceControllerCfg(
-                target_types=["pose_rel"],
-                impedance_mode="variable_kp",
-                motion_control_axes_task=(1, 1, 1, 1, 1, 1),
-                contact_wrench_control_axes_task=(0, 0, 0, 0, 0, 0),
-                inertial_dynamics_decoupling=True,
+                target_types=["wrench_abs"],
+                impedance_mode="fixed",
+                motion_control_axes_task=(0, 0, 0, 0, 0, 0),
+                contact_wrench_control_axes_task=(1, 1, 1, 1, 1, 1),
+                inertial_dynamics_decoupling=False,
                 partial_inertial_dynamics_decoupling=False,
                 gravity_compensation=True,
-                motion_stiffness_task=100.0,
-                motion_damping_ratio_task=1.0,
-                motion_stiffness_limits_task=(50.0, 200.0),
+                contact_wrench_stiffness_task=None,
                 nullspace_control="none",
             ),
             nullspace_joint_pos_target="none",

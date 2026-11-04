@@ -6595,3 +6595,409 @@ CLI/Hydra budget·분수 올림·환경 수 독립성,재개 offset·중간 이�
 기존 환경 cfg·train entrypoint·테스트·README와 이 기록만 수정했고 새 파일은 추가하지 않았다.
 `git diff --check` 및 Parallel·reward 함수·관측·model/PPO·UR5e/scene·외부 라이브러리의 보존을
 정적 diff로 확인했다. 실제 프로젝트 학습·GPU/PhysX simulation·play·commit·push는 실행하지 않았다.
+
+## 88. 2026-11-04 — 하나의 Action-rate 함수에서 Stiffness 분리
+
+사용자 요청으로 Original `contact_manipulation`의 `motion_action_rate` 한 함수 안에서
+pose·hand raw 변화와 stiffness 변화를 분리했다. 별도 reward term·코드 파일·controller는 추가하지 않았다.
+시작 HEAD는 `6e93059`였으며 기존 미커밋 변경인 팔 과속 threshold3rad/s를 보존했다.
+
+기존 공식 `action_rate_l2`는18D 전체 raw 차이를 합산하고 채널 선택 파라미터가 없다.
+따라서 이 연구 reward에 필요한 선택·가중만 로컬 tensor 연산으로 구현하고 공식 함수를 수정하지 않았다.
+단일 함수의 입력은 `motion_action_rate(env, stiffness_weight=0.0)`이다.
+
+```
+cost = ||Δraw_pose[0:6]||² + ||Δraw_hand[12:18]||²
+       + stiffness_weight * ||(Kp_now - Kp_prev) / (Kmax - Kmin)||²
+Kp = clip(raw_stiffness[6:12] * actual_scale, actual_Kmin, actual_Kmax)
+reward = -0.03 * step_dt * cost
+```
+
+기본 `stiffness_weight=0`에서는 Kp 계산과 cfg 조회도 생략한다. Pose·hand12D만 평가하며
+현재·직전 input을 수정하지 않는다. Kp 계수를 켜면 실제 arm action cfg의 scalar scale·limits를
+읽는다. 현재100과50–200을 상수로 중복 정의하지 않는다. 다른 raw 입력이 같은 적용 Kp로 clipping되면
+Kp 변화 비용0이고,상·하한이 같으면 고정 Kp로 보고0이다. 유효한 정규화 Kp 비용 범위는0–6이다.
+계수.1이면 기존 전체 weight−.03에 대한 Kp의 상대 계수.1이며 별도 dt/weight를 중복 적용하지 않는다.
+Pose·hand 비용은 기존 raw 제곱합이고,최종 비유한 비용은 기존 adapter처럼 환경별0으로 처리한다.
+
+Cfg에는 기존 `motion_action_rate` 항의 weight−.03을 유지하고
+`params={"stiffness_weight": 0.0}`만 추가했다. Environment별 Python 반복·CPU tensor 복사·scalar
+조회는 없으며 batched tensor slice·elementwise·마지막 차원 reduction으로 처리한다.
+기존 Time curriculum·사용자 reward/termination 설정·action/observation18D/244D·GNN/PPO·OSC·
+Parallel package·외부 라이브러리는 변경하지 않았다.
+
+**검증:** CPU 집중 검사11개가 모두 통과했다. 새 `ActionRateRewardTests`8개는 pose/hand/Kp의
+기여 분리,기본 Kp 완전 제외와 cfg 미조회,같은 clipping 결과0,사용자 scale/limits와 음수 scale,
+고정 bounds·scale0,전체 Kp 범위 비용6,상대 계수,원본 input 불변,32/64bit 및1024행·부분/빈 batch,
+host scalar/CPU 읽기 금지,형상/파라미터 검증,NaN/Inf·overflow와 native dt 산술을 확인했다.
+기존 공식18D L2 참조 검사는 유지하고,선택한12D adapter·native joint velocity 위임·native reward
+manager 검사를 새 목적에 맞춰 통과시켰다. 전체 suite는 실행하지 않았다. 사용자 F/T 비활성·
+joint velocity 활성 설정과 맞지 않는 기존 별도 cfg 기대값은 이번 변경에서 수정하지 않았다.
+
+`git diff --check`와 보존 경로의 diff를 확인했고 README에 수식·파라미터를 반영했다.
+실제 GPU/PhysX·프로젝트 학습·play·commit·push는 실행하지 않았다. 기존 checkpoint의 action 의미는
+바뀌지 않지만 이후 학습의 reward 목적은 달라지므로 이 CPU 검사만으로 정책 개선을 판단하지 않는다.
+
+## 89. 2026-11-04 — Episode 최소거리를 사용하는 별도 Blocker distance 함수
+
+사용자 요청으로 Original `contact_manipulation`에 `blocker_min_distance(env, decay=...)`를 추가했다.
+기존 `blocker_distance` 함수는 현재 거리만 평가하는 동작·signature로 보존했다. 공통 OBB 거리 계산만
+private helper로 공유하며, 새 코드 파일·reward term·센서는 추가하지 않았다.
+`RewardsCfg.blocker_distance.func`만 새 함수로 연결하고 기존 사용자 weight5·decay10을 유지했다.
+Term 이름과 TensorBoard key도 기존 `blocker_distance`다.
+
+```
+min_distance[env, pad] = min(min_distance[env, pad], current_distance[env, pad])
+raw_score = target_protected * mean_pad(exp(-decay * min_distance))
+paid_reward = weight * step_dt * raw_score
+```
+
+17개 pad 각각의 실제 접촉면 대표점과 현재 Blocker OBB 사이 거리를 평가한다.
+최소거리는 episode에서 보상이 평가된 control step들의 기록이다. 초기 reset 순간에 추가 거리
+조회를 넣지 않으며, 첫 평가에서 기록을 시작한다. Pad마다 최단거리에 도달한 시점이 달라도 된다.
+평균거리의 시간 최소값이나 한 시점의 가장 좋은 손 자세를 고르는 방식은 아니다.
+손이 멀어져도 유효한 기록은 유지되며, 매 step 기록에 따른 양의 점수를 지급한다.
+최소거리 개선 순간에만 지급하는 delta 보상으로 바꾸지는 않았다.
+
+`TaskState`에 `[num_envs,17]` buffer를 추가하고 초기값·reset 값을 `+inf`로 둔다.
+기존 reset 경로가 선택 행만 비우므로 부분 reset에서도 다른 환경의 기록은 보존한다.
+같은 sample의 반복 평가는 `minimum`의 성질상 중복 누적되지 않는다. Target gate가 닫혀도 이력은
+갱신하고 지급만 차단한다. Invalid 현재 pad는 이번 점수에서0이며 분모17을 유지한다.
+그 pad의 이전 유효 최소거리는 보존해 이후 유효 측정에서 재개한다. Blocker 전체가 invalid이면0점이다.
+
+GPU tensor의 기존 거리 계산에 elementwise minimum을 추가했다. 환경별 Python 반복문·CPU tensor
+조회·전송은 없고, 최소거리 buffer는1024환경 float32에서68KiB다. 이 buffer는 reward 내부 상태이며
+Actor/Critic observation에 추가하지 않았다. Parallel·GNN/PPO·OSC/action·spawn·termination·
+사용자의 기존 팔 과속3rad/s 및 직전 Action-rate 수정은 유지했다.
+
+**검증:** CPU 집중 검사13개가 통과했다. 새5개는 pad별 서로 다른 시점의 최소값·후퇴 시 점수 유지,
+기존 현재거리 함수의 독립 동작,실제 TaskState의 unsorted partial reset 및 selected-batch reset,
+Target gate·invalid·복구,1024행 float32/64와 host scalar/CPU 조회 금지·in-place buffer·gradient 없음,
+cfg의 새 함수 연결 및 기존 weight/decay를 확인했다. 기존 ContactRewardTests6개와 partial reset
+회귀2개도 통과했다. 전체 suite는 실행하지 않았다. `git diff --check` 및 보존 경로를 확인했고,
+실제 학습·GPU/PhysX simulation·play·commit·push는 실행하지 않았다.
+
+## 90. 2026-11-04 — Shelf displacement를 따르는 Target displacement 종료
+
+사용자 요청으로 Original `contact_manipulation`에 `target_displacement`를 추가했다.
+기존 `shelf_displacement`처럼 초기 pose 대비 위치 norm·quaternion 회전 차이를 검사하고,
+공식 `TerminationTermCfg(func=mdp.failure, params={"reason": "target_displacement"})`로 등록했다.
+새 controller·센서·파일·시뮬레이션 step은 없다.
+
+Target은 기존 보호 gate와 성공 조건의 허용값을 공유한다. 초기 canonical OBB 중심에서3D 이동이
+2cm를 초과하거나 초기 대비 회전이0.15rad(약8.59°)를 초과하면 한 sample에서 즉시 실패 종료한다.
+Shelf의 별도 임계값1cm·2°는 유지한다. 기존 고정 환경 좌표계에서 pose 차이를 계산하므로
+로봇의 움직임·EEF frame 변화가 Target 이동으로 계산되지 않는다.
+Shelf와 같은 부호 불변 `cos(theta/2)` 비교를 Target 보호·실패에 함께 적용하며,
+`q`와 `-q`는 같은 회전이다. Invalid/inactive 물체를 Target 이동으로 오인하지 않는다.
+
+`FAILURE_REASON_NAMES` 끝에 새 원인을 추가해 기존 열 순서를 보존했다. Native 활성 term mask·
+TaskState 캐시·부분 reset·통합 failure·성공 우선순위와 자동으로 연동되며, 같은 step에 성공 보상을
+지급하지 않는다. 로그는 `Episode_Termination/target_displacement`다.
+`env.terminations.target_displacement=null`이면 이 원인의 종료만 비활성화하고 Target gate·진단은 남긴다.
+기존 pose 계산을 재사용하는 batched tensor 조건이며 환경별 반복문·CPU tensor 조회는 추가하지 않는다.
+
+현재 사용자가 설정한 `failure_penalty=0`·팔 속도3rad/s·Actor vision interval0을 보존했다.
+거리 최소값 reward·Action-rate 수정·다른 reward와 성공/지지/전도 조건·Parallel·PPO·제어·spawn은
+바꾸지 않았다. Target gate 위반이 기본 설정에서 즉시 종료되므로 기존 회복 허용 동작은 해당
+종료 term을 끈 실험에서만 적용된다. Clearance의 기존 ungated 지급도 변경하지 않았다.
+
+**검증:** 새 CPU 검사6개가 위치·회전 경계값, quaternion 부호·크기, Target/활성 mask·invalid 구분,
+native enable/disable,1024환경 tensor 처리 및 host scalar/CPU 복사 금지,성공 배타성·부분 reset을 확인했다.
+관련 기존 검사13개(공식 TerminationManager의 원인별 로그·reset 포함)까지 총19개가 통과했다.
+기존 gate-only 회복 검사는 새 종료 term을 명시적으로 끈 상태로 보존했다. 전체 suite는 실행하지
+않았으며 `git diff --check`가 통과했다. 기존5개 reason 열에 의존한 검사는 새 원인 수를 반영했다.
+실제 학습·GPU/PhysX simulation·play·commit·push는 실행하지 않았다.
+
+## 91. 2026-11-04 — F/T 관측의 자중·관성 보상과 Sensor 기준 통일; Wrench 방식 확인 중
+
+사용자는 F/T observation의 자중·관성 제거와 sensor-frame OSC wrench 제어를 요청했다.
+추가 답변에서 force/torque scale10N·1N·m와 물체·로봇 EEF observation의 sensor frame 통일을 선택했다.
+다만 stiffness가 force에 영향을 주는지 질문했고, 순수 wrench12D와 Pose·stiffness18D 중 최종 선택은
+아직 답변되지 않았다. 아래 승인된 보상·frame 변경만 적용했으며 **OSC target은 아직 기존
+`pose_rel`/`variable_kp`18D를 유지한다. Wrench 모드 전환을 완료했다고 판단하면 안 된다.**
+
+`observations.self_motion_wrench`는 distal sensor half와 연결된 Hand의 모든 native 링크에 대해
+Newton–Euler 자중·관성 반력을 계산한다. `F_i=m_i(a_i-g)`,
+`tau_i=I_i*alpha_i+omega_i cross(I_i*omega_i)+(r_i-r_sensor) cross F_i`를 world에서 합산해
+sensor 축으로 표현한다. Native 실제 COM 가속도와 각속도를 쓰므로 reset pose를 차분하지 않는다.
+Inertia는 native API의 COM 기준 link-frame tensor이며 principal-axis quaternion을 중복 적용하지 않는다.
+고정 metadata인 mass/inertia/local COM은 scene binding에서 한 번만 CPU→GPU 캐시한다.
+매 step 계산은 기존 transition CUDA graph 안의 batched tensor 연산이며 환경별 반복은 없다.
+
+물리 SI-200-8 모델은 raw 반력을 먼저 clipping·양자화한다. Actor·Critic observation만
+`measured_reaction - modeled_self_load`를 정규화해 사용한다. Native parent-on-child 반력 부호를
+유지하므로 보상 후 residual은 Hand에 작용한 외력과 반대 부호다. Raw reward F/T·GUI 모니터·
+overrange 판정은 기존 측정값을 유지한다. Sensor 포화로 잃은 정보는 보상으로 복구하지 않는다.
+잘못된 payload dynamics는 observation을0으로 만들면서 기존 invalid-state 판정에 반영한다.
+
+제어 body·task frame과 scene `ee_frame`을 센서 중심 `ToolForceTorqueLink`로 통일했다.
+기존 reset IK의 손바닥 목표는 유지한다. Observation은 기존244D/72D sample이며 바뀐 F/T·frame
+의미를 보호하도록 contract를 `isaaclab_ur5e_sensor_osc_variable_kp_compensated_ft_v4`로 갱신했다.
+이전 wrist/raw F/T checkpoint의 재개·play는 새 contract에서 거부된다.
+사용자 position/orientation scale0.03/0.15·hand scale0.5,stiffness weight1·실패 비용0·팔3rad/s·
+Actor vision interval0을 보존했다. Parallel·PPO 설정·배치 생성·termination·reward 수식은 변경하지 않았다.
+
+공식 OSC 조사 결과 순수 `wrench_abs`6축은 motion stiffness를 사용하지 않는다.
+`contact_wrench_stiffness_task`는 별도 force-error gain이며 `variable_kp` action이 바꾸는 값이 아니다.
+또한 현재 버전은 force_scale/torque_scale 별도 필드 대신 `wrench_scale`6축 값으로10/1을 지정한다.
+순수 wrench를 선택하면 불필요한 motion Kp6채널을 제외한12D action과66D sample/232D observation으로
+계약을 함께 변경해야 한다. Native task-frame wrench의 원점 변환과 COM Jacobian 기준점 차이도
+검증 중이며, sensor 중심 wrench를 정확히 전달하려면 최소 frame adapter가 필요할 수 있다.
+아직 이 adapter나 wrench 설정은 적용하지 않았다.
+
+**검증:** CPU60개 통과·CUDA 전용1개 skip. F/T 관련58개는 독립 Newton–Euler oracle,
+회전된 sensor와 COM 레버암·비대칭 관성과 gyro·multibody 합산,1024행 float32/64·부분/빈 batch,
+host 조회 금지,관측만 보상하고 raw reward를 보존하는 경로,metadata 캐시·동일 timestamp·부분 reset,
+잘못된 dynamics 및 기존 native sensor 경로를 확인했다. 추가2개는 모델 input/action contract와
+checkpoint 불일치 거부를 확인했다. Native Kit 전용 cfg 검사는 실제 실행하지 않았다.
+`git diff --check`가 통과했으며 실제 학습·simulation·GPU benchmark·play·commit·push는 실행하지 않았다.
+현재 실행 중인 학습 프로세스는 수정·중단하지 않았다.
+
+## 92. 2026-11-04 — Sensor-frame Wrench 직접 제어와12D Action 전환 완료
+
+사용자가 목표 wrench 직접 출력(Arm6D+Hand6D)을 선택해91절에서 보류했던 전환을 완료했다.
+Original `contact_manipulation`만 수정했으며 현재 실행 중인 학습은 건드리지 않았다.
+Raw action 순서는 `[Fx,Fy,Fz,Tx,Ty,Tz,hand_1,...,hand_6]`다.
+공식 `wrench_scale=(10,10,10,1,1,1)`로 raw1당 Force10N·Torque1N·m를 지정한다.
+Stiffness6출력을 제거하고 공식 OSC `target_types=["wrench_abs"]`, `impedance_mode="fixed"`,
+motion축0·wrench축1·gravity=True·inertia decoupling=False·nullspace 없음으로 설정했다.
+`contact_wrench_stiffness_task=None`이므로 native open-loop wrench이며 추가 contact sensor는 없다.
+F/T observation을 활용하는 feedback은 정책이 수행한다. 0 wrench는 gravity compensation만
+남고 pose hold를 제공하지 않는다. Native IdealPD의 기존 관절 effort/velocity 제한과
+Hand `JointPositionToLimitsActionCfg`·scale0.5·URDF 범위·mimic/tactile 설정은 유지한다.
+
+**Sensor 원점 보정:** 설치된 native OSC는 task-frame wrench의 moment에 root 원점까지의
+`p_sensor cross F_base`를 추가하고, 이를 COM geometric Jacobian에 곱한다.
+원하는 sensor 원점 wrench에 대해서는 `T_COM=R*T_sensor+(p_sensor-p_COM) cross F_base`가
+필요하므로 cfg만 바꾸면 불필요한 moment가 더해진다.
+기존 `ur5e_env_cfg.py`에 `SensorFrameWrenchAction`을 두어 공식 Action을 상속하고
+전처리의 moment 기준점만 보정한다. Native scale 적용 후 sensor 축에서
+`(R^T*p_sensor+c_COM) cross F_sensor`를 빼면 공식 변환 후 올바른 COM moment가 된다.
+COM offset은 초기화 시 한 번 캐시하고 매 step GPU 회전·cross만 추가한다.
+공식 controller·Jacobian·동역학 계산·gravity·effort 제출·actuator는 교체하지 않았다.
+Raw action도 변하지 않는다. 별도 action 파일이나 controller 파일은 만들지 않았다.
+
+제어·관측 기준은91절의 sensor 중심 `ToolForceTorqueLink`를 사용한다. 기존 sensor-frame 자중·
+관성 보상도 유지한다. 단일 robot sample은54개 상태와12개 action으로66D이며 current/previous
+history132D + scene100D = Actor·Critic 각각232D다. Scene slot10개·17tactile·현재/직전 구조·
+독립 GNN/attention/native MLP·PPO 설정은 유지한다. `ModelCfg`와 observation slice·TaskState
+buffer·reset snapshot을 함께 수정했다. 검사에서 reset snapshot의 기존 zero41개(72D)가
+남아 있음을 찾아 `ROBOT_SAMPLE_DIM-31`(35개)로 수정하고 부분 reset까지 재검증했다.
+
+`motion_action_rate`는 공식 `action_rate_l2`로 wrench6+hand6 raw 변화 제곱합을 계산한다.
+기존 전체 weight−.03·native dt·비유한 최종 비용 보호는 유지한다. 없어지는 stiffness 출력에
+대한 구간 정규화와 `stiffness_weight` 파라미터(직전 사용자 값1)는 제거했다.
+기존 현재거리 `blocker_distance` 및 새 episode 최소거리 함수는 둘 다 보존했다.
+다른 reward·termination·실패 비용0·팔3rad/s·Actor vision interval0·Parallel은 변경하지 않았다.
+
+새 계약은 `isaaclab_ur5e_sensor_osc_wrench_compensated_ft_v5`다. 기존 wrist/pose18D v3와
+sensor/pose18D v4 checkpoint는 설정이나 Actor를 변경하기 전에 재개·play에서 거부한다.
+새 학습이 필요하다. Policy output Gaussian·초기std1·clipping 없음·PPO gamma.95/entropy.01 등
+기존 학습 설정과 native runner 흐름은 유지했다.
+
+**검증:** 관련 CPU195개 통과·CUDA 전용4개 skip.
+MDP127개 중125개가 통과해12D/66D/232D, reset·부분 reset·vision·F/T 자중/관성 보상,
+native action-rate와 reward/dt,Target/속도 종료 및 상태 갱신을 확인했다.
+실제 native OSC/action과 production adapter의 CPU 검사는1024개 임의 회전·COM offset·
+zero/force/torque/mixed 명령·gravity on/off·root 이동/회전의 물리 torque 일치를 확인했다.
+원점 보정 없이2N·m·보정 후 정답1N·m인 반례도 확인했으며 fp32 최대 오차는 약6.34e-5N·m다.
+Learning72개 중70개가 통과해 model/mask·독립 Actor/Critic·native PPO CPU fixture 갱신·
+checkpoint roundtrip·기존 계약 거부·1024행 CPU forward를 확인했다.
+기존 FT 비활성·JV 활성·실패 비용0과 충돌하던 test 기대값3개는 현재 설정을 존중하도록 수정했다.
+전체 기하 생성 suite나 native Kit scene은 실행하지 않았다. `git diff --check` 및 보존 경로를
+확인했다. 실제 프로젝트 학습·simulation·GPU benchmark·play·commit·push는 실행하지 않았다.
+
+## 93. 2026-11-04 — Action-rate의 이전 분리 계산 함수 복원
+
+사용자 요청으로 Original `motion_action_rate(env)`를 native `action_rate_l2` 위임에서
+이전의 단일 함수 내 그룹별 tensor 계산으로 복원했다. 현재12D wrench 제어에 맞춰
+`wrench[0:6]`와 `hand[6:12]`의 raw 변화 제곱합을 각각 구한 뒤 더한다.
+18D 시절의 Hand index12나 더 이상 존재하지 않는 stiffness 출력·파라미터는 복원하지 않았다.
+
+```
+cost = sum((wrench_now - wrench_prev)^2) + sum((hand_now - hand_prev)^2)
+paid_reward = -0.03 * step_dt * cost
+```
+
+Cfg는 이미 이 함수로 연결되어 있으므로 기존 함수명·weight−.03·native dt 적용을 유지했다.
+Force10N/Torque1N·m의 SI scale을 곱하기 전 raw action을 평가한다. 두 그룹 계수가 모두1이므로
+직전 전체12D native L2와 수학적으로 동일한 비용이며 합산 순서에 따른 roundoff만 가능하다.
+현재·직전 입력의 `[num_envs,12]` 형상을 검사해 이전18D 인덱스와 섞이는 것을 방지하고,
+기존 비유한 최종 비용 보호·환경별 GPU tensor 연산·입력 불변을 유지했다.
+Wrench OSC·sensor frame·F/T 보상·232D 관측·GNN/PPO·다른 reward·termination·Parallel은 바꾸지 않았다.
+
+**검증:** 관련 CPU7개가 모두 통과했다. Wrench와 Hand 기여·raw/SI 구분·1024행 float32/64·
+host scalar/CPU 조회 금지·native weight/dt·비유한 입력 보호·18D 및 잘못된 형상 거부·
+기존 native joint velocity 위임을 확인했다. `git diff --check`가 통과했으며 새 파일은 없다.
+전체 suite·실제 학습·simulation·GPU benchmark·play·commit·push는 실행하지 않았다.
+
+## 94. 2026-11-04 — TensorBoard의 관절 속도·F/T 모니터 추가
+
+Original `contact_manipulation`의 학습에서 기본 활성화되는 센서 모니터를 추가했다.
+기존 native RSL-RL Logger와 writer를 그대로 호출하는 작은 adapter를 사용하며,
+runner·PPO·기존 Loss/Reward/console 로그는 변경하지 않는다. 별도 writer나 파일은 만들지 않았다.
+
+- `JointVelocity/{Mean,RMS,AbsMax}/<joint_name>`: UR5e6·Hand 독립6관절의 실제 속도, rad/s.
+- `FT/Measured/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz}`: SI-200-8 clipping·양자화 후 전체 반력.
+  자중·관성을 포함하며 Force는 N, Torque는 N·m다.
+- `FT/CompensatedObservation/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz}`: 자중·관성을 제거한
+  실제 환경 observation을 SI로 환산한다. 관측의 최종 clipping도 반영한다.
+- `TensorboardMonitor/ValidFraction`과 `FT/OverrangeFraction`: 측정 유효성 및 유효 sample 중
+  센서 범위 초과 비율. `hand_velocity` 종료 조건이 활성화된 경우에만
+  `JointVelocity/ArmOverLimitFraction`도 실제 설정 한계로 기록한다. 현재 주석 설정은 유지했다.
+
+통계 window는 한 learning iteration의 모든 환경·control step이다. Mean은 부호 있는 평균,
+RMS는 제곱평균제곱근, AbsMax는 절댓값 최대다. Episode reward와 달리 weight·dt·최대 episode 시간
+나눗셈은 없다. Invalid sample과 비유한 채널은 통계에서 제외하고 전부 invalid면0을 기록하므로
+ValidFraction과 함께 본다. F/T 좌표계·반력 부호는 기존 sensor frame 규약을 유지한다.
+
+`get_task_state`의 새 completed transition을 reset 전에 한 번 기록해 종료 직전 피크를 보존한다.
+부분 reset은 iteration buffer를 지우지 않으며 reset 관측0·동일 step 재조회는 기록하지 않는다.
+매 step 이미 조회한 tensor의 세 slice와 두 mask만 GPU buffer에 복사하고 추가 PhysX 조회나
+CPU scalar 변환은 하지 않는다. Iteration 끝에서 통계를 GPU로 계산해 최대75개 scalar를 하나의
+벡터로 묶어 CPU로 한 번 옮긴다. 36step×1024환경의 float32 sample buffer는 약3.4MiB이며
+mask·통계 계산용 임시 tensor는 별도다. GPU 성능 수치는 이번에 측정하지 않았다.
+
+`env.tensorboard_sensor_monitor=False`로 끌 수 있다. Headless에서 동작하며 GUI 모니터와 독립적이다.
+다음 새 학습 또는 checkpoint 재개부터 적용되며 실행 중인 프로세스에는 소급 적용되지 않는다.
+Reward·termination·controller·observation/policy 계약·Parallel 프로젝트는 바꾸지 않았다.
+
+**검증:** 기존 테스트 두 파일에 CPU 검사8개를 추가했다. 관련 회귀 검사103개 통과·CUDA 전용2개
+skip. SI 환산·raw/보상 후 F/T 구분·invalid 처리·1024행 hot path의 host 조회 금지·iteration당
+CPU 복사1회·부분 reset 전 피크 보존·동일 step 중복 방지·실제 native Logger와 SummaryWriter의
+TensorBoard event 및 기존 Loss/Reward tag 보존을 확인했다. 기존 검사 하나는 사용자가 주석 처리한
+`hand_velocity` 활성화를 가정하므로 회귀 실행에서 제외했으며 해당 검사·사용자 설정은 수정하지 않았다.
+실제 프로젝트 학습·simulation·play·GPU benchmark는 실행하지 않았다.
+
+## 95. 2026-11-04 — Action 모니터와 sensor 범위 clipping·관측 이력 반영
+
+Original `contact_manipulation`에 사용자 요청의 Arm wrench clipping과 action TensorBoard 기록을
+추가했다. 목표 sensor-frame wrench의 범위는 Fx·Fy ±200N, Fz ±360N, Tx·Ty·Tz 각 ±8N·m다.
+현재 `wrench_scale=(10,10,10,1,1,1)`에서는 raw action을 ±[20,20,36,8,8,8]로 제한한다.
+
+공통 `wrench_action_limits()`가 sensor 사양과 cfg scale로 raw 한계를 초기화 때 계산한다.
+설치된 공식 OSC Action은 상속받은 `clip` 필드를 실제 적용하지 않으므로 기존
+`SensorFrameWrenchAction`의 native 전처리 진입 전에 GPU clamp를 추가했다.
+Clipping은 native scale과 sensor→COM moment 보정 전에 수행한다. 기준점 변환으로 생긴 moment를
+다시 ±8로 자르면 올바른 sensor wrench가 아니므로 보정 후에는 sensor 한계로 자르지 않는다.
+Controller·gravity compensation·effort 제출·IdealPD는 기존 native 경로를 유지한다.
+이 범위는 목표 wrench의 축별 한계이며 실제 측정 반력이나 최종 관절 torque를 보장하는 한계가 아니다.
+
+Observation의 current/previous sample에도 각 transition에서 사용한 clipping 후 **raw wrench**를
+넣는다. CUDA graph 내부에서 같은 cached bounds로 제한하므로 매 step CPU 계산이나 새 SDK 조회는
+없다. `ActionManager.prev_action`으로 바꾸어 한 step 더 늦추지 않으며 부분 reset의 이력은0이다.
+PPO sample·log probability·ActionManager 원본 history는 변경하지 않는다. 따라서 기존
+action-rate reward도 원본 action 차이로 계산한다. Invalid 판정은 clipping 전 NaN/Inf를 검사해
+Inf가 clamp로 유한해져도 invalid를 숨기지 않는다. Hand6입력은 기존 native scale0.5·joint limit
+mapping을 유지하고 sensor 범위로 제한하지 않는다. 12D action·232D observation·v5 frame 계약과
+PPO·reward/termination 설정·Parallel은 유지했다. 기존 checkpoint 재개 시에도 새 환경 clipping이 적용된다.
+
+기존 TensorBoard 모니터에 다음을 추가했다. 통계는 iteration 내 모든 환경·control step의
+Mean·RMS·AbsMax이며 reset 전에 원본과 관측용 command를 각각 저장한다.
+
+- `Action/PolicyRaw/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz,<hand_joint>}`: clipping 전12D 정책 출력.
+- `Action/Applied/{Mean,RMS,AbsMax}/...`: 제한 후 sensor 원점 wrench6은 N·N·m로 환산하고,
+  Hand6은 기존 raw 입력 단위로 기록한다. 실제 센서 반력·관절 torque·Hand 목표각과 구분한다.
+- `Action/WrenchClippedFraction`: 유한 action sample 중 Arm6축 하나라도 clipping된 환경·step 비율.
+- `Action/ValidFraction`: 원본과 관측 command가 모두 유한한 환경·step 비율.
+
+물리 상태가 invalid여도 유한한 action 채널은 기록한다. 원본이 비유한 채널은 관측의
+`nan_to_num` 대체값까지 통계에서 제외해0을 정상 명령처럼 표시하지 않는다.
+기존24 + 원본 action12 + command12의48채널 buffer로 확장했다. 36×1024환경의 float32 저장소는
+약6.8MiB이고 mask·통계 임시 tensor는 별도다. 최대149개 scalar를 iteration당 한 번 묶어 CPU로
+옮긴다. `hand_velocity`가 비활성인 현재 설정에서는148개다. 추가 hot-path host 조회나 PhysX 조회는 없다.
+
+**검증:** 관련 회귀 검사121개 중 CPU119개 통과·CUDA 전용2개 skip. 실제 native OSC를 CPU에서
+실행해6축 양·음 포화,1024개 회전·COM offset에서의 올바른 `J^T*wrench`와 moment 보정 순서,
+입력 불변·raw/적용 command 구분·현재/직전 이력·부분 reset·NaN/Inf 원본 invalid 유지·Hand 보존을
+확인했다. TensorBoard 원본/제한 후 값·clipping 비율·실제 native writer·한 번의 CPU 전송도 확인했다.
+사용자 주석 설정과 충돌하는 기존 `hand_velocity` 활성 가정 검사 하나는 제외하고 수정하지 않았다.
+`git diff --check` 통과. 실제 프로젝트 학습·simulation·play·GPU benchmark·commit·push는 실행하지 않았다.
+
+## 96. 2026-11-04 — Clipped Action-rate와 Hand 속도 발산 원인 검토
+
+사용자 요청으로 `motion_action_rate`의 현재·직전 입력에 실제 command 포화를 반영했다.
+기존 `bindings.action_limits` GPU cache를 재사용하며 wrench6·Hand6을 한 함수에서 계산한다.
+
+```
+u_now  = clamp(raw_now,  -limits, limits)
+u_prev = clamp(raw_prev, -limits, limits)
+cost   = sum((u_now[:6] - u_prev[:6])^2) + sum((u_now[6:] - u_prev[6:])^2)
+reward = -0.03 * step_dt * cost
+```
+
+95절에서는 Hand 입력을 raw로 남겼지만, 실제 native Hand는 `clamp(0.5*raw,-1,1)` 뒤
+URDF joint limit에 매핑한다. 따라서 Hand까지 raw ±2로 제한해야 같은 포화 명령에 서로 다른
+action-rate 비용이 발생하지 않는다. `action_input_limits()`가 현재 전체 한계를
+`[20,20,36,8,8,8,2,2,2,2,2,2]`로 한 번 계산한다. 현재 Hand 계약은 양의 scalar scale과
+`rescale_to_limits=True`이며 이를 초기화 때 검사한다.
+Hand의 실제 controller·position target mapping은 바꾸지 않는다. 관측 current/previous 이력과
+TensorBoard `Action/Applied`의 Hand 채널도 native 포화에 해당하는 raw ±2를 사용한다.
+정책 원본 sample·ActionManager의 raw 이력·PPO log probability·joint-velocity 수식은 유지한다.
+입력 tensor를 수정하지 않고 cached bounds로 GPU clamp하므로 추가 host 조회나 SDK 호출은 없다.
+현재 범위에서 최대 cost는9248, 100Hz의 한 step 비용 최대 크기는2.7744다.
+
+**Joint velocity 분석:** 최신 `2026-11-04_16-37-44` 기록에서 적용 wrench는95절의 범위를
+넘지 않았지만 실제 native `get_dof_velocities()`의 반환값이 폭증했다. Iteration9에는
+raw action 최대가 약4.91인 상태에서도 Middle35.11rad/s·Ring19.91rad/s가 기록됐고,
+iteration10에는 Ring약279만rad/s, iteration38에는 Middle약1.83e11rad/s가 기록됐다.
+이 값들은 유한하므로 현재 finite 검사 중심 `invalid_state`를 통과한다. 속도 termination도
+현재 사용자 설정에서 주석 처리되어 있다. Iteration 집계만으로 최초 이상 환경·step 또는
+raw action과 물리 상태 중 어느 것이 먼저 폭증했는지 확정할 수는 없다.
+
+우선 검토할 물리 원인은 Hand의 hard mimic·접촉·self-collision·drive 제약 경쟁이다.
+현재 `_configure_hand_joints`는 importer의 compliant mimic을 natural frequency0·damping ratio0의
+강체 mimic으로 덮는다. 모터 effort 제한은 drive torque에 적용되며 접촉·mimic·관절 한계
+해결 impulse 전체의 상한이 아니다. PhysX는 제약을 순차적으로 풀기 때문에 뒤의 제약이
+앞서 적용한 속도 제한을 바꿀 수 있고, 강체 제약들이 충돌하면 동시에 만족하지 못할 수 있다.
+[PhysX Drive Stability](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#articulation-drive-stability)와
+[Omni Physics Stability Guide](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.2/dev_guide/guides/articulation_stability_guide.html)
+에서도 mimic compliance와 drive·관성·time-step 관계를 검토하도록 안내한다.
+이 조합은 유력한 후보이며 직접 원인으로 확정하거나 이번에 물리 설정을 변경하지는 않았다.
+URDF 질량·관성은 양수이고 각도/속도 단위 변환에도 명백한 오류는 찾지 못했다.
+작은 fixed tactile 링크의 관성을 곧바로 관절 유효 관성으로 간주하지 않는다.
+후속 진단은 최초 이상 환경의 physics 전후 q/qdot·Hand target·mimic 오차·reset 여부를 보존하고
+공식 compliant mimic과 비교하는 것이다. 비정상 속도를 reward에서 잘라내는 것만으로 물리 원인이 해결되지는 않는다.
+
+**검증:** 관련 CPU107개 통과·CUDA 전용2개 skip. 현재·직전 모두 clipping·동일 포화 명령의 비용0·반대 포화9248·
+입력 불변·1024행 host 조회 금지·native weight/dt·빈 batch·부분 reset 행 독립성·관측/로그 일치를
+검사했다. 실제 native `JointPositionToLimitsAction.process_actions`를 CPU에서 실행해 큰 raw 입력과
+±2에 제한한 입력이 동일한 Hand position target을 내는 것도 확인했다.
+추가 Model/NativeLearning 회귀로 raw Gaussian과 native PPO 경로 보존도 확인했다.
+기존 `hand_velocity` 활성화를 가정하는 stale 검사 하나는 사용자 설정을 바꾸지 않고 제외했다.
+실제 프로젝트 학습·simulation·play·GPU benchmark는 실행하지 않았다.
+
+## 97. 2026-11-04 — Hand mimic의 importer 기본 설정 보존
+
+사용자 요청으로 Original `contact_manipulation`의 강체 mimic 후처리를 제거했다.
+`_configure_hand_joints()`는 이제 importer가 작성한6개 mimic API의 존재만 검사하며,
+reference joint·gearing·offset·natural frequency·damping ratio를 덮어쓰지 않는다.
+종속 관절의 DriveAPI type·max force도 다시 작성하지 않고 importer 값을 보존한다.
+공식 converter의 mimic parsing을 켜는 기존 flag=True와 `joint_drive=None`은 유지한다.
+
+독립 master6개의 URDF 위치 교집합·속도 한계·force drive/effort 설정은 유지한다.
+17개 tactile 링크·충돌 형상·필터·contact sensor·관측 순서, UR5e actuator·OSC·
+solver32/1·100Hz·reward/termination·PPO·Parallel은 바꾸지 않았다.
+새 환경 생성부터 적용되며 현재 프로세스의 이미 생성된 articulation을 변경하지 않는다.
+
+캐시된 importer 원본 USD를 CPU `pxr.Usd`로 읽어 실제 URDF와 대조했다.
+6개 reference joint·gearing·offset이 모두 원본 연동식과 일치하므로 재작성할 필요가 없었다.
+일반 손가락4개는 rotZ에 natural frequency25·damping ratio약0.005를 작성한다.
+엄지2개는 실제 mimic 축 rotX와 달리 compliance 속성이 rot에 작성되는 차이를 확인했다.
+따라서 이번 변경은 **설치된 importer 결과의 보존**이며6개 모두 동일한 compliant mimic이
+효과적으로 적용됨을 검증한 변경은 아니다. 엄지의 compliance 축 차이는 별도 조사 대상으로
+남기고 이번에 임의로 수정하지 않았다. 숫자25/0.005도 코드에서 새로 고정하지 않는다.
+현재 `usd_dir=None`인 converter는 새 실행마다 임시 USD를 생성하고, 기존 강체 설정은
+import 후 composed stage에만 작성됐으므로 별도 캐시 삭제는 필요 없다.
+
+기존21절의 강체 mimic·velocity solver2회 개폐/센서 검증 결과를 새 기본 설정의 검증으로
+사용하지 않는다. README에도 당시 기록이라는 점을 표시했다. 이번에 실제 physics를 실행해
+다양한 접촉·장기 학습의 안정성을 확인한 것은 아니다.
+
+**검증:** 기존 테스트 파일에3개 검사를 추가하고 관련 CPU24개가 통과했다.
+서로 다른 imported mimic sentinel 값과 child drive·범위가 보존되는지,6개 master의 한계·effort가
+유지되는지,API 누락·중복 거부와 parsing/drive cfg를 확인했다. 기존 tactile/contact/runtime
+회귀도 포함한다. 추가 범위 검사에서 사용자 주석 설정의 velocity binding을 가정한 기존 검사
+1개가 실패했으며 이번 변경과 무관해 해당 설정·검사를 수정하지 않았다.
+`git diff --check` 통과. 실제 학습·simulation·play·GPU benchmark·commit·push는 실행하지 않았다.

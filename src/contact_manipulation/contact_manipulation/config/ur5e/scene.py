@@ -437,14 +437,12 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
 
 
 def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> None:
-    """Preserve URDF limits and coupling through native USD/PhysX APIs.
+    """Restore master URDF limits while retaining importer-authored mimic setup.
 
-    This importer expands mimic limits and adds compliant coupling. Restore the
-    coupled master limits and configure native rigid mimic constraints.
+    Mimic reference, gearing, offset, compliance and dependent drives belong to
+    the native importer. Only validate their presence; do not override them.
     No joint motion or dependent position targets are computed in Python.
     """
-    from omni.physx.bindings import _physx
-
     joints = {prim.GetName(): UsdPhysics.RevoluteJoint(prim)
               for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.IsA(UsdPhysics.RevoluteJoint)}
     positions, velocities = hand_joint_limits(urdf_path)
@@ -452,37 +450,23 @@ def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> 
         if source.attrib["type"] != "revolute":
             continue
         joint = joints[source.attrib["name"]]
-        prim, limits = joint.GetPrim(), source.find("limit").attrib
-        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
-        drive.CreateTypeAttr("force")
-        drive.CreateMaxForceAttr(float(limits["effort"]))
+        prim = joint.GetPrim()
         mimic = source.find("mimic")
         if mimic is None:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+            drive.CreateTypeAttr("force")
+            drive.CreateMaxForceAttr(float(source.find("limit").attrib["effort"]))
             lower, upper = positions[source.attrib["name"]]
             joint.CreateLowerLimitAttr(math.degrees(lower))
             joint.CreateUpperLimitAttr(math.degrees(upper))
             PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr(math.degrees(velocities[source.attrib["name"]]))
             continue
-        # The official importer leaves mimic velocity unconstrained: applying a
-        # second brake fights its coupling. The master cap already incorporates
-        # every dependent URDF velocity limit through hand_joint_limits().
-        # Keep its expanded native position range too: the master interval and
-        # mimic equation imply the original child range without a second stop.
+        # Retain the importer's expanded child range and unconstrained velocity.
+        # The master cap incorporates the dependent URDF limits. Compliance is
+        # left exactly as authored by the installed importer, without tuning.
         apis = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
         if len(apis) != 1:
             raise RuntimeError(f"Native URDF importer must preserve one mimic constraint on {prim.GetPath()}.")
-        api = apis[0]
-        api.CreateReferenceJointRel().SetTargets([joints[mimic.attrib["joint"]].GetPath()])
-        api.CreateGearingAttr(-float(mimic.attrib.get("multiplier", 1.0)))
-        api.CreateOffsetAttr(-math.degrees(float(mimic.attrib.get("offset", 0.0))))
-        # Official PhysX constants support this installed pre-schema compliance API.
-        axis = next(schema.split(":", 1)[1] for schema in prim.GetAppliedSchemas()
-                    if schema.startswith("PhysxMimicJointAPI:")).upper()
-        # Native hard coupling matches the URDF relation. Dependent DOFs must
-        # retain the importer's unbraked velocity to avoid redundant constraints.
-        for field, value in (("NATURAL_FREQUENCY", 0.0), ("DAMPING_RATIO", 0.0)):
-            attribute = getattr(_physx, f"MIMIC_JOINT_ATTRIBUTE_NAME_{field}_{axis}")
-            prim.CreateAttribute(attribute, Sdf.ValueTypeNames.Float).Set(value)
 
 
 def _configure_hand_collisions(stage: Usd.Stage, hand_path: str) -> None:

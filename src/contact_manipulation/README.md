@@ -5,13 +5,13 @@ Sweeping-Policy의 **`min` branch 구조**를 기준으로 구성한 Isaac Lab �
 기존 `src/contact_rearrangement`와 별도 패키지이고, 해당 패키지를 import하지 않는다.
 
 **현재 배치 생성은 15–25개 물체의 통합 clutter 규칙이다.** 물리 최대 개수는25개이며,
-공개 관측은 Target·Blocker를 포함한10개 slot과244D를 유지한다. 기존 `parameterized`
+공개 관측은 Target·Blocker를 포함한10개 slot과232D를 사용한다. 기존 `parameterized`
 경로의90 ordered pair는10종에서 서로 다른 Target·Blocker를 고르는 `10×9` 종류 조합이며,
 미리 저장한90개 완성 장면을 의미하지 않는다. 기존의 두-row 주변 배치가 역할 물체와 분리되어
 보인다는 문제를 수정하며, 이전10물체·364장면·1,024환경 검증을 새 규칙의 검증으로 사용하지 않는다.
 Blocker의 빈 재배치 공간은 확보하되 이동·pivot 전체 경로를 비워 두지는 않는다.
 이전 최대40개 설정의 `clutter`는98개 standalone 장면과1,024환경 reset·10step을 통과했다.
-해당 검사 범위는20–38물체이며 현재 생성 범위는15–25개로 낮췄다. 정책 관측은244D를 유지한다. 장기 학습·정규 iteration 속도는
+해당 검사 범위는20–38물체이며 현재 생성 범위는15–25개로 낮췄다. 현재 정책 관측은232D다. 장기 학습·정규 iteration 속도는
 이번 짧은 실행 검사의 범위에 포함하지 않는다.
 현재 경로와 이전 구현은
 아래 [병렬 계산과 reset 연결](#병렬-계산과-reset-연결),
@@ -72,11 +72,11 @@ contact_manipulation/
 로봇별 설정은 `ur5e_env_cfg.py`에서 구체화한다. Arm에는 연구 설계에 따라
 가변 stiffness의 OSC torque 제어를, hand에는 독립 6관절 position 제어를 사용한다.
 에셋 로딩은 예제의 `src/ur5e.py`, `src/shelf_utils.py`를 참고해 `scene.py`에 모았다.
-공통 cfg의 observation은 `initial_scene` 100D, `current` 72D, `previous` 72D 순서로
-각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총244D로 연결한다.
+공통 cfg의 observation은 `initial_scene` 100D, `current` 66D, `previous` 66D 순서로
+각각 `ObservationTermCfg`에 선언한다. Native ObservationManager가 총232D로 연결한다.
 Actor의 `initial_scene`이라는 term 이름은 유지하지만 내용은 기본10step마다 갱신한 ray 관측이다.
 Critic은 별도 `critic` 그룹에서 초기 인식10개 슬롯의 현재 실제 물체 기하100D와 동일한
-현재·직전144D를 받는다. Critic의 초기 인식 ID·순서·padding은 reset에서 고정한다.
+현재·직전132D를 받는다. Critic의 초기 인식 ID·순서·padding은 reset에서 고정한다.
 새 규약에서는 물리 활성 개수15–25와 관측 용량10을 분리한다. 인식한 물체가10개를 넘으면
 Target·Blocker를 slot0/1에 두고, 나머지는 관측된 중심에서 두 역할의 관측 중심까지 거리의
 최솟값이 작은 순서로8개를 선택한다. 보이지 않은 물체를 정답 pose로 채우지 않으며,
@@ -96,7 +96,7 @@ Time weight curriculum은 공식 manager를 사용한다.
 | 영역 | 현재 사용하는 native 기능 | 남겨 둔 연구 확장 |
 |---|---|---|
 | 환경·학습 흐름 | `ManagerBasedRLEnv`, 각 Manager, `InteractiveScene`, `OnPolicyRunner` | Scene/MDP 설정과 함수 |
-| 제어 | `OperationalSpaceControllerAction`, `JointPositionToLimitsAction`, 팔 `IdealPDActuator`·Hand `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및 18D 입력 설정 |
+| 제어 | Native OSC Action + sensor 기준점 adapter, `JointPositionToLimitsAction`, 팔 `IdealPDActuator`·Hand `ImplicitActuator` | UR5e env cfg에서 대상 링크·관절 및12D 입력 설정 |
 | 좌표 연산 | `isaaclab.utils.math`의 quaternion 연산 | 배치 차원의 broadcasting adapter |
 | EEF·접촉 센서 | `FrameTransformer`, `ContactSensor` | 17개 tactile 링크 통합, 전체 행 갱신 최적화 |
 | 미사용 물체 | Native `UsdPhysics.RigidBodyAPI`의 kinematic 설정 | 격리된 주차 위치에서 kinematic 유지, 활성 물체만 dynamic으로 전환하며 GPU actor·view 유지 |
@@ -122,7 +122,7 @@ Time weight curriculum은 공식 manager를 사용한다.
 - F/T 원시 반력은 public `ArticulationData.body_incoming_joint_wrench_b`에서 읽는다.
   Quaternion 부호 정규화와 물리 FK 검사의 회전 변환도 `isaaclab.utils.math`를 사용한다.
   SI-200-8 양자화·범위, clearance·지지 기하 등은 연구 수식이다.
-  F/T 측정값에서 hand 링크의 자중·관성 하중은 제거하지 않는다.
+  F/T observation에서는 센서 아래쪽 링크들의 자중·관성 하중을 제거한다. Raw 모니터·reward는 측정 반력을 유지한다.
 - 출력 분포는 RSL-RL의 `GaussianDistribution`을 사용한다. Sampling·log-probability·
   analytic entropy·KL은 native 구현에 맡긴다. Actor와 Critic은 각각 공식 `MLPModel`을
   확장하고, GNN·attention·MLP 전체의 가중치를 별도로 학습한다.
@@ -180,7 +180,7 @@ Actor: 최신 ray vision / Critic: 최초 인식 ID들의 현재 GT [N,10,10]
                              ├─ Target / Blocker embedding
                              ├─ Target / Blocker 조건부 attention → scene 320D
                              └─ valid object mean pooling
-현재·직전 sample [N,2,72] ── 결측 masking → flatten 144D (별도 encoder 없음)
+현재·직전 sample [N,2,66] ── 결측 masking → flatten 132D (별도 encoder 없음)
                                    ↓
                       concat 464 → 공식 MLPModel head 256 → 128
                                    ├─ Actor: 18 → 공식 Gaussian distribution
@@ -197,14 +197,14 @@ reset 등 공통 인터페이스를 상속한다. 공식 `CNNModel`과 같은 �
 현재·직전 값은 순서대로 그대로 연결하여 최종 MLP에서 처리한다. 별도 temporal encoder는
 확정된 설계가 아니므로 이번 baseline에서 제거했다.
 
-Actor는 `policy`, Critic은 `critic`이라는 별도244D 관측 그룹을 받는다. Critic의 물체 목록은
+Actor는 `policy`, Critic은 `critic`이라는 별도232D 관측 그룹을 받는다. Critic의 물체 목록은
 reset에서 Actor의 초기 인식 ID·슬롯 순서·padding과 정확히 맞춰 고정한다. 이후 동일 물체의
 현재 실제 중심·회전·전체 OBB 크기를 제공하며, 처음 보이지 않았던 물체는 추가하지 않는다.
 가려지거나 선반 밖으로 나가도 ID는 유지한다. Critic에는 추가 ray casting이나 최근접 재선택이 없다.
 Actor는 주기 ray 관측에 따라 보이는 물체·추정 OBB를 갱신한다. 두 모델의 valid mask는
 분리되어 있어 Actor에서 가려진 물체도 Critic은 초기 ID를 유지하며 추적한다.
 표면으로 추정한 Actor OBB와 전체 실제 형상을 쓰는 Critic OBB는 값이 다를 수 있다.
-양쪽 물체 기하는 현재 UR5e 말단 EEF frame으로 표현하고, 로봇·센서·행동144D는 동일하다.
+양쪽 물체 기하는 현재 sensor EEF frame으로 표현하고, 로봇·센서·행동132D는 동일하다.
 Critic head는 `464→256→128→1`이며 Gaussian 분포는 없다. 두 모델 모두 ReLU를 사용한다.
 공통 Python 클래스로 구조를 정의하지만, encoder·attention·
 MLP·정규화 통계·compile cache는 각각 별도 인스턴스다. Critic의 value loss는 Actor에 직접
@@ -231,12 +231,13 @@ Architecture metadata를 검사하여 전체 resume를 거절하므로 **새 학
 이전 temporal encoder 모델의 checkpoint는 구조가 달라 resume할 수 없다.
 Activation도 checkpoint metadata에 기록하므로 이전 SiLU checkpoint의 그대로 resume는 거절한다.
 
-Actor는 학습 시 `a=μ+σε`, 일반 재생 시 `a=μ`를 사용한다. Tanh와 별도 action clipping은 없다.
+Actor는 학습 시 `a=μ+σε`, 일반 재생 시 `a=μ`를 사용한다. 분포에는 tanh나 ±1 clipping을 넣지 않는다.
 예제와 동일한 RSL-RL `GaussianDistribution(std_type="scalar", init_std=1.0)`를 사용한다.
 Sampling·log-probability·entropy·KL과 MLP의 기본 초기화는 공식 구현에 맡긴다.
-기존 mean-head gain.01/bias0 재초기화는 제거했다. Scale1.0의 pose action에는 ±1 상한이 없다.
-현재/직전 observation의 action 값도 ±1로 자르지 않고 실제 raw 값을 보존한다.
-Hand 관절 한계와 OSC Kp·actuator 토크 제한은 각 native 클래스에서 적용한다.
+기존 mean-head gain.01/bias0 재초기화는 제거했다. 환경의 Arm ActionTerm에서 sensor 범위에 맞춰
+wrench를 clipping한다. PPO의 sample·log probability와 ActionManager의 raw 이력은 유지한다.
+현재/직전 observation의 action에는 각 transition에 사용한 clipping 후 raw wrench와
+native 포화를 반영한 Hand 입력을 넣는다. Hand 관절 한계와 actuator 토크 제한은 각 native 클래스에서 적용한다.
 
 출력 분포는 Actor checkpoint의 `actor_model.distribution_cfg`에 기록한다. 이전 tanh checkpoint는
 새 Gaussian으로 resume/play하지 않도록 weights·optimizer 로드 전에 명시적으로 거절한다.
@@ -246,7 +247,7 @@ Hand 관절 한계와 OSC Kp·actuator 토크 제한은 각 native 클래스에�
 mask를 만든 다음 모델에 별도로 전달한다. Mask·role ID를 observation이나 학습 feature에
 붙이지 않는다. 물체 padding, reset 시 직전 step 이력의 결측, tactile 결측은 해당 mask로 제외한다.
 Mask는 항상 raw 관측에서 판정한다. 각 모델의 `obs_normalization=True`를 선택하면 공식 running
-normalizer를 robot/sensor/action history 144D에만 적용하고 결측 mask를 다시 적용한다.
+normalizer를 robot/sensor/action history 132D에만 적용하고 결측 mask를 다시 적용한다.
 Scene 기하와 role/padding 판정은 raw 값을 유지한다. 현재 기본값은 Actor/Critic 모두
 `obs_normalization=False`이며, 예제의 값을 따른다.
 
@@ -284,51 +285,89 @@ graph Actor의 JIT/ONNX export는 구현하지 않았다.
 
 | 영역 | 구현 |
 |---|---|
-| Observation | Actor·Critic 각각 물체 기하 10×10 + 현재·직전 sample 2×72 = **244D** |
-| 물체 정보 | 현재 `wrist_3_link` 기준. Actor는 기본10step마다 ray OBB 갱신, Critic은 초기 인식 ID들의 현재 실제 OBB 갱신 |
+| Observation | Actor·Critic 각각 물체 기하 10×10 + 현재·직전 sample 2×66 = **232D** |
+| 물체 정보 | 현재 sensor `ToolForceTorqueLink` 기준. Actor 갱신 주기는 `actor_vision_update_interval`(현재0), Critic은 초기 인식 ID들의 현재 실제 OBB 갱신 |
 | 슬롯 | Target 0, Blocker 1, 나머지 관측 물체와 zero padding. Role ID·mask 채널 없음 |
-| 72D sample | 12관절 q/dq 24 + base에서 표현한 `wrist_3_link` pose 7 + sensor 기준 F/T 6 + tactile 17 + 직전 적용 action 18 |
-| F/T | Sensor frame의 반력 → SI-200-8 축별 clipping·양자화 → full scale 정규화. 자중·관성 하중 포함 |
+| 66D sample | 12관절 q/dq 24 + base에서 표현한 sensor pose 7 + sensor 기준 보상 F/T 6 + tactile 17 + 직전 적용 action 12 |
+| F/T | Sensor frame 반력 → SI-200-8 clipping·양자화 → distal 자중·관성 제거 → full scale 정규화 |
 | Tactile | 마지막 physics sample의 normal force norm > 0.01 N이면 1, 미접촉 0, 결측 −1 |
-| Action | 현재 EEF 축 TCP 증분 6 + EEF 축 stiffness 6 + hand 독립 관절 위치 6 = **18D** |
+| Action | 현재 sensor 축 목표 wrench 6 + hand 독립 관절 위치 6 = **12D** |
 
 제어는 [UR5e 환경 cfg](contact_manipulation/config/ur5e/ur5e_env_cfg.py)의 `__post_init__`에서
 공식 `OperationalSpaceControllerActionCfg`와 `JointPositionToLimitsActionCfg`로 설정한다.
-공통 `ActionsCfg`는 두 term을 `MISSING`으로 선언한다. 별도 custom action/controller 클래스는 없다.
+공통 `ActionsCfg`는 두 term을 `MISSING`으로 선언한다. 공식 OSC Action을 상속한
+`SensorFrameWrenchAction`은 sensor 범위 clipping과 wrench 기준점 보정을 수행하며
+controller 계산·actuator는 교체하지 않는다.
 `ActionManager.process_action → native process_actions/set_command → physics substep의
 native apply_actions/compute → scene.write_data_to_sim` 순서로 실행한다.
 
-OSC 구조·gain 설정은 원격 `min` branch의
+환경 cfg와 native 제어 class를 조합하는 구조는 원격 `min` branch의
 [`UR5eSweepKpOSCRelativeObsEnvCfg`](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/blob/min/sweeping_policy/config/ur5e/osc_random_sweep_env_cfg.py)를 따른다.
-2026-10-20 사용자 교정에 따라 제어 body는 UR5e의 실제 말단 rigid body인
-`wrist_3_link`로 정한다. `body_offset`은 사용하지 않으며 `tool0` 가상 frame과 구분한다.
-Action 좌표계와 물체 observation의 기준도 **현재 `wrist_3_link` frame**으로 통일한다.
-`task_frame_rel_path="Robot/wrist_3_link"`와 scene `ee_frame`의 같은 링크 target을 지정해
+2026-11-04 요청에 따라 제어 body는 센서 중심 rigid body인 `ToolForceTorqueLink`로 정한다.
+`body_offset`은 사용하지 않으며 Action 좌표계와 물체 observation도 **현재 sensor frame**으로 통일한다.
+`task_frame_rel_path="Robot/ToolForceTorqueLink"`와 scene `ee_frame`의 같은 링크 target을 지정해
 공식 ActionCfg·FrameTransformer가 좌표 변환을 수행한다. 확인한 min 커밋 `baa3740`은
-task frame을 지정하지 않아 base 축 증분을 사용한다는 점에서 다르다.
+task frame을 지정하지 않아 base 축 pose 증분을 사용한다. 현재는 사용자 선택으로6축 wrench를 직접 제어한다.
 
 | 입력/설정 | 현재 native 동작 |
 |---|---|
-| Arm 앞 6D | 현재 EEF 축 `pose_rel`; position/orientation scale 모두 0.5 (m, rad) |
-| Arm 뒤 6D | EEF 축별 `Kp = clip(100 × action, 50, 200)`; 병진·회전 동일 규칙 |
-| 현재 Gaussian 정책의 Kp 범위 | raw 출력에 ±1 상한이 없어 native 범위 50–200을 사용 가능 |
-| OSC | Full inertia decoupling, damping ratio 1, gravity compensation=True, nullspace 없음 |
+| Arm 6D | 현재 sensor 축 `wrench_abs`; raw1당 Force10N·Torque1N·m |
+| Action 순서 | $[F_x,F_y,F_z,T_x,T_y,T_z,h_1,\ldots,h_6]$ |
+| OSC | `fixed`, motion 축0·wrench 축1, gravity compensation=True, inertia decoupling·nullspace 없음 |
+| Force feedback | `contact_wrench_stiffness_task=None`; native open-loop wrench, 추가 contact sensor 없음 |
 | Hand 6D | `0.5 × raw action`을 native에서 [−1,1]로 clamp한 뒤 live soft limit 범위에 매핑 |
 
-사용자가 직접 조정한 현재 scale0.5에서는 위치 action0.01이5mm, 회전 action0.01이0.005rad다.
-Hand scale도0.5이며, Hand를 속도 종료에서 제외하는 수정에서 이 세 scale은 변경하지 않았다.
-정책 step 시작 시 측정한 EEF pose를 task frame으로 사용한다. Base 기준 EEF pose가
-$(p_t,R_t)$이면 목표는 $p^*=p_t+R_t\Delta p_{\mathrm{EEF}}$,
-$R^*=R_t\operatorname{Exp}(\Delta r_{\mathrm{EEF}})$다. 회전 입력은 Euler가 아닌 회전벡터다.
-공식 OSC는 EEF 축 stiffness/damping도 base로 변환하며, 생성된 목표는 해당 정책 step의
-physics substep 동안 유지한다. 이전 목표에 증분을 계속 누적하지 않는다.
-이전의 ±15 mm/±0.08 rad 제한과 축별 gain 매핑, workspace 목표 clipping,
-COM→TCP Jacobian/속도 보정, hand 측정 위치 기준 lead 제한, custom effort clipping은 제거했다.
-Native task-frame 변환과 기존 관절별 물리 제한을 사용한다.
+`wrench_scale=(10,10,10,1,1,1)`이며 raw0.1은 Force1N 또는 Torque0.1N·m다.
+Gaussian raw 출력에 ±1 상한이나 tanh는 추가하지 않았다. 기존 IdealPD의 관절 토크 상한을 유지한다.
+Arm 명령은 SI-200-8의 축별 범위에 맞춰 다음과 같이 제한한다.
+
+| 축 | Sensor-frame 목표 wrench 범위 | 현재 scale의 raw action 범위 |
+|---|---|---|
+| Fx·Fy | ±200 N | ±20 |
+| Fz | ±360 N | ±36 |
+| Tx·Ty·Tz | ±8 N·m | ±8 |
+
+`wrench_action_limits()`가 sensor 범위와 cfg의 scale로 Arm raw 한계를 한 번 계산한다.
+기존 adapter에서 native scaling·moment 기준점 변환 **이전**에 GPU clamp를 적용한다.
+설치된 native OSC는 `ActionCfg.clip`을 실제로 적용하지 않아 이 전처리가 필요하다.
+관측 생성도 같은 한계로 clipping해 current/previous sample의 action 이력에 넣으며,
+한 step 더 오래된 `ActionManager.prev_action`으로 바꾸지는 않는다. 부분 reset의 이력은0이다.
+원본 action과 PPO sample은 변경하지 않고, invalid 판정도 원본 NaN/Inf를 계속 검사한다.
+`action_input_limits()`는 여기에 native Hand 포화에 해당하는 `±1/hand_scale`을 붙여
+reward·관측의 공용12D GPU 한계를 초기화 때 저장한다. 현재 Hand scale0.5이므로 raw ±2다.
+Hand의 실제 native joint-limit mapping은 바꾸지 않고 그 포화를 action 이력에 반영한다.
+Action-rate reward는 현재·직전 raw 입력을 이 한계로 각각 제한한 뒤 차이를 평가한다.
+목표 wrench 범위 제한이 실제 센서 반력의 범위를
+보장하는 것은 아니다. 접촉·자중·관성 반력과 gravity feedforward는 별도다.
+Motion stiffness 출력은 제거했다. `variable_kp`는 motion gain을 바꾸는 모드이므로
+모든 축을 wrench로 제어하는 현재 구성에는 사용하지 않는다. Hand scale은0.5다.
+
+Sensor 원점을 $p_s$, sensor body의 COM을 $p_c$, sensor→base 회전을 $R$이라 하면
+공식 controller에 전달할 물리 wrench는 다음과 같다.
+
+$$
+F_b=RF_s,\qquad T_c=RT_s+(p_s-p_c)\times F_b,\qquad
+\tau_{\mathrm{arm}}=J_c^T[F_b,T_c]+g(q).
+$$
+
+설치된 native OSC는 task wrench를 root 원점으로 옮기는 $p_s\times F_b$를 추가한 뒤
+COM Jacobian에 곱한다. 이를 그대로 사용하면 불필요한 토크가 추가되므로, adapter는 native
+전처리 후 moment에서 $(R^Tp_s+c_{\mathrm{COM}})\times F_s$만 빼 올바른 COM moment를 만든다.
+COM offset은 초기화 시 한 번 캐시하고 매 step에는 GPU 회전·cross 연산만 추가한다.
+Sensor 범위로 제한한 입력에 native scale·`set_command/compute`·gravity·effort 제출·IdealPD를 적용한다.
+정책 step에서 측정한 sensor frame과 명령은 해당 physics substep 동안 유지된다.
+0 wrench는 gravity compensation만 남으며 position hold를 제공하지 않는다.
+F/T 관측을 이용한 feedback은 정책이 수행하고, 별도의6축 F/T feedback controller는 추가하지 않는다.
 OSC의 gravity compensation은 관절 중력 토크를 feedforward로 더해 제어 출력을 만드는 기능이다.
-F/T 측정값의 자중·관성 보상은 제거했다. Actor·Critic observation과 F/T 증가량 reward는
-동일한 SI-200-8 측정값을 사용하며 hand 자중·관성에 의한 하중도 포함한다.
-이 센서 처리 변경은 OSC의 gravity compensation=True와 별개다.
+Actor·Critic의 F/T observation에는 SI-200-8 측정 반력에서 distal self-load를 뺀 값을 넣는다.
+센서 distal half와 전체 Hand의 각 링크에 대해 $F_i=m_i(a_i-g)$ 및
+$\tau_i=I_i\alpha_i+\omega_i\times(I_i\omega_i)+(r_i-r_s)\times F_i$를 합산하고 sensor 축으로 변환한다.
+관성은 각 링크 COM 기준 tensor를 사용하며, 관절 운동에 따른 가속·회전도 반영한다.
+COM·질량·관성은 한 번 캐시하고 native COM 가속도·각속도와 현재 pose로 기존 GPU graph 안에서 계산한다.
+측정 반력의 부호를 보존하므로 residual은 Hand에 작용한 외력과 반대 부호다.
+Sensor clipping·해상도 모델을 먼저 적용하며, 포화로 잃은 정보는 보상으로 복구하지 않는다.
+F/T 증가량 reward·raw GUI 모니터·overrange 판정은 자중·관성을 포함한 기존 측정값을 유지한다.
+이 관측 보상은 OSC의 gravity compensation=True와 별개다.
 Action/적용 torque의 nonfinite는 MDP에서 검사한다.
 Arm actuator PD gain은0이고 Hand는 공식 `ImplicitActuatorCfg`와
 `JointPositionToLimitsActionCfg`로 독립6관절을 제어한다. 종속6관절에는 별도 action이나
@@ -336,23 +375,31 @@ Python 위치 갱신을 넣지 않고 **native PhysX Mimic API**로 URDF의 비�
 손의 위치·속도 제한과 토크1N·m는 URDF에서 읽어 공식 API에 설정한다.
 독립관절 gain20/1·종속관절0/0을 사용한다. 설치된 importer의 flag가 `parse_mimic`에
 직접 전달되므로 `convert_mimic_joints_to_normal_joints=True`와 `joint_drive=None`을 사용한다.
-Native mimic은 강체 제약으로 설정한다. Importer가 종속관절에 둔 확장 범위와 별도 속도
-brake를 두지 않는 방식은 유지하고, URDF 전체 제약을 독립관절의 범위에 반영한다.
+Mimic은 **설치된 importer의 기본 설정을 유지**한다. Reference·gearing·offset·natural frequency·
+damping ratio와 종속관절 drive를 덮어쓰지 않는다. 강체 mimic으로 바꾸던 후처리는 제거했다.
+Importer가 종속관절에 둔 확장 범위와 별도 속도 brake를 두지 않는 방식은 유지하고,
+URDF 전체 제약을 독립관절의 범위에 반영한다. Mimic API6개가 생성됐는지는 검사한다.
+기존 importer 원본 USD의6개 reference·gearing·offset은 URDF와 일치했다.
+일반 손가락4개에는 rotZ compliance 기본값이 작성되지만, 엄지2개는 mimic 축 rotX와
+compliance 속성의 rot 표기가 다르다. 이번에는 importer 결과 그대로 보존하며,
+6개 모두 동일한 compliant 설정이 실제 적용된다고 보장하지 않는다.
 
 URDF의 일부 master 상한은 mimic child 상한을 초과한다. 초기화 때 전체 연동 범위의
 교집합을 공식 physics limit에 전달한다. 네 손가락 master는0–1.36159rad·최대.922254rad/s,
 thumb2는0–.609221rad·최대2rad/s다. 공식 action은 이 한계를 그대로 사용한다.
-종속관절의 SDK limit 숫자는 원본보다 넓지만, native mimic과 master 한계를 합친 유효 범위는
-원본 URDF 제약을 따른다. 실제12관절각을 원본 범위와 비교해 검증한다.
+종속관절의 SDK limit 숫자는 원본보다 넓다. Master 한계는 URDF 연동식을 기준으로 원본 범위를
+반영하지만, compliant mimic은 하중에 따른 연동 오차를 허용하므로 실제 child의 원본 범위
+준수를 보장하지 않는다. 실제12관절각과 연동 오차를 원본 기준으로 함께 확인해야 한다.
 매 step coupling 계산이나 joint pose 덮어쓰기는 없다.
 속도 상한은 독립관절의 native 제한이다. 접촉 시 종속관절의 순간 속도까지 원본 상한에
 엄격히 묶는 것은 검증되지 않았다. 닫기 시험에서 index2는 순간9.25rad/s가 관측됐다.
 종속관절에도 별도 native 속도 제한을 중복 적용한 대조는 불안정해 채택하지 않았다.
-Native mimic과 접촉 제약의 수렴을 위해 결합된 로봇 articulation의 position solver를
+Native mimic과 접촉 제약을 위해 기존에 선택한 결합 로봇 articulation의 position solver를
 32회로 설정한다. 2026-10-23 사용자 요청으로 예제용 로컬 USD에 맞춰 velocity solver를
 1회로 변경했고, 물체도 예제 cfg와 같은 position16회·velocity1회다. 팔·손이 하나의
 articulation이므로 로봇의 수치 설정은 전체 로봇에 적용된다. UR5e의 actuator·controller·
-collision mesh는 유지한다. 아래 시험 수치는 변경 전 velocity2회에서 측정한 기록이다.
+collision mesh는 유지한다. 아래 시험 수치는 **이전 강체 mimic·velocity2회**의 기록이며,
+현재 importer 기본 mimic 구성의 안정성을 확인한 수치가 아니다.
 100Hz 여닫기 시험에서 최대 관절 범위 이탈은.000068rad, 최대 mimic 연동 오차는.030736rad였다.
 1,024환경의 동일 시작 상태에서 native32step은 solver32회1.330초·64회1.955초였다.
 이는 NN/PPO update가 빠진 환경 실행 시간이며, 64회는 연동 오차를 줄이는 대신 비용이47% 컸다.
@@ -363,28 +410,30 @@ collision mesh는 유지한다. 아래 시험 수치는 변경 전 velocity2회�
 position PD를 유지한다. 별도 custom controller나 torque clamp는 추가하지 않는다.
 이 출력 제한이 정책의 delta pose/stiffness 요구를 제한하거나 적절한 요구를 학습하도록
 보장하지는 않는다. 측정 joint torque observation/reward는 아직 추가하지 않았다.
-UR5e 팔6개 중 하나라도 절대 관절 속도가1rad/s를 초과하면 `hand_velocity`로 종료한다.
-Hand는 이 종료 검사에서 제외하며, joint velocity reward는 현재 비활성이다.
+UR5e 팔6개 중 하나라도 절대 관절 속도가3rad/s를 초과하면 `hand_velocity`로 종료한다.
+Hand는 이 종료 검사에서 제외하며, 기존 joint velocity reward 활성 설정은 유지한다.
 이는 actuator의 물리 속도 상한과 별개인 episode 종료 조건이다.
 
-Action 18D와 observation 244D, GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
+Action은12D, observation은232D로 변경하고 GNN·attention 구조는 유지한다. 제어 의미가 달라졌으므로
 이전 base-frame·손바닥 EEF·custom controller checkpoint는 action-contract metadata 검사에서 거절한다.
-현재 규약은 `isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3`이며 새 학습을 시작한다.
-244D 모양은 같지만 물체 기준점·관측 EEF pose·action의 의미와 중력 보상이 달라졌다.
+현재 규약은 `isaaclab_ur5e_sensor_osc_wrench_compensated_ft_v5`이며 새 학습을 시작한다.
+기존18D pose/Kp checkpoint는 새 observation/action 계약과 다르므로 재개·play에서 거부한다.
 
 ### Reward
 
 예제처럼 `RewardsCfg`에 함수·weight·파라미터를 선언하고 native RewardManager가 호출한다.
 `mdp/rewards.py`는 각 수식의 raw score 또는 양의 cost를 환경별 `(num_envs,)` tensor로 반환한다.
-Action-rate·joint-velocity 계산은 공식 MDP 함수에 맡기고, NaN/Inf 결과만0으로 처리한다.
+Joint-velocity는 공식 MDP 함수에 맡기고 Action-rate는 기존 분리 계산 함수를 현재12D에 맞춰 사용한다.
+두 함수의 NaN/Inf 결과는 기존처럼0으로 처리한다.
 `invalid_state` 종료 행도 reset 전에 reward가 평가되므로 필요한 보호다. 유한 비용에는 clipping을 하지 않는다. 초기화·이력이 필요한
 Blocker 접촉은 `ManagerTermBase`를 사용하고, 공통 기하·F/T는 기존 GPU snapshot을 재사용한다.
 별도의 합산 함수·환경 `step()`·reward component packed tensor는 두지 않는다.
 
 **Dense reward는 native `weight × dt`를 그대로 적용한다.** 아래 표의 값은 dt 곱 전이다.
 현재100Hz에서는 한 step 지급이 표의 weighted 값의0.01배다. 예를 들어 Distance 최대값은
-3 reward/s, step당0.03이며, 같은 상태를1초 유지하면 할인 전 합은3이다.
-Terminal은 성공+250·실패−10을 각각 일회 지급하므로 rate로 변환한다. 현재 설정은
+5 reward/s, step당0.05이며, 같은 점수를1초 유지하면 할인 전 합은5다.
+Terminal은 성공+250·실패 `-failure_penalty`를 각각 일회 지급하므로 rate로 변환한다.
+현재 사용자 설정은 `failure_penalty=0`이다. 기본 reward 구조는
 2026-11-02 확정 명세를 GNN `contact_manipulation`에 적용한 값이며 parallel 설정을 복사하지 않는다.
 성공은 현재 기하 조건을 처음 만족한 transition에서 지급하고 종료한다. PPO·관측·제어·spawn은
 유지하며,후속 요청으로 Time weight만 중간 지점부터 적용하는 curriculum을 추가했다.
@@ -392,17 +441,17 @@ Terminal은 성공+250·실패−10을 각각 일회 지급하므로 rate로 변
 | Reward | Weight | 함수가 반환하는 raw score / cost |
 |---|---:|---|
 | Clearance | 12.0 | $\max(0,C_t)$, $C_t=1-O_t/O_0$; 상태 gate 없음 |
-| `blocker_distance` | 3.0 | $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_i)$, 각 pad 표면 대표점에서 현재 Blocker OBB까지 거리 |
+| `blocker_distance` | 5.0 | 새 `blocker_min_distance` 함수: $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d^{\min}_{i,k})$, 각 pad의 episode 내 최소 OBB 거리 |
 | `blocker_contact_hold` | 0.40 | $V_T(H_k+0.5N_k)$; $H_k$는 유지 pad 수, $N_k$는 새 접촉 pad 수 |
 | `shelf_collision` | −0.5 | 초기 대비 선반 pose 또는 현재 속도가 허용값을 넘으면1, 아니면0 |
 | `target_collision` | −0.5 | Shelf와 같은 함수·임계값으로 Target의 초기 pose 편차·현재 속도 평가 |
 | `object_collision` | −0.5 | $\sum_{i\notin\{T,B\},\,i\text{ active}}\frac18\sum_{c=1}^{8}\lVert\mathbf v_{i,c}\rVert_2$ — 주변 물체의 현재 OBB 코너 속도 |
-| `motion_action_rate` | −0.03 | $\sum_{j=1}^{18}(a_{j,k}-a_{j,k-1})^2$ — 공식 `action_rate_l2` |
+| `motion_action_rate` | −0.03 | Clipping 후 Wrench6D·Hand6D 입력 변화 제곱합, raw 단위. Stiffness 출력·별도 계수 없음 |
 | `motion_force_growth` | −0.03 | $[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+^2$ |
 | `motion_torque_growth` | −0.03 | $[\lVert\tau_k\rVert_2-\lVert\tau_{k-1}\rVert_2]_+^2$ |
 | `object_stability` | 0.5 | $\exp[-\beta[\theta_B-5\pi/180]_+]-1$, $\beta=\ln(2)/(\pi/4)$ |
 | `time_penalty` | 초반0 → 설정 계수(현재−0.3) | $\mathbf1[\neg\mathrm{terminated}]\mathbf1[\neg\mathrm{success}]$ |
-| Terminal | 1.0 | 성공 $250/\Delta t$·실패 $-10/\Delta t$를 각각 episode당1회, 일반·timeout0 |
+| Terminal | 1.0 | 성공 $250/\Delta t$·실패 $-P_{\mathrm{fail}}/\Delta t$를 각각 episode당1회; 현재 $P_{\mathrm{fail}}=0$, 일반·timeout0 |
 
 기존 누적 Rearrangement와 그 OBB 경로 이력은 제거했다. 예제의 선반·주변 물체 움직임 비용으로
 대체했으며, **활성 Motion 세 항은 exp 포화 없이 양의 cost × 음의 weight**로 계산한다.
@@ -425,23 +474,41 @@ Target·주변 물체의 overlap은 제외하고 GPU 다각형 clipping도 Block
 Clearance에는 지지·Target 보호·failure 등의 **상태 gate를 적용하지 않는다.** 해당 조건의
 계산과 진단·성공·실패 소비자는 유지한다. 초기0·완전 확보1이며 초기보다 더 가리면 지급0이다.
 Signed raw `clearance_quality`는 진단용으로 남으므로 초기의1.2배 가림에서는 raw−0.2·지급0이다.
-Target이 초기 pose에서2cm 또는0.15rad를 넘으면 `V_T=0`으로 Distance·Contact만 차단한다.
-복구하면 재개하며 Contact 이력은 gate가 닫힌 동안에도 실제 접촉대로 갱신한다.
+Target이 초기 pose에서2cm 또는0.15rad를 넘으면 `V_T=0`으로 Distance·Contact를 차단하고,
+기본 활성 `target_displacement`로 같은 transition에서 종료한다. 해당 종료 term을 비활성화하면
+기존처럼 복구 후 재개할 수 있다. Contact 이력은 gate와 무관하게 실제 접촉대로 갱신한다.
 비율 상한 clip·exp·직전 step 대비 변화 bonus는 없다. 현재 겹침이 초기의60%라면 raw0.4,
 weighted rate4.8·100Hz 지급0.048이다. 지급 범위는0–12/s다. 유효 기하의 실패 step에도
-최대0.12를 지급하므로 실패−10과 두 항의 합은 최대−9.88이며, 성공은 실패 우선 규칙으로 제외한다.
-이는 해당 step의 두 항 산술이며 전체 episode의 안전 행동 선호를 보장하지 않는다.
+최대0.12를 지급할 수 있으며 실패 비용은 별도 `failure_penalty`를 따른다. 현재 비용0 설정은
+유지한다. 성공은 실패 우선 규칙으로 제외하며 전체 episode의 안전 행동 선호를 보장하지 않는다.
 유한한 $O_0>10^{-12}$와 유한한 $O_t\ge0$일 때만 raw를 계산하고 아니면0이다.
 함수 안에서는 dt·weight를 곱하지 않는다. 작은 초기 면적에서는
 같은 절대 면적 변화가 더 크게 평가되므로 새 학습의 실제 분포를 확인해야 한다.
 
 **Distance·Contact.** 실제 tactile collision mesh의 노출된 local+Z 표면에서 대표점 하나씩을
-초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 17개 pad 각각의 OBB 거리 $d_i$에
-대해 $\exp(-10d_i)$를 계산한 뒤 평균한다. 현재 사용자 실험 설정은 weight3·decay10이며
-점수 범위는0–1이다. 한 pad만 접근해도 다른16개의 거리가 계속 반영된다. 모든 pad가10cm이면
-품질약0.3679, 반감거리는6.93cm다. 78절에서 제안했던 weight1·decay15와 구분한다.
-Invalid pad는0점으로 두고 분모17을 유지한다. OBB 내부·표면은 거리0이며, 컵 빈 공간 등
-실제 접촉 여부는 별도 filtered force로 판정한다. 모든 환경·pad를 한 번의 batched tensor 연산으로 처리한다.
+초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 새 `blocker_min_distance`는
+각 pad의 현재 OBB 거리 $d_{i,k}$를 계산하고 episode의 보상 평가 step에서 기록한 최소거리를 사용한다.
+
+$$
+d^{\min}_{i,k}=\min(d^{\min}_{i,k-1},d_{i,k}),\qquad
+f_{\mathrm{distance},k}=\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d^{\min}_{i,k}).
+$$
+
+첫 보상 평가부터 기록하며 reset 직후의 별도 거리 조회는 추가하지 않는다.
+각 환경의 기록은 reset 때 $+\infty$로 비우고, 부분 reset에서는 해당 환경만 비운다.
+손이 멀어져도 유효한 최소거리 기록은 유지된다. Pad마다 다른 시점에 기록한 최소거리를 사용하므로
+17개가 동시에 가까웠던 상태를 평가하는 것은 아니다. 매 step 지급되는 상태 점수이며 개선량 bonus는 아니다.
+Target 보호 gate는 지급에만 적용하고, gate가 닫힌 동안에도 거리 기록은 갱신한다.
+기존 `blocker_distance` 함수는 현재 거리만 평가하는 동작으로 보존했으며,
+`RewardsCfg.blocker_distance.func`를 `mdp.blocker_distance`로 되돌리면 기존 방식을 사용할 수 있다.
+Term 이름은 유지하여 기존 TensorBoard key를 사용하되, 이전 값과의 비교에서는 평가 기준 변경을 고려한다.
+
+현재 사용자 실험 설정인 weight5·decay10을 유지한다. Raw 점수 범위는0–1이며,
+모든 pad의 최소거리가10cm이면 품질약0.3679, 반감거리는6.93cm다.
+한 pad의 접근만으로 전체 점수가 최대가 되지 않는다. Invalid 현재 pad는 이번 지급에서0점으로 두고
+분모17을 유지하며, 이전의 유효 최소거리는 보존한다. OBB 내부·표면은 거리0이고, 컵 빈 공간 등
+실제 접촉 여부는 별도 filtered force로 판정한다. 기존 거리 계산에 `[num_envs,17]`의
+elementwise minimum만 추가하며 환경별 반복문·CPU 복사 없이 처리한다.
 
 접촉 binary는 현재 Blocker와 pad 사이 normal force norm이0.01N을 초과하는지다.
 같은 pad에서 `new=current AND NOT previous`, `held=current AND previous`를 배타적으로
@@ -454,7 +521,7 @@ Invalid pad는0점으로 두고 분모17을 유지한다. OBB 내부·표면은 
 갱신한다. 같은 step 재호출은 중복 갱신하지 않고 native manager가 reset 행만 초기화한다.
 Invalid sample은 비접촉으로 처리하며, Target gate 재개 자체를 새 접촉으로 오인하지 않는다.
 현재 Blocker1열의 PhysX contact view를 재사용하며 Blocker 교체 때만 view를 바꾼다.
-Actor의 binary tactile17개·244D는 유지한다. Observation은 전체 `net_forces_w`를 써서 다른 물체·선반
+Actor의 binary tactile17개를 유지한다. 전체 observation은232D다. Observation은 전체 `net_forces_w`를 써서 다른 물체·선반
 접촉도 인식하고, Blocker 구분은 reward만 사용한다. 접근·유지 자체도 양의 점수이므로 접촉률만
 높아지는지와 접촉 후 Clearance·성공이 함께 증가하는지를 비교해야 한다.
 `env.rewards.blocker_contact_hold=null`이면 filtered 접촉 보상을 제외하고 기존 binary 관측은 유지한다.
@@ -501,10 +568,28 @@ tanh가 아니다. 후속 수정 방향을 논의할 때는 **현재 선형 비�
 다시 설명**한다. tanh는 큰 속도에서 포화되어 빠른 burst의 경로 비용을 상대적으로 줄이는 반면,
 현재 선형 비용은 큰 순간 속도·진동·측정 노이즈에도 그대로 반응한다. 자동으로 tanh를 복원하지 않는다.
 
-**Motion.** Action-rate는 현재·직전 raw18D 차이의 제곱합이며 Kp가 clamp되는 구간의 raw 변화도 포함한다.
-Joint velocity 함수는 팔6+hand 독립6관절의 제곱합을 계산하지만 현재 reward는 비활성이다.
-Action-rate와 F/T 증가량에 가속도·관절 수 정규화·exp는 추가하지 않는다.
-큰 cost의−1 포화가 없으므로 활성 Motion 비용의 유한 하한은 없다.
+**Motion.** `motion_action_rate(env)`는 현재12D action의 wrench[0:6]·hand[6:12] 입력을
+실제 포화 범위로 각각 제한한 뒤 변화 제곱합을 한 함수에서 더한다.
+
+$$
+c_{A,k}=\lVert\Delta u_{\mathrm{wrench}}\rVert_2^2+
+\lVert\Delta u_{\mathrm{hand}}\rVert_2^2,
+\quad r_{A,k}=-0.03\Delta t\,c_{A,k}.
+$$
+
+여기서 $u_k=\operatorname{clip}(a_k,-\ell,\ell)$,
+$\ell=[20,20,36,8,8,8,2,2,2,2,2,2]$는 현재 scale의 cached 한계다.
+SI scale을 곱하기 전의 raw 단위를 사용하며 전체 reward weight−.03과 native dt를 한 번 적용한다.
+Stiffness6채널 제거에 따라 `stiffness_weight` 파라미터도 제거했다.
+함수는 기존처럼 비유한 최종 비용을 해당 환경에서0으로 처리하고 입력 action을 수정하지 않는다.
+두 그룹의 계수는 모두1이며 한계 안에서는 기존 raw L2와 같다. 같은 방향의 포화 밖에서 raw가
+달라져도 적용 명령이 같으면 비용은0이다. 현재 범위에서 최대 cost는9248이다.
+기존18D의 Hand 시작 index12를 재사용하지 않으며,12D 계약과 맞지 않는 입력은 즉시 거부한다.
+
+Joint velocity 함수는 팔6+hand 독립6관절의 제곱합을 공식 함수로 계산한다.
+Wrench·Hand action 변화와 F/T 증가량에는 가속도·관절 수 정규화·exp를 추가하지 않는다.
+Action-rate는 입력 clipping으로 유계다. Joint velocity는 실제 속도를 그대로 제곱하므로
+비정상적으로 큰 유한 측정값에서 비용이 커질 수 있다.
 
 $$
 \Delta F_k=[\lVert F_k\rVert_2-\lVert F_{k-1}\rVert_2]_+,\qquad
@@ -597,27 +682,28 @@ bootstrap하므로 단순 비용 합을 전체 학습 return으로 해석하지 
 사용자의 PPO·다른 reward 설정은 수정하지 않았다. 이미 실행 중인 프로세스에는 소급 적용되지
 않으며 다음 학습 실행 또는 checkpoint 재개부터 적용한다.
 
-Terminal은 성공+250과 활성 실패−10을 **각각 episode당 한 번** 지급한다.
+Terminal은 성공+250과 활성 실패 비용 $-P_{\mathrm{fail}}$을 **각각 episode당 한 번** 지급한다.
+현재 사용자 설정은 $P_{\mathrm{fail}}=0$이며 종료 조건 추가와 함께 벌점을 변경하지 않는다.
 현재 success termination은 활성이고 최초 유효 성공에 보상과 종료가 같은 transition에서
 발생한다. 두 지급 이력은 기존 `success_paid`·`failure_paid`로 분리해 중복 지급을 막는다.
 
 $$
 P_k=\begin{cases}
--10,&\text{아직 비용을 지급하지 않은 활성 실패},\\
+-P_{\mathrm{fail}},&\text{아직 비용을 지급하지 않은 활성 실패},\\
 250,&\text{성공·실패 지급 이력이 없고 실패 없이 유효 성공 확정},\\
 0,&\text{그 외 및 timeout},
 \end{cases}
 \qquad f_{\mathrm{terminal},k}=P_k/\Delta t.
 $$
 
-RewardManager가 weight1·dt를 적용하므로 실제 한 번 지급되는 금액은 정확히−10 또는+250이다.
+RewardManager가 weight1·dt를 적용하므로 실제 한 번 지급되는 금액은 $-P_{\mathrm{fail}}$ 또는+250이다.
 여러 실패가 겹쳐도 기존 aggregate `state.failure`로 한 번만 감점하며 실패가 성공보다 우선한다.
 `hand_velocity`도 포함한다. Terminal 함수 자체의 반복 호출로 보상을 재지급하지 않는다.
 Timeout 단독은0이고 실패가 겹치면 실패 비용을 지급한다.
 부분 reset은 선택 행의 두 지급 flag만 비워 새episode에서 다시 평가한다.
 실패별 비용 합산·환경 step override·추가 센서나 PhysX 조회는 없다.
 기존 `Episode_Reward/terminal`에는 성공·실패 지급이 함께 누적되며 원인별 termination 로그는 유지한다.
-Distance 최대값의8초 합은24, Contact는54.4, Clearance는96이라는 느슨한 할인 전 상한이다.
+Distance 최대값의8초 합은40, Contact는54.4, Clearance는96이라는 느슨한 할인 전 상한이다.
 이들이 동시에 성립한다고 가정한 성공 선호 보장은 하지 않는다. 음의 L2 비용은 무한히 커질 수 있어
 과거 유계 reward·value 상한 비교를 새 설정의 전체 범위로 사용하지 않는다.
 
@@ -625,6 +711,42 @@ Console·TensorBoard는 native `Episode_Reward/<term>`으로 활성12개 항을 
 `rearrangement`는 없고 `shelf_collision`·`target_collision`·`object_collision`을 구분한다. 로그는 weighted episode
 누적값을 최대 episode 시간8초로 나눈 값이며 순간 점수나 실제 episode 길이 평균이 아니다.
 과거 `/step_dt` 상쇄·exp Motion 로그와 새 값을 그대로 비교하지 않는다.
+
+**TensorBoard의 관절 속도·F/T 모니터.** 학습 실행에서 기본 활성화되며 기존 RSL-RL writer에
+다음 Scalar를 추가한다. 각 iteration의 모든 환경·control step을 대상으로 `Mean`(부호 있는 평균),
+`RMS`, `AbsMax`(절댓값 최대치)를 기록한다. Episode 길이·reward weight·dt·최대8초 나눗셈은 적용하지 않는다.
+
+| TensorBoard tag | 데이터 | 단위 |
+|---|---|---|
+| `JointVelocity/{Mean,RMS,AbsMax}/<joint_name>` | UR5e6 + Hand 독립6관절의 실제 속도 | rad/s |
+| `FT/Measured/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz}` | SI-200-8 clipping·양자화 후 전체 반력; 자중·관성 포함 | Force N / Torque N·m |
+| `FT/CompensatedObservation/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz}` | 자중·관성을 제거한 실제 환경 observation을 SI로 환산 | Force N / Torque N·m |
+| `Action/PolicyRaw/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz,<hand_joint>}` | Clipping 전 정책 출력12채널 | raw action 단위 |
+| `Action/Applied/{Mean,RMS,AbsMax}/{Fx,Fy,Fz,Tx,Ty,Tz,<hand_joint>}` | Clipping 후 sensor 원점의 목표 wrench6 + native 포화 후 Hand 입력6 | Wrench N / N·m, Hand raw 단위 |
+
+F/T 축과 부호는 물리 sensor frame의 기존 반력 규약을 따른다. `CompensatedObservation`에는
+관측의 최종 정규화 clipping도 반영하며 포화 전의 이상적인 외력을 복원한 값은 아니다.
+`TensorboardMonitor/ValidFraction`은 유효한 MDP 측정 sample의 비율이다. Invalid sample은
+통계에서 제외하고 전부 invalid인 window는 통계를0으로 표시하므로 이 비율과 함께 확인한다.
+`FT/OverrangeFraction`은 유효 sample 중 원시 측정의 센서 범위 초과 비율이다.
+`hand_velocity` 종료 조건이 활성화되어 있으면 `JointVelocity/ArmOverLimitFraction`도 기록한다.
+해당 조건의 실제 한계를 팔6관절 중 하나라도 초과한 유효 sample의 비율이다.
+현재처럼 종료 조건을 주석 처리하면 이 tag는 생성하지 않는다. Episode 종료 원인 비율과 구분한다.
+`Action/WrenchClippedFraction`은 유한 action sample 중 Arm6축 하나라도 clipping된 비율이다.
+`Action/ValidFraction`은 정책 원본·관측 action12채널이 모두 유한한 환경·step 비율이다.
+Action 통계는 물리 상태가 invalid여도 유한한 채널을 기록해 실패 직전 출력을 확인할 수 있다.
+비유한 채널은 제외하며 `ValidFraction`을 함께 본다. `Action/Applied`는 실제 측정된 힘이나
+최종 관절 토크가 아니며, moment 기준점 보정 전의 sensor-frame 목표다.
+
+매 completed transition을 **reset 전에** GPU buffer에 저장하므로 실패 직전 과속·F/T 피크와
+부분 reset 전 측정값이 포함된다. 같은 step 재조회나 reset 관측0은 중복 기록하지 않는다.
+Iteration 끝에 GPU 통계를 한 벡터로 묶어 CPU로 한 번 옮기고 기존 writer에 기록한다.
+36step×1024환경의 float32 sample buffer는 약6.8MiB이며 유효성·overrange mask가 별도로 붙는다.
+추가 PhysX/sensor 조회나 매 step GPU→CPU 전송은 없다. Native runner·PPO·기본 loss/reward 로그·
+console 출력은 유지하고 로그 추가 adapter만 사용한다.
+`env.tensorboard_sensor_monitor=False`로 끄면 buffer와 추가 기록을 만들지 않는다.
+GUI 센서 시각화와 독립적이므로 headless 학습에서도 동작하며 다음 실행·checkpoint 재개부터 적용한다.
+
 `TaskState`는 `clearance_quality`, `terminal_reward`, `force_growth`, `torque_growth`,
 환경별 scalar `object_motion_cost`를 이름 있는 tensor로 캐시한다. Packed reward_components와 누적 OBB
 이력은 제거하고 공통 GPU snapshot·부분 reset·한 step당1회 갱신 규칙은 유지한다.
@@ -721,24 +843,29 @@ Tilt는 모든 활성 물체에 대해 개별적으로 누적하며100Hz에서 �
 | `object_support_lost` | 같은 활성 물체의 유한 작업판까지의 지지점 거리 ≥3cm가0.1초 연속 지속 |
 | `object_tilt` | 같은 활성 물체의 기울기 ≥80°가 0.2초 연속 지속 |
 | `shelf_displacement` | 선반 이동 1 cm 또는 회전 2° 초과 |
+| `target_displacement` | 초기 Target OBB 중심에서3D 이동 >2cm 또는 초기 대비 회전 >0.15rad(약8.59°). 한 sample 초과 시 즉시 종료 |
 | `invalid_state` | 유효하지 않은 물리·센서·제어 상태 |
 | `singularity` | 현재 팔 자세의 보수적 이동능력 지표 s≤0.005 |
-| `hand_velocity` | UR5e 팔6개 중 하나라도 절대 관절 속도 >1rad/s. 한 sample 초과 시 즉시 종료. Hand 제외 |
+| `hand_velocity` | UR5e 팔6개 중 하나라도 절대 관절 속도 >3rad/s. 한 sample 초과 시 즉시 종료. Hand 제외 |
 
 한 episode에 여러 원인이 동시에 기록될 수 있어 원인별 비율의 합이 전체 실패율과 같지는
-않다. 현재 활성 실패6개·success·timeout을 합쳐 native 종료 term은8개다.
+않다. 현재 활성 실패7개·success·timeout을 합쳐 native 종료 term은9개다.
 Success는 최초 유효 transition에서 종료하며 timeout은 기존 truncation이다.
 활성 실패끼리는 동시에 기록될 수 있지만 성공은 활성 실패가 없을 때만 성립한다.
-Terminal은 유효 성공+250·활성 실패−10을 각각 한 번 지급하며 일반 진행·timeout 단독은0이다.
+Target은 Shelf와 같이 초기 pose 대비 위치 norm·quaternion 회전 차이를 사용한다.
+Quaternion 부호가 반대인 같은 회전은 이동으로 보지 않는다. Target은 기존 보호 gate와
+같은2cm·0.15rad 허용값을 공유하며, Shelf의1cm·2° 임계값과 구분한다.
+별도 센서·시뮬레이션 step·지속시간 카운터는 추가하지 않는다.
+`env.terminations.target_displacement=null`이면 진단과 보호 gate는 남고 이 원인에 의한 종료만 끈다.
+Terminal은 유효 성공+250·활성 실패 비용(현재0)을 각각 한 번 지급하며 일반 진행·timeout 단독은0이다.
 동시 실패는 합산하지 않으며 성공과 겹치면 실패가 우선한다.
 연구 task의 내부 실패는 초기화 때 읽은 native 활성 term 설정을 따르며, 속도 실패는
 native manager가 해석한 현재 `hand_velocity` 설정으로 성공·terminal 지급 전에 반영한다.
 따라서 속도 초과와 성공 보상이 동시에 발생하지 않는다. 관절은 팔 action과 동일한 이름으로
-선택하고 Hand·mimic/passive 관절은 검사하지 않는다. 경계1rad/s 자체는 통과하며
-1.01rad/s와−1.01rad/s는 해당 환경만 실패시킨다.
-Joint velocity reward는 현재 비활성이고 팔 속도 종료 조건은 유지한다.
-1rad/s는2026-11-02 확정 실험 기준이며 별도 속도 penalty·warning·joint-velocity reward는
-추가하지 않았다. 과거3rad/s 비교와 Hand 제외의 경위는 [학습 기록68·70절](../../docs/TRAINING_LOG.md)에 남긴다.
+선택하고 Hand·mimic/passive 관절은 검사하지 않는다. 현재 사용자 설정인 경계3rad/s 자체는
+통과하며3.0001rad/s와−3.0001rad/s는 해당 환경만 실패시킨다.
+기존 joint velocity reward 활성 설정과 팔 속도 종료 조건을 유지한다.
+과거 기준 및 Hand 제외의 경위는 [학습 기록68·70절](../../docs/TRAINING_LOG.md)에 남긴다.
 Action 변화량 자체의 종료·clipping은 추가하지 않았다. Native 순서상 종료 step에도 reward를
 계산하므로 이 속도 종료만으로 큰 finite action/관절속도 비용의 PPO 유입이 차단되지는 않는다.
 
@@ -764,7 +891,7 @@ reference10 catalog: T/B 상대 pose·시점·초기 가림만 재사용
   → GPU FFT: 실제 collider의 비충돌 위치/방향 영역에서 partial seed 생성
   → 한 번의 CPU 공동 제약 계산: 필수 물체·추가 prefix·빈 Blocker 목적지를 함께 결정
   → 고정3회 X/Y 유효 구간 mixing
-  → 초기 메시 관측1회 → T/B + 가까운 주변8개 → 정책244D
+  → 초기 메시 관측1회 → T/B + 가까운 주변8개 → 정책232D
 ```
 
 GPU seed에서 빠진 필수 물체는 최종 장면에서 제거하지 않는다. Partial graph를 받아 공동 제약에서
@@ -815,8 +942,8 @@ Scene15mm·self2mm 여유는 유지한다. 거의 평행한 축은 원래 좌표
 계산해 FP32 상쇄로 겹침을 놓치던 문제를 보정한다. CPU·다른 dtype은 eager 수식을 사용한다.
 
 Reset snapshot은 초기 OBB·로봇/선반 pose·관절값만 읽는다. 초기화 시 버리는 F/T·tactile·action과
-가속도·물체 속도는 계산하지 않는다. 정상 step도 F/T 자중·관성 보상을 수행하지 않으며,
-이를 위한 hand COM·질량·관성 cache와 링크 가속도·각속도 조회를 제거했다.
+가속도·물체 속도는 계산하지 않는다. 정상 step의 F/T 관측에는 자중·관성 보상을 적용한다.
+Hand COM·질량·관성은 초기 바인딩에서 캐시하고, native COM 가속도·각속도를 기존 GPU graph에서 사용한다.
 Object 코너 속도 계산용 고정 local COM은 유지하며, object COM을 randomize한다면 함께 갱신해야 한다.
 
 2026-10-15 RTX3090·1,024환경·10물체의 전체 최적화 후30 iteration에서 초기 compile 회차와
@@ -861,7 +988,7 @@ Pool 크기로 첫 body의 주차 변환이 달라지지
 않도록 기존3-copy slot을 유지하고 추가 복사본만 뒤에 둔다. 주차 위치 집합은 그대로다.
 
 관측 용량은 물리 개수와 분리한10개로 고정한다. Target·Blocker가 slot0/1이며 인식한 주변
-물체는 두 역할까지의 최소 거리 순서로 최대8개를 선택한다. 공개 관측 폭은244D다.
+물체는 두 역할까지의 최소 거리 순서로 최대8개를 선택한다. 공개 관측 폭은232D다.
 이전30/40-slot checkpoint를 현재10-slot 설정으로 해석하지 않는다.
 
 ### 이전 10물체 연속 영역 생성 경로의 검증
@@ -906,7 +1033,7 @@ actor·critic·optimizer 값도 모두 유한했다. 학습 시간108.254초에�
 Target40–90%·Blocker≥95%는 startup의 실제 메시 구간에서 인증하며 reset에서 다시 승인하지 않는다.
 따라서 관측의 `visible_fractions=None`은 미측정이라는 뜻이고, cache 예측값은 별도 provenance다.
 Actor 관측 기하는 기본10step마다 같은 가상 시점에서 갱신하고, 사이에는 cache를 유지하며
-매 step 현재 `wrist_3_link` frame으로 재표현한다.
+매 step 현재 sensor `ToolForceTorqueLink` frame으로 재표현한다.
 Headless 학습은 render를 호출하지 않으며 GUI·video의 native 렌더링은 별도다.
 
 구현은 [events.py](contact_manipulation/mdp/events.py)의 catalog·직접 생성·reset,
@@ -993,7 +1120,7 @@ Observation의 OBB는 **첫 교차점으로 보이는 표면만** 모아 upright
 물체는 padding으로 남기며, 물체의 정답 pose·전체 크기로 가려진 부분을 채우지 않는다.
 이상적인 교차점에는 depth outlier가 없으므로 이전 depth의 1–99% quantile 대신 표면 extrema를
 사용한다. CUDA에서는 배경 ray를 제외한 count·moment·bounds를 Warp atomic 연산으로 계산한다.
-Actor 244D 규약과 현재 EEF frame 표현은 유지한다.
+Actor는 현재232D 규약과 sensor EEF frame 표현을 사용한다.
 
 Actor의 기본 `actor_vision_update_interval=10`은 정책100Hz에서 **환경당10Hz** 갱신이다.
 Reset 직후에는 기존 초기 ray 관측을 즉시 사용한다. 이후 환경 ID를10개 phase로 나눠 첫
@@ -1042,7 +1169,8 @@ GUI·`--video`를 요청한 경우 화면 표시/녹화의 native 렌더링은 �
 </details>
 
 50 mm 연결부 중앙 fixed joint의 실제 reaction을 F/T로 읽고, SI-200-8 범위 제한·양자화를 MDP에서
-한 번 적용한다. 자중·관성 보상은 수행하지 않는다. Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
+한 번 적용한다. Observation만 distal 자중·관성을 보상하고 raw GUI·reward·overrange는 측정 반력을 유지한다.
+Tactile은 공식 `ContactSensor` 하나가 17개 링크를 함께 읽는다.
 `net_forces_w`의 `[N,17,3]`를 `TACTILE_BODY_NAMES` 순서로 정렬하고, 링크별 0.01 N
 기준으로 `[N,17]` binary observation을 만든다. 힘을 링크끼리 합치지 않는다.
 기존 arm·spacer 금지 접촉 센서는 제거했으며, 선반 이동 여부를 종료 조건으로 사용한다.
@@ -1150,7 +1278,7 @@ Actor의 OBB는 ray에서 보이는 표면으로만 계산한다.
 현재 success termination은 활성이고 성공 유지 시간 없이 첫 유효 transition에 reset한다.
 **로봇은 매 reset마다 Blocker 앞 허용 영역에서 hand 위치·회전을 연속적으로 샘플링**하며,
 GPU IK·elbow-up/전완 방향·충돌 검사를 수행한다. 이 배치용 TCP는 손바닥
-`right_plam_force_sensor`를 유지한다. OSC·물체/robot observation의 `wrist_3_link`와
+`right_plam_force_sensor`를 유지한다. OSC·물체/robot observation의 `ToolForceTorqueLink`와
 역할이 다르며, 말단 제어 기준 변경으로 초기 hand가 Blocker에서 멀어지지 않게 한다.
 위치는 기존 Blocker 앞 12–40 cm, 좌우±8 cm, 선반 위20–28 cm와 선반 앞 여유를 유지한다.
 기준 방향 R₀의 축이 환경 축의 순열이므로 이 직사각형은 중심 p₀에 대해
@@ -1174,7 +1302,7 @@ Native 로그 `Reset/robot_start_fallback_count`, `fallback_fraction`, `fallback
 예외 상세는 실행 로그 폴더의 `robot_start_fallbacks.jsonl`에 환경ID·seed·reset횟수·장면번호와
 budget을 기록한다. Normal reset에는 파일 쓰기를 추가하지 않는다. Native runner의 평균 로그를
 fallback 총횟수로 합산하지 말고 누적 `fallback_total`과 JSONL을 사용한다.
-카메라 관측은 robot-base frame으로 캐시하고 각 환경의 현재 `wrist_3_link` frame으로 변환한다.
+카메라 관측은 robot-base frame으로 캐시하고 각 환경의 현재 `ToolForceTorqueLink` frame으로 변환한다.
 Robot은 ray casting 대상이 아니므로 새 로봇 시작 자세에는 공유 초기 관측을 재사용한다.
 이후 주기 조회는 각 환경의 실제 물체 상태에서 수행한다.
 

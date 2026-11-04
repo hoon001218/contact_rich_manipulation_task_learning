@@ -30,9 +30,9 @@ import warp as wp
 from isaaclab.utils.math import convert_quat, matrix_from_quat
 
 from .observations import (
-    SI_200_8_RANGES, SI_200_8_RESOLUTION, calibrate_wrench,
+    SI_200_8_RANGES, SI_200_8_RESOLUTION, ROBOT_SAMPLE_DIM, calibrate_wrench,
     dynamic_sample, geometry_in_eef_frame, pack_policy_observation, prepare_initial_geometry,
-    quat_apply, quat_conjugate, quat_mul,
+    quat_apply, quat_conjugate, quat_mul, self_motion_wrench, action_input_limits,
 )
 from .rewards import clearance_quality, object_motion_cost, singularity_margin
 from .terminations import (
@@ -52,8 +52,8 @@ class MdpCfg:
     motion_singularity_decay: float = math.log(2.0) / 0.03**2
     singularity_termination_threshold: float = 0.005
     # One-time terminal payments; failure_penalty is a positive cost magnitude.
-    success_reward: float = 250.0
-    failure_penalty: float = 10.0
+    success_reward: float = 10.0
+    failure_penalty: float = 0.0
     success_overlap_area: float = 1.0e-5
     target_translation_tolerance: float = 0.02
     target_rotation_tolerance: float = 0.15
@@ -116,8 +116,145 @@ class TransitionBatch:
     sensor_range_exceeded: torch.Tensor  # N,6; before clipping
     shelf_pose: torch.Tensor           # N,7; world link pose, wxyz
     state_valid: torch.Tensor          # N; robot and sensor finite/ready
-    sample: torch.Tensor               # N,72; current robot/sensor/action observation
+    sample: torch.Tensor               # N,66; current robot/sensor/action observation
     tcp_pose_b: torch.Tensor            # N,7; measured EEF in robot base
+
+
+class TensorboardSensorMonitor:
+    """Buffer completed transitions on-device; summarize one native PPO rollout.
+
+    Samples include the final pre-reset transition, not reset-time zeroes. The
+    compensated F/T is exactly the observation value, including its final clip.
+    Policy outputs and accepted command inputs are recorded separately. Applied
+    wrench commands use sensor-frame SI units; hand channels retain policy units.
+    No episode counters or reward-manager dt normalization enter these stats.
+    """
+
+    def __init__(self, env, num_steps):
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps <= 0:
+            raise ValueError("Sensor monitoring requires a positive rollout length.")
+        state = env._contact_mdp
+        if state.bindings is None:
+            raise RuntimeError("Initialize the task scene before installing sensor monitoring.")
+        robot = state.bindings.robot
+        _, arm = robot.find_joints(env.cfg.actions.arm_action.joint_names, preserve_order=True)
+        _, hand = robot.find_joints(env.cfg.actions.hand_action.joint_names, preserve_order=True)
+        if len(arm) != 6 or len(hand) != 6 or len(set(arm + hand)) != 12:
+            raise ValueError("Sensor monitoring requires 12 distinct independent joint names.")
+        self.policy_actions = env.action_manager.action
+        if self.policy_actions.shape != (env.num_envs, 12):
+            raise ValueError("Action monitoring requires 12 wrench/hand policy outputs per environment.")
+        wrench_scale = env.cfg.actions.arm_action.wrench_scale
+        if isinstance(wrench_scale, (int, float)):
+            wrench_scale = (wrench_scale,) * 6
+        if len(wrench_scale) != 6 or any(not math.isfinite(value) or value <= 0 for value in wrench_scale):
+            raise ValueError("Action monitoring requires six finite positive wrench scales.")
+        self.num_steps, self.num_envs, self.count = num_steps, env.num_envs, 0
+        self.arm_velocity_limit = None
+        manager = getattr(env, "termination_manager", None)
+        if manager is not None and "hand_velocity" in manager.active_terms:
+            limit = manager.get_term_cfg("hand_velocity").params.get("max_velocity")
+            if isinstance(limit, (int, float)) and math.isfinite(limit) and limit > 0:
+                self.arm_velocity_limit = limit
+        # The native learner records under inference_mode; normal buffers also
+        # permit use by CPU tests and callers outside that context.
+        with torch.inference_mode(False):
+            self.samples = torch.empty((num_steps, env.num_envs, 48),
+                                       device=state.history.device, dtype=state.history.dtype)
+            self.valid = torch.empty((num_steps, env.num_envs),
+                                     device=state.history.device, dtype=torch.bool)
+            self.range_exceeded = torch.empty((num_steps, env.num_envs, 6),
+                                              device=state.history.device, dtype=torch.bool)
+            self.scales = torch.cat((self.samples.new_full((12,), state.cfg.joint_velocity_scale),
+                                     self.samples.new_ones(6), state.bindings.ranges.clone(),
+                                     self.samples.new_ones(12), self.samples.new_tensor(wrench_scale),
+                                     self.samples.new_ones(6)))
+        axes = ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")
+        channels = ([f"JointVelocity/{{}}/{name}" for name in arm + hand]
+                    + [f"FT/Measured/{{}}/{axis}" for axis in axes]
+                    + [f"FT/CompensatedObservation/{{}}/{axis}" for axis in axes]
+                    + [f"Action/PolicyRaw/{{}}/{name}" for name in axes + tuple(hand)]
+                    + [f"Action/Applied/{{}}/{name}" for name in axes + tuple(hand)])
+        self.tags = tuple(channel.format(stat) for stat in ("Mean", "RMS", "AbsMax") for channel in channels)
+        self.tags += ("TensorboardMonitor/ValidFraction", "FT/OverrangeFraction")
+        if self.arm_velocity_limit is not None:
+            self.tags += ("JointVelocity/ArmOverLimitFraction",)
+        self.tags += ("Action/ValidFraction", "Action/WrenchClippedFraction")
+
+    @torch.no_grad()
+    def record(self, batch):
+        """Copy existing measurements and action inputs without reduction/host reads."""
+        if self.count >= self.num_steps:
+            raise RuntimeError("Sensor monitor rollout buffer is full; flush it once per learning iteration.")
+        row = self.samples[self.count]
+        row[:, :12].copy_(batch.sample[:, 12:24])
+        row[:, 12:18].copy_(batch.sensor_wrench)
+        row[:, 18:24].copy_(batch.sample[:, 31:37])
+        row[:, 24:36].copy_(self.policy_actions)
+        row[:, 36:48].copy_(batch.sample[:, 54:66])
+        self.valid[self.count].copy_(batch.state_valid)
+        self.range_exceeded[self.count].copy_(batch.sensor_range_exceeded)
+        self.count += 1
+
+    def discard(self):
+        """Reuse storage without clearing it; only recorded rows are consumed."""
+        self.count = 0
+
+    @torch.no_grad()
+    def write(self, writer, iteration):
+        """Write rollout stats using one packed device-to-host transfer."""
+        if writer is None or not self.count:
+            self.discard()
+            return
+        # Double-precision reductions keep finite but extreme velocities from
+        # overflowing the monitoring mean/RMS. This occurs only once per rollout.
+        values = self.samples[:self.count].to(torch.float64) * self.scales
+        valid = self.valid[:self.count]
+        finite = torch.isfinite(values)
+        finite[..., :24] &= valid[..., None]
+        # Observation sanitization may turn a NaN command into zero. Do not
+        # present that replacement as an applied finite command in diagnostics.
+        finite[..., 36:48] &= finite[..., 24:36]
+        safe = torch.where(finite, values, 0.0)
+        counts = finite.sum((0, 1)).clamp_min(1)
+        mean = safe.sum((0, 1)) / counts
+        rms = (safe.square().sum((0, 1)) / counts).sqrt()
+        maximum = safe.abs().amax((0, 1))
+        valid_count = valid.sum().clamp_min(1)
+        fractions = [valid.to(values.dtype).mean(),
+                     (self.range_exceeded[:self.count].any(-1) & valid).sum() / valid_count]
+        if self.arm_velocity_limit is not None:
+            over_limit = (values[..., :6].abs() > self.arm_velocity_limit).any(-1)
+            fractions.append((over_limit & valid).sum() / valid_count)
+        # Finite actions remain diagnostic even if their resulting physical
+        # transition is invalid. Compare normalized inputs before SI scaling.
+        commands = self.samples[:self.count, :, 24:48]
+        action_valid = torch.isfinite(commands).all(-1)
+        clipped = (commands[..., :6] != commands[..., 12:18]).any(-1)
+        fractions.extend((action_valid.to(values.dtype).mean(),
+                          (clipped & action_valid).sum() / action_valid.sum().clamp_min(1)))
+        packed = torch.cat((torch.stack((mean, rms, maximum)).flatten(), torch.stack(fractions))).cpu().tolist()
+        self.discard()
+        for tag, value in zip(self.tags, packed):
+            writer.add_scalar(tag, value, iteration)
+
+
+class SensorMonitoringLogger:
+    """Add rollout diagnostics through the native logger's existing writer."""
+
+    def __init__(self, native_logger, monitor):
+        self.native_logger, self.monitor = native_logger, monitor
+
+    def __getattr__(self, name):
+        return getattr(self.native_logger, name)
+
+    def log(self, it, *args, **kwargs):
+        self.native_logger.log(it, *args, **kwargs)
+        writer = self.native_logger.writer
+        if writer is None:
+            self.monitor.discard()
+        else:
+            self.monitor.write(writer, it)
 
 
 def _cross2(a, b):
@@ -392,7 +529,7 @@ class TaskState:
         self.critic_geometry_valid = zeros(n, observed, kind=torch.bool)
         self.critic_source_indices = torch.full((n, observed), -1, dtype=torch.long, device=device)
         self.tcp_pose_b = zeros(n, 7)
-        self.history = zeros(n, 2, 72)
+        self.history = zeros(n, 2, ROBOT_SAMPLE_DIM)
         self.active = zeros(n, o, kind=torch.bool)
         self.target = zeros(n, o, kind=torch.bool)
         self.blocker = zeros(n, o, kind=torch.bool)
@@ -412,6 +549,7 @@ class TaskState:
         self.initial_center = zeros(n, o, 3)
         self.initial_rotation = zeros(n, o, 4)
         self.initial_blocker_overlap = zeros(n)
+        self.blocker_min_distance = torch.full((n, 17), math.inf, device=device, dtype=dtype)
         self.previous_wrench = zeros(n, 6)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
@@ -491,6 +629,7 @@ class TaskState:
         self.support_height[ids] = panel[..., 2].mean(-1)
         self.initial_center[ids] = batch.center[rows]
         self.initial_rotation[ids] = batch.rotation[rows]
+        self.blocker_min_distance[ids] = math.inf
         self.object_motion_cost[ids] = object_motion_cost(
             batch.center[rows], batch.corners[rows], batch.velocity[rows], self.active[ids], self.blocker[ids],
             self.target[ids],
@@ -520,7 +659,7 @@ class TaskState:
         # The reset state has no completed action/contact sample in this episode.
         self.history[ids, 0, 31:37] = 0
         self.history[ids, 0, 37:54] = -1
-        self.history[ids, 0, 54:72] = 0
+        self.history[ids, 0, 54:] = 0
         for name in ("previous_wrench", "elapsed_time", "stable_count", "tilt_count",
                      "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
                      "clearance_progress_valid", "completion_valid", "raw_goal",
@@ -955,6 +1094,8 @@ def _bind_scene(env, state, scene):
     from types import SimpleNamespace
 
     robot = env.scene["robot"]
+    if not env.cfg.actions.hand_action.rescale_to_limits:
+        raise ValueError("Task action history requires native hand rescale_to_limits=True.")
     # Resolve asset IDs through the public API; stock action terms do not expose
     # the task-specific attributes previously supplied by our subclasses.
     arm_ids, _ = robot.find_joints(env.cfg.actions.arm_action.joint_names, preserve_order=True)
@@ -973,12 +1114,33 @@ def _bind_scene(env, state, scene):
     # Object COM offsets are fixed in this task. Native COM properties
     # otherwise fetch CPU buffers again at every physics timestamp/reset.
     object_com_local = env.scene["object_collection"].data.object_com_pos_b.clone()
+    # Include the distal half of the load cell and every attached hand body,
+    # including the imported base and fixed/mimic sensor links. Native paths
+    # disambiguate the arm and hand's duplicate base_link names.
+    paths = robot.root_physx_view.link_paths[0]
+    payload_ids = [i for i, (name, path) in enumerate(zip(names, paths))
+                   if name == scene.sensor_body_name or "/ROASRightHand/" in str(path)]
+    if len(paths) != len(names) or len(payload_ids) < 2:
+        raise RuntimeError("Cannot identify the F/T distal link and its attached hand bodies.")
+    payload_ids = torch.tensor(payload_ids, dtype=torch.long, device=env.device)
+    # PhysX exposes mass/inertia/COM metadata on CPU. Cache it once: only native
+    # GPU pose, COM acceleration and angular velocity are read during rollout.
+    payload_mass = robot.root_physx_view.get_masses().to(env.device).index_select(1, payload_ids).clone()
+    payload_inertia = robot.root_physx_view.get_inertias().to(env.device).index_select(1, payload_ids)
+    payload_inertia = payload_inertia.reshape(n, -1, 3, 3).transpose(-1, -2).contiguous()
+    payload_com_local = robot.data.body_com_pos_b.index_select(1, payload_ids).clone()
     state.bindings = SimpleNamespace(
         robot=robot, objects=env.scene["object_collection"], shelf=env.scene["shelf"],
         joint_ids=joint_ids, tcp_id=tcp_ids[0],
         sensor_id=names.index(scene.sensor_body_name), object_com_local=object_com_local,
+        payload_ids=payload_ids, payload_mass=payload_mass, payload_inertia=payload_inertia,
+        payload_com_local=payload_com_local, gravity=torch.tensor(env.sim.cfg.gravity, device=env.device),
         ranges=torch.tensor(SI_200_8_RANGES, device=env.device),
         resolution=torch.tensor(SI_200_8_RESOLUTION, device=env.device),
+        # Mirror the arm's accepted wrench and the hand's native scaled [-1,1]
+        # saturation. Both are represented in raw policy units for history/cost.
+        action_limits=torch.tensor(action_input_limits(env.cfg.actions.arm_action.wrench_scale,
+                                                      env.cfg.actions.hand_action.scale), device=env.device),
         object_ids=torch.zeros(n, o, dtype=torch.long, device=env.device),
         local_center=torch.zeros(n, o, 3, device=env.device),
         local_corners=torch.zeros(n, o, 8, 3, device=env.device),
@@ -1062,7 +1224,7 @@ def _transition_tensors(env, state, rows, values):
     (object_pose, object_velocity, body_position, body_rotation,
      root_position, root_rotation, joint_position,
      joint_velocity, ideal_wrench, wrench_valid_all, tactile_force_all, tactile_valid_all,
-     shelf_pose, actions, joint_effort) = values
+     shelf_pose, actions, joint_effort, body_acceleration, body_angular_velocity) = values
     ids = b.object_ids[rows]
     origins = env.scene.env_origins[rows, None, :]
     pose = object_pose[rows].gather(1, ids[..., None].expand(-1, -1, 7))
@@ -1079,9 +1241,21 @@ def _transition_tensors(env, state, rows, values):
     raw_wrench, wrench_valid = ideal_wrench[rows], wrench_valid_all[rows]
     tactile_force = tactile_force_all[rows]
     measured, overrange = calibrate_wrench(raw_wrench, b.ranges, b.resolution)
-    # Use the measured reaction directly; hand weight and inertia remain in
-    # both observation and reward. Invalid/reset sensor samples stay zero.
+    # Retain calibrated total reaction for rewards, overrange and raw monitoring.
+    # Subtract the distal self-load only from the policy's sensor observation,
+    # after the physical sensor's clipping/resolution model (no second quantization).
     wrench = torch.where(wrench_valid[:, None], measured, 0.0)
+    payload_rotation = body_rotation.index_select(1, b.payload_ids)
+    payload_com = (body_position.index_select(1, b.payload_ids)
+                   + quat_apply(payload_rotation, b.payload_com_local[rows]))
+    self_load = self_motion_wrench(
+        b.payload_mass[rows], b.payload_inertia[rows], payload_com, payload_rotation,
+        body_acceleration[rows].index_select(1, b.payload_ids),
+        body_angular_velocity[rows].index_select(1, b.payload_ids),
+        sensor_position, sensor_rotation, b.gravity,
+    )
+    compensation_valid = torch.isfinite(self_load).all(-1)
+    observation_wrench = torch.where((wrench_valid & compensation_valid)[:, None], measured - self_load, 0.0)
     inverse_root = quat_conjugate(root_rotation[rows])
     position = quat_apply(inverse_root, body_position[:, b.tcp_id] - root_position[rows])
     orientation = quat_mul(inverse_root, body_rotation[:, b.tcp_id])
@@ -1090,14 +1264,15 @@ def _transition_tensors(env, state, rows, values):
     joint_pos = joint_position[rows].index_select(1, b.joint_ids)
     joint_vel = joint_velocity[rows].index_select(1, b.joint_ids)
     tactile_valid = tactile_valid_all[rows] & torch.isfinite(tactile_force).all(-1)
+    accepted_actions = actions[rows].clamp(-b.action_limits, b.action_limits)
     sample = dynamic_sample(
-        joint_pos, joint_vel, tcp_pose, wrench,
+        joint_pos, joint_vel, tcp_pose, observation_wrench,
         torch.linalg.vector_norm(tactile_force, dim=-1) > state.cfg.tactile_threshold,
-        tactile_valid, torch.nan_to_num(actions[rows], nan=0.0, posinf=1.0, neginf=-1.0), joint_position_scale=state.cfg.joint_position_scale,
+        tactile_valid, torch.nan_to_num(accepted_actions, nan=0.0, posinf=1.0, neginf=-1.0), joint_position_scale=state.cfg.joint_position_scale,
         joint_velocity_scale=state.cfg.joint_velocity_scale, wrench_ranges=b.ranges,
     )
     valid = (torch.isfinite(sample).all(-1) & torch.isfinite(raw_wrench).all(-1)
-             & wrench_valid & torch.isfinite(actions[rows]).all(-1)
+             & wrench_valid & compensation_valid & torch.isfinite(actions[rows]).all(-1)
              & torch.isfinite(joint_effort[rows]).all(-1))
     return TransitionBatch(center, corners, rotation, velocity, wrench, sensor_position,
                            sensor_rotation, overrange & wrench_valid[:, None],
@@ -1113,7 +1288,8 @@ def _read_transition(env, state, env_ids=None):
               data.body_link_pos_w, data.body_link_quat_w,
               data.root_pos_w, data.root_quat_w, data.joint_pos, data.joint_vel,
               sensors.ideal_wrench, sensors.wrench_valid, sensors.tactile_force, sensors.tactile_valid,
-              b.shelf.data.root_link_pose_w, env.action_manager.action, data.applied_torque)
+              b.shelf.data.root_link_pose_w, env.action_manager.action, data.applied_torque,
+              data.body_com_acc_w, data.body_com_ang_vel_w)
     rows = slice(None) if env_ids is None else env_ids
     if env_ids is not None or not values[0].is_cuda:
         return _transition_tensors(env, state, rows, values)
@@ -1159,7 +1335,8 @@ def _read_reset_snapshot(env, state, ids):
     tcp_pose = torch.cat((tcp_position, tcp_rotation), -1)
     joints = data.joint_pos[ids].index_select(1, b.joint_ids) / state.cfg.joint_position_scale
     velocity = data.joint_vel[ids].index_select(1, b.joint_ids) / state.cfg.joint_velocity_scale
-    sample = torch.cat((joints, velocity, tcp_pose, joints.new_zeros((ids.numel(), 41))), -1)
+    sample = torch.cat((joints, velocity, tcp_pose,
+                        joints.new_zeros((ids.numel(), ROBOT_SAMPLE_DIM - 31))), -1)
     # reset_scene writes zero object velocities before this snapshot. Reuse that
     # known reset state instead of requesting an extra PhysX velocity buffer.
     return SimpleNamespace(center=center, corners=corners, rotation=rotation,
@@ -1345,8 +1522,12 @@ def get_task_state(env):
             term = manager.get_term_cfg("hand_velocity")
             if not term.time_out:
                 velocity_failure = term.func(env, **term.params)
-        state.advance(_read_transition(env, state), env.common_step_counter,
+        batch = _read_transition(env, state)
+        state.advance(batch, env.common_step_counter,
                       singularity=margin, hand_velocity=velocity_failure)
+        monitor = getattr(env, "_tensorboard_sensor_monitor", None)
+        if monitor is not None:
+            monitor.record(batch)
         # Native env resets after reward/done. Preserve the final observation
         # here for the learner's timeout bootstrap, before any reset.
         geometry = geometry_in_eef_frame(state.geometry_b, state.geometry_valid, state.tcp_pose_b)

@@ -163,7 +163,8 @@ class SensorReader:
     The F/T incoming joint frame is authored at the distal spacer origin with
     identity child rotation. Its parent-on-child reaction is already expressed
     in physical sensor axes. SI-200-8 calibration belongs to
-    events._read_transition; gravity and inertia are not subtracted.
+    events._read_transition. The raw reaction remains available for rewards
+    and monitoring; that transition removes self-load only for observation.
     """
 
     def __init__(self, env):

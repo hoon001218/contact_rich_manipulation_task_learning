@@ -45,6 +45,7 @@ from contact_manipulation.config.ur5e.agents.ppo import (
     ACTION_CONTRACT, load_checkpoint, prepare_inference_checkpoint,
 )
 from contact_manipulation.mdp.observations import SI_200_8_RANGES, SI_200_8_RESOLUTION
+from contact_manipulation.mdp.events import SensorMonitoringLogger, TensorboardSensorMonitor
 
 
 def pack(geometry, history):
@@ -121,16 +122,18 @@ class ModelTests(unittest.TestCase):
         return self.model.get_output_log_prob(actions), self.model.output_entropy
 
     def test_default_observation_layout_excludes_mask_channels(self):
-        self.assertEqual(ModelCfg().observation_dim, 244)
+        self.assertEqual(ModelCfg().observation_dim, 232)
         self.assertEqual(asdict(ModelCfg())["history_steps"], 2)
         self.assertEqual(asdict(ModelCfg())["activation"], "relu")
         self.assertFalse(any(isinstance(module, torch.nn.SiLU) for module in self.model.modules()))
         self.assertEqual(asdict(ModelCfg())["observation_layout"], "fixed_roles_v1")
-        self.assertEqual(ModelCfg().step_features, 72)
+        self.assertEqual(ModelCfg().step_features, 66)
+        self.assertEqual(ModelCfg().action_dim, 12)
+        self.assertEqual(ACTION_CONTRACT, "isaaclab_ur5e_sensor_osc_wrench_compensated_ft_v5")
         self.assertEqual(self.model.encoder.scene_encoder.node_encoder[0].in_features, 10)
         self.assertFalse(hasattr(self.model, "history_encoder"))
-        self.assertEqual(self.model.mlp[0].in_features, 5 * self.cfg.node_dim + 144)
-        with self.assertRaisesRegex(ValueError, "72 physical observation"):
+        self.assertEqual(self.model.mlp[0].in_features, 5 * self.cfg.node_dim + 132)
+        with self.assertRaisesRegex(ValueError, "66 physical observation"):
             ModelCfg(step_features=89)
         with self.assertRaisesRegex(ValueError, "At least two object slots"):
             ModelCfg(max_objects=1)
@@ -143,10 +146,10 @@ class ModelTests(unittest.TestCase):
         for name in ("forward", "get_output_log_prob", "get_kl_divergence", "reset",
                      "get_hidden_state", "detach_hidden_state"):
             self.assertIs(getattr(NativeContactActor, name), getattr(MLPModel, name))
-        self.assertEqual(self.model.mlp[0].in_features, 5 * self.cfg.node_dim + 144)
+        self.assertEqual(self.model.mlp[0].in_features, 5 * self.cfg.node_dim + 132)
         self.assertEqual(self.model.mlp[0].out_features, 2 * self.cfg.latent_dim)
         self.assertEqual(self.model.mlp[2].out_features, self.cfg.latent_dim)
-        self.assertEqual(self.model.mlp[-1].out_features, 18)
+        self.assertEqual(self.model.mlp[-1].out_features, 12)
         self.assertFalse(hasattr(self.model, "policy"))
         self.assertFalse(hasattr(self.model.encoder, "distribution"))
         self.assertFalse(hasattr(self.model.encoder, "fusion"))
@@ -155,16 +158,16 @@ class ModelTests(unittest.TestCase):
         groups = {"actor": ["policy"]}
         obs = TensorDict({"policy": self.observation}, batch_size=[3])
         torch.manual_seed(123)
-        actor = NativeContactActor(obs, groups, "actor", 18, model_cfg=asdict(self.cfg))
+        actor = NativeContactActor(obs, groups, "actor", 12, model_cfg=asdict(self.cfg))
         self.assertEqual(actor.distribution.std_type, "scalar")
-        torch.testing.assert_close(actor.distribution.std_param, torch.ones(18))
+        torch.testing.assert_close(actor.distribution.std_param, torch.ones(12))
         # Account for encoder initialization before constructing the same native
         # MLP head. There must be no task-specific output gain/bias rewrite.
         torch.manual_seed(123)
         ContactManipulationEncoder(self.cfg)
-        latent = torch.zeros(3, 5 * self.cfg.node_dim + 144)
+        latent = torch.zeros(3, 5 * self.cfg.node_dim + 132)
         reference = MLPModel(
-            TensorDict({"policy": latent}, batch_size=[3]), groups, "actor", 18,
+            TensorDict({"policy": latent}, batch_size=[3]), groups, "actor", 12,
             hidden_dims=[2 * self.cfg.latent_dim, self.cfg.latent_dim], activation="relu",
             distribution_cfg={"class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.},
         )
@@ -175,9 +178,9 @@ class ModelTests(unittest.TestCase):
         # Independent copy of the previous fusion+output expression. Copying
         # weights isolates the structure change from random initialization.
         reference = torch.nn.Sequential(
-            torch.nn.Linear(5 * self.cfg.node_dim + 144, 2 * self.cfg.latent_dim), torch.nn.ReLU(),
+            torch.nn.Linear(5 * self.cfg.node_dim + 132, 2 * self.cfg.latent_dim), torch.nn.ReLU(),
             torch.nn.Linear(2 * self.cfg.latent_dim, self.cfg.latent_dim), torch.nn.ReLU(),
-            torch.nn.Linear(self.cfg.latent_dim, 18),
+            torch.nn.Linear(self.cfg.latent_dim, 12),
         )
         reference.load_state_dict(self.model.mlp.state_dict())
         features = self.model.encoder(self.observation, masks=self.masks()).detach().requires_grad_()
@@ -290,7 +293,7 @@ class ModelTests(unittest.TestCase):
         expected_geometry = torch.where(masks.object_valid[..., None], geometry, 0)
         expected_history = torch.where(masks.history_valid[..., None], history, 0)
         torch.testing.assert_close(node_inputs[0], expected_geometry)
-        torch.testing.assert_close(history_inputs[0][:, -144:], expected_history.flatten(1))
+        torch.testing.assert_close(history_inputs[0][:, -132:], expected_history.flatten(1))
 
     def test_distractor_slot_permutation_preserves_policy(self):
         perm = torch.tensor([0, 1, 4, 2, 3])
@@ -345,9 +348,9 @@ class ModelTests(unittest.TestCase):
             hook.remove()
         _, history = self.model.encoder._split(inputs)
         expected = torch.where(self.masks(inputs).history_valid[..., None], history, 0)
-        torch.testing.assert_close(captured[0][:, -144:], expected.flatten(1))
+        torch.testing.assert_close(captured[0][:, -132:], expected.flatten(1))
         means.square().sum().backward()
-        gradient = inputs.grad[:, -144:].reshape(-1, 2, 72)
+        gradient = inputs.grad[:, -132:].reshape(-1, 2, 66)
         self.assertGreater(float(gradient[0, 0].abs().sum()), 0)
         self.assertGreater(float(gradient[0, 1].abs().sum()), 0)
         self.assertEqual(float(gradient[-1, 1].abs().sum()), 0)
@@ -442,7 +445,7 @@ class ModelTests(unittest.TestCase):
         self.assertIsInstance(self.model.distribution, GaussianDistribution)
         self.assertEqual(self.model.distribution.std_type, "log")
         parameter = self.model.distribution.log_std_param
-        torch.testing.assert_close(parameter.exp(), torch.full((18,), .3))
+        torch.testing.assert_close(parameter.exp(), torch.full((12,), .3))
         before = parameter.detach().clone()
         optimizer = torch.optim.SGD(self.model.parameters(), lr=.01)
         actions = torch.zeros(3, self.cfg.action_dim)
@@ -457,14 +460,14 @@ class ModelTests(unittest.TestCase):
         repeated = self.observation[None].expand(2, -1, -1)
         masks = self.masks(repeated)
         actions, logs = self.act(repeated, masks=masks)
-        self.assertEqual(actions.shape, (2, 3, 18))
+        self.assertEqual(actions.shape, (2, 3, 12))
         self.assertEqual(logs.shape, (2, 3))
         self.assertEqual(masks.roles.shape, (2, 3, 5, 2))
 
     def test_single_observation_without_batch_dimension(self):
         single = self.observation[0]
         actions, log_probability = self.act(single, masks=self.masks(single))
-        self.assertEqual(actions.shape, (18,))
+        self.assertEqual(actions.shape, (12,))
         self.assertEqual(log_probability.shape, ())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA fused edge reduction")
@@ -562,7 +565,7 @@ class ModelTests(unittest.TestCase):
             self.evaluate_actions(self.observation, actions, masks=masks)
 
     def test_research_history_and_action_contract_rejects_incompatible_config(self):
-        for kwargs in ({"history_steps": 16}, {"action_dim": 12}, {"max_objects": True}):
+        for kwargs in ({"history_steps": 16}, {"action_dim": 18}, {"step_features": 72}, {"max_objects": True}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ModelCfg(**kwargs)
 
@@ -613,12 +616,12 @@ class SmallVectorEnv:
         self.steps = 0
 
     def get_observations(self):
-        critic = torch.cat((self.critic_current[:, :-144], self.current[:, -144:]), dim=-1)
+        critic = torch.cat((self.critic_current[:, :-132], self.current[:, -132:]), dim=-1)
         return TensorDict({"policy": self.current.clone(), "critic": critic}, batch_size=[self.num_envs])
 
     def step(self, actions):
         if actions.shape != (self.num_envs, self.num_actions):
-            raise AssertionError("Runner must preserve the 18-dimensional vector action.")
+            raise AssertionError("Runner must preserve the 12-dimensional vector action.")
         self.steps += 1
         self.episode_length_buf += 1
         self.current[:, :3] += .001
@@ -657,6 +660,95 @@ def collect(algorithm, env):
             obs, rewards, dones, extras = env.step(actions)
             algorithm.process_env_step(obs, rewards, dones, extras)
         algorithm.compute_returns(obs)
+
+
+class TensorboardMonitoringLoggerTests(unittest.TestCase):
+    def fixture(self, steps=1):
+        arm, hand = [f'arm_{index}' for index in range(6)], [f'hand_{index}' for index in range(6)]
+        names = arm + hand
+        env = SimpleNamespace(
+            num_envs=2,
+            cfg=SimpleNamespace(actions=SimpleNamespace(
+                arm_action=SimpleNamespace(joint_names=arm, wrench_scale=(10., 10., 10., 1., 1., 1.)),
+                hand_action=SimpleNamespace(joint_names=hand, scale=.5, rescale_to_limits=True))),
+            action_manager=SimpleNamespace(action=torch.tensor(
+                [[1000., 0., 0., 0., 0., 0., 4., 0., 0., 0., 0., 0.],
+                 [-1000., 0., 0., 0., 0., 0., -4., 0., 0., 0., 0., 0.]])),
+            _contact_mdp=SimpleNamespace(
+                cfg=SimpleNamespace(joint_velocity_scale=2.), history=torch.zeros(2, 2, 66),
+                bindings=SimpleNamespace(
+                    ranges=torch.tensor(SI_200_8_RANGES),
+                    robot=SimpleNamespace(find_joints=lambda selected, preserve_order=False:
+                                          ([names.index(name) for name in selected], selected)))),
+        )
+        monitor = TensorboardSensorMonitor(env, steps)
+        sample = torch.zeros(2, 66)
+        sample[:, 12:24] = torch.tensor([[1.], [-1.]])
+        sample[:, 31:37] = .25
+        sample[:, 54] = torch.tensor([20., -20.])
+        sample[:, 60] = torch.tensor([2., -2.])
+        batch = SimpleNamespace(sample=sample, sensor_wrench=torch.ones(2, 6),
+                                state_valid=torch.ones(2, dtype=torch.bool),
+                                sensor_range_exceeded=torch.zeros(2, 6, dtype=torch.bool))
+        return monitor, batch
+
+    def test_actual_native_logger_writer_records_si_stats_and_preserves_standard_tags(self):
+        monitor, batch = self.fixture()
+        monitor.record(batch)
+        cfg = runner_config()
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            native = Logger(directory, cfg, {}, 2, False, 1, 0, 'cpu')
+            adapter = SensorMonitoringLogger(native, monitor)
+            with patch.object(Logger, '_store_code_state', return_value=[]):
+                adapter.init_logging_writer()
+            self.assertIs(adapter.writer, native.writer)
+            self.assertIs(adapter.process_env_step.__self__, native)
+            adapter.process_env_step(torch.tensor([1., 2.]), torch.ones(2),
+                                     {'log': {'Episode_Reward/manipulation': torch.tensor(.5)}})
+            adapter.log(5, start_it=5, total_it=6, collect_time=.1, learn_time=.2,
+                        loss_dict={'value': 123., 'surrogate': -.2}, learning_rate=.001,
+                        action_std=torch.ones(12), rnd_weight=None)
+            adapter.writer.flush()
+            event = EventAccumulator(directory).Reload()
+            adapter.writer.close()
+            tags = event.Tags()['scalars']
+            for tag in ('Loss/value', 'Loss/surrogate', 'Policy/mean_std', 'Perf/total_fps',
+                        'Episode_Reward/manipulation', 'Train/mean_reward',
+                        'JointVelocity/RMS/arm_0', 'FT/Measured/Mean/Fx',
+                        'FT/CompensatedObservation/Mean/Fx', 'FT/CompensatedObservation/Mean/Tx',
+                        'Action/PolicyRaw/AbsMax/Fx', 'Action/Applied/AbsMax/Fx',
+                        'Action/WrenchClippedFraction', 'Action/Applied/AbsMax/hand_0'):
+                self.assertIn(tag, tags)
+            self.assertEqual(event.Scalars('Loss/value')[0].value, 123.)
+            self.assertEqual(event.Scalars('Train/mean_reward')[0].value, 1.5)
+            self.assertEqual(event.Scalars('JointVelocity/Mean/arm_0')[0].value, 0.)
+            self.assertEqual(event.Scalars('JointVelocity/RMS/arm_0')[0].value, 2.)
+            self.assertEqual(event.Scalars('FT/Measured/Mean/Fx')[0].value, 1.)
+            self.assertEqual(event.Scalars('FT/CompensatedObservation/Mean/Fx')[0].value, 50.)
+            self.assertEqual(event.Scalars('FT/CompensatedObservation/Mean/Tx')[0].value, 2.)
+            self.assertEqual(event.Scalars('Action/PolicyRaw/AbsMax/Fx')[0].value, 1000.)
+            self.assertEqual(event.Scalars('Action/Applied/AbsMax/Fx')[0].value, 200.)
+            self.assertEqual(event.Scalars('Action/Applied/AbsMax/hand_0')[0].value, 2.)
+            self.assertEqual(event.Scalars('Action/WrenchClippedFraction')[0].value, 1.)
+            self.assertEqual(event.Scalars('JointVelocity/RMS/arm_0')[0].step, 5)
+            self.assertEqual(adapter.tot_timesteps, cfg['num_steps_per_env'] * 2)
+            self.assertEqual(monitor.count, 0)
+
+    def test_disabled_native_writer_discards_window_without_copy_or_extra_logging(self):
+        monitor, batch = self.fixture()
+        monitor.record(batch)
+        calls = []
+        native = SimpleNamespace(writer=None, log=lambda *args, **kwargs: calls.append((args, kwargs)),
+                                 disable_logs=True)
+        adapter = SensorMonitoringLogger(native, monitor)
+        with patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('Disabled logger copied telemetry')), \
+             patch.object(monitor, 'write', side_effect=AssertionError('Disabled logger flushed telemetry')):
+            adapter.log(9, marker='native')
+        self.assertEqual(calls, [((9,), {'marker': 'native'})])
+        self.assertTrue(adapter.disable_logs)
+        self.assertEqual(monitor.count, 0)
+        monitor.record(batch)  # Discarded storage is reusable for the next rollout.
+        self.assertEqual(monitor.count, 1)
 
 
 class NativeLearningTests(unittest.TestCase):
@@ -808,7 +900,7 @@ class NativeLearningTests(unittest.TestCase):
     def test_actor_and_critic_execute_scene_encoder_before_final_native_mlp(self):
         algorithm, env = make_algorithm()
         obs = env.get_observations()
-        for model, width in ((algorithm.actor, 18), (algorithm.critic, 1)):
+        for model, width in ((algorithm.actor, 12), (algorithm.critic, 1)):
             calls, scene_features, head_inputs = [], [], []
 
             def scene_hook(_module, _args, output):
@@ -833,7 +925,7 @@ class NativeLearningTests(unittest.TestCase):
                 source = obs["policy" if model is algorithm.actor else "critic"]
                 masks = build_policy_masks(source, model.cfg)
                 expected_history = model.encoder.history_input(source, masks=masks)
-                torch.testing.assert_close(head_inputs[0][:, -144:], expected_history)
+                torch.testing.assert_close(head_inputs[0][:, -132:], expected_history)
                 self.assertFalse(hasattr(model.encoder, "history_encoder"))
                 self.assertFalse(hasattr(model.encoder, "fusion"))
 
@@ -843,8 +935,8 @@ class NativeLearningTests(unittest.TestCase):
         self.assertEqual(inputs["policy"].shape[-1], algorithm.actor.cfg.observation_dim)
         self.assertEqual(inputs["critic"].shape[-1], algorithm.critic.cfg.observation_dim)
         self.assertEqual(inputs["policy"].shape, inputs["critic"].shape)
-        self.assertFalse(torch.equal(inputs["policy"][:, :-144], inputs["critic"][:, :-144]))
-        torch.testing.assert_close(inputs["policy"][:, -144:], inputs["critic"][:, -144:])
+        self.assertFalse(torch.equal(inputs["policy"][:, :-132], inputs["critic"][:, :-132]))
+        torch.testing.assert_close(inputs["policy"][:, -132:], inputs["critic"][:, -132:])
         with torch.no_grad():
             actions, values = algorithm.actor(inputs), algorithm.critic(inputs)
             hidden_truth = inputs.clone()
@@ -895,11 +987,11 @@ class NativeLearningTests(unittest.TestCase):
     @staticmethod
     def transition(algorithm, obs, values):
         algorithm.transition.observations = obs
-        algorithm.transition.actions = torch.zeros(obs.batch_size[0], 18)
+        algorithm.transition.actions = torch.zeros(obs.batch_size[0], 12)
         algorithm.transition.values = torch.tensor(values).reshape(-1, 1)
         algorithm.transition.actions_log_prob = torch.zeros(obs.batch_size[0])
         algorithm.transition.distribution_params = (
-            torch.zeros(obs.batch_size[0], 18), torch.ones(obs.batch_size[0], 18),
+            torch.zeros(obs.batch_size[0], 12), torch.ones(obs.batch_size[0], 12),
         )
 
     def test_native_actor_normalizes_history_after_raw_masks_and_preserves_padding(self):
@@ -909,7 +1001,7 @@ class NativeLearningTests(unittest.TestCase):
         actor = algorithm.actor
         raw = env.get_observations()["policy"].clone()
         geometry = raw[:, :(actor.cfg.max_objects * actor.cfg.node_features)].reshape(3, actor.cfg.max_objects, 10)
-        history = raw[:, (actor.cfg.max_objects * actor.cfg.node_features):].reshape(3, 2, 72)
+        history = raw[:, (actor.cfg.max_objects * actor.cfg.node_features):].reshape(3, 2, 66)
         geometry[:, -1] = float("nan")
         history[-1, 1] = float("nan")
         history[0, 0, 37] = -1
@@ -935,7 +1027,7 @@ class NativeLearningTests(unittest.TestCase):
         expected = actor.encoder(raw, masks=masks, history=actor.obs_normalizer(clean))
         torch.testing.assert_close(latent, expected)
         torch.testing.assert_close(scene_inputs[0], torch.where(masks.object_valid[..., None], geometry, 0))
-        normalized_history = latent[:, -144:].reshape(3, 2, 72)
+        normalized_history = latent[:, -132:].reshape(3, 2, 66)
         self.assertEqual(normalized_history[-1, 1].count_nonzero(), 0)
         self.assertEqual(float(normalized_history[0, 0, 37]), 0.)
         self.assertTrue(torch.isfinite(actor(obs, stochastic_output=True)).all())
@@ -1236,6 +1328,38 @@ class NativeLearningTests(unittest.TestCase):
                 algorithm.actor.load_state_dict(changed)
         algorithm.actor.load_state_dict(original)
 
+    def test_pose_stiffness_checkpoints_are_rejected_before_runner_or_playback_mutation(self):
+        cfg = runner_config()
+        env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            runner = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+            original = deepcopy(runner.alg.save())
+            before = {name: value.detach().clone() for name, value in runner.alg.actor.named_parameters()}
+            for old_contract in ("isaaclab_ur5e_wrist_osc_variable_kp_gravity_v3",
+                                 "isaaclab_ur5e_sensor_osc_variable_kp_compensated_ft_v4"):
+                saved = deepcopy(original)
+                for name in ("actor_state_dict", "critic_state_dict"):
+                    contract = saved[name]["_extra_state"]
+                    contract["action_contract"] = old_contract
+                    contract["model_cfg"].update(action_dim=18, step_features=72)
+                path = Path(directory) / "pose_stiffness.pt"
+                torch.save(saved, path)
+                agent = SimpleNamespace(obs_groups=deepcopy(cfg["obs_groups"]),
+                                        actor=SimpleNamespace(**deepcopy(cfg["actor"])),
+                                        critic=SimpleNamespace(**deepcopy(cfg["critic"])))
+                settings_before = deepcopy(vars(agent))
+                with self.subTest(contract=old_contract):
+                    with self.assertRaisesRegex(ValueError, "action contract"):
+                        load_checkpoint(runner, path)
+                    with self.assertRaisesRegex(ValueError, "action contract"):
+                        load_checkpoint(runner, path, inference=True)
+                    with self.assertRaisesRegex(ValueError, "action contract"):
+                        prepare_inference_checkpoint(agent, path)
+                    self.assertEqual(vars(agent), settings_before)
+                    for name, value in runner.alg.actor.named_parameters():
+                        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+                    self.assertFalse(runner.alg.optimizer.state)
+
     def test_inference_policy_uses_same_observable_input(self):
         cfg = runner_config()
         env = SmallVectorEnv(ModelCfg(**cfg["actor"]["model_cfg"]))
@@ -1248,7 +1372,7 @@ class NativeLearningTests(unittest.TestCase):
             inputs = env.get_observations()
             actions = policy(inputs)
             expected = runner.alg.actor(inputs)
-        self.assertEqual(actions.shape, (2, 18))
+        self.assertEqual(actions.shape, (2, 12))
         self.assertTrue(torch.isfinite(actions).all())
         self.assertTrue((actions > 1.).all())
         torch.testing.assert_close(actions, expected, atol=0, rtol=0)
@@ -1388,13 +1512,13 @@ class NativeLearningTests(unittest.TestCase):
         cfg["actor"]["stochastic"] = False
         cfg["critic"]["distribution_cfg"] = None
         algorithm, _ = make_algorithm(cfg)
-        torch.testing.assert_close(algorithm.actor.distribution.log_std_param.exp(), torch.full((18,), .3))
+        torch.testing.assert_close(algorithm.actor.distribution.log_std_param.exp(), torch.full((12,), .3))
         cfg["actor"]["distribution_cfg"] = {
             "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": .7,
         }
         scalar, _ = make_algorithm(cfg)
         self.assertEqual(scalar.actor.distribution.std_type, "scalar")
-        torch.testing.assert_close(scalar.actor.distribution.std_param, torch.full((18,), .7))
+        torch.testing.assert_close(scalar.actor.distribution.std_param, torch.full((12,), .7))
         self.assertEqual(scalar.save()["actor_state_dict"]["_extra_state"]["actor_model"]["distribution_cfg"],
                          cfg["actor"]["distribution_cfg"])
         cfg["actor"]["distribution_cfg"] = {"class_name": "tanh_gaussian", "init_std": .3}

@@ -62,6 +62,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import contact_manipulation  # Register the local task after AppLauncher.
 from contact_manipulation.config.ur5e.agents.ppo import load_checkpoint
+from contact_manipulation.mdp.events import SensorMonitoringLogger, TensorboardSensorMonitor
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -154,6 +155,10 @@ def main(env_cfg, agent_cfg):
         sync_time_penalty_curriculum(
             env, env_cfg, completed_iterations=completed, num_steps_per_env=agent_cfg.num_steps_per_env,
         )
+        if env_cfg.tensorboard_sensor_monitor and not runner.logger.disable_logs:
+            monitor = TensorboardSensorMonitor(env.unwrapped, agent_cfg.num_steps_per_env)
+            env.unwrapped._tensorboard_sensor_monitor = monitor
+            runner.logger = SensorMonitoringLogger(runner.logger, monitor)
         if time_penalty_start_iteration is not None:
             target_weight = env_cfg.curriculum.time_penalty.params["weight"]
             print(f"[INFO] Time penalty: 0 -> {target_weight} at iteration {time_penalty_start_iteration}"
