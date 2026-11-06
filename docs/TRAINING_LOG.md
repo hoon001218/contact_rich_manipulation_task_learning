@@ -5,6 +5,30 @@
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
 [프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
 
+**재발 시 참고(2026-11-05):** `2026-11-04_19-52-40` 실행의 CUDA 실패와 동시각 NVIDIA
+`Xid 32` 확인 기록은 **99절**을 따른다. 근본 원인은 미확정이며 사용자 요청으로 해결·재현은
+보류했다. 이후 유사 오류를 조사할 때 이 실행과 비교하되 과거 Hand 속도 발산과 동일시하지 않는다.
+
+**보상 후보 속도 실측(2026-11-05):** 동적 Blocker goal 지도 갱신의 독립 GPU 측정은 **100절**을
+참고한다. 검증용 코드와 결과만 추가했으며 학습 환경·reward에는 아직 반영하지 않았다.
+
+**새 보상 적용(2026-11-05):** 원본 `contact_manipulation`에 초기 빈 재배치 영역의 중심거리
+보상을 추가하고, 손–Blocker 거리는 episode 최소값에서 현재값으로 복원했다. 수식·GPU 비용·
+검증 범위는 **101절**을 따른다. 100절의 도달 가능 자세 탐색 보상은 계속 보류한다.
+
+**GPU 오류 추가 기록(2026-11-05 21:51:57 KST):** 새 실행의 Vulkan page fault와 커널
+**Xid31**은 **102절**에 기록했다. 99절의 Xid32와 오류 종류가 다르며 원인은 미확정이다.
+
+**후속 CUDA 오류(2026-11-05 22:44:51 KST):** **103절**의 Xid69는10월25일과
+Class·Offset·Data·ErrorCode가 같다. PPO loss 출력 위치를 최초 실패 연산으로 단정하지 않는다.
+
+**동일 Xid69 재발(2026-11-06 02:27:56 KST):** **104절**은 OSC 관절 조회에서 보고된
+실패다. 저장 설정은103절과 동일하며 compile_model=true가 유지됐다. 이번에는2298회가 기록됐다.
+
+**컴파일 경로 분리·재검증(2026-11-06):** **105절**에 모델 컴파일 기본값 변경, 단계별 환경
+CUDA graph 스위치, 1,024환경 검사와 Compute Sanitizer 결과를 기록했다. 장기 안정성 대조를
+시작했으며, Xid69의 근본 원인을 해결했다고 판단한 상태는 아니다.
+
 **최신 적용:** 기존 Terminal에 일회 실패−5를 추가했다. 성공+250·일반/timeout0이며,
 현재 사용자 실험의 다른 weight는 유지한다. 변경·근거·검증은 **79절**에 기록한다.
 직전 reward 조정 이력은 **78절**, GUI tactile/F/T 모니터는 **77절**, 저장 실행 분석은
@@ -7001,3 +7025,652 @@ import 후 composed stage에만 작성됐으므로 별도 캐시 삭제는 필�
 회귀도 포함한다. 추가 범위 검사에서 사용자 주석 설정의 velocity binding을 가정한 기존 검사
 1개가 실패했으며 이번 변경과 무관해 해당 설정·검사를 수정하지 않았다.
 `git diff --check` 통과. 실제 학습·simulation·play·GPU benchmark·commit·push는 실행하지 않았다.
+
+## 98. 2026-11-04 — Parallel의 비네트워크 학습 설정을 원본과 동기화
+
+사용자는 학습 중이므로 어떤 학습·시험 실행도 하지 말고, 네트워크 구조를 제외한 Parallel의
+설정을 현재 `contact_manipulation`과 일치시키도록 요청했다. 원본 파일을 읽어 사용자 최신
+수정값까지 반영했으며 Original 소스와 실행 중인 프로세스는 변경하지 않았다.
+
+Parallel의 Actor·Critic은 기존 공식 `MLPModel`·[256,128]·ReLU·독립 가중치를 유지한다.
+GNN·attention·custom PPO/model 파일을 복사하지 않았다. PPO gamma는0.999→0.95,
+entropy coefficient는0.005→0.01로 맞췄으며 rollout36·epochs8·minibatches4·lr1e-3 adaptive·
+GAE0.95·clip0.2·desired KL0.02·value coefficient1·gradient norm1도 원본과 동일하다.
+프로젝트·Gym task·로그·cache·환경변수 namespace와 MLP용 좌우 정렬·초기 인접 교환20%는 유지한다.
+
+동기화한 주요 설정·동작은 다음과 같다.
+
+| 항목 | 현재 공통 설정 |
+|---|---|
+| Action / observation | sensor-frame wrench6 + Hand6 =12D / scene100 + sample66×2 =232D |
+| Arm 제어 | native OSC wrench_abs·fixed·gravity compensation, sensor→COM 원점 adapter |
+| 명령 범위 | sensor SI-200-8 한계, Hand native 포화, clipped 관측 이력·action-rate |
+| F/T | 센서 축에서 distal 자중·관성 보상, raw 측정 경로와 구분 |
+| Hand | native controller·URDF master 한계·importer 기본 mimic·17 tactile |
+| Physics / policy | dt0.01·decimation2:100Hz /50Hz |
+| Actor vision | interval0: reset 때만; Critic은 초기 인식 ID의 현재 GT를 갱신 |
+| Reward | Clearance12, episode 최소거리5, Hold0.4, Shelf/Target/Object 각각−0.5 |
+| Motion | clipped action-rate−0.03, 실제12관절 velocity−0.03; F/T growth·singularity reward 비활성 |
+| Stability / Time | Blocker 기울기5° 여유·weight0.5, Time−0.3·학습 절반부터 curriculum |
+| Terminal | 성공10·실패0·success_duration0 |
+| Termination | Target displacement 포함, 팔 속도1rad/s 종료 등 현재 원본 조건 |
+| Logging | 기존 native writer + joint velocity·raw/보상 F/T·raw/적용 action 모니터 |
+
+MDP runtime도 현재 원본에서 동기화했다. `rewards.py`·`terminations.py`는 원본과 동일하다.
+Parallel 전용 차이는 ray first-hit 픽셀 중심으로 선택된 주변 물체를 좌→우 정렬하는 기능과
+reset 때20% 인접 교환을 Actor geometry·Critic ID에 함께 적용하는 기능이다. 역할0/1은 고정한다.
+Periodic Actor vision의 기존 순서 유지 코드도 보존해 추후 양수 주기를 설정할 수 있다.
+
+Train은 공식 Time curriculum 준비·resume 시점 동기화·TensorBoard 연결을 반영한다.
+Checkpoint는 기존 native MLP `runner.load`를 사용하며 GNN 전용 loader를 가져오지 않는다.
+이전 Parallel18D/244D checkpoint는 새12D/232D 모델과 크기가 달라 호환되지 않으므로 새 학습이
+필요하다. 실행 중인 학습에는 소급 적용되지 않고 다음 환경 생성부터 새 설정을 사용한다.
+
+README와 기존 테스트 정의도232D/12D·현재 default에 맞췄다. MLP와 이미지 정렬 검사는 유지했다.
+기존 original 테스트의 graph mask 의존 코드는 Parallel에 가져오지 않았다. Nonzero terminal 동작을
+검사하는 fixture는250/10을 명시하고 현재 default 검사는10/0을 확인하도록 구분했다.
+
+**확인 범위:** 사용자 지시에 따라 파일 읽기·수정·텍스트 diff·공백 검사만 수행했다.
+테스트·모듈 import·Python 컴파일·checkpoint 로딩·학습·simulation·play·GPU 측정은 실행하지 않았다.
+따라서 실행 검증 통과나 성능·안정성 개선을 주장하지 않는다. 소스 diff에서 잔여 차이가 MLP·
+의도한 정렬·프로젝트 namespace뿐임을 검토했고 `git diff --check`가 통과했다.
+
+## 99. 2026-11-05 — CUDA 실패와 NVIDIA Xid 32 조사 기록·해결 보류
+
+사용자 요청으로 이번 오류의 증거만 남기고 다른 안건으로 이동한다. **원인 해결·재현 실험은
+보류했으며 해결 완료로 취급하지 않는다.** 재발하면 먼저 이번 기록과 같은 종류의 실패인지 비교한다.
+
+| 항목 | 확인 내용 |
+|---|---|
+| 실행 | `logs/rsl_rl/contact_manipulation/2026-11-04_19-52-40` — Original GNN 프로젝트 |
+| 발생 시각 | 2026-11-05 06:54:33 KST = 2026-11-04 21:54:33 UTC |
+| 실행 경과 | 약 11시간 2분, Kit elapsed 39,729,855ms |
+| GPU / 드라이버 | RTX 3090, PCI `0000:26:00.0` / `580.173.02` |
+| 학습 프로세스 | PID `3227629` |
+| 마지막 완료 기록 | iteration 7368, 06:54:32.7778 KST — 오류 약 0.22초 전 |
+| 당시 설정 | 1024환경, physics100Hz·policy50Hz, robot solver32/1, patch buffer262144 |
+
+첨부 로그와 전체 Kit 로그에서 최초 CUDA 오류는 같은 시각의
+`omni.physx.tensors.plugin / GpuRigidBodyView.cpp:192–201 / unspecified launch failure`다.
+후속 traceback은 `events.py`의 `reset_task → state.reset` 중 다음 대입에서 끝난다.
+
+```python
+self.blocker_min_distance[ids] = math.inf
+```
+
+이 대입은 episode 최소거리 이력을 위한 `[num_envs, 17]` tensor의 정상 초기화다.
+Reset ID의 범위·중복 검사와 관련 gather 경로에서도 명백한 인덱스 오류는 찾지 못했다.
+**비동기 GPU 실패가 이 줄에서 보고됐다는 사실만으로 이 대입이나 reset이 최초 원인이라고
+판정하지 않는다.** 오류 전 전체 Kit 로그에는 OOM·patch overflow·singular inverse·PhysX
+수치 경고가 없었으며, allocator 경고는 약 2초 뒤 종료 처리 과정에서 나타났다.
+
+시스템 kernel journal에는 오류와 정확히 같은 시각·학습 PID·GPU의 다음 기록이 있었다.
+
+```text
+Nov 05 06:54:33 hoon kernel: NVRM: Xid (PCI:0000:26:00): 32, pid=3227629, name=python, channel 0x02000028 intr1 00000008 HCE_DBG0 00000518 HCE_DBG1 00000001
+```
+
+NVIDIA는 Xid32를 드라이버와 GPU 사이 PCIe 명령 전달을 담당하는 DMA 경로의 오류로 설명한다.
+따라서 드라이버·PCIe 경로를 조사할 중요한 단서지만 **일회성 GPU 오류, 하드웨어 고장 또는
+프로젝트 코드와 무관한 오류라고 확정한 것은 아니다.** 드라이버·PhysX·Warp·CUDA graph 등의
+소프트웨어 문제도 배제하지 않았다.
+[NVIDIA Xid32 설명](https://docs.nvidia.com/deploy/xid-errors/archive/index.html#xid-32-pbdma-error)
+
+마지막 완료 iteration의 TensorBoard 값은 다음과 같다. Reward 로그는 기록된 통계값이며
+순간 step reward나 아래 관절 최대속도와 같은 환경·시점의 값으로 해석하지 않는다.
+
+| 지표 | iteration 7368 |
+|---|---:|
+| Value loss | 0.003498 |
+| UR5e 독립 6관절 속도 최대 | 2.7753 rad/s |
+| Hand 독립 6관절 속도 최대 | 2.00001 rad/s |
+| Joint velocity reward 로그 | −0.007753 |
+| Action-rate reward 로그 | −0.006209 |
+| Sensor/action valid fraction | 각각 1.0 |
+| Invalid-state 종료 로그 | 0 |
+| Wrench clipping 비율 | 0 |
+
+이번 실행에서는 이전 `2026-11-04_16-37-44`의 `1e11 rad/s` 같은 지속적 속도·loss 폭증 전조를
+확인하지 못했다. 전체 실행의 Value loss 최대는0.821878, 독립 Hand 속도 최대는39.7505rad/s였다.
+Hand raw action은 마지막에 약41.4까지 커졌지만 적용 입력은 native position mapping의 포화에
+해당하는 raw ±2로 제한됐다. Raw drift는 별도 정책 검토 대상이며 이번 오류 직전 물리 명령
+폭증이 확인됐다는 뜻은 아니다. **모니터는 완료된 policy transition과 독립 관절12개만 집계하므로
+미완료 iteration·physics substep·종속 mimic 관절에서 순간 문제가 생긴 가능성은 남는다.**
+
+이 실행에는 이미97절의 **importer 기본 mimic 보존**이 반영됐다. 미사용 object pool도
+`set_disable_simulations()` 대신 **kinematic 전환**을 사용했다. 따라서 예전 강체 mimic 또는
+simulation 비활성화 API를 이번 실행의 원인으로 그대로 적용해서 설명하지 않는다.
+시작 시 IOMMU enabled 경고도 있었지만, 그것이 이번 오류를 유발했다는 증거는 없다.
+
+드라이버 논의에서 Isaac Sim5.1의 Linux 검증 버전은580.65.06, 연결된 Omniverse 공통 표의
+Ampere·GeForce R580 검증 버전은580.95.05로 확인했다. 현재580.173.02가 더 높다는 이유만으로
+비호환이라고 판단하거나 downgrade를 해결책으로 확정하지 않았다.
+R580 데이터센터 드라이버580.178.04에는 `CUDA_SCALE_LAUNCH_QUEUES=2x/4x`와 많은 CUDA graph
+연결 노드를 사용할 때 발생하는 Xid32 수정 내역이 있다. 하지만 이번 실행이 그 조건에 해당하는지,
+RTX3090에 동일 수정이 적용되는지는 미확인이다. 해당 데이터센터 패키지를 설치하라는 결정은 없다.
+[Isaac Sim5.1 사양](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/requirements.html),
+[Omniverse 드라이버 검증표](https://docs.omniverse.nvidia.com/dev-guide/latest/common/technical-requirements.html#ada-ampere-and-turing),
+[조건부 Xid32 수정 내역](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-178-04/index.html)
+
+**재발 시 확인할 사항:** kernel journal의 최초 Xid·시각·PID·PCI 주소를 전체 Kit 로그와 맞추고,
+실행에 저장된 cfg·git diff와 마지막 정상 TensorBoard 기록을 비교한다. 같은 Xid32가 반복되는지
+확인한 뒤 호환 드라이버·PCIe 연결·전원·온도와 GPU 실행 경로를 원인별로 검토한다.
+Checkpoint에서 새 프로세스로 재개하는 것은 손실 완화이며 재발 방지나 원인 해결과 구분한다.
+
+**원본 증거 위치:** 첨부 `621ebc55-c662-4fec-b099-1258e4ea4bc0/Pasted text.txt`, 위 실행의
+`params/env.yaml`·`params/agent.yaml`·저장 git diff·`events.out.tfevents.1793789609.hoon.3227629.0`,
+Isaac Sim 설치 환경의 `kit/logs/Kit/Isaac-Sim/5.1/kit_20261104_195223.log`, 시스템 kernel journal.
+
+**수행 범위:** 소스·기존 로그 읽기와 CPU TensorBoard 분석만 수행했고 학습·simulation·play·
+checkpoint 로딩·GPU 진단·재현 테스트는 실행하지 않았다. 이번 기록 외 소스·학습 설정·
+드라이버·하드웨어 설정을 변경하지 않았다.
+
+## 100. 2026-11-05 — 동적 Blocker goal 지도 갱신 독립 GPU 벤치마크
+
+[노션 보상 후보](https://app.notion.com/p/40e4968094ee81508608c1d3589c4aa5)를 검토한 뒤,
+사용자가 변하는 환경에서 goal을 계속 갱신할 때의 실제 비용을 간단한 독립 코드로 측정하도록
+요청했다. 이번 변경은 **검증 스크립트·결과·이 기록에 한정**하며, production MDP·reward·
+termination·관측·제어·Actor/Critic·학습 cfg는 변경하지 않았다. 실제 학습·PhysX도 실행하지 않았다.
+
+확정된 설계 논의는 다음과 같다. 새 항은 기존 Clearance처럼 추가적인 Target 보호·지지 gate를
+두지 않는다. 초기 지도 무효 시 reset까지 새 항을0으로 두는 안에는 사용자 동의가 있었지만,
+이후 기존 penalty와 보상 차단이 중복 억제를 만들 수 있다는 우려로 동적 재계산을 검토 중이다.
+최종 지급·지도 교체 시 최저기록 처리와 학습 반영은 아직 확정하지 않았다.
+
+**측정 조건:** RTX3090·driver580.173.02, PyTorch2.7.0+cu128, Warp1.15.0.
+활성 CUDA 학습 프로세스가 없는 상태에서 실행했다. XY10mm·yaw10°의
+`39×92×36=129168` 자세 격자와 1024환경 저장소를 사용했다. 초기 import·버퍼 준비·
+Warp 컴파일은 steady-state 시간과 분리하고 CUDA event elapsed와 동기화 포함 wall time을
+함께 기록했다. 아래 표는 warmup2회 후3회 측정의 **wall time 중앙값**이다.
+
+실제 자료는 `clutter_mixing_20261022/native_clutter_reset_1024_probe.json`에 저장된24개
+물체 배치다. 원본 convex collision polygon을 보수적인 최소면적 OBB로 감쌌으며, 실제 접근영역을
+사용했다. 환경별0.1mm·0.05° 수준의 작은 변형을 줬다. 별도의 비교 장면은 장애물23개와
+더 작은 직사각형 Blocker를 사용한 합성 배치이며 도달 가능한 goal 약40318개가 있었다.
+두 장면은 물체 크기·배치·연결 영역이 다르므로 goal 개수만의 효과를 비교한 실험이 아니다.
+
+초기 eager Torch 전수 구현에서 실제1024환경은 자세·goal 판정12.731초, edge 검사7.403초,
+도달성0.500초였다(각1회). 이는 하드웨어 하한이 아니다. 중복 trig·막힌 자세의 clipping과
+충돌 검사를 줄이고 Warp kernel로 호출을 합친 뒤 최종 측정을 수행했다.
+
+**동적 지도 갱신 전체:** 장애물에0.1mm 변화를 준 뒤 free/goal node·연속 swept edge·
+실제 시작 자세의 격자 연결·도달성을 순서대로 다시 계산했다. 매 step의 거리 평가와
+PhysX·PPO는 아래 시간에 포함하지 않는다.
+
+| 이번에 재계산한 환경 수 | 저장된24개 배치 | goal이 있는 합성 배치 |
+|---|---:|---:|
+| 1 | 3.252ms | 6.295ms |
+| 16 | 3.596ms | 11.908ms |
+| 64 | 13.940ms | 40.997ms |
+| 1024 | 214.063ms | 751.618ms |
+
+매 policy step에1024개를 모두 다시 계산한다면 rollout36 step의 지도 계산만 약7.71초 또는
+27.06초가 추가되는 산술 추산이다. 실제 학습 iteration을 실행해 측정한 시간이 아니다.
+16개만 매번 갱신하면 같은 추산은 약0.13초·0.43초다. 충분한 최적화 전 전체 환경의 매step
+전수 갱신을 그대로 학습에 넣을 근거는 없다.
+
+**비용 분해:** 저장 배치의1024환경에서 node 판정 약7.36ms, edge 검사 약2.12ms,
+시작 연결점 검색 약181.86ms, 순수 graph 탐색 약30.65ms였다. 합성 장면은 각각
+124.57ms·27.47ms·183.97ms·424.91ms였다. 각 단계의 독립 중앙값이므로 전체 갱신 중앙값과
+정확히 합산 일치하지 않는다. 시작 연결점은 아직 전체 격자에서 nearest-free 후보를 찾는
+Torch 경로이고, graph는8회마다 host convergence check가 남아 있다. 지역 연결·유효 노드만의
+탐색·변화한 node/edge만 갱신하는 개선 여지가 있으며, 현 결과를 최종 최적 성능으로 주장하지 않는다.
+별도 프로세스의 peak PyTorch allocated memory는 최대 약2160MiB였고 학습과 동시 측정하지 않았다.
+
+**거리 평가만의 측정:** `D=min_g(||p-pg||+R*|wrap(yaw-yawg)|)`를 GPU에서 계산했다.
+1024개 query를 한 번에 처리하고, goal4096개 단위로 나눠 임시 메모리를 제한했다.
+무작위 연속 goal 좌표의 산술 부하이며 도달성 생성 비용을 포함하지 않는다.
+
+| 후보 goal 수 | 공유 집합 | query별 mask |
+|---|---:|---:|
+| 2500 | 0.421ms | 0.457ms |
+| 10000 | 1.501ms | 1.656ms |
+| 40000 | 6.000ms | 7.080ms |
+
+7회 중앙값이며 query별 mask는4가지 패턴의 반복이고 유효 후보는75%다. 이를1024개의 실제
+독립 재계획 장면으로 해석하지 않는다. 거리 계산보다 지도 구축·연결성 갱신이 큰 비용인 사례가
+확인됐지만, 작은 goal 집합을 공유할 때의 거리 평가까지 어렵다는 결론은 아니다.
+
+**정확도·범위 확인:** 독립 scalar SAT·polygon clipping160개씩, 중간 자세5050개를 이용한
+sweep envelope 확인, 작은 격자의 CPU BFS·yaw 주기·부분 갱신 행 격리를 통과했다.
+GPU에서도 실제/합성 장면 각각4환경 전체 격자의 free·goal·edge·reachable·reachable-goal
+mask가 Torch 참조와 모두 일치했다. 코드가 검사하는 것은 보수적 OBB·6방향 연결이며,
+26방향 복합 이동·pivot·실제 mesh·마찰·손의 실행 가능성을 검증한 것은 아니다.
+현재 SAT는 접선 접촉도 충돌로 취급하므로 노션안의 접촉 허용 경계 처리와도 차이가 있다.
+
+특히 저장 배치에서는 **이 해상도와 보수적 연결 모델에서 reachable goal이0개**였다.
+초기 자세는 격자에 연결됐지만 이것이 실제 물리적 해법 부재를 뜻하지 않는다. 거친 격자·
+OBB proxy·6방향·단일 seed 선택으로 경로를 놓칠 수 있다. 빈 goal만으로 비용을 과소평가하지
+않도록 도달 가능한 goal이 충분한 합성 장면도 별도로 측정했다. 이 정확도/coverage 문제도
+학습 반영 전 해결해야 한다.
+
+재현 스크립트와 원자료는
+[`blocker_goal_benchmark_20261105`](../outputs/contact_manipulation/blocker_goal_benchmark_20261105/)에 둔다.
+`benchmark.py`는 Torch 참조와 compact 거리 부하, `fused_benchmark.py`는 fused GPU 비교,
+`validate.py`는 독립 CPU oracle이다. `scene_input.json`은 실제 배치의 필요한 필드만 보존한다.
+주요 결과는 `actual_final.json`·`synthetic_final.json`·`distance_final.json`·`summary.json`,
+검증은 `geometry_validation.json`·`gpu_validation.json`에 있다.
+
+```bash
+./IsaacLab/isaaclab.sh -p outputs/contact_manipulation/blocker_goal_benchmark_20261105/fused_benchmark.py \
+  --synthetic --counts 1 16 64 1024 --repeats 3 \
+  --output outputs/contact_manipulation/blocker_goal_benchmark_20261105/repeat_synthetic.json
+```
+
+**다음 검토:** 거리 평가는 매step 유지하면서, 시작 연결점의 전수 검색 제거와 환경 안에서
+영향받은 node/edge만 갱신하는 방식을 먼저 검증한다. 동적 goal 교체만으로 개선 보상이 생기는
+문제와 기존 신기록 이력의 재평가 문제도 속도와 별개로 남아 있다. 새 reward를 학습에 넣거나
+현재 보상 수식·weight를 변경하지 않았다.
+
+## 101. 초기 재배치 영역 보상과 현재 손–Blocker 거리 복원 (2026-11-05)
+
+**사용자 요청:** 동적 도달 가능 목표 자세 탐색은 별도 테스트로 보류하고, 초기 Clearance 양옆의
+빈 재배치 영역으로 Blocker가 가까워지는 보상 하나를 추가한다. 사용자가 선택한 판정은
+**Blocker 중심점의 영역 진입**이며, 영역 내부에서는 같은 보상을 유지한다. 여러 영역이면
+거리의 최솟값을 사용한다. 기존 `blocker_distance`는 episode 최소거리 평가에서 현재 거리로
+복원한다. 적용 대상은 원본 `src/contact_manipulation`이다.
+
+### 수식과 초기 계수
+
+환경 고정 XY 좌표계에서 보정된 Blocker OBB 중심을 $p_t$, 초기 빈 영역을 $R_j$라 한다.
+
+$$
+d_t=\min_j\operatorname{dist}(p_t,R_j),\qquad
+r_{\mathrm{relocation},t}=\exp(-a d_t),\qquad
+a=\frac{\ln 2}{0.10}\;\mathrm{m}^{-1}.
+$$
+
+영역 내부·경계에서는 $d_t=0$, 밖에서는 polygon 선분까지의 최단 거리를 사용한다.
+raw score는 내부1, 5cm에서0.7071, 10cm에서0.5, 20cm에서0.25다.
+`blocker_relocation.weight=1.0`으로 시작하며 native RewardManager의 `weight × step_dt`를
+그대로 적용한다. 매 step 현재 거리로 지급하며 신기록 이력·추가 상태 gate·`/dt` 상쇄는 없다.
+유효 영역이 없거나 중심이 비유한 경우 해당 항만0이며 scene 재생성·실패 예외를 추가하지 않는다.
+
+`blocker_distance` term은 기존 `mdp.blocker_distance` 함수로 되돌렸다.
+
+$$
+r_{\mathrm{distance},t}=\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_{i,t}).
+$$
+
+17개 pad 모두 현재 OBB 거리를 평가하므로 손이 멀어지면 보상도 감소한다. weight5.0과
+Target 보호 gate는 유지한다. 이전 `blocker_min_distance` 함수와 이력 필드는 비교용으로 보존한다.
+
+### 빈 영역과 실행 경로
+
+- 초기 Clearance의 양옆 Y band에서 모든 활성 non-Blocker 충돌 footprint를 장애물로 사용한다.
+  그 AABB 경계의 X 구간과 Y interval union으로 maximal empty rectangle을 추출하고,
+  Blocker의 principal 방향 중 하나에서 들어갈 크기의 사각형만 등록한다. 공간 격자·SE(2)
+  자세 탐색·IK·경로 연결성 계산은 수행하지 않는다.
+- 생성기가 확보한 pocket은 certificate의 center/yaw로 실제 convex footprint를 복원하고
+  선반 지지 범위·Y side band·다른 물체와의 convex SAT 분리를 재검증한다. 외접 AABB 전체가
+  비었다고 간주하지 않는다. Y side band 밖의 pocket은 이 항의 목표로 사용하지 않는다.
+- 다른 물체의 AABB를 사용하는 추가 공간 추출은 보수적이다. 대각선 물체 사이에서 실제로
+  가능한 모든 비정형 빈 공간까지 찾는 완전한 알고리즘은 아니다. 실제 pocket은 이 보수적
+  rectangle 근사와 별도로 검사한다.
+- 새 공유 배치에서만1회 생성한다. `SceneBatch`의 immutable polygon/count/mask를
+  zero-stride broadcast view로 공유하고 부분 reset에서는 재계산하지 않는다. `EpisodeBatch`나
+  물체 생성 규칙·PhysX actor·collision 설정은 변경하지 않았다.
+- `TaskState`가 기존 transition의 `batch.center`에서 현재 Blocker 중심을 보관한다. 매 step
+  보상은 GPU tensor의 point–polygon 거리와 region min만 수행하며 추가 PhysX 조회가 없다.
+  초기 영역은 주변 물체·선반이 움직여도 고정한다.
+
+중심 진입 기준이므로 전체 Blocker가 현재 yaw에서 영역 안에 들어갔다는 보장은 없다.
+최댓값도 실제 Clearance 성공을 뜻하지 않는다. 현재 상태의 성공·전도·주변 물체 이동 등은
+기존 보상과 종료 조건이 계속 판단한다. 도달 가능성이나 실제 push 경로의 존재를 증명하는
+보상은 아니며, 학습 성능 향상 여부는 새 실행으로 확인해야 한다.
+
+### 검증과 연산 비용
+
+Isaac Sim·PhysX·train/play 없이 CPU 수식·native adapter/reset mock과 독립 GPU 연산만 검사했다.
+
+- 원시 거리/보상8개 테스트와 초기 영역3개 테스트: 내부·경계 plateau, CW/CCW polygon,
+  polygon padding, 여러 영역의 최근접 선택, invalid/빈 영역, 1024행 tensor, actual rotated
+  pocket과 그 외접 AABB 차이, 물체가 영역을 점유한 경우 제외를 확인했다.
+- Native adapter에서 비대칭 USD 원점의 보정 중심, nonzero env origin, step cache와 부분
+  reset 선택행을 검사했다. 공유 reset에서는 새 배치당1회 추출과 metadata 재사용을 확인했다.
+- 관련 CPU 테스트144개 실행: **142통과·2skip·새 실패0**. 별도4개는 수정 전 HEAD에서도
+  동일하게 실패했다. 과거 기대값250과 현재 success_reward10의 불일치3개 및 arm velocity
+  기대값3과 현재1의 불일치1개다. 이4개를 통과시키려고 사용자 설정이나 무관한 판정을 바꾸지 않았다.
+- 저장된24개 물체 배치에서 유효 영역3개를 찾았다. 모든 영역의 실제 물체/A0 overlap이
+  $10^{-9}\;\mathrm m^2$ 미만임을 CPU에서 확인하고, GPU polygon·보상과 CPU float64 결과를
+  비교했다.
+
+RTX3090, PyTorch2.7.0+cu128의 독립 wall-clock 중앙값은 다음과 같다.
+
+| 단계 | 중앙값 |
+|---|---:|
+| 저장 배치의 초기 영역 생성: 공유 scene당1회 | 5.269ms |
+| 저장 영역3개로1024행 보상 계산: 매 step | 0.876ms |
+| 합성 영역64개로1024행 보상 계산: 매 step | 0.924ms |
+
+저장 배치의 region metadata 자체는123bytes이며 환경 수만큼 복제하지 않는다. 위 값에는
+PPO·물리 step·기존 snapshot 비용이 포함되지 않는다. 36step이면 거리/보상 계산만 약31.5ms에
+해당하지만 실제 training iteration을 측정한 값은 아니다. 실제 빈 영역 수와 polygon vertex 수에
+따라 비용이 달라진다. 합성64영역은 arithmetic stress case이며 실제 장면64개 영역을 뜻하지 않는다.
+
+재현 코드·원자료:
+[`relocation_reward_20261105`](../outputs/contact_manipulation/relocation_reward_20261105/)
+의 `benchmark.py`, `results.json`, `cpu_tests.json`.
+
+## 102. Headless 초기 실행의 Vulkan page fault·Xid31 (2026-11-05)
+
+사용자 제공 오류는 **2026-11-05 12:51:57 UTC = 21:51:57 Asia/Seoul**에 발생했다.
+해당 실행은 `logs/rsl_rl/contact_manipulation/2026-11-05_21-50-04`, PID71361이다.
+읽은 자료는 다음과 같다.
+
+- Kit 전체 로그:
+  `/home/hoon/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261105_214947.log`
+- Vulkan crash dump:
+  같은 디렉터리의 `kit_20261105_214947-0.nv-gpudmp`.
+- 커널 근거: `/var/log/kern.log:1176–1177`, `/var/log/syslog:82660–82661`와
+  `journalctl -k -n 80`.
+
+### 확인된 사실
+
+```text
+Nov 5 21:51:57 KST
+NVRM: Xid (PCI:0000:26:00): 31, pid=71361, name=python,
+channel 0x0000003c, intr 00000000.
+MMU Fault: ENGINE GR0_PBDMA1 HUBCLIENT_ESC
+faulted @ 0x40_05740000.
+Fault is of type FAULT_PDE ACCESS_TYPE_VIRT_READ
+```
+
+1. Vulkan이 기록한 가상주소 `0x0000004005740000`와 커널 주소 `0x40_05740000`가
+   일치한다. GPU 가상메모리 읽기 중 MMU fault가 있었고 이후 Vulkan은
+   `ERROR_DEVICE_LOST`를 보고하며 앱을 종료했다.
+2. GPU는 기존과 같은 PCI0000:26:00, UUID `GPU-87dfa229-670d-63dd-0199-0e6629448650`,
+   드라이버는580.173.02 Open Kernel Module이다. **99절은 Xid32**, 이번은 **Xid31**로
+   동일 종류의 재발이라고 단정할 수 없다.
+3. Kit 로그에서 page fault 전에 CUDA/PhysX error·patch overflow·명시적인 OOM은 확인되지
+   않았다. 같은 커널 구간에도 AER/PCIe Bus Error·fallen-off/reset·OOM/killed-process 기록이
+   없다. 이는 원인 배제의 증거가 아니라 해당 로그에 그런 선행 기록이 없다는 뜻이다.
+   오류 직전 peak VRAM은 저장되지 않았다. `device lost, out of memory, or an unexpected bug`
+   문장은 일반적인 원인 목록이며 OOM 확정 메시지가 아니다.
+4. 실제 실행은 headless Kit와 `--no-window`를 사용했다. 설정은1024환경, physics dt0.01,
+   decimation2, render_interval2147483647, actor/critic compile_model true다. Headless에서도
+   이 실행은 Vulkan renderer를 초기화했다. Vulkan이 오류를 보고했다는 것만으로 최초 원인
+   연산이 렌더링이라고 단정할 수 없다.
+5. 해당 TensorBoard 파일은88bytes, scalar tag0개, checkpoint0개다. 첫 iteration 통계를
+   기록하기 전에 종료됐으며 reward/loss 상승이나 행동 발산을 근거로 원인을 설명할 수 없다.
+6. 새 relocation 보상은 활성(weight1)이고 손–Blocker distance도 현재값 함수다. 신규 코드
+   검토에서 명백한 gather 범위 초과·공유 polygon의 수명 문제·새 CUDA graph capture는
+   찾지 못했다. 새 영역 계산은 stage/PhysX actor/collider를 바꾸지 않는다. 다만101절의 GPU
+   검증은 독립 연산이므로 SDK·물리·Vulkan과의 통합 상호작용을 배제하지는 못한다.
+
+### 판단과 다음 구분 실험
+
+[NVIDIA Xid31 공식 설명](https://docs.nvidia.com/deploy/xid-errors/archive/index.html#xid-31-fifo-mmu-error)은
+MMU의 잘못된 주소 접근 계열 오류로 분류하며 애플리케이션·드라이버·하드웨어 원인이 모두
+가능하다고 설명한다. 이번 오류를 단순한 일시 GPU 오류나 드라이버 문제로 확정하지 않는다.
+
+신규 변경의 영향을 구분하려면 같은 명령·seed에서 relocation 항의 **초기 영역 준비와 매 step
+평가를 함께 제외한 대조**가 필요하다. 현재 `weight=0`만 설정하면 native RewardManager가
+매 step 평가만 생략하고 초기 영역 생성은 계속하므로 전체 신규 경로를 제거한 대조가 아니다.
+그 대조에서도 재발하면 기존 CUDA graph·torch.compile 및 SDK/드라이버 경로를 분리하는
+실험을 이어갈 수 있다. CUDA 측 최초 접근은 Compute Sanitizer 등으로 추가 추적할 수 있지만
+현재 자료에는 원인 함수·행을 확정할 증거가 없다.
+
+이번 조사에서는 로그 읽기와 CPU TensorBoard 파일 확인만 수행했다. 학습·simulation·GPU
+재현 테스트나 driver/cache/config 변경은 하지 않았다. 신규 오류와 이전 Xid32를 각각 보존하여
+이후 재발 조사 시 같은 GPU·다른 fault 종류임을 비교한다.
+
+## 103. 학습135 iteration 후 CUDA 실패와 과거와 동일한 Xid69 (2026-11-05)
+
+실행은 `logs/rsl_rl/contact_manipulation/2026-11-05_22-26-35`, PID93333이다.
+사용자 traceback은 PhysX `GpuRigidBodyView.cpp:192–201`의 unspecified launch failure와
+PPO `mean_value_loss += value_loss.item()`에서 보고된 CUDA 실패다.
+
+### 오류 순서와 과거 비교
+
+커널 `/var/log/kern.log:1179`, `/var/log/syslog:92146`에서 다음을 확인했다.
+
+```text
+Nov 5 22:44:51 KST = 2026-11-05 13:44:51 UTC
+NVRM: Xid (PCI:0000:26:00): 69, pid=93333, name=python,
+Class Error: channel 0x00000013, Class 0000c7c0,
+Offset 000001b0, Data 00000041, ErrorCode 00000053
+```
+
+같은 PID의 Kit 로그는
+`/home/hoon/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261105_222618.log`다.
+최초 `[Error]`는5372줄, 13:44:52UTC의 `GpuRigidBodyView.cpp:192`이며10개 CUDA 오류가
+이어진다. allocator 경고는 종료 중13:44:54UTC에 발생했다. 선행 OOM·patch overflow·
+singular inverse·Vulkan pagefault/device-lost 기록은 없으며 같은 커널 구간에도 AER·OOM·GPU
+reset/fallen-off 기록이 없다. 오류 직전 peak VRAM이 없어 OOM을 완전히 배제하는 근거는 아니다.
+
+**과거 동일 signature:** `/var/log/kern.log.1:18`의10월25일16:32:21KST, PID858212,
+실행 `2026-10-25_02-40-51`에서도 Xid69와 Class`c7c0`·Offset`1b0`·Data`41`·ErrorCode`53`이
+같았다. 채널 번호는 달랐다. 이번은102절의 Xid31이 아니라, 새 relocation 항 추가 전에도
+존재했던 Class Error 유형과 일치한다. 신규 항만이 이 signature를 만들 수 있다는 가설은
+맞지 않지만, 현재 변경이 발생 빈도에 영향을 주는지까지 배제할 수는 없다.
+
+[NVIDIA Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html)는69를
+Graphics Engine class error로 분류하고 `CHECK_APP/CUDA` 조사를 안내한다.
+공개 [Ampere compute header](https://raw.githubusercontent.com/NVIDIA/open-gpu-doc/master/classes/compute/clc7c0.h)에서
+Class`0xC7C0`는 `AMPERE_COMPUTE_B`, Offset`0x01b0`는 `NVC7C0_LAUNCH_DMA`다.
+따라서 이름의 Graphics만 보고 viewport/렌더링 문제로 해석하지 않는다. 이 명령 정보만으로
+PhysX·Torch·Warp·드라이버 중 호출 주체나 실패 데이터의 근원을 특정할 수는 없다.
+ErrorCode`0x53`의 상세 의미를 다른 API의 숫자 코드와 임의로 대응시키지 않는다.
+
+CUDA 비동기 실행에서는 `.item()` 같은 동기화 시점에 앞선 실패가 보고될 수 있다.
+[PyTorch2.7 문서](https://docs.pytorch.org/docs/2.7/notes/cuda.html#asynchronous-execution)에 따라
+traceback의 loss 출력 행을 수식/critic의 직접 실패 지점으로 보지 않는다. 커널 Xid가 PhysX
+보고보다 먼저 있었지만, 기록 시각만으로 최초 원인 연산을 확정하지 않는다.
+
+### 실패 전 저장된 수치
+
+TensorBoard194개 scalar series를 CPU로 확인했다. iteration0–134, 총135개가 기록됐으며
+마지막 wall time은13:44:47.220100UTC로 오류보다 약4.78초 앞선다.
+
+| 지표 | 마지막134회 | 전체 기록 |
+|---|---:|---:|
+| Value loss | 0.0589255 | 최대0.0589255 |
+| Surrogate loss | -0.000797685 | -0.0530615–0.0486085 |
+| 정책 평균 std | 0.534005 | 0.534005–0.961274 |
+| Action-rate reward | -0.0110162 | 최소-0.0164486 |
+| Joint-velocity reward | -0.0129296 | 최소-0.0172378 |
+| Invalid-state 종료 | 0 | 전체0 |
+| 상태·action 유효 비율 | 1 | 전체1 |
+| Wrench clipping 비율 | 0 | 전체0 |
+| Arm 관절속도 최대값 | 4.05262rad/s | 최대6.27946rad/s |
+| 독립 Hand 관절속도 최대값 | 3.32495rad/s | 최대19.6902rad/s |
+| 적용 force 최대 축값 | 23.6959N | 최대46.4871N |
+| 적용 torque 최대 축값 | 1.68438N·m | 최대4.61083N·m |
+
+scalar에 NaN/Inf는 없다. Value loss는 마지막0.0322→0.0486→0.0589로 올랐지만 과거의
+극단적인 수치 폭발과 같은 증거는 없다. 속도 수치를 안전하다고 인증하는 뜻도 아니며,
+실패한 마지막4.78초의 rollout/update 자체는 이 기록에 포함되지 않는다. 속도 모니터는
+36×1024 transition의 실제 최대값으로12개 독립 관절만 포함하고 mimic 관절은 포함하지 않는다.
+
+마지막 mean return1.85146, mean length26.42step, hand_velocity 종료비율0.78814,
+singularity0.05941, success0이다. 종료 편향은 학습 관점의 별도 문제이며 GPU Class Error의
+원인으로 연결할 근거는 없다.
+
+저장 설정은1024환경, physics dt0.01·decimation2(정책50Hz), rollout36step, Actor/Critic
+compile_model true다. 당시 relocation은 **weight3·decay10**, 현재 거리 보상은weight5·decay10,
+Contact hold는weight3이다.101절 최초 적용값1·ln2/.10과 구분한다.10월25일 동일 signature의
+실행도1024환경과 두 모델 compile_model true였다. 공통점은 원인 증명이 아니다.
+
+### 후속 검증 방향
+
+loss나 reward weight를 GPU 오류의 직접 원인으로 단정해 바꾸기보다, 동일 조건에서
+GPU 실행 경로를 분리한다. Actor/Critic `torch.compile`을 끈 대조, 기존 transition/support/IK
+CUDA graph 경로를 분리한 대조를 한 종류씩 비교할 수 있다. 현재 모델 compile 코드 자체는
+`options={"triton.cudagraphs": False}`를 사용하므로 compile off와 환경 CUDA graph off는
+동일한 변경이 아니다. `CUDA_LAUNCH_BLOCKING=1`은 최초 실패 호출을 좁히는 진단 수단이며
+해결책이나 정상 학습 설정으로 간주하지 않는다. 필요하면 NVIDIA 버그 리포트와 메모리
+검사 도구로 최초 잘못된 연산을 추가 추적한다.
+
+이번 조사에서는 로그·저장 설정·설치된 PPO 코드·TensorBoard만 읽었다. 새로운 학습·재현
+테스트·GPU 연산이나 driver/실행 설정 변경은 수행하지 않았다. 코드·SDK·드라이버·하드웨어
+중 근본 원인 귀속은 아직 미확정이다.
+
+## 104. OSC 관절 조회에서 보고된 동일 Xid69 재발 (2026-11-06)
+
+실행 `logs/rsl_rl/contact_manipulation/2026-11-05_22-52-36`, PID106662에서 발생했다.
+사용자 traceback은 공식 OSC Action의 `_compute_joint_states()`가
+`self._asset.data.joint_pos[:, self._joint_ids]`를 읽는 중 unspecified launch failure를
+보고한다. 관절 인덱스 오류나 OSC 수식 오류가 직접 확인됐다는 뜻은 아니다.
+
+### 커널·Kit 대조
+
+```text
+2026-11-06 02:27:56 KST = 2026-11-05 17:27:56 UTC
+NVRM: Xid (PCI:0000:26:00): 69, pid=106662, name=python,
+Class Error: channel 0x00000013, Class 0000c7c0,
+Offset 000001b0, Data 00000041, ErrorCode 00000053
+```
+
+- 근거는 `/var/log/kern.log:1184`, `/var/log/syslog:94175`다.103절의 Xid69와는
+  Class·Offset·Data·ErrorCode뿐 아니라 채널 번호까지 같다.10월25일에도 같은4개 필드가
+  존재한다.102절 Xid31의 MMU fault 주소와는 연결하지 않는다.
+- Kit는 `kit_20261105_225220.log`, 시작 시각은11월5일22:52:20KST다.
+  이 로그에는 선행 `[Error]`가 없고,11월6일02:27:58KST에 종료 시작과 allocator 경고를
+  기록했다. 첨부된 `12,938,517ms` 경고가 이 파일5378줄과 일치한다. allocator 경고는
+  kernel fault 약2초 뒤 종료 중 발생하므로 최초 원인으로 판단하지 않는다.
+- OOM·patch overflow·singular inverse·Vulkan pagefault/device-lost·AER·GPU reset/fallen-off
+  선행 기록은 발견하지 못했다. peak VRAM 및 실패 순간의 CUDA 입력은 저장되지 않았다.
+- close 이후에도 Kit에 omniclient token 갱신 로그가 남아 종료 완료가 지연된 정황은 있다.
+  조사 당시 `ps -p 106662`에는 해당 PID가 없었다. 이를 최초 GPU fault의 원인으로 연결하지 않는다.
+
+### 저장된 학습 상태
+
+TensorBoard에는 iteration0–2297, **2298회**가 기록됐다. 마지막 기록은
+11월6일02:27:56.142679KST로 사용자 CUDA 보고보다 약1.86초 앞선다.
+
+| 지표 | 마지막2297회 | 전체 기록 |
+|---|---:|---:|
+| Value loss | 0.0548914 | 최대0.853210 @2058 |
+| Surrogate loss | 0.00440623 | -0.0525547–0.125904 |
+| 평균 std | 0.955622 | 0.540090–0.959331 |
+| Action-rate reward | -0.0176155 | 최소-0.0443837 |
+| Joint-velocity reward | -0.0272967 | 최소-0.0379490 |
+| Arm 속도 최대값 | 3.73472rad/s | 10.9939rad/s @1438 |
+| 독립 Hand 속도 최대값 | 2.00941rad/s | 29.8748rad/s @1638 |
+| 적용 force 최대 축값 | 14.4631N | 46.7431N |
+| 적용 torque 최대 축값 | 1.03902N·m | 4.61083N·m |
+
+194개 scalar series에 NaN/Inf가 없고 invalid_state는 전체0, 상태/action 유효 비율은1이다.
+마지막 value loss10개는0.12834,0.00852,0.01021,0.01246,0.01220,0.01805,0.03195,
+0.03077,0.03978,0.05489다. 기록된 구간에는 과거1e11급 상태나 극단적인 loss 폭발의 증거가
+없지만 실패한 마지막 약1.86초의 상태까지 배제할 수는 없다. 속도 최대값을 안전하다고
+인증하는 결과도 아니다.
+
+Hand raw action은 마지막15.2821·전체16.5939지만 적용 채널 절댓값은 계속2 이하였다.
+Wrench clipping 비율은 전체0이다. 마지막 mean return14.0806·episode length214.10step,
+timeout0.609484·hand_velocity0.375705·success0이다. 학습 품질은 GPU failure와 별도로 평가한다.
+
+### 설정과 판단
+
+저장 `agent.yaml`은103절 실행과 byte-identical이며 `env.yaml`도 log_dir만 다르다.
+따라서 **두 모델 compile_model=true**와1024환경·reward·제어 설정이 그대로다.
+이번 실행을 compile off 대조로 해석하지 않는다. 동일 GPU Class Error가 PPO loss 집계와
+OSC 상태 조회 등 다른 호출에서 보고된 것으로, 특정 traceback 행을 고치는 근거는 없다.
+
+다음 비교는 기존 명령에 `agent.actor.compile_model=false agent.critic.compile_model=false`를
+추가해 모델 컴파일만 제외하는 방식으로 수행할 수 있다. 환경의 transition/support/IK CUDA
+graph는 별도 경로이므로 이 설정으로 꺼지지 않는다. 모델의 Triton CUDA graph도 현재 코드에서
+이미 false이므로 두 종류의 graph를 혼동하지 않는다. 이 대조가 원인 증명이나 해결 보장은
+아니며 재발하면 환경 graph와 동기화 진단을 별도로 비교해야 한다.
+
+이번 조사에서는 로그·저장 설정·공식 OSC 코드와 CPU scalar만 읽었다. 추가 실행·GPU 작업·
+driver/학습 설정 변경은 하지 않았다. 기존 설정을 보존하고 실패 유형의 재발 기록을 추가했다.
+
+## 105. 모델 컴파일 분리와 GPU 검증 (2026-11-06)
+
+사용자가 반복 오류의 원인 해결·학습 재개를 요청했고, 실행 중이던 GUI play를 직접 종료한 뒤
+검증을 진행했다. GPU 사용 프로세스가 없는 것을 확인하고 각 GPU 작업을 순서대로 실행했다.
+
+### 변경 범위와 해석
+
+- 원본 Actor·Critic의 `compile_model` 기본값을 `true → false`로 변경했다. `torch.compile`은
+  GNN·attention 등의 tensor feature 계산을 TorchInductor로 최적화하는 선택 기능이다.
+  네트워크 구조·파라미터 이름·checkpoint contract·native PPO·reward·제어 설정은 유지한다.
+  이 변경은 **컴파일 원인 확정에 따른 수정이 아니라 원인 분리를 위한 실행 기준 변경**이다.
+- 환경 설정에 `transition_cuda_graph`, `support_cuda_graph`, `robot_start_cuda_graph`를 추가했다.
+  기본값은 모두 `true`다. 각각 `false`로 지정하면 해당 단계의 자체 capture/replay만 우회하고,
+  GPU tensor 계산·Warp kernel·동일한 후보 순서는 유지한다. PhysX SDK 내부 graph를 끄는 API가 아니다.
+- 모델의 `triton.cudagraphs=false`는 이전부터 적용되어 있었다. 모델 컴파일과 환경의 CUDA graph는
+  다른 경로다. 컴파일을 꺼도 직접 작성한 Triton edge reduction과 Warp 기하 kernel은 남는다.
+- `contact_manipulation_parallel`, 보상 weight·수식, 물리·로봇·센서 설정은 이번 조사에서 변경하지 않았다.
+  드라이버·BIOS·IOMMU·GPU clock도 변경하지 않았다.
+
+### GPU 오류에 대해 확인한 범위
+
+104절과103절의 동일 `Xid69 / c7c0 / 1b0 / 41 / 53`은
+[해당 드라이버의 NVIDIA class 정의](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.173.02/src/common/sdk/nvidia/inc/class/clc7c0.h#L212)에서
+Ampere compute class의 `LAUNCH_DMA`에 해당한다. Data `0x41`은 정의된 flag 조합이며,
+그 숫자 자체를 비정상 action이나 torque 값으로 해석하지 않는다. Hardware class ErrorCode `0x53`은
+별도 `NV_STATUS` enum의 같은 숫자로 해독할 수 없다.
+
+[NVIDIA Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html)는 Xid69에
+앱 재시작과 앱/CUDA 경로 조사를 안내한다. 현재 로그만으로 앱·SDK·driver·hardware 중 하나를 확정할
+수 없다. 검토한 Warp/Triton kernel의 인덱스 mask, stream, mesh·graph buffer 수명에서 구체적인
+메모리 오류는 찾지 못했지만 이는 전체 경로의 무결성 증명이 아니다.
+
+[2023년 PyTorch 이슈의 RTX3090 보고](https://github.com/pytorch/pytorch/issues/74235#issuecomment-1612030397)에도
+정확히 같은 오류 서명이 있다. 해당 사용자는 BIOS 업데이트 후 개선을 보고했지만 CPU·보드·driver가
+다르므로 우리 시스템의 해결책으로 단정하지 않는다. 현재 로컬 시스템은 Ryzen7 3700X,
+MSI B450M MORTAR MAX, BIOS2.P1(2025-09-18), RTX3090, driver580.173.02다.
+IOMMU 활성화는 확인했지만 단일 GPU인 이번 실패가 PCIe peer transfer와 연관됐다는 증거는 없다.
+580.178.04의 특정 launch-queue/CUDA graph 관련 Xid32 수정도 이번 Xid69의 확인된 해결책은 아니다.
+
+### 실제 검증
+
+검증 자료는 `outputs/contact_manipulation/gpu_stability_20261106/`에 저장했다.
+
+| 검사 | 조건 | 결과 |
+|---|---|---|
+| CPU 회귀 검사 | native Actor/Critic·checkpoint·Time curriculum·새 graph switch | 41개 중40통과, GPU 전용1skip |
+| 기본값 변경 검사 | native 학습 설정의 compile=false | 통과 |
+| 실제 환경16 iteration | 1024환경, checkpoint2250, 모델 compile=false, 환경 graph=true | 정상 종료,147.66초, invalid_state=0,193개 scalar 모두 finite |
+| 실제 환경4 iteration | 1024환경, checkpoint2250, 모델/환경 graph off, CUDA_LAUNCH_BLOCKING=1 | 정상 종료,97.46초, invalid_state=0,193개 scalar 모두 finite |
+| 모델 독립 memcheck | 실제 checkpoint,1024 추론·9216 backward(8192+1024), compile on/off, full FP32 | 출력·gradient 일치, GPU 메모리 오류0 |
+| Encoder 갱신 후 memcheck | 두 모드의 node encoder weight를 동일하게 변경 후 재평가 | 새 weight 반영·출력·gradient 일치, GPU 메모리 오류0 |
+
+독립 모델 검사는 실제 production 모델과 checkpoint를 사용하지만 observation은 유효한 형식의
+합성 입력이며 optimizer step이나 PhysX simulation은 없다. Full-FP32 비교에서 최대 출력 차이는
+1.91e-6, gradient 차이는1.70e-6였다. Encoder weight 갱신 검사는 출력2.03e-6,
+gradient1.70e-6 이내였다. 두 검사 모두 Compute Sanitizer `ERROR SUMMARY: 0 errors`로 종료했다.
+
+처음에는 기존 학습과 같은 TF32 설정으로 비교했다. Critic 출력의 최대 절대 차이0.0045967 때문에
+미리 정한 일치 기준(atol5e-4,rtol2e-3)을 통과하지 못했다. 그 구간의 memcheck 오류는0이었다.
+기준을 완화하지 않고 TF32만 꺼서 재검사했으며, 위의 full-FP32 결과를 얻었다. 이는 관찰된 출력
+차이가 정밀도·연산 결합 차이와 일치한다는 단서이며 **TF32가 Xid69의 원인이라는 결과가 아니다**.
+장기 대조 학습의 TF32 설정은 기존대로 유지한다.
+
+짧은 환경 검사는 checkpoint2250을 새 장면에서 재개한 안정성 검사다. 첫 rollout 뒤에는
+`hand_velocity=1`, 평균 episode 길이1step이 관찰되어 학습 품질이 좋은 결과로 해석하지 않는다.
+환경 상태·RNG 전체를 복원한 동일 trajectory 재현도 아니다. 짧은 검사의 max_iterations 때문에
+Time curriculum이 앞당겨지지 않도록 해당 검사에서만 Time을0으로 유지했다. 원래45000회 이전과
+같은 지급 상태이며, 본 학습의 curriculum을 비활성화한 변경은 아니다. 위 시간은 이 높은 reset
+빈도와 동기화 조건의 수치이므로 정상 학습의 처리량 비교에 그대로 사용하지 않는다.
+
+### 장시간 대조 학습
+
+검증 뒤 1024환경·seed42·90000회 예산으로 **새 학습**을 시작했다. 모델 컴파일만 끄고,
+환경 graph 세 개·TF32·Time curriculum·모든 reward/termination/제어 설정은 기존대로 둔다.
+Checkpoint2250 재개 검사의 결과물은 새 학습의 초기 weight로 사용하지 않는다.
+
+실행 정보·PID·정확한 인수·소스 hash는 `training_launch.json`, 전체 콘솔은
+`training_model_eager.console.log`에 보존한다. 자동 재시작은 하지 않는다.
+이 실행은 **재발 여부를 확인하는 대조 실행이며 원인 해결이 확정된 학습은 아니다**.
+새 Xid69가 발생하면 컴파일만 제거해서는 해결되지 않는다는 근거로 남기고, 환경 graph·동기화
+진단과 SDK/driver 경로 조사를 이어간다. 짧은 검사 통과만으로 수 시간 뒤의 재발을 배제하지 않는다.
+
+실제 시작한 실행은 `2026-11-06_12-40-40_stability_model_eager`, PID298879다.
+초기 iteration0–4의 PPO update·checkpoint0 저장까지 확인했다. 이 구간의 높은
+`hand_velocity` 종료율(0.9989–1.0)은 이전104절 실행의0–5회에도 동일하게 관찰되어,
+컴파일 해제로 새로 발생한 현상으로 단정하지 않는다. 학습 품질·초기 reset 빈도 문제는
+별도 평가 대상이며, GPU 오류의 재발과 구분한다. 이번 장기 실행의 최종 결과는 아직 없다.
+
+## 106. 모델 컴파일 기본값 복원 (2026-11-06)
+
+사용자가 learning time 증가를 검토한 뒤 Actor·Critic의 `compile_model`을 다시 `true`로
+설정하도록 요청했다. 원본 `ContactActorCfg` 기본값을 복원했고 `ContactCriticCfg`도 이를 상속한다.
+환경 graph 스위치·`triton.cudagraphs=false`·네트워크·PPO·reward 설정은 유지했다.
+105절의 PID298879 대조 실행은 앞선 사용자 중단 요청으로 종료·GPU 점유 해제를 확인했다.
+이번 변경은 다음 실행부터 적용되며 이미 실행 중인 학습의 설정을 바꾸지 않는다.
+사용자가 학습 중이라고 명시했으므로 테스트·벤치마크·학습 실행은 하지 않고 파일만 수정했다.
+Xid69의 원인 확정이나 컴파일 ON/OFF의 새 성능 비교 결과를 뜻하지 않는다.

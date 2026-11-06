@@ -4,19 +4,19 @@
 Isaac Lab의 공식 `RslRlMLPModelCfg`와 RSL-RL의 기본 `MLPModel`을 사용한다.
 GNN, Attention, 별도의 observation encoder, 사용자 모델 subclass는 없다.
 
-원본의 물체 자세 갱신·제어·물리·배치 생성을 기준으로 독립 복사한 MLP 실험이다.
-모델과 초기 물체 슬롯 순서를 변경했으며, 현재 학습 설정은
-[다음 학습 최종 명세 — Codex 구현 기준](https://app.notion.com/p/40a4968094ee813ba809e044a2db975a)에
-맞췄다(2026-10-31). 이후 사용자 요청으로 Actor 비전을 10step마다 갱신하도록 확장했다
-(2026-11-01). 원본 패키지를 import하지 않는다.
+2026-11-04 현재 `contact_manipulation`의 학습·제어·물리·배치·MDP 설정을 동기화했다.
+차이는 기본 MLP 네트워크, MLP용 물체 좌우 정렬·초기 인접 교환과 프로젝트별 이름뿐이다.
+원본 패키지를 import하지 않는 독립 프로젝트다. 아래 현재값은 실행 시 CLI/Hydra로 덮어쓸 수 있다.
+기존 18D action/244D observation checkpoint는 새 12D/232D 환경에서 사용할 수 없으므로
+새 학습을 시작한다. 실행 중인 학습에는 소급 적용되지 않는다.
 
 ## 모델
 
 | 항목 | Actor | Critic |
 |---|---|---|
 | 관측 그룹 | `policy` | `critic` |
-| 입력 | 244D | 244D |
-| 네트워크 | 244 → 256 → 128 → 18 | 244 → 256 → 128 → 1 |
+| 입력 | 232D | 232D |
+| 네트워크 | 232 → 256 → 128 → 12 | 232 → 256 → 128 → 1 |
 | 활성화 | ReLU | ReLU |
 | 가중치 | 독립 | 독립 |
 | 관측 정규화 | OFF | OFF |
@@ -24,14 +24,15 @@ GNN, Attention, 별도의 observation encoder, 사용자 모델 subclass는 없�
 
 Actor의 Gaussian은 `std_type="scalar"`, 초기 표준편차 1.0이다.
 Sampling·log probability·entropy·KL·PPO·GAE·logger·checkpoint는 공식 구현에 맡긴다.
-추가 tanh나 action clipping은 없다. Critic에는 출력 분포가 없다.
+분포에 tanh나 ±1 clipping을 추가하지 않는다. 환경에서 sensor wrench 범위와 native Hand
+포화를 적용한다. Critic에는 출력 분포가 없다.
 
 현재·직전 상태를 별도 인코딩하지 않고, 물체 100D와 그대로 연결해 기본 MLP에 입력한다.
 Actor·Critic 사이에 encoder·MLP·파라미터·optimizer parameter를 공유하지 않는다.
 
 ## Observation과 물체 순서
 
-두 그룹 모두 `물체 100D + 현재 72D + 직전 72D = 244D`다.
+두 그룹 모두 `물체 100D + 현재 66D + 직전 66D = 232D`다.
 물체 하나는 `중심 3 + quaternion 4 + OBB 크기 3`의 10D다.
 Mask나 역할 ID를 observation에 추가하지 않는다.
 
@@ -74,21 +75,21 @@ Mask나 역할 ID를 observation에 추가하지 않는다.
 픽셀×물체 크기의 비교 tensor나 환경·물체별 Python 반복문을 추가하지 않는다.
 교환 패턴의 추첨은 reset 행만 tensor로 처리하며, 교환 때문에 ray cast를 추가하지 않는다.
 
-### Actor 비전 10step 갱신과 Critic GT
+### Actor 비전 갱신과 Critic GT
 
-- **Actor:** 고정된 episode 시점에서 10step마다 현재 물체에 실제 메시 ray casting을 수행한다.
-  보이는 표면에서만 OBB를 추정하며, 새로 보이는 물체를 넣고 가려진 물체는 zero padding한다.
-  중간 step에는 최근 ray snapshot을 유지하면서 현재 UR5e 말단 EEF frame으로 변환한다.
+- **Actor:** 기본 `actor_vision_update_interval=0`으로 reset 때만 메시 ray casting을 수행한다.
+  보이는 표면의 OBB를 캐시하고 매 step 현재 sensor EEF frame으로 표현한다.
+  주기를 양수로 설정하면 고정된 episode 시점에서 현재 보이는 물체를 다시 추정한다.
 - **Critic:** 초기 Actor가 인식한 동일 물체 ID의 현재 실제 중심·회전·전체 OBB 정보를
   갱신하고, 현재 EEF frame으로 표현한다. 처음 보이지 않았던 물체를 새로 추가하거나
   사라진 물체를 제거하지 않는다. Actor와 별도 valid mask를 유지한다.
-- **공통:** Target·Blocker는 0·1번 슬롯을 유지하고 관측 차원은 244D다. 현재·직전 로봇·센서·행동
-  144D는 기존과 동일하다. 초기 reset의 직전 sample은 0이다. F/T는 센서 frame을 사용한다.
+- **공통:** Target·Blocker는 0·1번 슬롯을 유지하고 관측 차원은 232D다. 현재·직전 로봇·센서·행동은
+  132D다. 초기 reset의 직전 sample은0이다. F/T는 sensor frame에서 자중·관성을 보상한다.
+  Action 이력은 실제 포화를 반영한 raw 단위의12D 명령이다.
 
-100Hz 정책에서 10step은 0.1초, 비전은 10Hz다. 초기 reset snapshot은 즉시 제공하고,
-env ID별 phase를 나눠 첫 정기 갱신은 reset 후 1–10step 안에 수행한다. 이후 각 환경은
-10step 간격이다. 1024개 환경이면 매 step 102–103개씩 처리해 한 step의 급격한 부하를 줄인다.
-Reset 직후 및 종료 행은 같은 step의 추가 ray를 건너뛰며, 같은 step의 중복 관측도 재촬영하지 않는다.
+현재 정책50Hz에서 주기5는10Hz, 주기10은5Hz 비전이다. 양수 주기에서는 env ID별 phase를
+분산하고 reset 직후·종료 행·같은 step 중복 조회의 추가 ray를 건너뛴다. Critic GT만 읽으면
+Actor ray를 실행하지 않는다.
 
 기존 64×48 observation grid·메시 BVH를 재사용하고, 32개 view씩 나눠 GPU에서 처리한다.
 Online 경로에는 실루엣 분모·가시성 조건 검사·시점 탐색·재시도·CPU 요청 dict·이미지 저장을
@@ -97,80 +98,78 @@ Online 경로에는 실루엣 분모·가시성 조건 검사·시점 탐색·�
 Critic·로봇 history 접근만으로는 Actor ray를 실행하지 않는다. 갱신된 관측 OBB GUI는 같은
 Actor cache를 표시하고, 종료 전 관측 tensor는 갱신·부분 reset으로 수정되지 않는다.
 
-기본값은 `env.actor_vision_update_interval=10`이다. 0이면 기존 reset-only Actor 비전으로 돌아간다.
-관련 CPU 검증은 188개 중 185개 통과·CUDA 전용 3개 생략이며, 실제 메시 ray 결과와 주기·reset
-격리를 확인했다. 실제 GPU 처리 시간과 학습 효과는 미측정이다.
+기본값은 원본과 같은 `env.actor_vision_update_interval=0`이다. 10Hz 갱신을 선택하는 예시는 다음과 같다.
 
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation_parallel/scripts/train.py \
-  --num_envs 1024 --headless env.actor_vision_update_interval=0
+  --num_envs 1024 --headless env.actor_vision_update_interval=5
 ```
 
 ## MDP와 실행 주기
 
 | 항목 | 설정 |
 |---|---|
-| 물리·정책 주기 | 100 Hz / 100 Hz (`dt=0.01`, `decimation=1`) |
-| Actor 비전 주기 | 10step / 10Hz, 환경별 phase 분산 |
+| 물리·정책 주기 | 100 Hz / 50 Hz (`dt=0.01`, `decimation=2`) |
+| Actor 비전 주기 | 0: reset 때만 |
 | Episode | 최대 8초 |
-| Action | UR5e 상대 pose 6D + 가변 stiffness 6D + Hand 6관절 = 18D |
-| Arm 제어 | 공식 OSC, UR5e 말단 EEF/task frame, gravity compensation |
-| Hand 제어 | 공식 joint-position-to-limits action, URDF 범위·mimic 반영 |
+| Action | Sensor-frame wrench6D + Hand6D = 12D |
+| Arm 제어 | 공식 OSC `wrench_abs`/`fixed`, sensor 중심 frame, gravity compensation |
+| Hand 제어 | 공식 joint-position-to-limits action, URDF master 한계·importer 기본 mimic |
 | 물체 수 | 15–25개, 관측 용량 10개 |
 | Reset | 기존 공통 clutter 장면과 환경별 로봇 초기 자세 randomization |
 | Tactile | 17개 binary, 기존 전체 접촉 관측과 Blocker 접촉 유지 보상 |
 | Reward | 선형 Clearance, 현재 성공 중 Time 면제, 성공 보상과 종료 분리 |
-| 성공 종료 | 유효 성공 조건을 연속 0.5초 만족하면 +250을 한 번 지급하고 종료 |
-| PPO | Rollout 36, epochs 8, minibatches 4, γ=0.999, λ=0.95 |
+| 성공 종료 | 원본과 같은 유효 성공 판정 즉시 +10을 한 번 지급하고 종료 |
+| 실패 | 원본과 같은 원인별 종료, terminal 실패 비용0 |
+| Arm 과속 종료 | 팔6관절 중 하나라도 절댓값1rad/s 초과 |
+| PPO | Rollout36, epochs8, minibatches4, γ=0.95, λ=0.95, entropy=0.01 |
 | Learning rate | 초기 `1e-3`, `adaptive` 유지 |
 
-### 2026-10-31 다음 학습 Reward 설정
+### 현재 Reward 설정
 
 일반 reward는 raw score를 반환하고 공식 `RewardManager`가 weight와 `dt`를 곱한다.
-Clearance·Distance·Hold·환경 비용은 유지하고, 세 동작 비용과 실패 이벤트를 명세대로 조정했다.
+함수와 모든 coefficient·weight는 원본과 같다. 공식 manager가 일반 항에 `weight * step_dt`를 적용한다.
 
 | 항목 | 계산 | Weight |
 |---|---|---:|
-| Clearance | `1 - current_overlap / initial_overlap` | 12 |
-| Distance | 17개 pad별 `exp(-10 * distance_m)`의 평균 | 3 |
-| Palmar contact-hold | 현재·이전 sample 모두 Blocker에 접촉한 동일 pad 수 | 0.2 |
-| Shelf / Object collision | 기존 선반 교란 / 비-Blocker OBB 코너 속도 비용 | 각각 −0.5 |
-| Action-rate | 18D raw action 변화량의 제곱합 | −0.003 |
-| Force / Torque growth | 힘·토크 norm의 양의 step 증가량 제곱 | 각각 −0.01 |
-| Object stability | 기존 비양수 expm1 품질 | 0.5 |
-| Time | 공식 `is_alive` 비용, 현재 유효 성공 상태에서는 0 | −1 |
-| Terminal | 성공 +250 / 실패 −10, 실패 우선의 일회 이벤트 | 1 |
+| Clearance | `max(0, 1 - current_overlap / initial_overlap)` | 12 |
+| Distance | 17개 pad별 episode 최소거리의 `exp(-10 * distance_m)` 평균 | 5 |
+| Palmar contact-hold | 유지 접촉 수 + 새 접촉 수의 절반, Target 보호 gate | 0.4 |
+| Shelf / Target / Object collision | 원본의 선반·Target 교란 및 주변 물체 코너 속도 비용 | 각각 −0.5 |
+| Action-rate | Clipping 후12D 입력 변화 제곱합, raw 단위 | −0.03 |
+| Joint velocity | 실제 팔6+Hand 독립6관절 속도 제곱합 | −0.03 |
+| Force / Torque growth / Singularity reward | 비활성 | — |
+| Object stability | Blocker 기울기5° 초과의 비양수 expm1 품질 | 0.5 |
+| Time | 유효 성공 중 면제, 학습 절반부터 적용 | −0.3 |
+| Terminal | 성공 +10 / 실패0, 일회 이벤트 | 1 |
 
-Action-rate는 mean이 아니라 18개 성분의 합이다. F/T는 벡터 차 norm이나 시간 미분이
-아니며, norm이 감소하거나 방향만 바뀌면 비용이 0이다. 원시 비용 1일 때 100Hz 지급액은
-Action-rate −0.00003, Force/Torque growth 각각 −0.0001이다. Joint-velocity·singularity
-reward는 계속 비활성이다. 별도의 Target dense cost·정규화·curriculum은 추가하지 않는다.
+Raw1당 Force10N·Torque1N·m이며 sensor 원점의 목표 wrench를 ±[200,200,360,8,8,8] SI로 제한한다.
+Hand는 native `clamp(0.5*raw,-1,1)`을 관절 범위에 매핑한다. 관측 action 이력과 action-rate는
+동등한 raw 한계 `[20,20,36,8,8,8,2,2,2,2,2,2]`를 사용한다. PPO의 원본 sample은 수정하지 않는다.
+Sensor→COM moment 기준점만 기존 native OSC adapter에서 보정한다. 0 wrench는 gravity 보상만
+남으며 pose hold가 아니다. F/T observation은 distal 자중·관성을 제거한 sensor-frame 반력이다.
 
 Clearance의 분모는 초기 Blocker 전체 면적이 아니라 **초기 Blocker와 Target 접근 영역의
 겹침 면적**이다. 초기에는 0, 완전 확보 시 1, 초기의 두 배를 가리면 −1이다.
-진행률 상한 clip·exponential·추가 초기 점수 차감은 없다. 개선 상태를 유지하면 같은
-양의 점수를 계속 지급한다. Target 보호·지지·실패 gate는 기존과 같고, 무효인 동안
-양수만 차단하며 음수 비용은 유지한다. 유효한 양수 초기 겹침이 없는 경우에는
-Clearance를 0으로 처리한다. 부분 reset은 선택된 환경의 기준 면적만 갱신한다.
+진행률 상한 clip·exponential·추가 초기 점수 차감은 없다. 원점수는 악화 시 음수가 되지만
+현재 지급 함수는 양수만 남기고 별도 상태 gate를 적용하지 않는다. 개선 상태를 유지하면
+같은 점수를 계속 지급한다. 유효한 초기 겹침이 없으면0이다. 부분 reset은 선택 행만 갱신한다.
 
 Time 함수의 기존 `is_alive * (~state.success)` mask를 유지한다. 현재 성공 여부를 사용하며
 과거 성공 보너스 지급 이력으로 면제하지 않는다. 성공·실패의 non-timeout 종료 step에는
-비용이 0이고, 성공하지 않은 순수 timeout step에는 −0.01을 지급한다. 시간 제한은 8초다.
+비용이0이다. `time_penalty_start_fraction=0.5`로 기본90000 iteration의45000부터−0.3을 적용한다.
+50Hz에서 활성화된 정상 step 비용은−0.006이다. 시간 제한은8초다.
 
-성공 termination을 복원했다. 기존 공간 확보·Target 보호·모든 활성 물체의 지지/retention·
-정착·실패 없음 조건을 연속 0.5초(100Hz에서 50회) 만족하면 성공 +250을 한 번 지급하고
-non-timeout 종료한다. 중간에 조건이 깨지면 연속 카운터는 0이 된다. 물리적 실패는 −10을
-한 번 지급하고 종료하며, 같은 step에서는 실패가 우선한다. 순수 timeout은 기존 truncation을
-유지하고 실패 이벤트를 지급하지 않는다. `terminal`의 기존 금액/`dt` 변환과 weight1을
-유지하므로 manager 적용 후 실제 일회 지급액은 +250/−10이다.
+성공·실패의 구체적인 조건은 원본과 동일한 `mdp/terminations.py`를 사용한다. `success_duration=0`,
+`success_reward=10`, `failure_penalty=0`이며 terminal 금액/`dt` 변환으로 성공 시 실제10을 지급한다.
+Target displacement 종료와 원인별 로그도 포함한다. 순수 timeout은 truncation이다.
 
 성공·실패 latch, F/T 이전 값, contact history는 기존 부분 reset 경로로 선택 행만 비운다.
-팔6개 중 abs(qdot)>3rad/s를 포함한 모든 hard failure 기준, 기본 PPO·래퍼·timeout
+팔6개 중 abs(qdot)>1rad/s를 포함한 모든 hard failure 기준, 기본 PPO·래퍼·timeout
 bootstrap·로깅·reset 분포·Actor/Critic 관측은 유지한다. Original 프로젝트는 수정하지 않는다.
 
-위의 선형식은 원점수 기준이다. 100Hz에서 Clearance step 보상은 `0.12 * score`이며,
-완전 확보 시 0.12다. 직전 논의한 초기 겹침 분모 지수안의 최대 점수 0.8647보다
-약15.7% 커지지만 첫 비교에서는 weight12를 유지한다. 이전 수식과의 비교 자료는
+현재50Hz에서 Clearance step 보상은 `0.24 * max(0, score)`이며 완전 확보 시0.24다.
+이전 수식과의 비교 자료는
 [`분모·초기 기준값`](../../docs/figures/clearance_reward_comparison.png),
 [`초기 겹침 분모`](../../docs/figures/clearance_overlap_normalization.png),
 [`선형·지수식의 개선/악화`](../../docs/figures/clearance_linear_comparison.png)에 있다.
@@ -181,10 +180,11 @@ bootstrap·로깅·reset 분포·Actor/Critic 관측은 유지한다. Original �
 [배치 규칙](../../docs/SPAWN_RULES.md), [학습 기록](../../docs/TRAINING_LOG.md)에 있다.
 이 기록들은 이번 MLP 변형의 새 학습 결과를 의미하지 않는다.
 
-2026-10-31 보상·PPO 최종 명세에 대한 CPU 검증은 165개 중 162개 통과, CUDA 전용 3개 생략이다.
-설정·native dt 지급·연속 성공·혼합 batch·부분 reset·접촉 이력을 확인했으며,
-실제 학습·PhysX simulation·성능 측정은 실행하지 않았다.
-[학습 기록 83절](../../docs/TRAINING_LOG.md#83-2026-10-31--parallel-다음-학습-최종-명세-반영)에 검증 범위를 둔다.
+TensorBoard의 관절 속도·raw/보상 F/T·원본/적용 action 모니터도 원본과 동일하게 제공한다.
+이번 동기화는 학습 중인 사용자의 지시에 따라 파일 수정·텍스트 검토만 수행했다.
+테스트·모듈 import·학습·PhysX simulation·성능 측정은 실행하지 않았다.
+이전 [83절](../../docs/TRAINING_LOG.md#83-2026-10-31--parallel-다음-학습-최종-명세-반영)의 검증 수치는
+현재 설정의 실행 검증으로 사용하지 않는다.
 
 ## 코드 구조
 

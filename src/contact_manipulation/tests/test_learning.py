@@ -798,6 +798,7 @@ class NativeLearningTests(unittest.TestCase):
         self.assertIsNone(actual["clip_actions"])
         self.assertEqual(actual["obs_groups"], {"actor": ["policy"], "critic": ["critic"]})
         actor = class_settings(production, "ContactActorCfg")
+        self.assertTrue(actor["compile_model"])
         self.assertEqual(actor["obs_normalization"], expected["policy"]["actor_obs_normalization"])
         self.assertEqual(actor["distribution_cfg"], {
             "class_name": "GaussianDistribution", "std_type": "scalar",

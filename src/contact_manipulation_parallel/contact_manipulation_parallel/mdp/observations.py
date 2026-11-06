@@ -18,7 +18,7 @@ from isaaclab.utils.math import quat_apply as _lab_quat_apply, quat_conjugate, q
 __all__ = [
     "prepare_initial_geometry", "select_initial_geometry_indices", "visible_object_image_x",
     "adjacent_geometry_permutation", "geometry_in_eef_frame", "pack_policy_observation",
-    "dynamic_sample", "calibrate_wrench",
+    "dynamic_sample", "calibrate_wrench", "self_motion_wrench", "wrench_action_limits", "action_input_limits",
     "policy_observation", "initial_scene_geometry", "critic_observation", "critic_scene_geometry",
     "current_robot_sample", "previous_robot_sample",
     "quat_apply", "quat_conjugate", "quat_mul",
@@ -26,6 +26,31 @@ __all__ = [
 
 SI_200_8_RANGES = (200.0, 200.0, 360.0, 8.0, 8.0, 8.0)
 SI_200_8_RESOLUTION = (0.1, 0.1, 0.1, 0.005, 0.005, 0.005)
+ACTION_DIM = 12  # Sensor-frame wrench 6, then independent hand positions 6.
+ROBOT_SAMPLE_DIM = 54 + ACTION_DIM
+
+
+def wrench_action_limits(scale):
+    """Resolve raw sensor-range bounds once, before any rollout tensor work."""
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+        scale = (scale,) * 6
+    if (not isinstance(scale, (tuple, list)) or len(scale) != 6
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) or value <= 0 for value in scale)):
+        raise ValueError("Wrench scale must contain six finite positive values, or one scalar.")
+    limits = tuple(limit / value for limit, value in zip(SI_200_8_RANGES, scale))
+    if not all(math.isfinite(limit) for limit in limits):
+        raise ValueError("Wrench scale produces nonfinite raw sensor-range bounds.")
+    return limits
+
+
+def action_input_limits(wrench_scale, hand_scale):
+    """Raw wrench bounds plus the native hand's scaled [-1, 1] saturation."""
+    if (isinstance(hand_scale, bool) or not isinstance(hand_scale, (int, float))
+            or not math.isfinite(hand_scale) or hand_scale <= 0
+            or not math.isfinite(1.0 / hand_scale)):
+        raise ValueError("Hand scale must be a finite positive scalar with finite raw bounds.")
+    return (*wrench_action_limits(wrench_scale), *((1.0 / hand_scale,) * 6))
 
 
 # Preserve broadcastable task tensors while using Isaac Lab's quaternion math.
@@ -204,16 +229,40 @@ def geometry_in_eef_frame(
 
 
 def pack_policy_observation(geometry_eef: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
-    """Concatenate preordered/padded geometry and newest-first [N, 2, 72] history.
+    """Concatenate preordered/padded geometry and newest-first [N, 2, 66] history.
 
     The producer zeroes missing geometry/history before this operation. There
-    are no mask or role channels. With 10 geometry slots the result is 244D.
+    are no mask or role channels. With 10 geometry slots the result is 232D.
     """
     if geometry_eef.ndim != 3 or geometry_eef.shape[-1] != 10:
         raise ValueError("Geometry must have shape [N, M, 10].")
-    if history.shape != (geometry_eef.shape[0], 2, 72):
-        raise ValueError("History must contain current and previous samples with shape [N, 2, 72].")
+    if history.shape != (geometry_eef.shape[0], 2, ROBOT_SAMPLE_DIM):
+        raise ValueError("History must contain current and previous samples with shape [N, 2, 66].")
     return torch.cat((geometry_eef.flatten(1), history.flatten(1)), dim=-1)
+
+
+def self_motion_wrench(masses, inertias, com_position, body_rotation, com_acceleration,
+                       angular_velocity, sensor_position, sensor_rotation, gravity):
+    """Sum distal Newton--Euler self-load at the sensor origin, in sensor axes.
+
+    Masses are [N,B], COM inertias [N,B,3,3] in link axes, and all measured
+    kinematics are in world axes. Native COM acceleration includes centripetal
+    motion; use its physical-step value rather than differencing reset poses.
+    The incoming parent-on-child reaction equals this self-load minus external
+    loading on the hand. Subtracting this result preserves that reaction sign.
+    """
+    force = masses[..., None] * (com_acceleration[..., :3] - gravity)
+    inverse_body = quat_conjugate(body_rotation)
+    alpha = quat_apply(inverse_body, com_acceleration[..., 3:6])
+    omega = quat_apply(inverse_body, angular_velocity)
+    momentum = (inertias @ omega[..., None]).squeeze(-1)
+    moment = ((inertias @ alpha[..., None]).squeeze(-1)
+              + torch.cross(omega, momentum, dim=-1))
+    moment = (quat_apply(body_rotation, moment)
+              + torch.cross(com_position - sensor_position[:, None], force, dim=-1))
+    inverse_sensor = quat_conjugate(sensor_rotation)
+    return torch.cat((quat_apply(inverse_sensor, force.sum(-2)),
+                      quat_apply(inverse_sensor, moment.sum(-2))), -1)
 
 
 def dynamic_sample(
@@ -229,10 +278,13 @@ def dynamic_sample(
     joint_velocity_scale: float = 2.0,
     wrench_ranges: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Assemble one 72D robot/sensor/action sample with no device-to-host reads.
+    """Assemble one 66D robot/sensor/action sample with no device-to-host reads.
 
     The 12 independent joints are arm 6 then hand 6; mimic joints are excluded.
-    F/T remains in the physical sensor frame, including hand weight and inertia.
+    F/T remains in the physical sensor frame, after distal self-load removal.
+    ``previous_action`` is the command used by the completed transition, with
+    wrench clipping and native hand saturation expressed in raw action units,
+    before sensor-origin conversion or hand joint-limit mapping.
     Pass cached ``wrench_ranges`` in the environment hot path to avoid rebuilding
     a device constant. On reset,
     the caller supplies zero previous action and false tactile validity.
@@ -244,8 +296,8 @@ def dynamic_sample(
         raise ValueError("EEF pose and measured wrench must have shapes [N, 7] and [N, 6].")
     if tactile_contacts.shape != (batch, 17) or tactile_valid.shape != (batch, 17):
         raise ValueError("Tactile measurements and validity must each contain 17 channels.")
-    if previous_action.shape != (batch, 18):
-        raise ValueError("The preceding action must have 18 channels.")
+    if previous_action.shape != (batch, ACTION_DIM):
+        raise ValueError("The preceding action must have 12 channels (wrench 6, hand 6).")
     if joint_position_scale <= 0 or joint_velocity_scale <= 0:
         raise ValueError("Joint normalization scales must be positive.")
     if wrench_ranges is None:
@@ -319,9 +371,9 @@ def critic_scene_geometry(env) -> torch.Tensor:
 
 def current_robot_sample(env) -> torch.Tensor:
     """Current robot, SI-200-8 F/T reaction, tactile and action measurements."""
-    return policy_observation(env, refresh_vision=False)[:, 100:172]
+    return policy_observation(env, refresh_vision=False)[:, 100:100 + ROBOT_SAMPLE_DIM]
 
 
 def previous_robot_sample(env) -> torch.Tensor:
     """Previous completed sample, zeroed for rows beginning a new episode."""
-    return policy_observation(env, refresh_vision=False)[:, 172:244]
+    return policy_observation(env, refresh_vision=False)[:, 100 + ROBOT_SAMPLE_DIM:100 + 2 * ROBOT_SAMPLE_DIM]

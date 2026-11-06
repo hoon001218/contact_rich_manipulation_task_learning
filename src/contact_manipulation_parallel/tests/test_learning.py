@@ -49,12 +49,12 @@ class NativeMlpTests(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(81)
-        self.obs = TensorDict({"policy": torch.randn(4, 244), "critic": torch.randn(4, 244)}, batch_size=[4])
+        self.obs = TensorDict({"policy": torch.randn(4, 232), "critic": torch.randn(4, 232)}, batch_size=[4])
         self.actor, self.critic = self.models()
 
     def models(self):
         models = []
-        for role, output_dim in (("actor", 18), ("critic", 1)):
+        for role, output_dim in (("actor", 12), ("critic", 1)):
             kwargs = deepcopy(model_kwargs(self.cfg[role]))
             self.assertEqual(kwargs.pop("class_name"), "MLPModel")
             models.append(MLPModel(self.obs, self.groups, role, output_dim, **kwargs))
@@ -63,10 +63,10 @@ class NativeMlpTests(unittest.TestCase):
     def test_native_forward_and_separate_observation_groups(self):
         self.assertIs(type(self.actor), MLPModel)
         self.assertIs(type(self.critic), MLPModel)
-        self.assertEqual(self.actor(self.obs, stochastic_output=True).shape, (4, 18))
+        self.assertEqual(self.actor(self.obs, stochastic_output=True).shape, (4, 12))
         self.assertEqual(self.critic(self.obs).shape, (4, 1))
         for model in (self.actor, self.critic):
-            self.assertEqual(model.mlp[0].in_features, 244)
+            self.assertEqual(model.mlp[0].in_features, 232)
             self.assertFalse(hasattr(model, "encoder"))
             self.assertTrue(torch.isfinite(model(self.obs)).all())
         changed = self.obs.clone()
@@ -78,7 +78,7 @@ class NativeMlpTests(unittest.TestCase):
         self.assertIsInstance(self.actor.distribution, GaussianDistribution)
         self.assertEqual(self.actor.distribution.std_type, "scalar")
         sampled = self.actor(self.obs, stochastic_output=True)
-        torch.testing.assert_close(self.actor.output_std, torch.ones(4, 18))
+        torch.testing.assert_close(self.actor.output_std, torch.ones(4, 12))
         self.assertTrue(torch.isfinite(self.actor.get_output_log_prob(sampled)).all())
         self.assertIsNone(self.critic.distribution)
         torch.testing.assert_close(self.critic(self.obs), self.critic(self.obs, stochastic_output=True))
@@ -119,7 +119,7 @@ class NativeMlpTests(unittest.TestCase):
                 self.assertTrue(load_cfg["actor"] and load_cfg["critic"])
                 self.assertFalse(load_cfg["optimizer"])
 
-    def test_ppo_settings_match_final_parallel_spec(self):
+    def test_ppo_settings_match_original_except_native_mlp_architecture(self):
         expected_runner = {
             "num_steps_per_env": 36,
             "max_iterations": 90000,
@@ -142,12 +142,12 @@ class NativeMlpTests(unittest.TestCase):
             "value_loss_coef": 1.0,
             "use_clipped_value_loss": True,
             "clip_param": 0.2,
-            "entropy_coef": 0.005,
+            "entropy_coef": 0.01,
             "num_learning_epochs": 8,
             "num_mini_batches": 4,
             "learning_rate": 1.0e-3,
             "schedule": "adaptive",
-            "gamma": 0.999,
+            "gamma": 0.95,
             "lam": 0.95,
             "desired_kl": 0.02,
             "max_grad_norm": 1.0,
