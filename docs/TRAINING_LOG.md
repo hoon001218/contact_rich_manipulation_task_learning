@@ -7770,3 +7770,60 @@ rollout36·epochs8·minibatches4·gamma.95·lambda.95·LR1e-3 adaptive·entropy.
 추가로 해당 checkpoint를 공식 runner에 inference 모드로 로드해 실제4환경에서16step을
 재생했다.23회 auto-reset 전후를 포함해 매 관측의 `policy`·`critic` 전체 `[4,232]` 값이
 `torch.equal`로 일치했고, Actor/Critic parameter storage가 공유되지 않음도 확인했다.
+
+## 109. 2026-11-06 — 원격 병합 후 Symmetric의 최신 reward·action 대조와 동기화
+
+사용자 요청으로 통합 브랜치 `work/integrate-20261106-183634`의 HEAD `617d4d6`에서
+최신 `contact_manipulation`과 `contact_manipulation_symmetric`을 비교했다.
+108절의 최초 복사본은 원격 `8ca3bae` 이전 원본을 기준으로 만들어졌으므로, Git 병합만으로
+새 프로젝트의 reward·reset 코드에 원격 변경이 반영되지 않았던 상태다.
+
+**이번 반영:**
+
+- `blocker_distance` term을 episode 최소거리 함수에서 현재17pad OBB 거리 함수로 복원했다.
+  weight5·decay10·Target 보호 gate는 최신 원본과 같다. 과거 최소거리 helper와 buffer는
+  원본처럼 비교용으로 보존했다.
+- `blocker_relocation`을 추가했다. 현재 Blocker OBB 중심에서 초기 빈 convex 영역들까지의
+  최소 XY 거리 d에 대해 raw `exp(-10*d)`, weight3이다. 영역 내부·경계는 raw1이며,
+  유효 영역이 없으면0이다. Native weight×dt를 적용해50Hz에서 최대0.06/step이다.
+  별도 safety gate·신기록 이력·`/dt` 상쇄는 없다. 101절의 초기 weight1·decay ln2/.1이
+  아니라 **현재 실제 원본 cfg의3·10**을 기준으로 했다.
+- `blocker_contact_hold` weight를0.4→3으로 동기화했다. 유지 pad+0.5×새 pad·Target gate와
+  canonical17pad·force threshold·부분 reset history는 기존 수식을 사용한다.
+- 새 공유 scene에서 초기 재배치 영역을1회 준비하고 SceneBatch의 region/count/valid를
+  zero-stride broadcast로 공유하는 경로를 동기화했다. 부분 reset은 이 metadata를 재사용한다.
+  TaskState의 보정 Blocker 중심 갱신과 초기 영역 validation·binding도 함께 반영했다.
+- 원본의 transition/support/robot-start CUDA graph 진단 스위치와 CPU/GPU 분기 회귀를
+  동기화했다. 세 기본값과 모델 compile_model=True는 유지한다.
+
+**Action 확인:** 이름공간을 정규화한 source 비교에서 `ur5e_env_cfg.py`·`scene.py`·`sensors.py`
+및 action 관측 이력 계산은 이미 원본과 동일했다. Sensor-frame wrench6 + Hand6의12D,
+Force10N/Torque1N·m scale, SI-200-8 범위 clipping·sensor→COM moment 보정,
+Hand scale.5·native limit mapping과 clipped action-rate를 그대로 사용한다.
+추가 action 변경을 만들어 넣지 않았다.
+
+Reward·events·PPO cfg·train/play 등은 이름공간을 제외하면 현재 원본과 동일하다.
+남은 runtime 차이는 Actor 관측을 Critic에도 제공하는 observation cfg·helper와 model/loader의
+`actor_observation_v1` 계약뿐이다. 원본 패키지·기존 Parallel·Isaac Lab은 변경하지 않았고,
+원본27개 파일의 hash 보존을 확인했다. 공식 ManagerBasedRLEnv·RslRlVecEnvWrapper·
+OnPolicyRunner/PPO·rollout·GAE·update·checkpoint 경로를 유지한다.
+
+**CPU 검증:** MDP491개·learning76개, 전체567개 중 **544개 통과·CUDA/Kit 전용23개 생략**.
+현재 거리와 과거 최소거리의 구분, polygon 내부 plateau·경계·최근접 영역·invalid/빈 영역,
+1024행 host 조회 금지, 공유 scene 생성당1회 준비·부분 reset metadata 재사용, graph 스위치,
+기존 대칭 관측·독립 모델·native PPO·checkpoint 계약 회귀를 포함한다.
+복사한 과거 테스트 중 relocation weight1/decay ln2/.1과 Hold.4 기대값만 현재 원본3/10·3에
+맞췄으며 production 설정을 테스트의 과거 값으로 되돌리지 않았다.
+
+**실제 실행:** GPU compute process가 없는 것을 확인한 뒤 새 production train에서
+4환경·`--max_iterations 1 --run_name symmetric_sync_smoke`를 실행했다.
+`Learning iteration 0/1`·새 checkpoint 저장을 완료하고 exit0으로 종료했다.
+학습 구간15.80초는 전체 초기화 시간과 구분한다. 결과는
+`logs/rsl_rl/contact_manipulation_symmetric/2026-11-06_18-47-59_symmetric_sync_smoke/`이며
+`Episode_Reward/blocker_relocation`의 실제 양수 지급도 확인했다.
+이는 변경된 경로의 실행 검증이며 학습 성능·장기 안정성이나 CUDA 오류 해결의 증거는 아니다.
+
+새 checkpoint를 native runner로 로드한16step 재생에서도20회 auto-reset 전후의
+`policy`·`critic` 전체 `[4,232]` 관측이 bit-exact하게 일치했다. 해당 장면은 공유 영역12개를
+가졌고, 실제 relocation/Hold weight3·현재 거리 함수 연결과 독립 모델 parameter storage도
+검사했다. 영역 개수는 이 검증 장면의 결과이며 전체 scene에 대한 고정 개수가 아니다.

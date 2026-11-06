@@ -795,6 +795,7 @@ class NativeLearningTests(unittest.TestCase):
         self.assertIsNone(actual["clip_actions"])
         self.assertEqual(actual["obs_groups"], {"actor": ["policy"], "critic": ["critic"]})
         actor = class_settings(production, "ContactActorCfg")
+        self.assertTrue(actor["compile_model"])
         original_actor = class_settings(baseline, "ContactActorCfg")
         original_actor["class_name"] = original_actor["class_name"].replace(
             "contact_manipulation.", "contact_manipulation_symmetric.")

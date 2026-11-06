@@ -28,7 +28,7 @@ Reset·부분 reset·terminal snapshot·결측 mask도 두 입력에 동일하�
 
 ## 유지한 모델과 설정
 
-2026-11-06의 원본 코드 기준이며 namespace와 Critic 관측 계약 이외의 제어·물리·
+2026-11-06 통합 브랜치의 원본 코드 기준이며 namespace와 Critic 관측 계약 이외의 제어·물리·
 배치·reward·termination·학습 설정은 동일하다. 원본 패키지를 import하지 않는다.
 Asset과 Isaac Lab checkout은 저장소의 공통 경로를 사용하고, 초기 카탈로그는 독립 복사했다.
 
@@ -43,8 +43,34 @@ Asset과 Isaac Lab checkout은 저장소의 공통 경로를 사용하고, 초�
 | PPO | rollout36, epochs8, minibatches4, γ=.95, λ=.95 |
 | LR / KL / entropy | 1e-3 adaptive / .02 / .01 |
 | 학습 길이 / 저장 | 최대90,000 iteration / 50 iteration |
+| 실행 경로 | 모델 compile=True, transition/support/robot-start CUDA graph=True |
 | Time curriculum | 학습 budget의50%에서 weight0→−.3 |
 | Terminal / Arm 과속 종료 | 성공+10·실패 비용0 / Arm6의abs(qdot)>1rad/s |
+
+### 최신 reward·action 동기화
+
+원격 변경을 병합한 원본 `contact_manipulation`과 reward·reset 상태 계산을 다시 맞췄다.
+
+| 항목 | 현재 설정 |
+|---|---|
+| Clearance | 초기 Blocker 가림 대비 양의 개선, weight12 |
+| Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
+| Blocker relocation | 초기 빈 재배치 영역까지 현재 중심점 거리의 `exp(-10*d)`, weight3 |
+| Contact hold | 새 접촉0.5·유지 접촉1의 pad 합, weight3·Target 보호 gate |
+| Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
+| Action-rate / Joint velocity | 각각−.03, 기존 clipping·12독립관절 선택 |
+| Blocker stability / Time / Terminal | 위 원본 설정 유지 |
+
+Distance는 이전 episode 최소거리 이력 대신 현재 거리를 평가한다. 초기 재배치 영역은
+새 공유 scene을 생성할 때1회 준비하고 부분 reset에서 재사용한다. Blocker 중심이 유효 영역
+내부나 경계에 있으면 relocation raw1이며, 영역이 없으면0이다. 접근 경로의 존재나 전체
+Blocker footprint의 영역 진입을 보장하는 판정은 아니다. Native RewardManager가 weight와
+control dt를 한 번 곱한다. 현재50Hz의 relocation 최대 지급은 step당0.06이다.
+
+Action 관련 source는 원본과 동일함을 확인했다. Sensor-frame wrench6 + Hand6의12D,
+Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정,
+Hand scale.5·native joint-limit mapping, 적용 action 이력·action-rate를 그대로 사용한다.
+Transition/support/robot-start의 진단용 CUDA graph 스위치도 원본과 동일하게 제공한다.
 
 ## Isaac Lab 기본 학습 흐름
 
@@ -100,6 +126,12 @@ GT 기하의 입력 차단, 부분 reset·terminal tensor 보존, 주기 비전�
 RolloutStorage와 PPO update, 독립 모델 가중치, checkpoint 계약을 검사한다.
 실제 실행 결과와 범위는 [학습 기록](../../docs/TRAINING_LOG.md)을 참고한다.
 
-2026-11-06: 전체550개 검사 중527개 통과·CUDA/Kit 전용23개 생략. 새 production
+최초 생성 시 검증(2026-11-06, 원격 변경 재동기화 이전): 전체550개 검사 중527개 통과·CUDA/Kit 전용23개 생략. 새 production
 train에서4환경·1 iteration과 checkpoint 저장을 완료했다. 저장 checkpoint의 실제16step
 재생에서도23회 auto-reset을 포함해 두 관측의 `[4,232]` 전체 값이 bit-exact하게 일치했다.
+
+최신 reward 동기화 후 검증(2026-11-06): MDP491개·learning76개, 전체567개 중544개 통과·
+CUDA/Kit 전용23개 생략.4환경·1 iteration의 native 학습과 새 checkpoint 저장을 완료했으며
+`Episode_Reward/blocker_relocation`의 실제 지급을 확인했다.
+새 checkpoint의16step 재생에서도20회 auto-reset 전후의 두 관측 전체 값이 일치했고,
+실제 reward 함수 연결·weight와 초기 재배치 영역의 준비를 확인했다.

@@ -609,14 +609,14 @@ class EpisodeMinimumDistanceTests(unittest.TestCase):
             self.assertFalse(result.requires_grad)
             self.assertIsNone(state.blocker_min_distance.grad_fn)
 
-    def test_cfg_switches_existing_term_to_minimum_distance_without_changing_weight_or_decay(self):
+    def test_cfg_restores_current_distance_without_changing_weight_or_decay(self):
         source = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
         term = next(node.value for node in definition.body if isinstance(node, ast.Assign)
                     and node.targets[0].id == 'blocker_distance')
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
-        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_min_distance')
+        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_distance')
         self.assertEqual(ast.literal_eval(fields['weight']), 5.)
         self.assertEqual(ast.literal_eval(fields['params']), {'decay': 10.})
         for decay in (0., -1., math.nan, math.inf):
@@ -624,6 +624,193 @@ class EpisodeMinimumDistanceTests(unittest.TestCase):
                 for function in (rewards.blocker_min_distance, rewards.blocker_distance):
                     with self.assertRaises(ValueError):
                         function(SimpleNamespace(), decay=decay)
+
+
+class RelocationRewardTests(unittest.TestCase):
+    """Current center proximity to fixed physical empty regions, with no history."""
+
+    @staticmethod
+    def rectangle(xmin, xmax, ymin, ymax, *, dtype=torch.float64):
+        return torch.tensor([[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]], dtype=dtype)
+
+    def test_interior_edges_and_vertices_have_zero_distance_and_outside_uses_euclidean_boundary(self):
+        points = torch.tensor([[.1, .1], [0., .1], [.2, .2], [.3, .1], [.3, .3]], dtype=torch.float64)
+        polygon = self.rectangle(0., .2, 0., .2)
+        regions = polygon[None, None].expand(len(points), 1, -1, -1)
+        actual = rewards.relocation_distance(points, regions, torch.full((5, 1), 4),
+                                              torch.ones((5, 1), dtype=torch.bool))
+        torch.testing.assert_close(actual, points.new_tensor([0., 0., 0., .1, math.sqrt(.02)]))
+
+    def test_triangle_and_opposite_winding_ignore_nan_padding_and_keep_the_actual_polygon(self):
+        regions = torch.full((2, 1, 6, 2), math.nan, dtype=torch.float64)
+        triangle = regions.new_tensor([[0., 0.], [2., 0.], [0., 2.]])
+        regions[0, 0, :3] = triangle
+        regions[1, 0, :3] = triangle.flip(0)
+        # This point lies in the triangle AABB but outside its actual boundary.
+        points = regions.new_tensor([[1.5, 1.5], [1.5, 1.5]])
+        actual = rewards.relocation_distance(points, regions, torch.full((2, 1), 3),
+                                              torch.ones((2, 1), dtype=torch.bool))
+        torch.testing.assert_close(actual, points.new_full((2,), math.sqrt(.5)))
+        points[:] = .25
+        torch.testing.assert_close(rewards.relocation_distance(points, regions, torch.full((2, 1), 3),
+                                                               torch.ones((2, 1), dtype=torch.bool)),
+                                   points.new_zeros(2))
+
+    def test_closest_region_wins_and_disabled_regions_cannot_receive_reward(self):
+        polygons = torch.stack((self.rectangle(0., .1, -.1, .1), self.rectangle(.9, 1., -.1, .1)))
+        points = polygons.new_tensor([[.2, 0.], [.8, 0.], [.95, 0.], [.95, 0.]])
+        regions = polygons[None].expand(4, -1, -1, -1)
+        valid = torch.ones((4, 2), dtype=torch.bool)
+        valid[3, 1] = False
+        actual = rewards.relocation_distance(points, regions, torch.full((4, 2), 4), valid)
+        torch.testing.assert_close(actual, points.new_tensor([.1, .1, 0., .85]))
+        # Taking min over qualities instead would select the farther region.
+        torch.testing.assert_close(torch.exp(-math.log(2.) / .1 * actual),
+                                   points.new_tensor([.5, .5, 1., 2. ** -8.5]))
+
+    def test_invalid_points_degenerate_polygons_counts_and_absent_regions_return_infinity(self):
+        regions = self.rectangle(0., 1., 0., 1.)[None, None].repeat(9, 1, 1, 1)
+        points = regions.new_full((9, 2), .5)
+        counts = torch.full((9, 1), 4)
+        valid = torch.ones((9, 1), dtype=torch.bool)
+        valid[0] = False
+        counts[1], counts[2] = 2, 5
+        regions[3, 0, 1, 0] = math.nan
+        regions[4] = 0.  # A point/line is not an empty two-dimensional region.
+        points[5, 0], points[6, 1] = math.nan, math.inf
+        counts[7] = 0
+        counts[8] = -1
+        actual = rewards.relocation_distance(points, regions, counts, valid)
+        self.assertTrue(torch.isinf(actual).all())
+        torch.testing.assert_close(torch.exp(-actual), torch.zeros_like(actual))
+        empty = rewards.relocation_distance(points, regions[:, :0], counts[:, :0], valid[:, :0])
+        self.assertTrue(torch.isinf(empty).all())
+
+    def test_variable_vertex_counts_wrap_the_last_valid_edge_without_using_padding(self):
+        regions = torch.full((2, 1, 5, 2), math.inf, dtype=torch.float64)
+        regions[0, 0, :3] = regions.new_tensor([[0., 0.], [1., 0.], [0., 1.]])
+        regions[1, 0, :4] = self.rectangle(0., 1., 0., 1.).flip(0)
+        points = regions.new_tensor([[-.1, .25], [-.2, .25]])
+        distance = rewards.relocation_distance(points, regions, torch.tensor([[3], [4]]),
+                                                torch.ones((2, 1), dtype=torch.bool))
+        torch.testing.assert_close(distance, points.new_tensor([.1, .2]))
+
+    def test_current_center_adapter_has_constant_inside_quality_no_safety_gate_and_no_dt_scaling(self):
+        center = torch.tensor([[.05, 0., 7.], [.15, 0., -3.], [.2, 0., 0.], [.3, 0., 0.]], dtype=torch.float64)
+        state = SimpleNamespace(
+            blocker_center=center,
+            relocation_regions=self.rectangle(0., .2, -.1, .1)[None, None].expand(4, 1, -1, -1),
+            relocation_vertex_counts=torch.full((4, 1), 4),
+            relocation_valid=torch.ones((4, 1), dtype=torch.bool),
+            target_protected=torch.zeros(4, dtype=torch.bool),
+            clearance_progress_valid=torch.zeros(4, dtype=torch.bool), failure=torch.ones(4, dtype=torch.bool))
+        with patch.object(task, 'get_task_state', return_value=state) as getter:
+            for dt in (.01, .02, .1):
+                env = SimpleNamespace(step_dt=dt)
+                torch.testing.assert_close(rewards.blocker_relocation(env), center.new_tensor([1., 1., 1., .5]))
+                self.assertIs(getter.call_args.args[0], env)
+            center[0, 0] = .4
+            torch.testing.assert_close(rewards.blocker_relocation(SimpleNamespace()),
+                                       center.new_tensor([.25, 1., 1., .5]))
+            state.relocation_valid.zero_()
+            torch.testing.assert_close(rewards.blocker_relocation(SimpleNamespace()), center.new_zeros(4))
+
+    def test_1024_environment_tensor_path_matches_rectangle_oracle_without_host_reads(self):
+        def reject(*args, **kwargs):
+            raise AssertionError('Relocation proximity must remain on the tensor device')
+
+        for dtype in (torch.float32, torch.float64):
+            points = torch.zeros((1024, 2), dtype=dtype)
+            points[:, 0] = torch.linspace(-.5, .5, 1024, dtype=dtype)
+            polygons = torch.full((1024, 2, 6, 2), math.nan, dtype=dtype)
+            polygons[:, 0, :4] = self.rectangle(-.1, .1, -.1, .1, dtype=dtype)
+            counts = torch.zeros((1024, 2), dtype=torch.long)
+            counts[:, 0] = 4
+            valid = counts >= 3
+            expected = (points[:, 0].abs() - .1).clamp_min(0.)
+            with patch.object(torch.Tensor, '__bool__', reject), patch.object(torch.Tensor, 'item', reject), \
+                 patch.object(torch.Tensor, 'cpu', reject), patch.object(torch.Tensor, 'numpy', reject):
+                actual = rewards.relocation_distance(points, polygons, counts, valid)
+            torch.testing.assert_close(actual, expected)
+            self.assertEqual(actual.shape, (1024,))
+            self.assertEqual(actual.dtype, dtype)
+
+    def test_cfg_uses_current_original_relocation_weight_and_decay(self):
+        source = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
+        term = next(node.value for node in definition.body if isinstance(node, ast.Assign)
+                    and node.targets[0].id == 'blocker_relocation')
+        fields = {keyword.arg: keyword.value for keyword in term.keywords}
+        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation')
+        self.assertEqual(ast.literal_eval(fields['weight']), 3.)
+        params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
+        self.assertEqual(params, {'decay': 10.})
+        for decay in (0., -1., math.nan, math.inf):
+            with self.subTest(decay=decay), self.assertRaises(ValueError):
+                rewards.blocker_relocation(SimpleNamespace(), decay=decay)
+
+
+class InitialRelocationRegionTests(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        geometries = (
+            task.ObjectGeometry('target', (-.03, -.03, 0.), (.03, .03, .1)),
+            task.ObjectGeometry('blocker', (-.04, -.025, 0.), (.04, .025, .1)))
+        rules = task.SpawnRules(x_range=(-.5, .5), y_range=(-.5, .5), edge_margin=.02)
+        sample = task.SceneSample((0, 1), 0, 1, {0: (0., 0., 1.), 1: (0., .05, 1.)},
+                                  {0: 0., 1: 0.}, (-.1, .1, -.1, .1), (0., -.3))
+        return sample, geometries, rules
+
+    def test_extracts_both_empty_sides_and_preserves_the_initial_scene(self):
+        sample, geometries, rules = self.fixture()
+        saved = dict(sample.positions)
+        polygons, counts, valid = task.build_initial_relocation_regions(
+            sample, geometries, rules, device='cpu', dtype=torch.float64)
+        self.assertGreaterEqual(int(valid.sum()), 2)
+        self.assertTrue((polygons[valid, :, 1].amax(-1) <= -.1 + 1.e-7).any())
+        self.assertTrue((polygons[valid, :, 1].amin(-1) >= .1 - 1.e-7).any())
+        self.assertEqual(sample.positions, saved)
+        points = polygons.new_tensor([[-.3, -.3], [.3, .3], [0., 0.]])
+        distance = rewards.relocation_distance(points, polygons[None].expand(3, -1, -1, -1),
+                                                counts[None].expand(3, -1), valid[None].expand(3, -1))
+        torch.testing.assert_close(distance, points.new_tensor([0., 0., .1]))
+
+    def test_rotated_reserved_pocket_uses_actual_vertices_and_rejects_an_occupied_pocket(self):
+        sample, _, rules = self.fixture()
+        rules = dataclasses.replace(rules, x_range=(-.7, .7), y_range=(-.7, .7))
+        geometries = (
+            task.ObjectGeometry('target', (-.008, -.008, 0.), (.008, .008, .1)),
+            task.ObjectGeometry('bar', (-.2, -.05, 0.), (.2, .05, .1)))
+        # The target is in a corner of the pocket AABB, outside the rotated bar.
+        sample = dataclasses.replace(sample, positions={0: (.17, .67, 1.), 1: (0., 0., 1.)},
+            reserved_regions=((-1., 1., .1, .7),),
+            parameter_certificate={'relocation_pocket': {'center': (0., .5), 'yaw': math.pi / 4}})
+        polygons, counts, valid = task.build_initial_relocation_regions(
+            sample, geometries, rules, device='cpu', dtype=torch.float64)
+        self.assertTrue(valid[-1])
+        expected = torch.as_tensor(task._collision_polygon(geometries[1], math.pi / 4), dtype=polygons.dtype)
+        expected += expected.new_tensor([0., .5])
+        # Compare as sets because the convex hull may change its starting vertex.
+        actual = polygons[-1, :counts[-1]]
+        torch.testing.assert_close(torch.cdist(actual, expected).amin(-1), actual.new_zeros(len(actual)))
+        corner = actual.new_tensor([[.17, .67]])
+        distance = rewards.relocation_distance(corner, polygons[None], counts[None], valid[None])
+        self.assertGreater(float(distance[0]), 0.)
+        occupied = dataclasses.replace(sample, positions={0: (0., .5, 1.), 1: (0., 0., 1.)})
+        _, _, occupied_valid = task.build_initial_relocation_regions(
+            occupied, geometries, rules, device='cpu', dtype=torch.float64)
+        self.assertFalse(occupied_valid[-1])
+
+    def test_no_region_is_reported_when_blocker_cannot_fit_in_either_side(self):
+        sample, geometries, rules = self.fixture()
+        rules = dataclasses.replace(rules, x_range=(-.015, .015), edge_margin=0.)
+        polygons, counts, valid = task.build_initial_relocation_regions(
+            sample, geometries, rules, device='cpu', dtype=torch.float64)
+        self.assertFalse(valid.any())
+        distance = rewards.relocation_distance(torch.zeros((1, 2), dtype=polygons.dtype),
+                                                polygons[None], counts[None], valid[None])
+        self.assertTrue(torch.isinf(distance).all())
 
 
 class RewardTests(unittest.TestCase):
@@ -842,7 +1029,8 @@ class RewardTests(unittest.TestCase):
             self.assertLess(terms[name][1], 0.)
         # Research weights/decays are experiment parameters. Check the public
         # function wiring and cost signs without freezing one experiment's values.
-        for name, fn in (('clearance', 'clearance'), ('blocker_distance', 'blocker_min_distance'),
+        for name, fn in (('clearance', 'clearance'), ('blocker_distance', 'blocker_distance'),
+                         ('blocker_relocation', 'blocker_relocation'),
                          ('blocker_contact_hold', 'BlockerContactHold'),
                          ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
             if name == 'motion_singularity' and name not in terms:
@@ -854,7 +1042,8 @@ class RewardTests(unittest.TestCase):
         self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
         self.assertEqual(terms['clearance'], ('clearance', 12.))
-        self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', .4))
+        self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', 3.))
+        self.assertEqual(terms['blocker_relocation'], ('blocker_relocation', 3.))
         self.assertEqual(terms['target_collision'], ('target_collision', -.5))
         self.assertEqual(terms['object_stability'], ('object_stability', .5))
         self.assertNotIn('motion_singularity', terms)
@@ -3494,6 +3683,141 @@ class GeometryTests(unittest.TestCase):
         torch.testing.assert_close(relative, torch.tensor([[1., 0., 0., 0.]], dtype=q.dtype))
 
 
+class CudaGraphSwitchTests(unittest.TestCase):
+    @staticmethod
+    @contextmanager
+    def reject_capture():
+        """Fail if a disabled path even probes or initializes CUDA capture."""
+        reject = AssertionError('Disabled CUDA graph path accessed capture APIs')
+        with patch.object(torch.cuda, 'CUDAGraph', side_effect=reject), \
+             patch.object(torch.cuda, 'graph', side_effect=reject), \
+             patch.object(torch.cuda, 'Stream', side_effect=reject), \
+             patch.object(torch.cuda, 'is_current_stream_capturing', side_effect=reject):
+            yield
+
+    def test_config_defaults_preserve_graphs_and_reject_nonboolean_switches(self):
+        source = Path(task.__file__).parent.parent / 'shelf_manipulation_env_cfg.py'
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == 'ShelfManipulationEnvCfg')
+        names = ('transition_cuda_graph', 'support_cuda_graph', 'robot_start_cuda_graph')
+        defaults = {node.target.id: ast.literal_eval(node.value) for node in definition.body
+                    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                    and node.target.id in names}
+        self.assertEqual(defaults, dict.fromkeys(names, True))
+        # Execute the actual complete post-init without importing Kit classes.
+        method = next(node for node in definition.body
+                      if isinstance(node, ast.FunctionDef) and node.name == '__post_init__')
+        namespace = {}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                     str(source), 'exec'), namespace)
+        def config(**updates):
+            return SimpleNamespace(**(dict(defaults, actor_vision_update_interval=0, decimation=2,
+                sim=SimpleNamespace(physx=SimpleNamespace()), viewer=SimpleNamespace()) | updates))
+        for enabled in (False, True):
+            namespace['__post_init__'](config(**dict.fromkeys(names, enabled)))
+        for name in names:
+            for invalid in (0, 1, None, 'false'):
+                with self.subTest(name=name, value=invalid), self.assertRaisesRegex(ValueError, name):
+                    namespace['__post_init__'](config(**{name: invalid}))
+
+    def test_support_optional_argument_and_runtime_switch_preserve_state(self):
+        legacy = task.TaskState(2, 'cpu', task.MdpCfg(), .01)
+        self.assertTrue(legacy.support_cuda_graph)
+        for invalid in (0, 1, None, 'false'):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, 'support_cuda_graph'):
+                task.TaskState(2, 'cpu', task.MdpCfg(), .01, support_cuda_graph=invalid)
+        env, _, _ = native_fixture(2)
+        env.cfg.support_cuda_graph = False
+        state = task._ensure_state(env)
+        self.assertFalse(state.support_cuda_graph)
+        snapshot = state.history.clone()
+        env.cfg.support_cuda_graph = True
+        self.assertIs(task._ensure_state(env), state)
+        self.assertTrue(state.support_cuda_graph)
+        torch.testing.assert_close(state.history, snapshot)
+        del env.cfg.support_cuda_graph
+        self.assertTrue(task._ensure_state(env).support_cuda_graph)
+
+    def test_disabled_transition_matches_eager_for_changing_full_and_partial_batches(self):
+        env, _, _ = native_fixture(4)
+        env.cfg.transition_cuda_graph = False
+        task.reset_task(env)
+        state = env._contact_mdp
+        for scale, ids in ((.2, None), (.4, torch.tensor([3, 1])), (.8, None)):
+            env.scene['robot'].data.joint_vel.fill_(scale)
+            env.sensors.ideal_wrench.add_(scale)
+            expected = task._read_transition(env, state, ids)
+            # CPU storage emulates the CUDA dispatch predicate only. Arithmetic
+            # remains real CPU tensor code, and capture is forbidden explicitly.
+            with patch.object(torch.Tensor, 'is_cuda', new=property(lambda _tensor: True)), \
+                 self.reject_capture():
+                actual = task._read_transition(env, state, ids)
+            for field in dataclasses.fields(expected):
+                torch.testing.assert_close(getattr(actual, field.name), getattr(expected, field.name),
+                                           rtol=0, atol=0, equal_nan=True)
+        self.assertFalse(getattr(state, '_transition_graphs', {}))
+
+    def test_disabled_support_matches_eager_and_updates_current_measurements(self):
+        state, batch, _ = fixture(3)
+        state.support_cuda_graph = False
+        for shift in (.005, .04):
+            batch.center[0, 1, 2] += shift
+            batch.corners[0, 1, :, 2] += shift
+            expected = state._support_tensors(batch)
+            with patch.object(torch.Tensor, 'is_cuda', new=property(lambda _tensor: True)), \
+                 self.reject_capture():
+                actual = state._support_validity(batch)
+            for field in expected._fields:
+                torch.testing.assert_close(getattr(actual, field), getattr(expected, field), rtol=0, atol=0)
+        self.assertFalse(getattr(state, '_support_graphs', {}))
+
+    def test_disabled_robot_graph_keeps_fixed_batch_candidate_path_without_capture(self):
+        default = torch.zeros(7)
+        constants = dict(default=default, arm_ids=torch.arange(6), scene_half=torch.full((2, 3), .02))
+        active_masks = []
+        def solve(positions, rotations, seeds, *, active_mask=None):
+            active_masks.append(active_mask)
+            tcp = torch.eye(4).expand(len(seeds), -1, -1).clone()
+            tcp[:, :3, 3], tcp[:, :3, :3] = positions, rotations
+            frames = positions.new_zeros((len(seeds), 1, 4, 4))
+            return torch.cat((seeds, positions[:, :1]), -1), torch.ones(len(seeds), dtype=torch.bool), frames, frames, tcp
+        def clear(_env, frames, *_args, candidate_valid=None):
+            valid = torch.ones(len(frames), dtype=torch.bool) if candidate_valid is None else candidate_valid
+            return valid, frames.new_full((len(frames),), .1)
+        model = SimpleNamespace(joint_names=tuple(range(7)), base_origin=np.zeros(3),
+                                _tensor_constants=lambda *_: constants, solve_batch=solve)
+        geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
+        sample = task.SceneSample((0, 1), 0, 1, {0: (-.7, 0., 1.05), 1: (-.55, 0., 1.05)},
+                                  {0: 0., 1: 0.}, (-.6, -.4, -.05, .05), (-.55, .2))
+        rules = task.RobotStartRules(max_attempts=8, ik_batch_size=16, orientation_range=(0., 0., 0.))
+        env = SimpleNamespace(robot_pose_model=model, spawn_geometries=geometry,
+            spawn_rules=task.SpawnRules(x_range=(-.8, -.4)),
+            cfg=SimpleNamespace(robot_start=rules, robot_start_cuda_graph=False), device='cpu')
+        boxes = (torch.zeros((1, 1, 3)), torch.eye(3).reshape(1, 1, 3, 3),
+                 torch.ones((1, 1, 3)), torch.zeros((1, 1), dtype=torch.bool))
+        class CudaDispatchWithCpuStorage:
+            def __getattr__(self, name):
+                return getattr(torch, name)
+            def device(self, *_args):
+                return SimpleNamespace(type='cuda')
+        with patch.object(task, '_scene_boxes_tensor', return_value=boxes), \
+             patch.object(task, '_robot_candidate_clearance', side_effect=clear):
+            expected, expected_regions = task._sample_robot_starts(
+                env, [sample]*3, [17, 18, 19], max_attempts=8, return_tensors=True)
+            active_masks.clear()
+            with patch.object(task, 'torch', CudaDispatchWithCpuStorage()), self.reject_capture():
+                actual, regions = task._sample_robot_starts(
+                    env, [sample]*3, [17, 18, 19], max_attempts=8, return_tensors=True)
+                replay, _ = task._sample_robot_starts(
+                    env, [sample]*3, [17, 18, 19], max_attempts=8, return_tensors=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(regions, expected_regions, rtol=0, atol=0)
+        torch.testing.assert_close(replay, expected, rtol=0, atol=0)
+        self.assertTrue(active_masks)
+        self.assertTrue(all(mask is not None for mask in active_masks))
+        self.assertTrue(all(cached[1] is None for cached in model._robot_start_graphs.values()))
+
+
 class StateTests(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), 'Support replay cache requires CUDA.')
     def test_support_graph_tracks_new_samples_counters_partial_reset_and_inference_modes(self):
@@ -4067,6 +4391,41 @@ class StateTests(unittest.TestCase):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    def test_blocker_center_reuses_corrected_local_geometry_and_partial_reset_updates_only_selected_rows(self):
+        env, _, _ = native_fixture(3)
+        source = env.task_scene_data
+        source.lower[0, 0] += .2
+        source.upper[0, 0] += .2
+        pose = env.scene['object_collection'].data.object_link_pose_w
+        pose[:, 0, 3:] = pose.new_tensor([math.sqrt(.5), 0., 0., math.sqrt(.5)])
+        polygons = pose.new_tensor([[[-.5, -.4], [-.2, -.4], [-.2, -.2], [-.5, -.2]]])
+        source.relocation_regions = polygons[None].expand(3, -1, -1, -1)
+        source.relocation_vertex_counts = torch.tensor([[4]]).expand(3, -1)
+        source.relocation_valid = torch.tensor([[True]]).expand(3, -1)
+        task.reset_task(env)
+        state = task.get_task_state(env)
+        expected = pose.new_tensor([[-.1, .2, .05]]).expand(3, -1)
+        torch.testing.assert_close(state.blocker_center, expected)
+        self.assertIs(state.relocation_regions, source.relocation_regions)
+        self.assertIs(state.relocation_vertex_counts, source.relocation_vertex_counts)
+        self.assertIs(state.relocation_valid, source.relocation_valid)
+        # World origins differ by meters, but the cached center stays env-local.
+        self.assertGreater(float(env.scene.env_origins[-1, 1]), 1.)
+        pose[:, 0, 0] += .03
+        env.common_step_counter = 1
+        reads = env.sensor_read_count
+        torch.testing.assert_close(task.get_task_state(env).blocker_center,
+                                   expected + expected.new_tensor([.03, 0., 0.]))
+        self.assertEqual(env.sensor_read_count, reads + 1)
+        task.get_task_state(env)
+        self.assertEqual(env.sensor_read_count, reads + 1)
+        before = state.blocker_center.clone()
+        ids = torch.tensor([2, 0])
+        pose[ids, 0, 0] += .2
+        task.reset_task(env, ids)
+        torch.testing.assert_close(state.blocker_center[ids], before[ids] + before.new_tensor([.2, 0., 0.]))
+        torch.testing.assert_close(state.blocker_center[1], before[1])
+
     def test_singularity_uses_one_fresh_public_jacobian_per_completed_step_and_partial_reset_is_local(self):
         env, _, _ = native_fixture(3)
         task.reset_task(env)
@@ -6696,6 +7055,7 @@ class EpisodeResetTests(unittest.TestCase):
                                   robot_start=task.RobotStartRules(), mdp=SimpleNamespace(max_objects=10))
         env._episode_reset.specs = (None,) * 4
         env._episode_reset.support_heights = torch.ones(4)
+        env.spawn_geometries, env.spawn_rules = (), SimpleNamespace(max_objects=10)
         sample = task.SceneSample(
             (2, 0, 3), 2, 0, {i: (-.7, i * .03, 1.05) for i in (2, 0, 3)},
             {i: 0. for i in (2, 0, 3)}, (-.8, -.5, -.1, .1), (-.7, -.2))
@@ -6708,9 +7068,13 @@ class EpisodeResetTests(unittest.TestCase):
 
     def test_shared_scene_initializes_once_and_partial_reset_only_reruns_ik(self):
         env, template, sample = self.shared_fixture()
+        relocation = (torch.tensor([[[-.8, -.3], [-.6, -.3], [-.6, -.2], [-.8, -.2]]]),
+                      torch.tensor([4]), torch.tensor([True]))
         with patch.object(task, '_build_episode_batch', return_value=(template, sample)) as build, \
-             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts) as ik:
+             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts) as ik, \
+             patch.object(task, 'build_initial_relocation_regions', return_value=relocation) as regions:
             task.reset_scene(env)
+            shared_regions = env.task_scene_data.relocation_regions
             before = env.scene['object_collection'].state.clone()
             joints = env.scene['robot'].position.clone()
             vision = env.task_scene_data.geometry_b.clone()
@@ -6719,6 +7083,10 @@ class EpisodeResetTests(unittest.TestCase):
             env.common_step_counter = 17
             task.reset_scene(env, torch.tensor([4, 1]))
         self.assertEqual(build.call_count, 1)
+        self.assertEqual(regions.call_count, 1)
+        self.assertIs(env.task_scene_data.relocation_regions, shared_regions)
+        self.assertEqual(shared_regions.stride(0), 0)
+        torch.testing.assert_close(shared_regions, relocation[0][None].expand(5, -1, -1, -1))
         self.assertEqual(build.call_args.kwargs, {'scene_generation': 0})
         torch.testing.assert_close(build.call_args.args[2], torch.tensor([0]))
         self.assertEqual(ik.call_count, 2)
@@ -6742,8 +7110,11 @@ class EpisodeResetTests(unittest.TestCase):
         _, second = episode_reset_fixture(selected=1)
         second.object_state[:, :, 1] += .027
         second.geometry_b[:, :, 1] += .031
+        relocation = (torch.empty((0, 4, 2)), torch.empty(0, dtype=torch.long),
+                      torch.empty(0, dtype=torch.bool))
         with patch.object(task, '_build_episode_batch', side_effect=[(first, sample), (second, sample)]) as build, \
-             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts):
+             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts), \
+             patch.object(task, 'build_initial_relocation_regions', return_value=relocation) as regions:
             task.reset_scene(env)
             env.common_step_counter = 399
             task.reset_scene(env, torch.tensor([4, 1]))
@@ -6752,6 +7123,8 @@ class EpisodeResetTests(unittest.TestCase):
             self.assertTrue(scene_time_out(env).all())
             task.reset_scene(env, torch.tensor([4, 3, 2, 1, 0]))
         self.assertEqual(build.call_count, 2)
+        self.assertEqual(regions.call_count, 2)
+        self.assertEqual(env.task_scene_data.relocation_regions.shape, (5, 0, 4, 2))
         self.assertEqual(build.call_args.kwargs, {'scene_generation': 1})
         self.assertEqual(env._episode_reset.next_scene_step, 800)
         self.assertFalse(scene_time_out(env).any())
@@ -6789,8 +7162,11 @@ class EpisodeResetTests(unittest.TestCase):
                 bound = blocker_id
 
         env._blocker_contact_hold = SimpleNamespace(configure_blocker=Mock(side_effect=configure))
+        relocation = (torch.empty((0, 4, 2)), torch.empty(0, dtype=torch.long),
+                      torch.empty(0, dtype=torch.bool))
         with patch.object(task, '_build_episode_batch', side_effect=[(first, sample), (second, second_sample)]), \
-             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts):
+             patch.object(task, '_sample_robot_starts', side_effect=self.shared_starts), \
+             patch.object(task, 'build_initial_relocation_regions', return_value=relocation) as regions:
             task.reset_scene(env)
             env.common_step_counter = 17
             task.reset_scene(env, torch.tensor([4, 1]))
@@ -6798,6 +7174,7 @@ class EpisodeResetTests(unittest.TestCase):
             env.common_step_counter = env._episode_reset.next_scene_step
             task.reset_scene(env, torch.arange(env.num_envs))
         self.assertEqual(calls, [(sample.blocker_id, 1), (sample.blocker_id, 2), (3, 3)])
+        self.assertEqual(regions.call_count, 2)
         self.assertEqual(native_rebinds, [sample.blocker_id, 3])
 
     def test_shared_robot_retry_keeps_accepted_rows_and_reuses_perception(self):
