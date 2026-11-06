@@ -15,7 +15,7 @@ class ContactActorCfg(RslRlMLPModelCfg):
     hidden_dims = [256, 128]
     activation = "relu"
     max_forward_batch_size: int = 8192
-    # Inductor fuses the unchanged FP32 model/mask math; no CUDA graph replay.
+    # Compile tensor features; keep Triton CUDA graph replay disabled in the model.
     compile_model: bool = True
     obs_normalization: bool = False
     distribution_cfg: dict = {

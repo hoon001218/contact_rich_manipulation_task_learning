@@ -100,9 +100,12 @@ class RewardsCfg:
 
     clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_min_distance, weight=5.0, params={"decay": 10.0},
+        func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=0.4)
+    blocker_relocation = RewardTermCfg(
+        func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
+    )
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
@@ -203,6 +206,11 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
     actor_vision_update_interval: int = 0
+    # Independent diagnostic switches retain GPU tensor/Warp arithmetic while
+    # bypassing only cached CUDA graph capture/replay in the selected stage.
+    transition_cuda_graph: bool = True
+    support_cuda_graph: bool = True
+    robot_start_cuda_graph: bool = True
     # Optional cross-PC comparison: require the transferred catalog instead of rebuilding it.
     initial_catalog_fingerprint: str | None = None
     target_asset: str | None = None
@@ -217,6 +225,9 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     episode_length_s: float = 8.0
 
     def __post_init__(self):
+        for name in ("transition_cuda_graph", "support_cuda_graph", "robot_start_cuda_graph"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
         if (isinstance(self.actor_vision_update_interval, bool)
                 or not isinstance(self.actor_vision_update_interval, int)
                 or self.actor_vision_update_interval < 0):

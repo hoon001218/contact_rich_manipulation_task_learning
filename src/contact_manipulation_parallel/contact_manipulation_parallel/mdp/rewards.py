@@ -14,9 +14,10 @@ import torch
 from isaaclab.utils.math import quat_error_magnitude
 
 __all__ = [
-    "clearance_quality", "clearance", "shelf_collision", "object_collision",
+    "clearance_quality", "clearance", "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
+    "blocker_min_distance",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -100,6 +101,27 @@ def tactile_pad_points(env):
     return position + quat_apply(rotation, offsets)
 
 
+def _blocker_pad_distances(pad_points, blocker_center, blocker_rotation, blocker_half_extent):
+    """Current solid-OBB distances [N,17]; invalid pads/geometry become +inf."""
+    from .observations import quat_apply, quat_conjugate
+
+    if pad_points.ndim != 3 or pad_points.shape[1:] != (17, 3):
+        raise ValueError("Expected 17 tactile points per environment, shaped [N, 17, 3].")
+    batch = pad_points.shape[0]
+    if (blocker_center.shape != (batch, 3) or blocker_rotation.shape != (batch, 4)
+            or blocker_half_extent.shape != (batch, 3)):
+        raise ValueError("Blocker center, wxyz rotation and half extents must have shapes [N, 3/4/3].")
+    relative = quat_apply(quat_conjugate(blocker_rotation)[:, None],
+                          pad_points - blocker_center[:, None])
+    outside = (relative.abs() - blocker_half_extent[:, None]).clamp_min(0.0)
+    distance = torch.linalg.vector_norm(outside, dim=-1)
+    valid_blocker = (torch.isfinite(blocker_center).all(-1) & torch.isfinite(blocker_rotation).all(-1)
+                     & torch.isfinite(blocker_half_extent).all(-1) & (blocker_half_extent > 0).all(-1)
+                     & (blocker_rotation.square().sum(-1) > 0))
+    valid = torch.isfinite(pad_points).all(-1) & torch.isfinite(distance) & valid_blocker[:, None]
+    return torch.where(valid, distance, math.inf)
+
+
 def blocker_distance_quality(pad_points, blocker_center, blocker_rotation, blocker_half_extent,
                              *, decay=math.log(2.0) / 0.10):
     """Mean per-pad exp quality to the current solid Blocker OBB.
@@ -111,30 +133,14 @@ def blocker_distance_quality(pad_points, blocker_center, blocker_rotation, block
     invalid pad makes the mean distance infinite. An invalid Blocker gives zero
     quality. No simulator access or device scalar reads.
     """
-    from .observations import quat_apply, quat_conjugate
-
-    if pad_points.ndim != 3 or pad_points.shape[1:] != (17, 3):
-        raise ValueError("Expected 17 tactile points per environment, shaped [N, 17, 3].")
-    batch = pad_points.shape[0]
-    if (blocker_center.shape != (batch, 3) or blocker_rotation.shape != (batch, 4)
-            or blocker_half_extent.shape != (batch, 3)):
-        raise ValueError("Blocker center, wxyz rotation and half extents must have shapes [N, 3/4/3].")
     if not math.isfinite(decay) or decay <= 0:
         raise ValueError("Distance decay must be finite and positive.")
-    relative = quat_apply(quat_conjugate(blocker_rotation)[:, None],
-                          pad_points - blocker_center[:, None])
-    outside = (relative.abs() - blocker_half_extent[:, None]).clamp_min(0.0)
-    distance = torch.linalg.vector_norm(outside, dim=-1)
-    valid_blocker = (torch.isfinite(blocker_center).all(-1) & torch.isfinite(blocker_rotation).all(-1)
-                     & torch.isfinite(blocker_half_extent).all(-1) & (blocker_half_extent > 0).all(-1)
-                     & (blocker_rotation.square().sum(-1) > 0))
-    valid = torch.isfinite(pad_points).all(-1) & torch.isfinite(distance) & valid_blocker[:, None]
-    distance = torch.where(valid, distance, math.inf)
+    distance = _blocker_pad_distances(pad_points, blocker_center, blocker_rotation, blocker_half_extent)
     return torch.exp(-decay * distance).mean(-1), distance.mean(-1)
 
 
 def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, valid=None):
-    """Count pads touching the Blocker in both policy samples; return new flags.
+    """Return disjoint held/new Blocker contact counts and current pad flags.
 
     ``filtered_force`` is the current Blocker-only normal force [N, 17, 3], never
     the any-object force used by observations. ``previous_contact`` is [N, 17]
@@ -153,7 +159,9 @@ def blocker_contact_hold(filtered_force, previous_contact, *, threshold=0.01, va
         torch.linalg.vector_norm(filtered_force, dim=-1) > threshold)
     if valid is not None:
         current = current & valid
-    return (current & previous_contact).sum(-1).to(filtered_force.dtype), current
+    held = current & previous_contact
+    new = current & ~previous_contact
+    return held.sum(-1).to(filtered_force.dtype), new.sum(-1).to(filtered_force.dtype), current
 
 
 def clearance_quality(blocked, initial_overlap):
@@ -170,20 +178,17 @@ def clearance_quality(blocked, initial_overlap):
 
 
 def clearance(env):
-    """Linear initial-overlap progress; placement gates suppress positive scores."""
+    """Pay positive initial-overlap progress, independently of state gates."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    score = state.clearance_quality
-    return torch.where(state.clearance_progress_valid, score, score.clamp_max(0.0))
+    return state.clearance_quality.clamp_min(0.0)
 
 
-def blocker_distance(env, decay=math.log(2.0) / 0.10):
-    """All-pad distance quality; pay only while Target remains protected."""
-    from .events import get_task_state
+def _current_blocker_pad_distances(env):
+    """Read current native poses and share the same OBB geometry for both rewards."""
     from .observations import quat_apply, quat_conjugate, quat_mul
 
-    state = get_task_state(env)
     scene = env.task_scene_data
     blocker = scene.blocker_id
     pose = env.scene["object_collection"].data.object_link_pose_w.gather(
@@ -191,13 +196,42 @@ def blocker_distance(env, decay=math.log(2.0) / 0.10):
     rotation = quat_mul(pose[:, 3:], quat_conjugate(scene.upright[blocker]))
     lower, upper = scene.lower[blocker], scene.upper[blocker]
     center = pose[:, :3] + quat_apply(rotation, (lower + upper) * .5)
-    quality, _ = blocker_distance_quality(
-        tactile_pad_points(env), center, rotation, (upper - lower) * .5, decay=decay)
+    return _blocker_pad_distances(tactile_pad_points(env), center, rotation, (upper - lower) * .5)
+
+
+def blocker_distance(env, decay=math.log(2.0) / 0.10):
+    """Original current-distance quality; pay only while Target remains protected."""
+    from .events import get_task_state
+
+    if not math.isfinite(decay) or decay <= 0:
+        raise ValueError("Distance decay must be finite and positive.")
+    state = get_task_state(env)
+    quality = torch.exp(-decay * _current_blocker_pad_distances(env)).mean(-1)
     return torch.where(state.target_protected, quality, 0.0)
 
 
-def object_motion_cost(center, corners, velocity, active, blocker):
-    """Sum active non-Blocker mean OBB corner speeds, in meters per second.
+@torch.no_grad()
+def blocker_min_distance(env, decay=math.log(2.0) / 0.10):
+    """Score each pad's closest sampled distance during this episode.
+
+    Different pads may reach their minima at different steps. History updates
+    even while Target protection gates payment. Invalid current pads earn zero
+    without erasing valid history. TaskState.reset clears only reset rows.
+    """
+    from .events import get_task_state
+
+    if not math.isfinite(decay) or decay <= 0:
+        raise ValueError("Distance decay must be finite and positive.")
+    state = get_task_state(env)
+    distance = _current_blocker_pad_distances(env)
+    torch.minimum(state.blocker_min_distance, distance, out=state.blocker_min_distance)
+    quality = torch.where(torch.isfinite(distance),
+                          torch.exp(-decay * state.blocker_min_distance), 0.0).mean(-1)
+    return torch.where(state.target_protected, quality, 0.0)
+
+
+def object_motion_cost(center, corners, velocity, active, blocker, target):
+    """Sum surrounding-object mean OBB corner speeds, in meters per second.
 
     The linear velocity is measured at the OBB center, in the same fixed axes
     as the corners and angular velocity. Averaging the eight corners preserves
@@ -205,7 +239,7 @@ def object_motion_cost(center, corners, velocity, active, blocker):
     No saturation is applied to valid costs. Nonfinite object measurements are
     unavailable costs; the existing physical-state termination handles them.
     """
-    selected = active & ~blocker
+    selected = active & ~blocker & ~target
     twist = torch.where(selected[..., None], velocity, 0.0)
     origin = torch.where(selected[..., None], center, 0.0)
     offset = torch.where(selected[..., None, None], corners, 0.0) - origin.unsqueeze(-2)
@@ -216,7 +250,7 @@ def object_motion_cost(center, corners, velocity, active, blocker):
 
 
 def object_collision(env):
-    """Current non-Blocker corner motion, including translation and rotation."""
+    """Current non-role corner motion, including translation and rotation."""
     from .events import get_task_state
 
     state = get_task_state(env)
@@ -257,6 +291,25 @@ def shelf_collision(env, asset_cfg, *, translation_threshold=0.005,
     )
 
 
+def target_collision(env, *, translation_threshold=0.005,
+                     rotation_threshold=math.pi / 180.0, linear_velocity_threshold=0.005,
+                     angular_velocity_threshold=0.05):
+    """Apply the same shelf moved flag to the Target's world link pose/COM twist."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    data = env.scene["object_collection"].data
+    ids = env.task_scene_data.target_id[:, None, None]
+    pose = data.object_link_pose_w.gather(1, ids.expand(-1, 1, 7)).squeeze(1)
+    velocity = data.object_com_vel_w.gather(1, ids.expand(-1, 1, 6)).squeeze(1)
+    return shelf_motion_cost(
+        pose, velocity, state.initial_target_pose,
+        translation_threshold=translation_threshold, rotation_threshold=rotation_threshold,
+        linear_velocity_threshold=linear_velocity_threshold,
+        angular_velocity_threshold=angular_velocity_threshold,
+    )
+
+
 def motion_force_growth(env):
     """Squared positive force-norm increase per control step, in N squared."""
     from .events import get_task_state
@@ -272,10 +325,22 @@ def motion_torque_growth(env):
 
 
 def motion_action_rate(env):
-    """Native L2 cost; invalid-state rows must not send NaN/Inf to PPO."""
-    from isaaclab.envs.mdp.rewards import action_rate_l2
+    """Separate accepted wrench/hand input variation for the 12D action.
 
-    return torch.nan_to_num(action_rate_l2(env), nan=0.0, posinf=0.0, neginf=0.0)
+    Clip both samples with the observation's cached native-input bounds, while
+    leaving the PPO/manager raw history untouched. The units remain raw action
+    units; native RewardManager applies weight and dt once.
+    """
+    action, previous = env.action_manager.action, env.action_manager.prev_action
+    if action.ndim != 2 or action.shape[1] != 12 or previous.shape != action.shape:
+        raise ValueError("Action-rate requires matching [N,12] current/previous wrench-hand actions.")
+    from .events import get_task_state
+
+    limits = get_task_state(env).bindings.action_limits
+    change = action.clamp(-limits, limits) - previous.clamp(-limits, limits)
+    wrench_cost = change[:, :6].square().sum(-1)
+    hand_cost = change[:, 6:12].square().sum(-1)
+    return torch.nan_to_num(wrench_cost + hand_cost, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def motion_joint_velocity(env, asset_cfg):
@@ -286,19 +351,13 @@ def motion_joint_velocity(env, asset_cfg):
 
 
 def object_stability(env):
-    """Worst active object's tilt and OBB-XY/collision-bottom support risk.
-
-    Distance has a 10 mm slack; tilt uses the angle itself, excluding yaw.
-    Independent inverse-unit coefficients make their joint risk dimensionless.
-    Existing center-based support-loss and tilt terminations remain separate.
-    """
+    """Blocker-only shelf-relative tilt cost after a five-degree allowance."""
     from .events import get_task_state
 
     state = get_task_state(env)
-    distance = torch.where(state.active, state.stability_distance, 0.0)
-    tilt = torch.where(state.active, state.tilt_angle, 0.0)
-    excess = (distance - state.cfg.support_warning_distance).clamp_min(0.0)
-    risk = state.cfg.support_stability_decay * excess.square() + state.cfg.stability_tilt_decay * tilt
+    tilt = torch.where(state.active & state.blocker, state.tilt_angle, 0.0)
+    excess = (tilt - state.cfg.stability_tilt_slack).clamp_min(0.0)
+    risk = state.cfg.stability_tilt_decay * excess
     risk = torch.nan_to_num(risk, nan=math.inf, posinf=math.inf, neginf=math.inf)
     return torch.expm1(-risk.amax(-1))
 

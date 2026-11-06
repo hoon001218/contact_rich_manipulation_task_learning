@@ -493,14 +493,17 @@ class TaskState:
     """Cached actor vision and independently tracked reset-time critic objects."""
 
     def __init__(self, num_envs, device, cfg, dt, *, dtype=torch.float32, step=0, termination_cfg=None,
-                 active_capacity=None, actor_vision_update_interval=0):
+                 active_capacity=None, actor_vision_update_interval=0, support_cuda_graph=True):
         cfg.__post_init__()
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("step_dt must be finite and positive.")
         if (isinstance(actor_vision_update_interval, bool)
                 or not isinstance(actor_vision_update_interval, int) or actor_vision_update_interval < 0):
             raise ValueError("actor_vision_update_interval must be a nonnegative integer.")
+        if not isinstance(support_cuda_graph, bool):
+            raise ValueError("support_cuda_graph must be a boolean.")
         self.cfg, self.dt = cfg, dt
+        self.support_cuda_graph = support_cuda_graph
         self.last_step = step
 
         self.ready = False
@@ -534,6 +537,12 @@ class TaskState:
         self.target = zeros(n, o, kind=torch.bool)
         self.blocker = zeros(n, o, kind=torch.bool)
         self.object_motion_cost = zeros(n)
+        self.blocker_center = torch.full((n, 3), math.nan, device=device, dtype=dtype)
+        # Immutable scene metadata is attached at reset as broadcast views.
+        # No region geometry is rebuilt or copied per environment/physics step.
+        self.relocation_regions = zeros(n, 0, 3, 2)
+        self.relocation_vertex_counts = zeros(n, 0, kind=torch.long)
+        self.relocation_valid = zeros(n, 0, kind=torch.bool)
         self.access_region = zeros(n, 4)
         self.workspace_bounds = zeros(n, 4)
         self.shelf_top = zeros(n)
@@ -605,6 +614,9 @@ class TaskState:
                             ("shelf_top", shelf_top), ("ceiling", ceiling)):
             getattr(self, name)[ids] = value[rows]
         self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
+        role = self.blocker[ids] & self.active[ids]
+        center = batch.center[rows].gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
+        self.blocker_center[ids] = torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan)
         self.initial_target_pose[ids] = 0
         if self.bindings is not None and hasattr(self.bindings, "objects"):
             target_slots = self.target[ids].long().argmax(-1)
@@ -718,6 +730,9 @@ class TaskState:
             raise RuntimeError("reset_task must run after scene/vision initialization before stepping.")
         if step != self.last_step + 1:
             raise RuntimeError("MDP must be evaluated once every completed control transition.")
+        role = self.blocker & self.active
+        center = batch.center.gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
+        self.blocker_center.copy_(torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan))
         if singularity is None:
             self.singularity_margin.fill_(self.cfg.motion_singularity_threshold)
         else:
@@ -808,7 +823,8 @@ class TaskState:
 
     def _support_validity(self, batch):
         """Replay the fixed geometric task check without small-op CPU dispatch."""
-        if not batch.center.is_cuda or torch.cuda.is_current_stream_capturing():
+        if (not self.support_cuda_graph or not batch.center.is_cuda
+                or torch.cuda.is_current_stream_capturing()):
             return self._support_tensors(batch)
         key = (torch.is_inference_mode_enabled(), torch.backends.cuda.matmul.allow_tf32)
         cache = getattr(self, "_support_graphs", {})
@@ -888,6 +904,10 @@ class SceneBatch:
     support_vertices: torch.Tensor | None = None  # catalog,V,3 canonical collision hulls
     support_vertex_mask: torch.Tensor | None = None  # catalog,V, bool
     support_error: torch.Tensor | None = None  # catalog; primitive approximation bound in meters
+    # Initial empty patches outside A0; immutable across robot-only resets.
+    relocation_regions: torch.Tensor | None = None  # N,K,V,2, environment-local XY
+    relocation_vertex_counts: torch.Tensor | None = None  # N,K
+    relocation_valid: torch.Tensor | None = None  # N,K
 
 
 @dataclass
@@ -1079,7 +1099,10 @@ def _ensure_state(env):
                                      step=env.common_step_counter,
                                      termination_cfg=getattr(env.cfg, "terminations", None),
                                      active_capacity=_active_object_capacity(env),
-                                     actor_vision_update_interval=getattr(env.cfg, "actor_vision_update_interval", 0))
+                                     actor_vision_update_interval=getattr(env.cfg, "actor_vision_update_interval", 0),
+                                     support_cuda_graph=getattr(env.cfg, "support_cuda_graph", True))
+    # Diagnostic toggles also apply to an already initialized environment.
+    env._contact_mdp.support_cuda_graph = getattr(env.cfg, "support_cuda_graph", True)
     return env._contact_mdp
 
 
@@ -1170,6 +1193,24 @@ def _validate_reset_data(env, scene, ids):
             raise ValueError(f"SceneBatch.{name} must be a catalog tensor on {device}.")
         if not bool(torch.isfinite(value).all()):
             raise ValueError(f"SceneBatch.{name} contains nonfinite values.")
+    regions = scene.relocation_regions
+    region_counts, region_valid = scene.relocation_vertex_counts, scene.relocation_valid
+    if regions is None:
+        if region_counts is not None or region_valid is not None:
+            raise ValueError("Relocation region vertices, counts and validity must be supplied together.")
+    else:
+        if (regions.ndim != 4 or regions.shape[0] != n or regions.shape[-1] != 2
+                or regions.shape[-2] < 3 or regions.device != device or not regions.is_floating_point()
+                or region_counts is None or region_valid is None
+                or region_counts.shape != regions.shape[:2] or region_counts.dtype != torch.long
+                or region_valid.shape != regions.shape[:2] or region_valid.dtype != torch.bool
+                or region_counts.device != device or region_valid.device != device):
+            raise ValueError("Relocation geometry requires device polygons [N,K,V,2], counts and validity [N,K].")
+        counts, valid = region_counts[ids], region_valid[ids]
+        used = torch.arange(regions.shape[-2], device=device) < counts[..., None]
+        if bool((valid & ((counts < 3) | (counts > regions.shape[-2]))).any()
+                | (valid[..., None] & used & ~torch.isfinite(regions[ids]).all(-1)).any()):
+            raise ValueError("Valid relocation regions require finite polygon vertices and valid counts.")
     if (scene.lower.shape != scene.upper.shape or scene.upright.shape[0] != scene.lower.shape[0]
             or scene.lower.shape[0] != env.scene["object_collection"].data.object_link_pose_w.shape[1]):
         raise ValueError("Catalog bounds/upright must match the native object collection size.")
@@ -1291,7 +1332,8 @@ def _read_transition(env, state, env_ids=None):
               b.shelf.data.root_link_pose_w, env.action_manager.action, data.applied_torque,
               data.body_com_acc_w, data.body_com_ang_vel_w)
     rows = slice(None) if env_ids is None else env_ids
-    if env_ids is not None or not values[0].is_cuda:
+    if (env_ids is not None or not values[0].is_cuda
+            or not getattr(env.cfg, "transition_cuda_graph", True)):
         return _transition_tensors(env, state, rows, values)
     key = (torch.is_inference_mode_enabled(), torch.backends.cuda.matmul.allow_tf32)
     cache = getattr(state, "_transition_graphs", {})
@@ -1420,6 +1462,17 @@ def reset_task(env, env_ids=None):
         prepared = cached[1]
     if state.bindings is None:
         _bind_scene(env, state, scene)
+    # A SceneBatch owns all rows, so partial resets keep other rows' metadata.
+    # Native shared layouts supply zero-stride broadcast views, avoiding N
+    # copies of the same polygons and preserving them across robot-only resets.
+    if scene.relocation_regions is not None:
+        state.relocation_regions = scene.relocation_regions
+        state.relocation_vertex_counts = scene.relocation_vertex_counts
+        state.relocation_valid = scene.relocation_valid
+    else:
+        state.relocation_regions = state.blocker_center.new_zeros((env.num_envs, 0, 3, 2))
+        state.relocation_vertex_counts = torch.empty((env.num_envs, 0), device=env.device, dtype=torch.long)
+        state.relocation_valid = torch.empty((env.num_envs, 0), device=env.device, dtype=torch.bool)
     b = state.bindings
     for name in ("object_ids", "local_center", "local_corners", "upright"):
         getattr(b, name)[ids] = getattr(prepared, name)
@@ -3806,6 +3859,143 @@ def _collision_polygon(geometry, yaw):
     return points @ np.asarray(((c, s), (-s, c)))
 
 
+def _free_relocation_rectangles(obstacles, bounds, footprint_sizes):
+    """Maximal empty AABB patches in one side band, without a spatial grid.
+
+    The obstacle AABBs conservatively contain the initial collision footprints.
+    X intervals use their boundary coordinates; a sorted interval union gives
+    every free Y gap. Boundary contacts discard rectangles that can still be
+    extended in X. All layout-dependent work stays on the input tensor device;
+    this helper runs once per shared scene, never once per environment or step.
+    """
+    tolerance = 1.0e-7
+    xmin, xmax, ymin, ymax = bounds.unbind()
+    edges = torch.cat((bounds[:2], obstacles[:, :2].flatten().clamp(xmin, xmax))).unique(sorted=True)
+    pairs = torch.triu_indices(edges.numel(), edges.numel(), offset=1, device=edges.device)
+    left, right = edges[pairs[0]], edges[pairs[1]]
+    crosses = ((obstacles[None, :, 0] < right[:, None] - tolerance)
+               & (obstacles[None, :, 1] > left[:, None] + tolerance)
+               & (obstacles[None, :, 2] < ymax - tolerance)
+               & (obstacles[None, :, 3] > ymin + tolerance))
+    low = torch.where(crosses, obstacles[None, :, 2].clamp(ymin, ymax), ymax)
+    high = torch.where(crosses, obstacles[None, :, 3].clamp(ymin, ymax), ymin)
+    low, order = low.sort(dim=-1, stable=True)
+    high = high.gather(-1, order).cummax(-1).values
+    bottom = torch.cat((ymin.expand(left.shape[0], 1), high), -1)
+    top = torch.cat((low, ymax.expand(left.shape[0], 1)), -1)
+    width, height = (right - left)[:, None], top - bottom
+    fits = ((width[..., None] + tolerance >= footprint_sizes[:, 0])
+            & (height[..., None] + tolerance >= footprint_sizes[:, 1])).any(-1)
+    y_overlap = ((obstacles[None, None, :, 2] < top[..., None] - tolerance)
+                 & (obstacles[None, None, :, 3] > bottom[..., None] + tolerance))
+    left_touch = ((obstacles[None, :, 1] - left[:, None]).abs() <= tolerance)[:, None, :]
+    right_touch = ((obstacles[None, :, 0] - right[:, None]).abs() <= tolerance)[:, None, :]
+    blocked_left = ((left - xmin).abs() <= tolerance)[:, None] | (y_overlap & left_touch).any(-1)
+    blocked_right = ((right - xmax).abs() <= tolerance)[:, None] | (y_overlap & right_touch).any(-1)
+    gap_valid = torch.arange(obstacles.shape[0] + 1, device=edges.device)[None] <= crosses.sum(-1, keepdim=True)
+    keep = (fits & gap_valid & blocked_left & blocked_right & (width > tolerance)
+            & (height > tolerance) & (ymax > ymin + tolerance))
+    rectangles = torch.stack((left[:, None].expand_as(bottom), right[:, None].expand_as(bottom),
+                              bottom, top), -1)
+    return rectangles[keep]
+
+
+def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype):
+    """Initial free patches on either Y side of A0, in fixed environment XY.
+
+    Regions are physical empty patches large enough for the Blocker at one of
+    its principal footprint orientations. They are deliberately NOT eroded
+    center-feasibility sets: the reward's plateau begins when its center enters
+    the patch, as specified. All active objects, including Target, are obstacles;
+    only Blocker is removed. This is a conservative empty-space extraction,
+    not a path/reachability test, and does not alter the generated scene.
+
+    The packer's reserved region is an AABB of a rotated polygon and therefore
+    must not be trusted as empty. Its actual collision polygon is reconstructed
+    from certified pocket metadata and independently checked before inclusion.
+    Return padded convex vertices [K,V,2], vertex counts [K], validity [K].
+    """
+    ids = tuple(index for index in sample.active_ids if index != sample.blocker_id)
+    local = tuple(_collision_polygon(geometries[index], 0.) for index in ids)
+    capacity = max((len(polygon) for polygon in local), default=3)
+    padded = np.zeros((len(ids), capacity, 2), dtype=np.float64)
+    for slot, polygon in enumerate(local):
+        padded[slot, :len(polygon)] = polygon
+    points = torch.as_tensor(padded, device=device, dtype=dtype)
+    counts = torch.tensor([len(polygon) for polygon in local], device=device, dtype=torch.long)
+    slots = torch.arange(capacity, device=device)
+    vertex_valid = slots[None, :] < counts[:, None]
+    if sample.planar_poses is not None:
+        lookup = {index: slot for slot, index in enumerate(sample.planar_ids)}
+        rows = torch.tensor([lookup[index] for index in ids], device=sample.planar_poses.device)
+        poses = sample.planar_poses[rows].to(device=device, dtype=dtype)
+    else:
+        poses = torch.tensor([(*sample.positions[index][:2], sample.yaws[index]) for index in ids],
+                             device=device, dtype=dtype).reshape(-1, 3)
+    cosine, sine = poses[:, 2].cos(), poses[:, 2].sin()
+    world = torch.stack((points[..., 0] * cosine[:, None] - points[..., 1] * sine[:, None],
+                         points[..., 0] * sine[:, None] + points[..., 1] * cosine[:, None]), -1)
+    world = world + poses[:, None, :2]
+    lower = world.masked_fill(~vertex_valid[..., None], math.inf).amin(1)
+    upper = world.masked_fill(~vertex_valid[..., None], -math.inf).amax(1)
+    obstacles = torch.stack((lower[:, 0], upper[:, 0], lower[:, 1], upper[:, 1]), -1)
+    geometry = geometries[sample.blocker_id]
+    _, _, principal = _certified_footprint_profile(tuple(geometry.lower), tuple(geometry.upper),
+                                                 tuple(geometry.collision_footprint_vertices))
+    sizes = torch.as_tensor(np.asarray([np.ptp(_collision_polygon(geometry, angle), axis=0)
+                                        for angle in (principal, principal + math.pi * .5)]),
+                            device=device, dtype=dtype)
+    support = (rules.x_range[0] + rules.edge_margin, rules.x_range[1] - rules.edge_margin,
+               rules.y_range[0] + rules.edge_margin, rules.y_range[1] - rules.edge_margin)
+    bounds = torch.tensor(support, device=device, dtype=dtype)
+    a0 = sample.access_region
+    bands = ((support[2], min(support[3], a0[2])), (max(support[2], a0[3]), support[3]))
+    # Only two structural side bands are iterated; scenes/environments and all
+    # obstacle/gap candidates are processed together in device tensors.
+    rectangles = torch.cat([_free_relocation_rectangles(obstacles,
+        bounds.new_tensor((support[0], support[1], low, high)), sizes)
+        for low, high in bands], dim=0)
+    polygon = torch.stack((rectangles[:, (0, 2)], rectangles[:, (1, 2)],
+                           rectangles[:, (1, 3)], rectangles[:, (0, 3)]), 1)
+    region_counts = torch.full((len(polygon),), 4, device=device, dtype=torch.long)
+    valid = torch.ones((len(polygon),), device=device, dtype=torch.bool)
+    certificate = sample.parameter_certificate
+    pocket = certificate.get("relocation_pocket") if isinstance(certificate, Mapping) else None
+    if isinstance(pocket, Mapping) and "center" in pocket and "yaw" in pocket:
+        center, yaw = np.asarray(pocket["center"], dtype=np.float64), float(pocket["yaw"])
+        if center.shape == (2,) and np.isfinite(center).all() and math.isfinite(yaw):
+            pocket_points = torch.as_tensor(np.asarray(_convex_hull(tuple(map(tuple,
+                _collision_polygon(geometry, yaw) + center)))), device=device, dtype=dtype)
+            pmin, pmax = pocket_points.amin(0), pocket_points.amax(0)
+            inside = ((pmin >= bounds[[0, 2]] - 1.0e-7).all()
+                      & (pmax <= bounds[[1, 3]] + 1.0e-7).all()
+                      & ((pmax[1] <= a0[2] + 1.0e-7) | (pmin[1] >= a0[3] - 1.0e-7)))
+            # Exact convex SAT allows the reserved pocket even where another
+            # object's conservative AABB overlaps its diagonal empty space.
+            following = (slots[None, :] + 1) % counts[:, None].clamp_min(1)
+            edges = world.gather(1, following[..., None].expand_as(world)) - world
+            p_edges = pocket_points.roll(-1, 0) - pocket_points
+            p_axes = torch.stack((-p_edges[:, 1], p_edges[:, 0]), -1)
+            axes = torch.cat((p_axes[None].expand(len(ids), -1, -1),
+                              torch.stack((-edges[..., 1], edges[..., 0]), -1)), 1)
+            axis_valid = torch.cat((torch.ones((len(ids), len(pocket_points)), device=device,
+                                               dtype=torch.bool), vertex_valid), 1)
+            p_projection = torch.einsum("vd,nad->nav", pocket_points, axes)
+            projection = torch.einsum("nvd,nad->nav", world, axes)
+            other_low = projection.masked_fill(~vertex_valid[:, None], math.inf).amin(-1)
+            other_high = projection.masked_fill(~vertex_valid[:, None], -math.inf).amax(-1)
+            separated = ((p_projection.amax(-1) <= other_low + 1.0e-9)
+                         | (other_high <= p_projection.amin(-1) + 1.0e-9)) & axis_valid
+            pocket_valid = inside & separated.any(-1).all()
+            new_capacity = max(4, len(pocket_points))
+            polygon = torch.nn.functional.pad(polygon, (0, 0, 0, new_capacity - 4))
+            extra = torch.nn.functional.pad(pocket_points, (0, 0, 0, new_capacity - len(pocket_points)))
+            polygon = torch.cat((polygon, extra[None]), 0)
+            region_counts = torch.cat((region_counts, region_counts.new_tensor([len(pocket_points)])))
+            valid = torch.cat((valid, pocket_valid[None]))
+    return polygon, region_counts, valid
+
+
 def _constructive_pivot(polygon, center):
     """Rotate around a rear support vertex while every point stays in its front half-plane."""
     origin = polygon[int(np.argmin(polygon[:, 0]))]
@@ -5788,13 +5978,53 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
             # as one graph so inactive tail chunks have little Python overhead.
             maximum = min(32 if count <= 32 else 8, attempts_limit, rules.ik_batch_size)
             group_size = 1 << max(0, (rules.ik_batch_size // maximum).bit_length() - 1)
+            use_cuda_graph = getattr(env.cfg, "robot_start_cuda_graph", True)
             cache = getattr(model, "_robot_start_graphs", {})
             model._robot_start_graphs = cache
             for begin in range(0, count, group_size):
                 rows = min(group_size, count - begin)
                 bucket = 1 << (rows - 1).bit_length()
                 key = (str(noise.device), dtype, bucket, centers.shape[1], maximum, attempts_limit, anchored, recovery,
-                       tuple(vars(rules).items()), singularity_settings, torch.backends.cuda.matmul.allow_tf32)
+                       tuple(vars(rules).items()), singularity_settings, use_cuda_graph,
+                       torch.backends.cuda.matmul.allow_tf32)
+
+                def candidates(values):
+                    (random, scene_centers, scene_rotations, scene_half, scene_valid, bounds,
+                     reference_rotation, reference_arm, enabled_rows) = values
+                    low, high = bounds[:, ::2], bounds[:, 1::2]
+                    accepted_rows = ~enabled_rows
+                    output = torch.zeros((bucket, result.shape[1]), device=device, dtype=dtype)
+                    offset = 0
+                    while offset < attempts_limit:
+                        width = min(8 if offset == 0 else maximum, maximum, attempts_limit - offset)
+                        target, target_rotation, arm = candidate_inputs(
+                            random, low, high, reference_rotation, reference_arm, offset, width)
+                        active_candidates = (~accepted_rows[:, None]).expand(-1, width).reshape(-1).contiguous()
+                        q, valid, frames, joints, tcp = model.solve_batch(
+                            target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3),
+                            arm.reshape(-1, 6), active_mask=active_candidates)
+                        if singularity_settings is not None:
+                            valid &= _robot_start_nonsingular(model, frames, joints, singularity_settings)
+                        clear, heights = _robot_candidate_clearance(
+                            env, frames, joints, tcp,
+                            scene_centers[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_centers.shape[1:]),
+                            scene_rotations[:, None].expand(-1, width, -1, -1, -1).reshape(-1, *scene_rotations.shape[1:]),
+                            scene_half[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_half.shape[1:]),
+                            scene_valid[:, None].expand(-1, width, -1).reshape(-1, scene_valid.shape[1]),
+                            candidate_valid=valid & active_candidates)
+                        actual = tcp[:, :3, 3].reshape(bucket, width, 3) - origin
+                        valid = valid.reshape(bucket, width) & clear.reshape(bucket, width)
+                        valid &= (actual >= low[:, None]).all(-1) & (actual <= high[:, None]).all(-1)
+                        first = torch.where(valid, torch.arange(width, device=device), width).amin(-1)
+                        found = first < width
+                        chosen = torch.arange(bucket, device=device) * width + first.clamp_max(width - 1)
+                        selected = torch.cat((q[chosen], actual.reshape(-1, 3)[chosen],
+                                              heights[chosen, None], (first + offset + 1).to(dtype)[:, None]), -1)
+                        output = torch.where(found[:, None], selected, output)
+                        accepted_rows |= found
+                        offset += width
+                    return output
+
                 if key not in cache:
                     # These are independent input buffers. Scene changes update
                     # them on replay instead of retaining stale obstacle geometry.
@@ -5803,53 +6033,17 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
                                             nominal_rotation, anchor_arm)]
                     enabled = torch.zeros(bucket, device=device, dtype=torch.bool)
                     inputs.append(enabled)
-
-                    def candidates(values):
-                        (random, scene_centers, scene_rotations, scene_half, scene_valid, bounds,
-                         reference_rotation, reference_arm, enabled_rows) = values
-                        low, high = bounds[:, ::2], bounds[:, 1::2]
-                        accepted_rows = ~enabled_rows
-                        output = torch.zeros((bucket, result.shape[1]), device=device, dtype=dtype)
-                        offset = 0
-                        while offset < attempts_limit:
-                            width = min(8 if offset == 0 else maximum, maximum, attempts_limit - offset)
-                            target, target_rotation, arm = candidate_inputs(
-                                random, low, high, reference_rotation, reference_arm, offset, width)
-                            active_candidates = (~accepted_rows[:, None]).expand(-1, width).reshape(-1).contiguous()
-                            q, valid, frames, joints, tcp = model.solve_batch(
-                                target.reshape(-1, 3), target_rotation.reshape(-1, 3, 3),
-                                arm.reshape(-1, 6), active_mask=active_candidates)
-                            if singularity_settings is not None:
-                                valid &= _robot_start_nonsingular(model, frames, joints, singularity_settings)
-                            clear, heights = _robot_candidate_clearance(
-                                env, frames, joints, tcp,
-                                scene_centers[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_centers.shape[1:]),
-                                scene_rotations[:, None].expand(-1, width, -1, -1, -1).reshape(-1, *scene_rotations.shape[1:]),
-                                scene_half[:, None].expand(-1, width, -1, -1).reshape(-1, *scene_half.shape[1:]),
-                                scene_valid[:, None].expand(-1, width, -1).reshape(-1, scene_valid.shape[1]),
-                                candidate_valid=valid & active_candidates)
-                            actual = tcp[:, :3, 3].reshape(bucket, width, 3) - origin
-                            valid = valid.reshape(bucket, width) & clear.reshape(bucket, width)
-                            valid &= (actual >= low[:, None]).all(-1) & (actual <= high[:, None]).all(-1)
-                            first = torch.where(valid, torch.arange(width, device=device), width).amin(-1)
-                            found = first < width
-                            chosen = torch.arange(bucket, device=device) * width + first.clamp_max(width - 1)
-                            selected = torch.cat((q[chosen], actual.reshape(-1, 3)[chosen],
-                                                  heights[chosen, None], (first + offset + 1).to(dtype)[:, None]), -1)
-                            output = torch.where(found[:, None], selected, output)
-                            accepted_rows |= found
-                            offset += width
-                        return output
-
-                    with torch.cuda.device(device):
-                        stream = torch.cuda.Stream(device=device)
-                        stream.wait_stream(torch.cuda.current_stream(device))
-                        with torch.cuda.stream(stream):
-                            candidates(inputs)
-                        torch.cuda.current_stream(device).wait_stream(stream)
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
-                            output = candidates(inputs)
+                    graph, output = None, None
+                    if use_cuda_graph:
+                        with torch.cuda.device(device):
+                            stream = torch.cuda.Stream(device=device)
+                            stream.wait_stream(torch.cuda.current_stream(device))
+                            with torch.cuda.stream(stream):
+                                candidates(inputs)
+                            torch.cuda.current_stream(device).wait_stream(stream)
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph):
+                                output = candidates(inputs)
                     # At most a small set of count buckets is needed. Bound graph
                     # memory if object counts or runtime rules change repeatedly.
                     if len(cache) >= 8:
@@ -5863,7 +6057,12 @@ def _sample_robot_starts(env, samples, seeds, *, proposals=None, scene_cache=Non
                     buffer[:rows].copy_(value[begin:begin + rows])
                 inputs[-1].zero_()
                 inputs[-1][:rows] = True
-                graph.replay()
+                if graph is None:
+                    # Retain identical candidate ordering, masks and GPU kernels;
+                    # disable capture/replay without CPU acceptance polling.
+                    output = candidates(inputs)
+                else:
+                    graph.replay()
                 result[begin:begin + rows].copy_(output[:rows])
             if return_tensors:
                 return result, regions
@@ -8190,11 +8389,19 @@ def reset_scene(env, env_ids=None):
         # this boundary; the temporary robot-only check validates native FK.
         template, sample = _build_episode_batch(
             env, runtime, torch.zeros(1, device=env.device, dtype=torch.long), scene_generation=generation)
+        relocation = build_initial_relocation_regions(
+            sample, env.spawn_geometries, env.spawn_rules,
+            device=env.device, dtype=template.object_state.dtype)
     else:
         template, sample = runtime.shared_template, runtime.shared_sample
     batch = _shared_reset_batch(env, runtime, ids, template, sample)
     apply_episode_batch(env, ids, batch)
     if refresh:
+        vertices, counts, valid = relocation
+        scene = env.task_scene_data
+        scene.relocation_regions = vertices.unsqueeze(0).expand(env.num_envs, -1, -1, -1)
+        scene.relocation_vertex_counts = counts.unsqueeze(0).expand(env.num_envs, -1)
+        scene.relocation_valid = valid.unsqueeze(0).expand(env.num_envs, -1)
         runtime.shared_template, runtime.shared_sample = template, sample
         runtime.scene_generation = generation
         runtime.scene_start_step = env.common_step_counter

@@ -446,7 +446,8 @@ Terminal은 성공+250·실패 `-failure_penalty`를 각각 일회 지급하므�
 | Reward | Weight | 함수가 반환하는 raw score / cost |
 |---|---:|---|
 | Clearance | 12.0 | $\max(0,C_t)$, $C_t=1-O_t/O_0$; 상태 gate 없음 |
-| `blocker_distance` | 5.0 | 새 `blocker_min_distance` 함수: $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d^{\min}_{i,k})$, 각 pad의 episode 내 최소 OBB 거리 |
+| `blocker_distance` | 5.0 | 기존 `blocker_distance` 함수: $\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_{i,k})$, 각 pad의 현재 OBB 거리 |
+| `blocker_relocation` | 1.0 | $\exp[-a\min_j\operatorname{dist}(p_{B,XY},R_j)]$, $a=\ln(2)/0.10$; 초기 빈 재배치 영역 안에서는1 |
 | `blocker_contact_hold` | 0.40 | $V_T(H_k+0.5N_k)$; $H_k$는 유지 pad 수, $N_k$는 새 접촉 pad 수 |
 | `shelf_collision` | −0.5 | 초기 대비 선반 pose 또는 현재 속도가 허용값을 넘으면1, 아니면0 |
 | `target_collision` | −0.5 | Shelf와 같은 함수·임계값으로 Target의 초기 pose 편차·현재 속도 평가 |
@@ -491,22 +492,31 @@ weighted rate4.8·100Hz 지급0.048이다. 지급 범위는0–12/s다. 유효 �
 같은 절대 면적 변화가 더 크게 평가되므로 새 학습의 실제 분포를 확인해야 한다.
 
 **Distance·Contact.** 실제 tactile collision mesh의 노출된 local+Z 표면에서 대표점 하나씩을
-초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. 새 `blocker_min_distance`는
-각 pad의 현재 OBB 거리 $d_{i,k}$를 계산하고 episode의 보상 평가 step에서 기록한 최소거리를 사용한다.
+초기화 때 선택하고, native 링크 pose로 GPU에서 변환한다. `blocker_distance`는
+각 pad의 현재 OBB 거리 $d_{i,k}$를 계산한다.
 
 $$
-d^{\min}_{i,k}=\min(d^{\min}_{i,k-1},d_{i,k}),\qquad
-f_{\mathrm{distance},k}=\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d^{\min}_{i,k}).
+f_{\mathrm{distance},k}=\frac{V_T}{17}\sum_{i=1}^{17}\exp(-10d_{i,k}).
 $$
 
-첫 보상 평가부터 기록하며 reset 직후의 별도 거리 조회는 추가하지 않는다.
-각 환경의 기록은 reset 때 $+\infty$로 비우고, 부분 reset에서는 해당 환경만 비운다.
-손이 멀어져도 유효한 최소거리 기록은 유지된다. Pad마다 다른 시점에 기록한 최소거리를 사용하므로
-17개가 동시에 가까웠던 상태를 평가하는 것은 아니다. 매 step 지급되는 상태 점수이며 개선량 bonus는 아니다.
-Target 보호 gate는 지급에만 적용하고, gate가 닫힌 동안에도 거리 기록은 갱신한다.
-기존 `blocker_distance` 함수는 현재 거리만 평가하는 동작으로 보존했으며,
-`RewardsCfg.blocker_distance.func`를 `mdp.blocker_distance`로 되돌리면 기존 방식을 사용할 수 있다.
+17개 pad 모두 현재 거리에 기여하며 손이 멀어지면 점수도 감소한다. 매 step 지급되는 상태
+점수이며 개선량 bonus는 아니다. Target 보호 gate는 유지한다. 이전 episode 최소거리 함수
+`blocker_min_distance`는 별도 비교 실험을 위해 보존하며 현재 cfg에서는 사용하지 않는다.
 Term 이름은 유지하여 기존 TensorBoard key를 사용하되, 이전 값과의 비교에서는 평가 기준 변경을 고려한다.
+
+**Blocker 재배치 영역.** 초기 Clearance 접근 영역의 양옆(Y방향)에서 다른 모든 활성 물체의
+충돌 footprint를 피하는 빈 사각형을 추출한다. Blocker가 들어갈 크기의 사각형과, 실제로 비어
+있는 것으로 재검증한 기존 pocket의 convex polygon을 등록한다. 회전된 pocket의 외접 AABB를
+빈 영역으로 취급하지 않는다. 영역 추출은 새 공유 배치마다1회이며, 부분 reset에서는 재사용한다.
+영역 polygon은1024환경에 복제하지 않고 broadcast view로 공유한다.
+
+현재 Blocker의 보정된 OBB 중심과 초기 영역은 환경 고정 XY 좌표계로 비교한다. 각 polygon의
+내부·경계 거리는0, 외부는 선분까지의 최단 거리이며 여러 영역 중 최소 거리를 사용한다.
+영역 내부의 raw reward는 항상1이고, 밖에서5/10/20cm 떨어지면 약0.707/0.5/0.25다.
+센터 진입 기준이므로 현재 yaw에서 전체 물체가 영역에 포함됐다는 뜻은 아니다. 초기 영역은
+물체가 움직여도 고정하며, 도달 가능한 이동 경로를 검증하지 않는다. 새 안전 gate·신기록 이력·
+`/dt` 상쇄는 없고 기존 Clearance·penalty·성공 판정과 함께 사용한다. 유효한 빈 영역이 없거나
+중심이 비유한 값이면 이 항만0이다. 매 step 중심은 기존 transition snapshot을 재사용한다.
 
 현재 사용자 실험 설정인 weight5·decay10을 유지한다. Raw 점수 범위는0–1이며,
 모든 pad의 최소거리가10cm이면 품질약0.3679, 반감거리는6.93cm다.
@@ -1239,11 +1249,17 @@ Actor feature forward의 chunk 상한은 8,192다. PPO는 공식 update를 그�
 기본 PPO 경로는 native의 gradient clipping과 loss 전송 방식을 따른다.
 따라서 native update 내부의 minibatch별 `.item()`까지 제거한 구현은 아니다.
 
-CUDA에서는 `agent.actor.compile_model=true`가 기본이며, Actor의 GNN·attention·mask·마지막 MLP의
-순수 tensor forward를 Inductor로 compile한다. Compile 자체는 모델 구조나 checkpoint key를 바꾸지 않는다.
-최초 추론/학습 compile 시간이 추가된다. CUDA graph를 쓰는 `reduce-overhead`는 native 학습의
-InferenceMode 전환에서 오류가 재현되어 사용하지 않는다. CPU는 eager이며,
-`agent.actor.compile_model=false`로 CUDA에서도 eager 실행을 비교할 수 있다.
+Actor·Critic의 `compile_model` 기본값은 사용자 요청으로 `true`로 복원했다.
+GNN·attention의 tensor feature 계산을 TorchInductor로 최적화하며 모델 구조·checkpoint는 유지한다.
+`triton.cudagraphs=false`는 계속 사용하고, 최초 추론/학습 compile 시간이 추가된다.
+원인 분리에는 `agent.actor.compile_model=false agent.critic.compile_model=false`를 사용할 수 있다.
+직접 작성한 Triton edge reduction은 eager에서도 유지된다. 기본값 변경은 다음 실행부터 적용되며,
+명령행에 명시한 값이 우선한다. Xid69의 근본 원인은 아직 미확정이다.
+
+환경 CUDA graph는 모델 컴파일과 별개다. 기본값이 모두 `true`인
+`env.transition_cuda_graph`, `env.support_cuda_graph`, `env.robot_start_cuda_graph`를 각각 `false`로
+지정하면 해당 단계의 capture/replay만 우회한다. GPU tensor·Warp 계산과 후보 순서는 유지하며,
+CPU 탐색으로 바꾸지 않는다. 이 스위치는 단계별 오류 진단용이며 물리 SDK 내부 graph를 제어하지 않는다.
 
 아래 성능 수치는 독립 Critic으로 분리하기 전 공유 모델의 개발 이력이며,
 새 Actor·Critic 구성의 처리량을 측정한 결과가 아니다.
@@ -1634,7 +1650,7 @@ extension `isaacsim.asset.importer.urdf-2.4.31`을 요구한다. 이 번호는 `
 `config/extension.gen.toml`의 NVIDIA 원본 `archivePath`에서 같은 Kit·플랫폼·Python 버전용
 패키지를 받아 복구했다. Isaac Lab의2.4.31 고정과 Hand의 fixed-link·mimic 설정은 유지했다.
 실제 URDF 변환에서 tactile 링크17개와 mimic 제약6개를 확인했으며,4환경·1 iteration 학습도 완료했다.
-배포 경로·무결성·검증 결과는 [학습 기록98절](../../docs/TRAINING_LOG.md#98-2026-11-06--urdf-importer-2431-손상-캐시-복구)에 기록한다.
+배포 경로·무결성·검증 결과는 [학습 기록107절](../../docs/TRAINING_LOG.md#107-2026-11-06--urdf-importer-2431-손상-캐시-복구)에 기록한다.
 
 ### 다른 PC의 초기 카탈로그와 IK
 

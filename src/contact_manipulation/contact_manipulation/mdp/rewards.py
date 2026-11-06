@@ -17,7 +17,7 @@ __all__ = [
     "clearance_quality", "clearance", "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
-    "blocker_min_distance",
+    "blocker_min_distance", "relocation_distance", "blocker_relocation",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -228,6 +228,67 @@ def blocker_min_distance(env, decay=math.log(2.0) / 0.10):
     quality = torch.where(torch.isfinite(distance),
                           torch.exp(-decay * state.blocker_min_distance), 0.0).mean(-1)
     return torch.where(state.target_protected, quality, 0.0)
+
+
+def relocation_distance(points, regions, vertex_counts, valid):
+    """Shortest XY distance to any valid convex relocation region, shaped [N].
+
+    Points are [N,2], padded polygons [N,K,V,2], and counts/validity [N,K].
+    Either polygon winding is accepted. A point inside a region or on its
+    boundary has zero distance; no usable region produces +inf. Padding may
+    contain nonfinite values without affecting valid vertices. This is a
+    batched tensor calculation with no environment loops or device reads.
+    """
+    if (points.ndim != 2 or points.shape[-1] != 2 or regions.ndim != 4
+            or regions.shape[0] != points.shape[0] or regions.shape[-1] != 2
+            or vertex_counts.shape != regions.shape[:2] or valid.shape != regions.shape[:2]
+            or valid.dtype != torch.bool or vertex_counts.dtype not in (torch.int32, torch.int64)):
+        raise ValueError("Expected points [N,2], polygons [N,K,V,2], integer counts and boolean validity [N,K].")
+    if regions.shape[1] == 0 or regions.shape[2] < 3:
+        return points.new_full((points.shape[0],), math.inf)
+
+    count = vertex_counts.clamp(0, regions.shape[2])
+    index = torch.arange(regions.shape[2], device=regions.device)
+    used = index < count[..., None]
+    usable = (valid & (vertex_counts >= 3) & (vertex_counts <= regions.shape[2])
+              & (torch.isfinite(regions).all(-1) | ~used).all(-1))
+    start = torch.where(used[..., None], torch.nan_to_num(regions, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    next_index = torch.where(index + 1 < count[..., None], index + 1, 0)
+    end = start.gather(-2, next_index[..., None].expand(-1, -1, -1, 2))
+    edge = end - start
+    # Compute area in coordinates relative to the first vertex to avoid
+    # cancellation when a small region is far from the world origin.
+    local_start, local_end = start - start[..., :1, :], end - start[..., :1, :]
+    area_cross = local_start[..., 0] * local_end[..., 1] - local_start[..., 1] * local_end[..., 0]
+    usable = usable & (torch.where(used, area_cross, 0.0).sum(-1).abs() > 1.0e-12)
+
+    point_valid = torch.isfinite(points).all(-1)
+    offset = torch.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0)[:, None, None] - start
+    projection = (offset * edge).sum(-1) / edge.square().sum(-1).clamp_min(1.0e-20)
+    displacement = offset - projection.clamp(0.0, 1.0)[..., None] * edge
+    edge_distance = torch.linalg.vector_norm(displacement, dim=-1)
+    boundary_distance = torch.where(used, edge_distance, math.inf).amin(-1)
+    cross = edge[..., 0] * offset[..., 1] - edge[..., 1] * offset[..., 0]
+    inside = (((cross >= 0.0) | ~used).all(-1) | ((cross <= 0.0) | ~used).all(-1))
+    distance = torch.where(inside, 0.0, boundary_distance)
+    return torch.where(usable & point_valid[:, None], distance, math.inf).amin(-1)
+
+
+def blocker_relocation(env, decay=math.log(2.0) / 0.10):
+    """Current Blocker-center proximity to initial empty relocation regions.
+
+    Every region interior has quality one, regardless of the entry point.
+    The closest region wins; missing regions give zero. The native reward
+    manager applies dt and weight without an extra safety gate or history.
+    """
+    from .events import get_task_state
+
+    if not math.isfinite(decay) or decay <= 0:
+        raise ValueError("Relocation decay must be finite and positive.")
+    state = get_task_state(env)
+    distance = relocation_distance(state.blocker_center[:, :2], state.relocation_regions,
+                                   state.relocation_vertex_counts, state.relocation_valid)
+    return torch.exp(-decay * distance)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

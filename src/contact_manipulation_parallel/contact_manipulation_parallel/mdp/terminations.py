@@ -14,6 +14,7 @@ __all__ = ["FAILURE_REASON_NAMES", "ObjectSupportValidity", "object_support_vali
 # Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
 FAILURE_REASON_NAMES = (
     "object_support_lost", "object_tilt", "shelf_displacement", "invalid_state", "singularity",
+    "target_displacement",
 )
 _FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
 
@@ -79,8 +80,9 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
     XY and canonical-up tilt. These do not change the existing failure timers.
 
     All object predicates, including finite checks and timers, ignore inactive
-    slots. Only final completion requires settled objects. Failure timers belong
-    to individual objects, so alternating transients do not accumulate together.
+    slots. Completion requires current geometric support without a speed cap.
+    Failure timers belong to individual objects, so alternating transients do
+    not accumulate together.
     """
     if (center_shelf.ndim != 3 or center_shelf.shape[-1] != 3
             or corners_shelf.shape != (*center_shelf.shape[:-1], 8, 3)
@@ -119,9 +121,7 @@ def object_support_validity(cfg, *, center_shelf, corners_shelf, velocity, activ
                        & (signed_gap <= cfg.progress_support_gap))
     contained = ((xy_lo >= bound_lo - cfg.success_xy_tolerance)
                  & (xy_hi <= bound_hi + cfg.success_xy_tolerance)).all(-1)
-    settled = ((velocity[..., :3].square().sum(-1) <= cfg.stable_linear_velocity ** 2)
-               & (velocity[..., 3:].square().sum(-1) <= cfg.stable_angular_velocity ** 2))
-    complete_object = (finite & contained & upright & above_lower_limit & settled
+    complete_object = (finite & contained & upright & above_lower_limit
                        & (signed_gap <= cfg.success_support_gap))
 
     closest_xy = torch.maximum(torch.minimum(center_shelf[..., :2], bound_hi), bound_lo)
@@ -192,8 +192,9 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     ``active`` are boolean object masks. ``blocker_overlap`` is the designated
     blocker's overlap area with the target approach region, in square meters.
     Task success requires a protected Target, cleared Blocker, supported and
-    retained settled active objects, and no enabled failure. The terminal
-    transition confirms that predicate for ``success_duration`` seconds.
+    retained active objects, and no enabled failure. Zero ``success_duration``
+    confirms the first valid transition; optional positive durations retain
+    consecutive-sample confirmation without imposing an object speed cap.
 
     ``tilt_count`` tracks consecutive tipped samples separately for each object;
     recovering upright or becoming inactive clears only that object's count.
@@ -203,6 +204,8 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     ``raw_goal_out`` optionally receives the protected-target/cleared-blocker
     predicate before completion validity, so diagnostics do not recompute poses.
     ``target_protected_out`` exposes the same pose predicate to reward gates.
+    Target displacement, like shelf displacement, compares the current pose to
+    the episode's initial pose with separate position/rotation tolerances.
     Inactive slots never trigger a failure, even
     when padded with NaN. state_valid optionally incorporates robot, tactile, or
     other integration-specific finite checks supplied by the environment.
@@ -236,11 +239,13 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     distance = torch.linalg.vector_norm(center - initial_center, dim=-1)
     cosine_half_angle = ((rotation * initial_rotation).sum(-1).abs()
                          / (rotation_norm * initial_norm).clamp_min(1.0e-12)).clamp(0.0, 1.0)
-    angle = 2.0 * torch.acos(cosine_half_angle)
+    # Match shelf displacement's sign-invariant cos(theta/2) comparison and
+    # reuse this exact predicate for Target protection and its failure reason.
     within_target_tolerance = ((distance <= cfg.target_translation_tolerance)
-                               & (angle <= cfg.target_rotation_tolerance)
+                               & (cosine_half_angle >= math.cos(cfg.target_rotation_tolerance / 2))
                                & (rotation_norm > 1.e-8) & (initial_norm > 1.e-8))
     target_active = target & active
+    target_displaced = (target_active & valid_objects & ~within_target_tolerance).any(-1)
     protected = ((target_active.sum(-1) == 1)
                  & (within_target_tolerance | ~target_active).all(-1))
     if target_protected_out is not None:
@@ -279,7 +284,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
             step_dt=step_dt,
         )
     reasons = torch.stack((support_validity.lost, (next_tilt_count >= tilt_steps).any(-1),
-                           displaced, invalid, singular), -1)
+                           displaced, invalid, singular, target_displaced), -1)
     failed = (reasons if failure_mask is None else reasons & failure_mask).any(-1)
     raw_goal = (blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area) & protected
     if raw_goal_out is not None:
@@ -293,7 +298,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
 
 
 def success(env):
-    """Native TerminationTerm: a sustained, settled valid shelf rearrangement."""
+    """Native TerminationTerm: a valid shelf rearrangement at the current step."""
     from .events import get_task_state
 
     return get_task_state(env).success
