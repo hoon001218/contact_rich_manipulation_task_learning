@@ -21,6 +21,11 @@ Blocker의 빈 재배치 공간은 확보하되 이동·pivot 전체 경로를 �
 [학습 기록](../../docs/TRAINING_LOG.md)에 정리한다. 연구·개발 전체 이력은
 [CONTEXT.md](../../docs/CONTEXT.md)를 참고한다.
 
+Actor와 Critic에 동일한 Actor 관측을 주는 독립 GNN 비교 프로젝트는
+[`contact_manipulation_symmetric`](../contact_manipulation_symmetric/README.md)다.
+현재 모델·제어·reward·PPO 설정을 복사하고 Critic 입력을 일치시켰으며,
+Isaac Lab 기본 예제의 native 학습 흐름을 사용한다.
+
 주요 구조 기준은 [Sweeping-Policy/min](https://github.com/IROL-SSU/Sweeping-Policy-DRL-Sim-Train/tree/min)이다.
 로컬 [Sweeping-Policy 예제](../../examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/)와
 [Isaac Lab manager-based 템플릿](../../IsaacLab/tools/template/templates/tasks/manager-based_single-agent/env_cfg)도 함께 참고한다.
@@ -1615,6 +1620,21 @@ Isaac Lab이 설치된 Python 환경을 사용한다. 저장소 루트에서 별
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation/scripts/train.py --num_envs 1024 --headless --run_name independent_critic
 ```
+
+### URDF importer 2.4.31 로딩 오류
+
+Isaac Sim 5.1의 pip 패키지에는 URDF importer 2.4.30이 포함되지만, 현재 Isaac Lab은
+extension `isaacsim.asset.importer.urdf-2.4.31`을 요구한다. 이 번호는 `isaacsim` pip 패키지의
+버전과 별개다. 필요한 2.4.31은 NVIDIA extension 배포 패키지로 설치한다.
+
+`ModuleNotFoundError: No module named 'isaacsim.asset'`가 발생하면 Kit가 선택한 extension
+경로와 그 안의 `config/extension.toml`, Python 모듈, `_urdf*.so`를 확인한다. 2026-11-06에는
+사용자 캐시의 2.4.31이 파일198개 중197개가0바이트인 상태로 발견됐다. 빈 extension이
+2.4.31로 활성화되어도 Python importer는 제공하지 못한다. 해당 캐시를 백업한 뒤,
+`config/extension.gen.toml`의 NVIDIA 원본 `archivePath`에서 같은 Kit·플랫폼·Python 버전용
+패키지를 받아 복구했다. Isaac Lab의2.4.31 고정과 Hand의 fixed-link·mimic 설정은 유지했다.
+실제 URDF 변환에서 tactile 링크17개와 mimic 제약6개를 확인했으며,4환경·1 iteration 학습도 완료했다.
+배포 경로·무결성·검증 결과는 [학습 기록98절](../../docs/TRAINING_LOG.md#98-2026-11-06--urdf-importer-2431-손상-캐시-복구)에 기록한다.
 
 ### 다른 PC의 초기 카탈로그와 IK
 

@@ -1,0 +1,30 @@
+{
+  "archive_sha256": "18eba4c7e98625839d03dcc05776ccc3971313c702d3daa32e00e4f71afef3fc",
+  "file_count": 6593,
+  "fingerprint": "b29c25582cca0b352970065b46ecd3f341f56c72159c6ad94f0abdaa71c10e08",
+  "parts": [
+    {
+      "name": "catalog.tar.gz.part00",
+      "sha256": "dec6be071d29163841b935630fbea1aa55f866a47fa60d191efb8124046673f4",
+      "size": 41943040
+    },
+    {
+      "name": "catalog.tar.gz.part01",
+      "sha256": "3abf02e74d8d3aa1012f05aa1b524d2dc360a65897ade5cfb88dda8acd310c64",
+      "size": 41943040
+    },
+    {
+      "name": "catalog.tar.gz.part02",
+      "sha256": "74b5b4d7d5ad8c623d803904a9409182335ffe927342f55a85fbb0efa9e1389b",
+      "size": 41943040
+    },
+    {
+      "name": "catalog.tar.gz.part03",
+      "sha256": "007f34a3291f21f49fa6f1e7082fa218b630f880ef4390faba5eaf0c9c6c575b",
+      "size": 34242760
+    }
+  ],
+  "payload_sha256": "f7a41c08f4b0a6d334441f55ead6a38e1c69fdd6b0e5e0fa6c440b03bd5ebdad",
+  "schema": 1,
+  "unpacked_bytes": 607833917
+}

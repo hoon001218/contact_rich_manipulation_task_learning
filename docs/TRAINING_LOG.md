@@ -7001,3 +7001,99 @@ import 후 composed stage에만 작성됐으므로 별도 캐시 삭제는 필�
 회귀도 포함한다. 추가 범위 검사에서 사용자 주석 설정의 velocity binding을 가정한 기존 검사
 1개가 실패했으며 이번 변경과 무관해 해당 설정·검사를 수정하지 않았다.
 `git diff --check` 통과. 실제 학습·simulation·play·GPU benchmark·commit·push는 실행하지 않았다.
+
+## 98. 2026-11-06 — URDF importer 2.4.31 손상 캐시 복구
+
+`contact_manipulation/scripts/train.py --num_envs 4 --headless`의 Hand URDF 변환에서
+`ModuleNotFoundError: No module named 'isaacsim.asset'`가 발생했다. 설치된 Isaac Sim은
+5.1.0.0이고, pip의 `isaacsim-asset` 기본 importer는2.4.30이다. Isaac Lab은2.4.31을 요구한다.
+초기에는2.4.30 호환 경로를 검토했으나 사용자가 실제2.4.31 설치를 요청해 해당 임시 코드와
+검사 파일을 모두 제거하고 Isaac Lab 원본을 복원했다.
+
+추가 확인에서 실제 원인은 **손상된2.4.31 사용자 캐시**였다. Kit의 설치 경로가
+`~/.local/share/ov/data/exts/v2/isaacsim.asset.importer.urdf-2.4.31+107.3.3.lx64.r.cp311`을
+가리켰으며, 파일198개 중197개가0바이트였다. `extension.gen.toml`613바이트만 남아 있고
+`extension.toml`, Python 모듈, native plugin·binding도 비어 있었다. Kit는 이를 의존성이 없는
+extension으로 활성화했지만 실제 `isaacsim.asset` 모듈은 제공하지 못했다.
+
+캐시의 NVIDIA 배포 메타데이터에 기록된 다음 원본을 내려받았다.
+
+`https://d4i3qtqj3r0z5.cloudfront.net/isaacsim.asset.importer.urdf-2.4.31%2B107.3.3.lx64.r.cp311.zip`
+
+17,480,710바이트이며 SHA-256은
+`665cc13d48842ac6d0c203359819c1d5c767a1d920fb8a00179e147ec2fb5201`이다.
+ZIP CRC와 내부 package version2.4.31·Linux/Python3.11용 두 native library의 실제 내용을
+검사했다. 기존 캐시는 `~/.local/share/ov/data/exts/urdf-importer-backups/`에 보존하고
+검증한 패키지로 원래 캐시 경로를 교체했다. Kit의 기존 symlink는 유지했다.
+복구한 config는4,504바이트, Python native binding은680,112바이트다.
+
+**검증:** 실제 Kit에서 Isaac Lab 원본 `UrdfConverter`로 RH56E2 Hand URDF를 변환했다.
+활성 extension ID는 `isaacsim.asset.importer.urdf-2.4.31`이며, 생성한 USD에서 tactile
+링크17개와 mimic 제약6개를 확인했다. 기존 `HandUrdfBoundsTests` CPU4개도 통과했다.
+단독 변환 probe는 위 검증을 완료한 뒤 normal shutdown 대기에서180초 제한으로 종료됐다.
+이후 원본 학습 스크립트의 기본 shutdown 경로로 다음 실행을 완료해 별도로 확인했다.
+
+```bash
+/home/ssu/miniforge3/envs/env_isaaclab/bin/python -B -u \
+  src/contact_manipulation/scripts/train.py \
+  --num_envs 4 --max_iterations 1 --headless --run_name urdf2431_smoke
+```
+
+환경 생성·Git-bundled catalog 복원·초기 reset·PPO `Learning iteration 0/1`을 완료하고
+exit0으로 종료됐다. 학습 구간은35.38초이며 전체 초기화 시간과 구분한다. 실행 결과는
+`logs/rsl_rl/contact_manipulation/2026-11-06_17-57-41_urdf2431_smoke/`에 있으며
+`model_0.pt`와 `params/env.yaml`, `params/agent.yaml` 생성을 확인했다.
+학습 성능이나 장기 접촉 안정성을 검증한 결과는 아니다. 임시2.4.30 호환 수정은 남기지 않았다.
+
+## 99. 2026-11-06 — 동일 Actor 관측을 사용하는 독립 GNN 비교 프로젝트
+
+사용자 요청으로 `src/contact_manipulation_symmetric`을 현재 `contact_manipulation`에서
+독립 복사했다. 기존 MLP `contact_manipulation_parallel`과 별개다. 새 Gym task는
+`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`, experiment/log 경로는
+`contact_manipulation_symmetric`이다. 원본 runtime·기존 Parallel·Isaac Lab은 수정하지 않았다.
+Asset 경로와 `CONTACT_MANIPULATION_*` 환경변수는 공통으로 사용하며,
+초기 카탈로그의 manifest와4개 archive part를 같은 내용으로 독립 복사했다.
+
+두 관측 그룹의 기하 term을 모두 `initial_scene_geometry`에 연결하고 current·previous
+term도 동일하게 유지했다. 직접 호출하는 `critic_observation`과 `critic_scene_geometry`도
+Actor cache를 읽는다. Actor의232D 전체 값·가시성·padding·현재 EEF frame·reset/부분 reset·
+주기 비전 갱신을 Critic과 일치시킨다. 모델에 현재 GT OBB를 별도로 입력하지 않는다.
+물리·reward·termination의 GT 처리와 내부 상태 계산은 원본을 유지한다.
+Actor와 Critic의 GNN·attention·MLP·정규화 인스턴스는 독립적이다.
+Critic 관측 계약을 `actor_observation_v1`로 구분해 기존 `tracked_initial_objects_v1`
+checkpoint의 전체 resume와 play를 거부한다. 입력 폭만 같은 checkpoint를 섞지 않는다.
+
+모델과 하이퍼파라미터를 제외한 학습 실행은 **Isaac Lab 기본 RSL-RL 예제**를 따르라는
+추가 요청을 반영했다. 원본의 `AppLauncher → Hydra → gym.make → ManagerBasedRLEnv →
+RslRlVecEnvWrapper → OnPolicyRunner.learn()` 순서를 유지하고, 공식 PPO·RolloutStorage·
+GAE/return·minibatch update·logger·checkpoint를 사용한다. 자체 환경 step/reset override,
+PPO subclass나 학습 loop를 추가하지 않았다. 기존 Time schedule은 공식 CurriculumManager,
+센서 모니터는 native logger 기록을 사용하고 checkpoint helper는 계약 검사 후 runner.load에
+위임한다. 이 흐름을 실제 checkout의 `IsaacLab/scripts/reinforcement_learning/rsl_rl/train.py`와
+대조하고 native API를 직접 실행하는 기존 학습 통합 검사로 확인했다.
+
+**원본 설정 보존:** 12D wrench/Hand·232D 입력, 물리100Hz/정책50Hz·8초,
+Actor vision interval0, GNN2층·64D와 head256/128·ReLU, Gaussian std1,
+rollout36·epochs8·minibatches4·gamma.95·lambda.95·LR1e-3 adaptive·entropy.01·KL.02,
+90,000 iteration·50회 저장·Time50% curriculum을 유지했다. Reward·종료·clutter·센서·
+로봇·초기화 코드도 이름공간을 제외하면 동일하다. 이름공간 변경을 정규화한 파일 비교와
+원본 파일 hash를 확인했다. 새 프로젝트 테스트의 과거 성공250/실패10·속도3 기대값은 현재
+원본의 성공10/실패0·속도1 설정에 맞추거나, 비영 비용 검사를 위한 명시적 fixture 값으로
+분리했다. 이를 위해 production 설정을 과거 값으로 되돌리지 않았다.
+
+**CPU 검증:** 전체 MDP474개와 learning76개, 총550개 중 **527개 통과·CUDA/Kit 전용23개 생략**.
+동일232D 값·물체 이동의 GT 입력 차단·새 가시성/padding·현재 frame·부분 reset·terminal 보존,
+동일 관측 rollout 저장과 독립 모델 update·공식 PPO 메서드·checkpoint 왕복 및 GT 계약 거부를
+포함한다. 초기 CPU 전체 검사에서 Warp cache의 read-only 경로 오류가 발생해
+`WARP_CACHE_PATH=/tmp/contact_symmetric_warp_cache`로 실행했다.
+
+**실제 학습:** 새 production `scripts/train.py`로4환경·`--max_iterations 1`을 실행했다.
+환경 생성·reset·`Learning iteration 0/1`을 완료하고 exit0으로 종료됐다.
+학습 구간은22.54초이며 전체 초기화 시간과 구분한다. 결과는
+`logs/rsl_rl/contact_manipulation_symmetric/2026-11-06_18-18-09_symmetric_smoke/`이며
+`model_0.pt`와 native env/agent YAML을 저장했다. 이는 실행 검증이며 관측 통일에 따른
+학습 성능 향상이나 장기 안정성의 증거는 아니다.
+
+추가로 해당 checkpoint를 공식 runner에 inference 모드로 로드해 실제4환경에서16step을
+재생했다.23회 auto-reset 전후를 포함해 매 관측의 `policy`·`critic` 전체 `[4,232]` 값이
+`torch.equal`로 일치했고, Actor/Critic parameter storage가 공유되지 않음도 확인했다.
