@@ -1,0 +1,671 @@
+{
+  "seed": 0,
+  "environment_episode_seed": 5805682168991916484,
+  "sample": {
+    "active_ids": [
+      28,
+      61,
+      75,
+      70,
+      41,
+      68,
+      59,
+      45,
+      73,
+      56,
+      46,
+      65,
+      79,
+      71,
+      63,
+      74,
+      40
+    ],
+    "target_id": 28,
+    "blocker_id": 61,
+    "positions": {
+      "28": [
+        -0.6676970858719903,
+        -0.1985267491440313,
+        1.0500000000000005
+      ],
+      "61": [
+        -0.5654909021812684,
+        -0.1940370468861246,
+        1.138126686033755
+      ],
+      "75": [
+        -0.8539306214867094,
+        -0.2854394299303083,
+        1.1456509950238989
+      ],
+      "70": [
+        -0.5546921725480032,
+        0.25037057531205126,
+        1.100928000265479
+      ],
+      "41": [
+        -0.7569164795905831,
+        0.40396598226110936,
+        1.05
+      ],
+      "68": [
+        -0.7532014601966279,
+        -0.05732070042135229,
+        1.100928000265479
+      ],
+      "59": [
+        -0.8611005718777788,
+        0.21472589860590724,
+        1.138126686033755
+      ],
+      "45": [
+        -0.7539827492262277,
+        -0.21232582611327103,
+        1.05
+      ],
+      "73": [
+        -0.6040559752589455,
+        0.3088381995829994,
+        1.1456509950238989
+      ],
+      "56": [
+        -0.7630942098672688,
+        0.07977745815588888,
+        1.138126686033755
+      ],
+      "46": [
+        -0.5601712451392895,
+        -0.32615194128130603,
+        1.05
+      ],
+      "65": [
+        -0.5625120830283522,
+        0.4017648705658837,
+        1.100928000265479
+      ],
+      "79": [
+        -0.8508439154141215,
+        -0.38652727340961246,
+        1.1456509950238989
+      ],
+      "71": [
+        -0.8334849228849257,
+        0.40347618517690476,
+        1.100928000265479
+      ],
+      "63": [
+        -0.6867496685628359,
+        0.13977784957498307,
+        1.138126686033755
+      ],
+      "74": [
+        -0.7105216989986138,
+        0.21964710599230747,
+        1.1456509950238989
+      ],
+      "40": [
+        -0.6438928759384128,
+        -0.09025178860249296,
+        1.05
+      ]
+    },
+    "yaws": {
+      "28": 0.0494388105904774,
+      "61": 3.3655643893797036,
+      "75": 7.813600303008172,
+      "70": -0.9943378747540654,
+      "41": 7.537128772058506,
+      "68": 0.5757672207451073,
+      "59": 4.713142475257073,
+      "45": 7.537391092843184,
+      "73": 4.671303361785731,
+      "56": 4.711936754252945,
+      "46": 1.884689248285813,
+      "65": 2.146470964981824,
+      "79": 4.67229526932607,
+      "71": 3.7164722380234165,
+      "63": 4.711631110749193,
+      "74": 6.243419551368842,
+      "40": 7.538663783595114
+    },
+    "access_region": [
+      -0.6081308127515385,
+      -0.49999998807907103,
+      -0.2585267491440313,
+      -0.1385267491440313
+    ],
+    "clearance_witness": [
+      -0.7774256211725247,
+      0.1584597745205175
+    ],
+    "clearance_path": [],
+    "clearance_kind": "joint_clutter_free_pocket",
+    "planar_poses": null,
+    "planar_ids": [],
+    "neighbor_pairs": [],
+    "reserved_regions": [
+      [
+        -0.8237642874029648,
+        -0.7310869549420845,
+        0.13589270536255946,
+        0.18102684367847552
+      ]
+    ],
+    "camera_pose": [
+      0.24803924022614293,
+      -0.15321691297729023,
+      1.23,
+      0.48748880157364954,
+      -0.48748880157364954,
+      -0.512205689484495,
+      0.512205689484495
+    ],
+    "visibility_variants": [],
+    "parameter_certificate": {
+      "visibility_fingerprint": "12f842322c33e35b59d468dc4513444c6929f21ef8a420583190125c8a30c500",
+      "parameter": -0.0005666774880396708,
+      "common_yaw": 0.0494388105904774,
+      "predicted_role_visibility": [
+        0.4327485380116959,
+        1.0
+      ],
+      "live_visibility_measured": false,
+      "full_route_reserved": false,
+      "initial_role_bounds": [
+        -0.04816718659472976,
+        0.15268709779291936,
+        -0.06825382080106834,
+        0.06825382080106834
+      ],
+      "role_translation_bounds": [
+        [
+          -0.14942001417722417,
+          0.019725701435126752
+        ],
+        [
+          -0.0025735462381036855,
+          0.537607820184748
+        ]
+      ],
+      "method": "joint_clutter",
+      "type_composition": [
+        "mug_1",
+        "ycb_004_sugar_box",
+        "ycb_005_tomato_soup_can",
+        "can_1",
+        "ycb_006_mustard_bottle"
+      ],
+      "desired_count": 23,
+      "active_count": 17,
+      "gpu_seed": {
+        "method": "gpu_fft_free_grid",
+        "maximum_greedy_prefix": 21,
+        "input_order_preserved": false,
+        "row_ids_preserved": true,
+        "processing_order": [
+          6,
+          0,
+          10,
+          12,
+          4,
+          7,
+          2,
+          5,
+          1,
+          3,
+          9,
+          11,
+          8,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "mandatory_count": 13,
+        "mandatory_seeded_count": 13,
+        "seeded_count": 21,
+        "pose_proposals": 0,
+        "approval_retries": 0,
+        "placement_queries": 21,
+        "resolution": 0.0005,
+        "grid_shape": [
+          750,
+          1770
+        ],
+        "fft_shape": [
+          756,
+          1782
+        ],
+        "fft_roundtrip_max_error": 1.8189894035458565e-11,
+        "unique_shape_kernels": 41,
+        "peak_cached_shape_kernels": 2,
+        "virtual_reservation": false
+      },
+      "joint_packing": {
+        "method": "joint_separation_domain",
+        "minimum_background": 13,
+        "requested_background": 21,
+        "active_background": 15,
+        "seeded_background": 21,
+        "variables": 281,
+        "unfixed_binary_variables": 201,
+        "constraints": 706,
+        "preparation_seconds": 0.043606238992651924,
+        "solve_seconds": 0.03393551299814135,
+        "numerical_gap_guard": 1e-05,
+        "maximum_constraint_violation": 1.1102230246251565e-16,
+        "scene_redraws": 0,
+        "approval_retries": 0,
+        "optimal_capacity_claimed": false,
+        "solver_status": 0,
+        "role_translation": [
+          0.019715701435126753,
+          0.06899038782929084
+        ],
+        "role_translation_inset": [
+          1e-05,
+          1e-05
+        ],
+        "numerical_wall_guard": 1e-05
+      },
+      "mixing": {
+        "method": "fixed_coordinate_free_intervals",
+        "sweeps": 3,
+        "coordinate_draws": 90,
+        "pose_proposals": 0,
+        "approval_retries": 0,
+        "minkowski_pairs": 285,
+        "changed_coordinates": 90,
+        "split_interval_updates": 60,
+        "maximum_free_intervals": 5,
+        "coordinate_travel": 15.985903019291202
+      },
+      "relocation_pocket": {
+        "center": [
+          -0.7774256211725247,
+          0.1584597745205175
+        ],
+        "yaw": 3.141592653589793,
+        "route_reserved": false
+      }
+    }
+  },
+  "preliminary_roles": {
+    "active_ids": [
+      28,
+      61
+    ],
+    "target_id": 28,
+    "blocker_id": 61,
+    "positions": {
+      "28": [
+        -0.6874127873071171,
+        -0.26751713697332213,
+        1.0500000000000005
+      ],
+      "61": [
+        -0.5852066036163952,
+        -0.26302743471541545,
+        1.138126686033755
+      ]
+    },
+    "yaws": {
+      "28": 0.0494388105904774,
+      "61": 3.3655643893797036
+    },
+    "access_region": [
+      -0.6278465141866653,
+      -0.49999998807907103,
+      -0.32751713697332213,
+      -0.20751713697332214
+    ],
+    "clearance_witness": [
+      -0.5852066036163952,
+      -0.26302743471541545
+    ],
+    "clearance_path": [],
+    "clearance_kind": "clutter_roles",
+    "planar_poses": null,
+    "planar_ids": [],
+    "neighbor_pairs": [],
+    "reserved_regions": [],
+    "camera_pose": [
+      0.2283235387910162,
+      -0.22220730080658108,
+      1.23,
+      0.48748880157364954,
+      -0.48748880157364954,
+      -0.512205689484495,
+      0.512205689484495
+    ],
+    "visibility_variants": [],
+    "parameter_certificate": {
+      "visibility_fingerprint": "12f842322c33e35b59d468dc4513444c6929f21ef8a420583190125c8a30c500",
+      "parameter": -0.0005666774880396708,
+      "common_yaw": 0.0494388105904774,
+      "predicted_role_visibility": [
+        0.4327485380116959,
+        1.0
+      ],
+      "live_visibility_measured": false,
+      "full_route_reserved": false,
+      "initial_role_bounds": [
+        -0.04816718659472976,
+        0.15268709779291936,
+        -0.06825382080106834,
+        0.06825382080106834
+      ],
+      "role_translation_bounds": [
+        [
+          -0.14942001417722417,
+          0.019725701435126752
+        ],
+        [
+          -0.0025735462381036855,
+          0.537607820184748
+        ]
+      ]
+    }
+  },
+  "spawn_rules": {
+    "x_range": [
+      -0.899999988079071,
+      -0.49999998807907103
+    ],
+    "y_range": [
+      -0.45499999999999996,
+      0.45499999999999996
+    ],
+    "shelf_top": 1.05,
+    "ceiling": 1.48,
+    "min_objects": 15,
+    "max_objects": 25,
+    "min_asset_types": 4,
+    "max_asset_types": 10,
+    "all_asset_types": false,
+    "generation_mode": "clutter",
+    "parameter_cache_directory": "",
+    "edge_margin": 0.015,
+    "gap": 0.003,
+    "max_neighbor_gap": 0.01,
+    "hand_width": 0.1,
+    "approach_margin": 0.01,
+    "min_blocked_ratio": 0.3,
+    "min_x_coverage": 0.55,
+    "min_y_coverage": 0.65,
+    "neighbor_distance": 0.04,
+    "min_neighbor_fraction": 0.75,
+    "min_shelf_occupancy": 0.0,
+    "region_grid": [
+      2,
+      3
+    ],
+    "min_region_occupancy": 0.0,
+    "reserve_blocker_front": true,
+    "max_attempts": 300
+  },
+  "object_pool": 80,
+  "active_count": 17,
+  "target_asset": "mug_1",
+  "blocker_asset": "ycb_004_sugar_box",
+  "active_assets": [
+    "mug_1",
+    "ycb_004_sugar_box",
+    "ycb_006_mustard_bottle",
+    "ycb_005_tomato_soup_can",
+    "can_1",
+    "ycb_005_tomato_soup_can",
+    "ycb_004_sugar_box",
+    "can_1",
+    "ycb_006_mustard_bottle",
+    "ycb_004_sugar_box",
+    "can_1",
+    "ycb_005_tomato_soup_can",
+    "ycb_006_mustard_bottle",
+    "ycb_005_tomato_soup_can",
+    "ycb_004_sugar_box",
+    "ycb_006_mustard_bottle",
+    "can_1"
+  ],
+  "observed_slots": [
+    {
+      "slot": 0,
+      "pool_id": 28,
+      "asset": "mug_1",
+      "geometry_b": [
+        0.6755960583686829,
+        0.20512902736663818,
+        0.302995502948761,
+        0.8551741242408752,
+        0.0,
+        0.0,
+        -0.5183408856391907,
+        0.12471732497215271,
+        0.0796634703874588,
+        0.08596789836883545
+      ]
+    },
+    {
+      "slot": 1,
+      "pool_id": 61,
+      "asset": "ycb_004_sugar_box",
+      "geometry_b": [
+        0.5532853603363037,
+        0.20467634499073029,
+        0.3460979461669922,
+        0.9522541761398315,
+        0.0,
+        0.0,
+        0.30530643463134766,
+        0.08824208378791809,
+        0.03133506327867508,
+        0.16170001029968262
+      ]
+    },
+    {
+      "slot": 2,
+      "pool_id": 46,
+      "asset": "can_1",
+      "geometry_b": [
+        0.5354929566383362,
+        0.3248545825481415,
+        0.31110477447509766,
+        0.7328359484672546,
+        0.0,
+        0.0,
+        -0.6804053783416748,
+        0.05037254840135574,
+        0.016695968806743622,
+        0.10022664070129395
+      ]
+    },
+    {
+      "slot": 3,
+      "pool_id": 40,
+      "asset": "can_1",
+      "geometry_b": [
+        0.6251274347305298,
+        0.08694230765104294,
+        0.31671684980392456,
+        0.7542911171913147,
+        0.0,
+        0.0,
+        -0.6565400958061218,
+        0.05665583908557892,
+        0.02656548097729683,
+        0.11071908473968506
+      ]
+    },
+    {
+      "slot": 4,
+      "pool_id": 75,
+      "asset": "ycb_006_mustard_bottle",
+      "geometry_b": [
+        0.8383522033691406,
+        0.2752129137516022,
+        0.3446800708770752,
+        0.7432835698127747,
+        0.0,
+        0.0,
+        -0.6689764857292175,
+        0.0680374950170517,
+        0.024347525089979172,
+        0.15788674354553223
+      ]
+    },
+    {
+      "slot": 5,
+      "pool_id": 68,
+      "asset": "ycb_005_tomato_soup_can",
+      "geometry_b": [
+        0.7373406291007996,
+        0.02857036702334881,
+        0.30250102281570435,
+        0.9980242252349854,
+        0.0,
+        0.0,
+        -0.06283032894134521,
+        0.004000000189989805,
+        0.004000000189989805,
+        0.08157956600189209
+      ]
+    },
+    {
+      "slot": 6,
+      "pool_id": 79,
+      "asset": "ycb_006_mustard_bottle",
+      "geometry_b": [
+        0.8333926200866699,
+        0.38868048787117004,
+        0.38940292596817017,
+        0.7115457057952881,
+        0.0,
+        0.0,
+        -0.7026398181915283,
+        0.06949584186077118,
+        0.01965985633432865,
+        0.06838572025299072
+      ]
+    },
+    {
+      "slot": 7,
+      "pool_id": 56,
+      "asset": "ycb_004_sugar_box",
+      "geometry_b": [
+        0.7444932460784912,
+        -0.06369232386350632,
+        0.34240925312042236,
+        0.7453970313072205,
+        0.0,
+        0.0,
+        0.6666207909584045,
+        0.05996891111135483,
+        0.007523412816226482,
+        0.16468214988708496
+      ]
+    },
+    {
+      "slot": 8,
+      "pool_id": 63,
+      "asset": "ycb_004_sugar_box",
+      "geometry_b": [
+        0.6675716042518616,
+        -0.13064390420913696,
+        0.3410381078720093,
+        0.7263121008872986,
+        0.0,
+        0.0,
+        0.6873651146888733,
+        0.0733012780547142,
+        0.00635827612131834,
+        0.16907978057861328
+      ]
+    },
+    {
+      "slot": 9,
+      "pool_id": 74,
+      "asset": "ycb_006_mustard_bottle",
+      "geometry_b": [
+        0.6878960728645325,
+        -0.21411189436912537,
+        0.35092371702194214,
+        0.9624567031860352,
+        0.0,
+        0.0,
+        0.27143535017967224,
+        0.04931056499481201,
+        0.043116290122270584,
+        0.18743813037872314
+      ]
+    }
+  ],
+  "robot_regions": [
+    -0.39529740810394287,
+    -0.11529740691184998,
+    -0.27403706312179565,
+    -0.11403705179691315,
+    1.25,
+    1.3300000429153442
+  ],
+  "joint_names": [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+    "right_index_1_joint",
+    "right_little_1_joint",
+    "right_middle_1_joint",
+    "right_ring_1_joint",
+    "right_thumb_1_joint",
+    "right_index_2_joint",
+    "right_little_2_joint",
+    "right_middle_2_joint",
+    "right_ring_2_joint",
+    "right_thumb_2_joint",
+    "right_thumb_3_joint",
+    "right_thumb_4_joint"
+  ],
+  "robot_q": [
+    0.5123805999755859,
+    -2.068760395050049,
+    2.023247718811035,
+    -0.17344754934310913,
+    2.2011911869049072,
+    -0.2550104260444641,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sensor_pose_w": [
+    -0.25211358070373535,
+    -0.20189349353313446,
+    1.2755520343780518,
+    -0.4690229594707489,
+    -0.4528879225254059,
+    0.4551486074924469,
+    0.6064236164093018
+  ],
+  "physical_dt": 0.01,
+  "policy_dt": 0.02,
+  "actor_vision_update_interval": 0,
+  "physics_steps_after_reset": 0,
+  "production_spawn_code_changed": false,
+  "top_view": "Exact workspace render-only plane; actual shelf hidden for cutaway.",
+  "camera_usage": "Diagnostic RGB only. Production perception uses numerical viewpoint, not a camera prim."
+}

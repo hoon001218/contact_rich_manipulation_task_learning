@@ -1,9 +1,16 @@
 # Contact Manipulation 학습 기록과 수정 과제
 
-작성·검토: **2026-10-26, Asia/Seoul**. 현재 프로젝트는
-`src/contact_manipulation`, task는 `Isaac-Contact-Manipulation-UR5e-v0`다.
+최종 검토: **2026-11-07, Asia/Seoul**. 현재 메인 프로젝트는
+`src/contact_manipulation_symmetric`, task는
+`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`다. 원본 `contact_manipulation`과
+별도 MLP `contact_manipulation_parallel`의 기록은 실행별 프로젝트를 구분하여 보존한다.
 연구·개발 결정의 전체 이력은 [CONTEXT.md](CONTEXT.md), 현재 구현은
-[프로젝트 README](../src/contact_manipulation/README.md)를 참고한다.
+[Symmetric README](../src/contact_manipulation_symmetric/README.md)를 참고한다.
+
+**최신 오류 분석(2026-11-07):** 원본 `2026-11-06_13-53-02` 실행의 CUDA719와
+동시각 커널 **Xid32**는 **112절**에 기록했다. 같은 Kit 로그의 선행 broadphase
+`found null elements` 오류도 보존한다. 최근 Xid69와 구분하며 근본 원인은 미확정이다.
+현재 메인은 Symmetric이고 공통 물리 경로의 안정성 위험은 계속 추적한다.
 
 **재발 시 참고(2026-11-05):** `2026-11-04_19-52-40` 실행의 CUDA 실패와 동시각 NVIDIA
 `Xid 32` 확인 기록은 **99절**을 따른다. 근본 원인은 미확정이며 사용자 요청으로 해결·재현은
@@ -29,13 +36,13 @@ Class·Offset·Data·ErrorCode가 같다. PPO loss 출력 위치를 최초 실�
 CUDA graph 스위치, 1,024환경 검사와 Compute Sanitizer 결과를 기록했다. 장기 안정성 대조를
 시작했으며, Xid69의 근본 원인을 해결했다고 판단한 상태는 아니다.
 
-**최신 적용:** 기존 Terminal에 일회 실패−5를 추가했다. 성공+250·일반/timeout0이며,
-현재 사용자 실험의 다른 weight는 유지한다. 변경·근거·검증은 **79절**에 기록한다.
+**2026-10-26 당시 적용:** 기존 Terminal에 일회 실패−5를 추가했다. 성공+250·일반/timeout0이며,
+당시 사용자 실험의 다른 weight는 유지했다. 현재 수치로 사용하지 않으며 변경·근거·검증은 **79절**에 기록한다.
 직전 reward 조정 이력은 **78절**, GUI tactile/F/T 모니터는 **77절**, 저장 실행 분석은
 **76절**을 따른다.
 
 **이전 물리·관측 적용:** Patch 용량262,144·관측64×48과 GUI 관측 OBB의 변경·검증은
-**48절**에 기록한다. 아래 과거 학습 기록은 당시 설정이며 현재 값은79절과 README를 따른다.
+**48절**에 기록한다. 아래 과거 학습 기록은 당시 설정이며 현재 값은 Symmetric README와 최신 실행 cfg를 따른다.
 
 **직전 적용:** 2026-10-21_23-26-39 분석의1차 후보를 사용자 승인으로 적용했다.
 Hold .05→.10·Stability2→3·Success100→250이며 민감도와 나머지 설정은 유지한다.
@@ -7985,3 +7992,2529 @@ Symmetric 전체 CPU는551개 통과·환경 의존33개 생략·596개 subtest 
 실제 Original4환경·PPO1 iteration은15.79초 학습 후 exit0과 checkpoint 저장을 완료했다.
 결과는 `logs/rsl_rl/contact_manipulation/2026-11-06_20-35-12_hand_urdf_alignment_smoke/`다.
 이는 startup 및 학습 실행 확인이며 역꺾임·장기 물리 안정성의 통과 판정이 아니다.
+
+## 112. 2026-11-07 — 원본 장기 학습의 broadphase 오류·Xid32·CUDA719와 메인 프로젝트 전환
+
+사용자가 원본 `contact_manipulation`의 새 오류를 제공하고, 이후 메인 프로젝트를
+**`contact_manipulation_symmetric`**으로 지정했다. 이번에는 저장 로그·설정·시작 시 Git diff와
+운영체제 커널 기록만 읽었다. 재현·학습·play·GPU 진단·테스트는 실행하지 않았고,
+runtime·reward·제어·물리·driver 설정은 바꾸지 않았다. 메인 지정과 조사 결과만 문서에 반영했다.
+
+### 실행 식별과 시간
+
+- 첨부: `/home/hoon/.codex/attachments/f0056847-8194-404f-9174-f2787cb4cad9/Pasted text.txt`.
+- 실행: `logs/rsl_rl/contact_manipulation/2026-11-06_13-53-02/`, PID **324627**.
+  TensorBoard 파일명의 PID와 커널 Xid의 PID가 같다.
+- Kit 로그: `/home/hoon/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261106_135246.log`.
+- App 시작은 **11월6일13:52:46 KST**, 최종 실패는 **11월7일04:43:31 KST**다.
+  첨부의 `2026-11-06T19:43:31Z`는 UTC이며, 경과53,444,897ms는 약14시간50분45초다.
+- 저장 Git 기준은 `main`, commit `7f81f78474b5909a42a679e34f4465dc2e3c22f2`다.
+  시작 당시 변경은 run의 `git/contact_rich_manipulation_task_learning.diff`에 보존되어 있다.
+- 마지막 저장 checkpoint는 `model_10000.pt`(04:39 KST)다. 정확한 실패 iteration을 뜻하지 않는다.
+
+### 최초 이상 징후와 최종 실패 순서
+
+전체 Kit 로그에서는 첨부보다 먼저 다음 오류가 확인됐다.
+
+```text
+2026-11-06T12:04:11Z [25,884,910ms] [Error] [omni.physx.plugin]
+PhysX error: PxgAABBManager::processFoundPairs: found null elements!
+PxgAABBManager.cpp, LINE 921
+```
+
+Kit5379행이며 **11월6일21:04:11 KST**, 최종 장애보다 **7시간39분20초 전**이다.
+GPU broadphase의 충돌 후보 pair 처리에서 내부 오류가 보고됐지만 즉시 프로세스가 끝나지는
+않았다. 어떤 pair·환경·reset에서 발생했는지와 나중의 GPU 장애에 이어졌는지는 미확정이다.
+이 오류가 이후에도 정상 물리 계산을 보장하는 경고였다고 해석하지 않는다.
+
+최종 장애 직전 `/var/log/kern.log:1257–1258`와 `/var/log/syslog:108407–108408`에는
+같은 Xid32가 두 번 기록됐다.
+
+```text
+Nov  7 04:43:30 hoon kernel: NVRM: Xid (PCI:0000:26:00): 32,
+pid=324627, name=python, channel 0x00000014 intr 00200000
+```
+
+약1초 뒤 Kit5387행의 PhysX CUDA719가 발생하고, Articulation·RigidBody tensor 조회가
+연달아 실패했다. Python은 `scene.update → joint_acc → joint_vel → get_dof_velocities()`에서
+`Failed to get DOF velocities from backend`로 종료됐다. 종료 과정의 allocator68행 경고는
+이미 CUDA context가 실패한 뒤의 기록이다.
+
+### 의미와 미확정 원인
+
+1. **이번 커널 오류는 Xid32이며103–104절의 Xid69가 아니다.** 99절의 Xid32와 같은 분류지만
+   당시 intr/HCE 세부값이 다르므로 같은 근본 결함이라고 확정하지 않는다.
+   [NVIDIA Xid32 설명](https://docs.nvidia.com/deploy/xid-errors/archive/index.html#xid-32-pbdma-error)은
+   이를 driver–GPU 명령 전달의 PBDMA 오류로 분류한다. Driver·PCIe/시스템 경로가 중요한 조사
+   대상이지만, Xid 숫자만으로 물리적 PCIe 고장이나 사용자 코드의 무관함을 입증할 수는 없다.
+2. [CUDA719](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__TYPES.html)는
+   device kernel 실행 중 예외를 뜻한다. 이후 CUDA 호출에도 같은 오류가 전파될 수 있으므로
+   관절 속도를 읽는 Python 행을 최초 결함이나 관절 가속도 수식의 오류로 단정하지 않는다.
+3. 앞선 `PxgAABBManager` 오류는 **PhysX GPU broadphase 경로를 별도로 조사할 단서**다.
+   충돌 후보 자료·reset/kinematic 전환·SDK 내부 처리와 관련된 가능성을 남기되,
+   실제 최초 실패 pair와 kernel이 없어 특정 전환 코드나 물체 메시를 원인으로 확정하지 않는다.
+4. 읽은 Kit 로그에는 앞선 명시적 OOM·contact/patch buffer overflow·singular matrix 오류가
+   없었다. 따라서 allocator 경고만으로 VRAM 부족을 단정하거나 buffer를 다시 늘릴 근거는 없다.
+   오류 직전 메모리 사용량과 종속 관절을 포함한 Hand12관절의 상태는 저장되지 않아 정상이라고도
+   보증할 수 없다. `intr 00200000` 역시 action·토크 값으로 해독하지 않는다.
+
+실행 장비는 RTX3090, driver580.173.02 Open Kernel Module이며 Kit에 IOMMU 활성화 경고가
+있었다. 근접한 커널 구간에 명시적 PCIe AER bus error나 GPU fallen-off 기록은 확인하지 못했다.
+이는 driver/PCIe 원인을 배제하는 근거가 아니다. Driver·BIOS·IOMMU·clock은 변경하지 않았다.
+
+### 실행 당시 설정과 최신 손 변경의 구분
+
+저장 `params/env.yaml`·`params/agent.yaml`은 다음과 같다.
+
+| 항목 | 실패 실행의 저장 값 |
+|---|---|
+| 환경 수 / 프로젝트 |1,024 / Original `contact_manipulation`|
+| 물리 / 정책 |100Hz /50Hz (`dt=.01`, `decimation=2`)|
+| Actor·Critic compile |둘 다 true|
+| Transition / support / robot-start graph |모두 true|
+| Actor vision interval |0, reset-only|
+| Arm / Hand |IdealPD / Implicit, Hand master20/1·child0/0|
+| 로봇 solver |Position32 /Velocity1|
+| 활성 물체 수 |15–25|
+| GPU contact / patch 용량 |8,388,608 /262,144|
+| Found/lost pair 용량 / partitions |2,097,152 /1|
+
+이 프로세스는 **107–111절의 오후·저녁 수정 전에 시작됐다.** 이미 import된 Python 모듈과
+생성된 articulation에 파일 변경이 소급 적용되는 것은 아니다. 저장 diff에도 `scene.py` 변경이
+없다. 따라서 최신111절의12관절 hard limit·thumb compliance 보정이 적용된 실행에서
+동일 오류가 났다고 판단하지 않는다. 모델 compile과 환경 graph도 모두 켜진 실행이므로,
+이번 결과만으로 그중 하나가 원인이라고 확정할 수 없다.
+
+### Symmetric에서 이어갈 조사
+
+현재 Original과 Symmetric의 `scene.py`는 동일하며 PhysX·로봇·센서·물체/초기화 경로를
+공통 설계로 사용한다. Critic 관측을 Actor와 맞춘 것이 이 물리/GPU 위험을 제거하지는 않는다.
+111절의 현재 손 접촉 시험에서도1N 유지57/200frame·하한 이탈약15.33°·연동 오차.290112rad가
+남아 있다. 이는 별도의 실제 물리 문제지만 이번719의 직접 원인으로 증명된 것은 아니다.
+상대 프로젝트의12관절 drive 방식은 이번 조사에서 적용하지 않았다.
+
+후속 재현은 **Symmetric**을 기준으로 계획한다. 최초 broadphase 오류 시점의 전체 Kit 로그와
+커널 Xid를 보존하고, reset 여부·선택 환경·활성/주차 물체·kinematic 전환·12개 Hand 관절의
+실측 상태·목표·mimic 오차를 작은 진단 snapshot으로 연계하는 것이 우선이다. 모델 compile과
+환경 graph 분리는 기존 스위치를 이용하되 별도 실험으로 비교하며, 이 기록에서 실행하거나
+기본값을 바꾸지는 않았다. 다음 실행도 실제 source/diff·asset/importer·설정에 연결해서 판별한다.
+
+## 113. 2026-11-07 — Symmetric의 관측·action·모델 입출력 정적 점검
+
+사용자는 보상·학습 설계의 적절성과 별개로, 실제 observation과 action 경로가 의도대로
+작동하는지 점검하도록 요청했다. 메인 프로젝트 `contact_manipulation_symmetric`을 기준으로
+source HEAD `c73c5ff`와 공식 Isaac Lab action·OSC·actuator·Manager step 코드를 읽었다.
+이번에는 시뮬레이션·학습·play·CPU/GPU 테스트를 실행하지 않았으며 runtime은 수정하지 않았다.
+아래의 **코드 계약 확인**을 실제 물리 응답의 통과 판정으로 사용하지 않는다.
+
+### 현재 관측 계약
+
+| 전체 observation 구간 | 내용 | 표현 |
+|---|---|---|
+| `[0:100]` |10개 OBB의 위치3·quaternion4·전체 변 길이3|현재 sensor EEF frame, quaternion wxyz|
+| `[100:166]` |현재 robot/sensor/action sample66|아래 구성|
+| `[166:232]` |직전 sample66|동일 구성, reset한 행만0으로 초기화|
+
+Sample66의 순서는 `[q12/π, qdot12/2, sensor_pose_in_base7, compensated_FT6,
+tactile17, accepted_action12]`다. q/qdot는 Arm6과 독립 Hand6이고 mimic child6는 제외한다.
+F/T는 sensor 중심·축 기준이며 distal half와 Hand 전체의 자중·관성을 뺀 뒤 SI-200-8 범위로
+나누어±5로 제한한다. 측정 모델은 보상 전에 축별 saturation·해상도를 적용하므로 포화로 잃은
+정보는 복구되지 않는다. 물체와 달리 EEF pose7은 sensor 자체의 **base 기준 pose**다.
+이를 sensor 자신의 좌표계로 표현하면 항등 pose가 되므로 두 좌표계의 용도를 구분한다.
+Accepted action은 sensor-origin/hand-angle 변환 전의 clipped raw policy 단위다.
+
+Actor·Critic은 같은 세 관측 함수와 snapshot을 읽는다. 역할은 Target0·Blocker1 슬롯으로
+고정하고 role ID·mask를 feature로 추가하지 않는다. Model은 extent·quaternion·tactile 값에서
+mask를 만든다. 나머지 슬롯은 보이는 OBB 중 두 역할에 가까운 물체를 선택한다.
+History는 control transition당1회 current→previous로 진행하며 부분 reset은 선택 행만 비운다.
+Retained terminal observation을 제자리 수정하지 않도록 packed tensor를 교체한다.
+
+현재 `actor_vision_update_interval=0`은 **reset-only**다. Cached OBB를 매 step 현재 sensor frame으로
+변환하는 것과 물체의 관측 pose 자체를 새 ray로 갱신하는 것은 다르다. 주기를 켜면 가시성에 따라
+일반 물체의 membership/order도 바뀔 수 있다. 물리100Hz·정책50Hz이므로 interval10은5Hz다.
+이 값들은 현재 README와 일치하며 과거100Hz/10step 결정만으로 버그나 복원 대상으로 판단하지 않는다.
+
+### 현재 action과 모델 계약
+
+- Native Gaussian12D: sensor-axis `[Fx,Fy,Fz,Tx,Ty,Tz]`와 독립 Hand6이다. Tanh가 없고
+  wrapper `clip_actions=None`이며 PPO는 원래 표본/log-prob를 보존한다.
+- Arm raw bounds는±`[20,20,36,8,8,8]`이다. Scale `[10,10,10,1,1,1]` 뒤 각각
+  ±`[200,200,360] N`, ±8N·m의 sensor-origin wrench가 된다.
+- 이 설치 버전의 native OSC는 root-origin moment 변환과 COM Jacobian을 함께 사용한다.
+  Project adapter의 원점 보정은 이를 sensor-origin wrench와 일치시킨다.
+  보정 결과는 `tau_COM = R*tau_sensor + (p_sensor-p_COM) x (R*F_sensor)`이며,
+  sensor 범위 clipping은 보정 전에 수행한다. 보정 뒤 moment를 다시±8로 자르면 다른 명령이 된다.
+- `contact_wrench_stiffness_task=None`이므로 **OSC 내부**에서 F/T 오차를 보정하지 않는다.
+  보상된 F/T를 정책 observation으로 전달하는 피드백은 이미 존재한다.
+  공식 OSC가 `J_COM^T*w_COM + g`를 만들고 IdealPD가 합산 토크를150/28N·m로 제한한다.
+  명령10N과 실측10N의 일치를 보장하지 않는다. Arm wrench0도 위치 유지·정지 명령이 아니다.
+- Sensor frame은 policy 시작 시 읽어 base wrench로 변환하고 두10ms physics substep 동안
+  유지한다. 두 번째 substep에서 회전한 sensor 축으로 명령을 다시 변환하지 않는다.
+  이는 sampled-frame 명령이며 계속 회전하는 body-fixed wrench가 필요하면 별도 계약이다.
+- Hand는 공식 absolute `JointPositionToLimitsAction`, scale.5다.
+  `q*=lo+(clip(.5*a,-1,1)+1)*(hi-lo)/2`이므로 raw−2는하한, **0은중간각**, +2는상한이다.
+  0은현재각유지나완전열림이 아니다. 현재 구성은 master6 PD20/1과 child6 mimic0/0이며
+  논의한 전체12관절 drive 대안은 아직 적용하지 않았다.
+- 실제 forward는 scene GNN·role attention → scene320D와 raw current/previous132D concat →
+  native MLP256/128 → Actor Gaussian12D 또는 Critic value1D다. 별도 history encoder가 없고
+  두 모델의 파라미터는 독립이다. 출력되는 module 등록 순서는 실행 순서를 뜻하지 않는다.
+
+관절·슬롯 순서, 현재/직전 이력 배치, clipped previous action, sensor-origin 변환에서
+source로 입증되는 산술·인덱스 오류는 이번 정적 점검으로 발견하지 못했다.
+F/T inertia는 native107.3 API의 COM 기준·link-prim 축 tensor를 column-major로 읽고
+transpose하는 방식과 맞는다. Incoming wrench는 native child-joint frame이며 sensor의 child
+joint frame을 sensor 중심·동일 축으로 작성하므로 이 조건에서 직접 읽는 경로가 일관된다.
+Local Isaac Lab property의 parent-frame 설명 및 `time_stamp` 표기는 native SDK 설명/버퍼
+필드와 다르다. 이를 근거로 sensor 부호·축을 임의로 뒤집거나 이번에 framework를 수정하지 않았다.
+대조한 원문은 [Tensor API107.3](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/extensions/runtime/source/omni.physics.tensors/docs/api/python.html#omni.physics.tensors.impl.api.ArticulationView.get_inertias)와
+[PhysX incoming joint force](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#link-incoming-joint-force)다.
+
+### 확인된 검증 공백과 관측 한계
+
+1. **Physics 이전 nonfinite 차단은 별도 구현하지 않았다.** Arm/Hand clamp는NaN을 없애지 않는다.
+   `_transition_tensors`의 finite 검사·history `nan_to_num`·invalid_state 종료는
+   physics가 끝난 뒤 적용된다. 따라서 그것이 잘못된 입력의 PhysX 유입을 예방한다고
+   해석하면 안 된다. 실제NaN action이 발생했다거나112절의 GPU 장애를 일으켰다는 증거는 없다.
+   사용자 후속 확인에 따라 현재 invalid-state 종료를 방어 목적으로 유지하며 확장 우선순위에서 제외한다.
+2. **저해상도 초기 role 관측의 최종 보장이 없다.** 초기 가시성 certificate는160×120,
+   실제 observation fit은64×48·최소3점이다. Constructive 경로의 `observe_at_viewpoint`는
+   항상 snapshot을 반환하고, reset은 연관 ID를 검사하지만 Target/Blocker 슬롯의
+   유효성을 둘 다 요구하지 않는다. Certificate를 통과해도 저해상도에서3점 미만이면 역할
+   슬롯이0일 수 있는 구조다. 현재 실제 발생률은 미측정이며 발생했다고 단정하지 않는다.
+   Reset-only에서는 누락된 역할을 episode 동안 다시 인식하지 않는다.
+3. **Play가 학습 당시 환경 의미를 복원·대조하지 않는다.** `play.py`는 checkpoint의
+   모델 설정을 복원하지만 환경은 현재 cfg로 만든다. 고정 action contract 문자열과 차원
+   검사는 실제 wrench/hand scale·vision interval·frame·F/T 보상·물리 설정 비교를 대신하지
+   못한다. 같은 checkpoint가 다른 의미의 명령/관측으로 재생될 수 있다.
+4. **종속 마디의 상태를 직접 관측하지 않는 것은 의도된 설계다.** Mimic이 이상적으로 맞으면
+   master로 추정할 수 있지만111절의 실제 연동 오차가 큰 상황에서는 그 가정이 무너진다.
+   현재 policy는F/T·tactile로 간접 반응할 수 있으나 child6의 실제각·속도를 받지는 않는다.
+   실제 관측 가능한 독립 관절 상태만 사용한다는 사용자 기준을 따르며, 관측 누락 버그로 분류하지 않는다.
+5. **Tactile binary는접촉 event의 완전한 기록이 아니다.** Canonical17채널은 올바르게
+   매핑되지만 값은 마지막 physics sample의 `norm(net_forces_w)>.01N`이다.
+   Filter는Blocker reward 구분에만 쓰며 observation은 전체 net contact force다.
+   따라서 self/shelf 접촉도 포함할 수 있고, 같은 pad의 반대 방향 접촉이 상쇄되면 접촉이
+   있어도0이 될 수 있다. History0·마지막 substep 읽기이므로20ms control 구간 중간의 짧은
+   접촉을 누적해 제공하는 센서는 아니다. 구체적인 놓침 빈도는 물리 시험 전이다.
+6. **`Action/Applied`는실현된힘·토크가 아니다.** TensorBoard는 accepted input을
+   Arm SI·Hand raw 단위로 보여준다. Post-actuator joint torque나 실제 측정 wrench와 구분해야 한다.
+
+기존 테스트는 행렬 변환·mask·부분 reset·native PPO 연결 등을 다루지만 이번에는 실행하지
+않았다. Current code가 실제 sensor/actuator에서 동일한 수치 응답을 보이는지는 별도 검증이다.
+Native Gaussian의 직접 학습 std가 양수로 제한되지 않는 기존 위험도 남아 있으나,
+이는 GNN 입출력 순서 오류나 이번 관측 mapping의 실패로 분류하지 않는다.
+
+### 후속 확인 순서
+
+먼저 소규모 고정 action에서 raw→accepted→SI/Hand각→OSC raw torque→제한 torque→실측
+12개 Hand 관절·sensor 상태를 같은 timestamp로 대조한다. Arm0의 중력 보상, 힘/토크 각 축의
+부호·회전/원점 변환, Hand−2/0/+2의 의미를 독립적으로 확인한다. 다음으로 reset/부분 reset의
+232D 값, role 슬롯 유효율, 실제 무접촉 자중·관성 제거, 첫/둘째 substep의 짧은 pad 접촉을
+검사한다. Checkpoint의 저장 env.yaml과 현재 play cfg를 함께 비교해야 정책 실패와 설정 차이를
+구분할 수 있다. 보상 weight·PPO·관측 차원을 임의로 바꾸어 통과시키는 방식은 사용하지 않는다.
+
+불필요한 GT Critic tracking은 Symmetric에서도 매 step 계산되지만 실제 관측에는 연결되지
+않는다. 이는 정리할 중복 연산이며 GT 유출로 판정하지 않았다. Physics/policy 모두100Hz라는
+소스 주석 역시 현재100/50Hz 값과 다른 문서 오류로 기록하고 설정은 바꾸지 않았다.
+
+## 114. 2026-11-07 — Symmetric 점검에 대한 사용자 기준과 F/T 이중 피드백 요구
+
+113절의 정적 점검에 대해 사용자가 의도를 보충했다. 아래 결정이 이전 이슈 분류보다 우선한다.
+이번에는 문서만 갱신했다. 실행 코드·설정은 수정하지 않았으며 시뮬레이션·학습·play·테스트도
+실행하지 않았다. 아래 구현 방향을 적용 완료로 해석하지 않는다.
+
+### 유지할 연구 전제와 관측
+
+- `invalid_state`는 드문 비정상 상태를 위한 기존 방어 종료로 유지한다. NaN action이 현재
+  반복 장애의 원인이라는 증거가 없으므로 physics 이전 차단을 새 우선 과제로 삼지 않는다.
+- Target·Blocker는 상위 판단기가 제공하며 반드시 존재하고 인식된다는 연구 전제를 유지한다.
+  113절의 저해상도 역할 슬롯 누락 가능성은 이 전제와 구현 사이의 계약 문제다. 발생률은
+  미측정이며 GT로 누락을 채우거나 episode 재추첨으로 해결하지 않는다. 새 공유 scene의 실제
+  snapshot 계약 확인과, 실제 observation ray grid까지 포함한 사전 인증의 일치가 수정 방향이다.
+- Hand의 독립 6관절만 policy에 제공하는 것은 의도다. 현실에서 관측하지 못하는 mimic child의
+  실제 상태를 observation에 추가하지 않는다. 물리적 mimic 오차의 진단과 입력 설계는 구분한다.
+- Arm의 0 wrench가 정지를 보장할 필요는 없다. 정책이 센서 피드백으로 정지에 필요한 명령도
+  학습한다. Sensor frame은 그 목적을 위해 선택했으며 pose 제어로 임의 복원하지 않는다.
+
+### 확정한 F/T 피드백 구조와 현재 구현 차이
+
+사용자가 선택한 기준은 **정책 피드백 + OSC 내부 F/T 오차 보정**이다.
+
+현재 정책 피드백은 구현되어 있다. `mdp/events.py`의 transition은 incoming joint의 6축
+측정값을 SI-200-8 모델로 보정하고 Hand·sensor distal 부분의 자중·관성을 빼서 observation에
+넣는다. Actor는 이를 읽어 다음 wrench를 결정한다. 반면 `contact_wrench_stiffness_task=None`
+이므로 현재 OSC는 목표 wrench의 feed-forward 경로만 사용한다. 따라서 부족한 것은 **내부 루프**다.
+
+설치된 공식 `OperationalSpaceController.compute()`의 내부 피드백은 힘 3축만 지원한다.
+측정 torque를 목표 torque와 같게 대입하므로 torque 오차는 0이다. 또한 공식 ActionCfg에서
+gain을 켜면 제어 body 자체에 ContactSensor를 만들고 그 body의 `net_forces_w`를 사용한다.
+이는 손가락 전체에 전달되는 하중을 읽는 현재 articulation-joint F/T와 다르다. 따라서 단순히
+gain을 설정하는 것으로 사용자가 의도한 실제 6축 load-cell 피드백이 구현되지는 않는다.
+
+확장 방향은 기존 `SensorFrameWrenchAction`에서 실제 보상된 6축 F/T로 wrench를 보정한 뒤
+공식 OSC의 Jacobian·중력 보상·effort 제출과 IdealPD 상한을 계속 사용하는 것이다.
+Isaac Lab controller core를 수정하거나 별도의 joint torque controller를 만들지 않는다.
+
+구현 전 검증할 계약:
+
+1. 목표와 측정값을 같은 sensor 중심·축·부호로 맞춘다. Incoming joint reaction과 외부 접촉력의
+   부호를 동일하다고 가정하지 않는다. Force·torque 각 축에 대한 고정 명령 검증이 필요하다.
+2. 물리 substep마다 최신 센서 값으로 보정한다. Policy transition 캐시의 직전 값을 단순 재사용하거나
+   object geometry·vision까지 전체 갱신하지 않고, F/T 보상에 필요한 tensor만 일괄 취득한다.
+3. Force·torque gain은 따로 설정하고, sensor-origin clipping과 COM moment 변환의 순서를 유지한다.
+   현재 action/history는 제한된 **정책 목표값**이며 내부 보정된 wrench와 구분한다.
+4. 새 gain, 보정 wrench의 상한, sampled-frame 명령과 센서 회전의 관계는 구현·검증 시 명시한다.
+   목표 wrench가 측정값과 반드시 일치한다는 보장은 actuator 한계·접촉 조건 때문에 성립하지 않는다.
+5. 센서 전용 캐시는 physics timestamp와 부분 reset 행의 유효성을 관리한다. Reset 직전 reaction을
+   새 episode의 내부 루프에 재사용하지 않고 새 측정 전에는 feed-forward만 사용한다. 질량·관성·
+   COM·link ID는 고정 캐시를 재사용하고, 마지막 substep의 센서 계산을 policy와 공유한다.
+   Tactile 전체 조회·ray casting·reward·history 갱신은 내부 루프에서 수행하지 않는다.
+
+정적 힘 평형에서 parent→child incoming wrench는 distal 외력의 반대 부호를 포함한다.
+따라서 현재 `measured - self_load`를 외력이 Hand에 작용하는 방향이라고 가정해 임의로
+반전하면 안 된다. 목표 wrench가 Hand에서 환경에 가하는 방향일 때에는 같은 방향의 residual이
+될 수 있다. 이 유도는 payload 합산과 frame 작성이 맞다는 전제이므로 실제 축별 접촉 검증을
+대체하지 않는다. 자유 공간에서는 보상된 측정값이 거의 0이어도 내부 보정이 비영 목표를
+증폭할 수 있다. 접촉 상태에서만 보정을 켜는 조건은 별도 제어 설계이며 임의 추가하지 않는다.
+
+### Hand 0rad와 raw action 0의 구분
+
+URDF 하한 0rad는 현재도 물리·action limit에 구현되어 있다. 공식
+`JointPositionToLimitsAction`과 `scale=0.5`가 normalized raw action을 관절 범위에 매핑한다.
+
+```text
+q_target = lo + (clip(0.5 * action, -1, 1) + 1) * (hi - lo) / 2
+raw -2 -> lo(0rad), raw 0 -> 중간각, raw +2 -> hi
+```
+
+따라서 raw 0이 중간각인 것은 0rad 구현 누락이 아니다. Raw 0을 관절각 0rad로 쓰려면 action
+의미를 별도로 변경해야 하며 기존 checkpoint 재생 의미도 달라진다. 이번에는 변경하지 않았다.
+
+### Actor·Critic 독립 가중치와 play 설정
+
+공식 Isaac Lab 예제와 로컬 Sweeping 예제 모두 Actor·Critic 파라미터가 독립이다. 현재 설치된
+RSL-RL도 두 모델을 각각 생성하며, Symmetric의 독립 GNN·attention·MLP는 이 원칙과 같다.
+공식 PPO optimizer 하나에 양쪽 파라미터를 등록하는 것과 파라미터 공유는 다른 개념이다.
+각 파라미터의 Adam 상태는 따로 유지되고 Critic loss가 Actor에 직접 역전파되지 않는다.
+
+현재 play는 모델 설정만 checkpoint에서 복원하고 환경은 현재 cfg로 만든다. 공식 Isaac Lab
+play도 환경 YAML을 자동 복원하지 않는다. 필요하면 기존 `play.py`에서 학습 당시
+`params/env.yaml`의 action·observation·물리·종료 계약을 복원·대조하고, num_envs/device/viewer
+등 실행 옵션은 마지막에 적용할 수 있다. Resolve된 joint/body ID는 재사용하지 않고 이름으로
+다시 찾는다. 과거 YAML의 slice 태그·함수 namespace도 처리해야 하므로 무조건 전체 덮어쓰기나
+unsafe YAML load는 사용하지 않는다. 설정 복원만으로 과거 코드·자산 버전까지 복원되지는 않는다.
+
+환경 기초가 고정된 뒤 reward만 바뀌면 동일 observation에 대한 deterministic 정책 출력은
+바뀌지 않는다. 다만 termination·reset 변경은 episode 자체를 바꾸므로 재생 비교에 반영해야 한다.
+이번에는 play 복원 기능을 추가하지 않았다.
+
+### 정책 100Hz 검토 — 설정 변경 없음
+
+| 설정 | Physics | Decimation | Policy | rollout 36의 physics 호출 / 모의 시간 |
+|---|---|---|---|---|
+| 현재 | 100Hz | 2 | 50Hz | 72회 / 0.72초 |
+| Physics 유지 | 100Hz | 1 | 100Hz | 36회 / 0.36초 |
+| Decimation 유지 | 200Hz | 2 | 100Hz | 72회 / 0.36초 |
+
+Decimation 2를 유지할 때만 Physics 200Hz가 필요하다. 마지막 안도 rollout 길이가 36이면
+iteration당 physics 호출 수와 PPO batch 크기는 현재와 같다. 따라서 iteration 시간이 단순히
+두 배가 된다고 단정할 수 없다. 같은 모의 1초의 물리 계산은 늘고, 8초 episode의 정책 step은
+400에서 800으로 늘어난다. 같은 iteration 수로 경험하는 모의 시간은 줄어든다. dt에 따른
+접촉·센서 응답과 step 단위 할인·증가량 비용도 재검토 대상이며, 현재는 주기를 바꾸지 않았다.
+
+## 115. 2026-11-07 — 최종 MLP의 ELU 비교 설정과 GNN 활성화 함수 조사
+
+사용자가 Actor·Critic의 최종 MLP부터 ELU로 비교하는 방향에 동의하고, 일반적인 GNN에서
+사용하는 활성화 함수도 확인하도록 요청했다. 메인 `contact_manipulation_symmetric`만 변경했다.
+학습·시뮬레이션·play·GPU 실행은 하지 않았다.
+
+### 변경 범위
+
+- `config/ur5e/agents/rsl_rl_ppo_cfg.py`의 `ContactActorCfg.activation`을 `relu`에서 `elu`로
+  변경했다. `ContactCriticCfg`가 상속하므로 독립 Actor·Critic 모두 최종 native MLP 은닉층에 ELU를 쓴다.
+- GNN의 `ModelCfg.activation=relu`, node/message/update ReLU 및 Triton edge forward/backward는
+  유지한다. Role attention의 Softmax와 action mean/value의 선형 출력도 유지한다.
+- 물리 주기·action·observation·F/T 피드백·reward·termination·PPO hyperparameter는 수정하지 않았다.
+  원본 및 parallel 프로젝트는 변경하지 않았다.
+- 활성화 함수는 각 모델의 checkpoint metadata에 이미 포함된다. 과거 ReLU checkpoint는
+  기존 play helper가 저장된 Actor·Critic head activation을 복원하므로 ReLU로 재생한다.
+  반면 새 ELU 설정에 ReLU checkpoint를 그대로 resume하면 기존 계약 검사가 거부한다.
+  기존 checkpoint의 의미를 바꾸거나 architecture/action contract 버전을 임의로 올리지 않았다.
+
+### GNN 조사 근거와 해석
+
+| 대표 모델 | 은닉 표현의 활성화 | 근거 |
+|---|---|---|
+| GCN | ReLU | [저자 구현의 첫 graph convolution](https://github.com/tkipf/gcn/blob/master/gcn/models.py#L145-L161), [PyG GCN 기본값](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.models.GCN.html) |
+| GraphSAGE | node update 및 pooling 내부 MLP에서 ReLU | [저자 aggregator 구현](https://github.com/williamleif/GraphSAGE/blob/master/graphsage/aggregators.py), [PyG GraphSAGE 기본값](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.models.GraphSAGE.html) |
+| GIN | 내부 MLP 은닉층 및 graph update에서 ReLU | [저자 MLP](https://github.com/weihua916/powerful-gnns/blob/master/models/mlp.py), [PyG GIN 기본값](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.models.GIN.html) |
+| GAT 원본 | hidden head 출력에 ELU, attention 점수에는 LeakyReLU 후 Softmax | [저자 모델](https://github.com/PetarV-/GAT/blob/master/models/gat.py), [attention 구현](https://github.com/PetarV-/GAT/blob/master/utils/layers.py) |
+
+GCN의 마지막 분류 logits, GraphSAGE 마지막 aggregator의 바깥 활성화, GIN 내부 MLP의
+마지막 linear 등은 은닉층 ReLU와 구분한다. 위 표는 모든 레이어 출력이 ReLU라는 뜻이 아니다.
+대표적인 message-passing GNN과 공식 라이브러리 기본값에서는 ReLU가 흔한 선택임을 확인했다.
+이는 전체 연구의 사용 빈도를 정량 조사한 결과나, 우리 강화학습 문제에서 ReLU가 더 낫다는
+성능 근거는 아니다. 또한 우리 attention은 role-conditioned dot-product attention이므로 GAT의
+LeakyReLU를 그대로 추가할 근거로 해석하지 않는다.
+
+이번 비교는 GNN을 ReLU로 유지하고 Actor·Critic 최종 MLP만 Isaac Lab/Sweeping 예제의 ELU에
+맞추는 것이다. 학습 효과와 실제 learning time 차이는 아직 측정하지 않았다.
+
+### 검증
+
+기존 설정 비교 테스트의 ELU 예외를 갱신했다. 해당 테스트 메서드만 AST로 추출하여 표준
+라이브러리로 실행한 **정적 설정 검사 1개가 통과**했다. Torch·Isaac Sim을 import하거나
+학습·GPU context를 생성하지 않았다. 전체 learning test suite는 실행하지 않았다.
+
+## 116. 2026-11-07 — 학습 재개 전에 재확인할 attention-only128D 비교안
+
+사용자가 현재320D readout과 attention-only128D를 동일 조건에서 비교하는 제안을 기록하고,
+**검토를 마친 뒤 학습을 시작할 때 이 내용을 다시 알려달라**고 요청했다. 시간 예약이 아닌
+학습 재개 전 확인 항목으로 CONTEXT의 최신 진입점에 기록했다.
+
+현재 readout은 `[Target64, Blocker64, context1_64, context2_64, global_mean64]`의320D다.
+주요 역할의 GNN 특징과 전체 평균이 최종 MLP로 직접 전달되므로, 정책이 attention context를
+거의 사용하지 않아도 행동을 만들 수 있다. 이것이 현재 실제로 일어난다는 증거는 없으며,
+attention이 선택을 담당한다는 설계 의도를 얼마나 활용하는지 확인할 비교 과제다.
+
+비교 후보는 역할 조건부 query 두 개와 GNN을 유지하되 scene 출력에 context 두 개128D만
+사용하는 것이다. 현재·직전 센서/로봇 이력132D를 붙이면 최종 MLP 입력은452D에서260D가 된다.
+Target·Blocker는 여전히 query 생성에 사용되지만 직접 특징 전달 경로와 global mean은 없어진다.
+균일 attention이나 요약 과정의 역할/기하 정보 손실 가능성도 함께 확인해야 한다.
+
+비교 시 물리·관측·action·reward·termination·PPO 조건을 맞춘다. 최근 변경한 최종 MLP의 ELU는
+양쪽에 동일하게 적용해야 비교 목적이 분명하다. Readout 변경은 새 학습과 checkpoint 계약
+검토가 필요하며, 기존 checkpoint에 조용히 적용하지 않는다.
+
+**상태: 비교안 기록만 완료. 모델 구조·학습 설정은 변경하지 않았고 실행하지 않았다.**
+
+## 117. 2026-11-07 — Symmetric Hand의 URDF import·구동 설정 정적 재점검
+
+사용자는 로봇 제어 검토를 시작하며 우선 Hand를 URDF에서 불러와 설정하는 경로를 요청했다.
+Source·URDF·공식 converter를 읽고 표준 라이브러리 XML parser로 원문을 비교했다.
+이번에는 USD 변환·Kit·시뮬레이션·학습·play·GPU context·테스트를 실행하지 않았으며
+runtime 코드와 설정도 변경하지 않았다. 아래의 값은 설정 경로이며 접촉 동작의 통과 판정이 아니다.
+
+### 입력과 공식 import 경로
+
+- 기본 입력은 `assets/robots/Roas_provided_inspire_urdf/RH56E2 URDF/` 아래
+  `RH56E2_R_2025_9_11/urdf/RH56E2_R_2025_9_11_relative.urdf`다.
+  `CONTACT_MANIPULATION_HAND_URDF_PATH`로 변경할 수 있다.
+- Vendor 원문과 relative 파일은 mesh filename의 directory 부분을 제외한 XML 내용이 같았다.
+  32link·31joint(고정19/회전12), tactile17개, mimic6개, 명시 질량 합0.776662673kg이다.
+- 검증 함수는 URDF/mesh 존재·Git LFS pointer·17개 tactile 이름·pad collision mesh를 확인한다.
+- 공식 `UrdfFileCfg`와 `UrdfConverter`로 변환한다. `merge_fixed_joints=False`로 tactile fixed
+  link를 보존하고 `fix_base=False`로 손 자체를 월드에 고정하지 않는다. 이후 손의 중복
+  articulation root를 제거하고 sensor mount를 거쳐 UR5e의 articulation으로 결합한다.
+- `convert_mimic_joints_to_normal_joints=True`라는 이름과 달리 설치된 converter는 이 값을
+  그대로 `set_parse_mimic(True)`에 전달한다. 현재는 native mimic을 보존하는 설정이다.
+- `joint_drive=None`은 converter의 일괄 drive 재설정을 건너뛴다. 이후 공식 actuator에서
+  gain을 설정하므로 최종 drive가 없다는 뜻은 아니다.
+- 현재 converter는 Sim5.1 이상에서 importer2.4.31을 활성화한다. 고정 `usd_dir`를 지정하지
+  않아 기본 임시 변환 directory를 사용한다. 변환된 타 PC USD를 항상 재사용하는 경로가 아니다.
+
+### 관절·drive·mimic의 실제 구분
+
+URDF에는 revolute12개의 위치·속도·effort와 mimic 관계가 있다. PD gain·joint dynamics·
+transmission·mimic compliance 값은 없다. 모든 하한은0rad, effort는1N·m다.
+
+| 관절 | 원문 위치 상한(rad) | 원문 속도(rad/s) | 연동 |
+|---|---:|---:|---|
+| thumb1 |1.658|2|독립|
+| thumb2 |.62|2|독립|
+| thumb3 |.5410520681182421|2|thumb2×.8392|
+| thumb4 |.45553093477052004|2|thumb3×.891|
+| 일반 손가락 master4개 |1.4381|1|독립|
+| 일반 손가락 child4개 |1.476374|1|각 master×1.0843|
+
+모든 mimic offset은0이다. Post-import `_configure_hand_joints()`는12관절 hard 위치·속도·
+drive effort를 원문 값으로 복원한다. 독립 관절 drive type은 force로 지정하고, 종속 관절의
+reference/gearing/offset/compliance는 유지한다. 엄지의 `rot`/`rotX` namespace 문제는 기존
+값을 복사해 보정하며, compliance가 없으면 임의 강체 값으로 대체하지 않고 오류를 낸다.
+
+공식 `ImplicitActuatorCfg`는12개 회전 관절을 그룹으로 선택하지만, 독립6개에만 Kp20/Kd1을
+설정하고 종속6개는0/0이다. 종속 관절은 native compliant mimic으로 움직인다. 따라서
+**mimic 제거 후 전체12관절에 multiplier 기반 drive를 넣는 방식은 아직 적용하지 않았다.**
+Drive effort1N·m는 모든 mimic/contact constraint 반력의 상한을 뜻하지 않는다.
+
+Startup event는 독립6개의 action용 soft 위치 범위만 child 제약의 교집합으로 좁힌다.
+Thumb2 상한은 약.609221, 일반 master 상한은 약1.361592rad다. Physical hard 범위는 원문을
+유지한다. Helper가 계산하는 coupled velocity envelope는 현재 적용하지 않는다.
+일반 master1rad/s와 child1rad/s를 동시에 유지하므로 exact mimic 관계에서 master 최고속도는
+child의 속도 제한과 간섭할 수 있다. 이는 관측한 속도 장애의 확정 원인이라는 뜻은 아니다.
+
+### URDF에 추가되는 물리 설정과 센서
+
+- Hand 질량·COM·관성을 별도로 덮어쓰지 않는다. 공식5.1 URDF ImportConfig의
+  [importInertiaTensor 기본값은 True](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/py/api/structisaacsim_1_1asset_1_1importer_1_1urdf_1_1_import_config.html)이며
+  local converter는 이를 변경하지 않는다.111절의 실제32link 비교 기록과도 일치한다.
+  이번에는 실제 USD/PhysX 값을 다시 측정하지 않았다.
+- 원본 mesh를 collider로 그대로 쓰는 것은 아니다. Importer는 convex hull을 만들고,
+  palm1개는 최대16hull, 일반 손가락 부모 mesh4개는 각각 최대4hull로 추가 분해한다.
+  이5개 collider의 contact offset만0.5mm로 명시한다. Tactile17개는 독립 rigid body로 보존한다.
+- Importer 단계 Hand self-collision은False이지만, 결합 articulation 설정은True다.
+  Palm housing2개×finger root5개의 장착부10pair는 별도로 collision filtering한다.
+- `activate_contact_sensors=True`는 공식 subtree helper를 통해 Hand 전체32개 rigid link에
+  ContactReportAPI를 설정한다. 실제 tactile reader의 대상은17개다. 추가 mount2half에도
+  ContactReportAPI를 직접 붙인다. Reporting이 tactile에만 제한된다는 일부 주석과 차이가 있다.
+  연산 비용 차이는 측정하지 않았다.
+- 마운트는 URDF 외부에서 만든 길이5cm·반경2.5cm·총0.20kg proxy다. 두 half 사이 중앙
+  fixed joint가 F/T 계측 기준이며 Hand base도 fixed joint로 연결한다.
+- Hand에 별도의 physics material·탄성 pad 모델을 설정하지 않는다. URDF의 material은
+  시각 색상이며, 실제 pad의 마찰·탄성·motor/기구부 특성을 보장하지 않는다.
+
+중요한 구분은 **URDF의 관절·질량 정의 보존**과 **실제 손의 하중–변형 재현**이다.
+PD20/1·importer mimic compliance·collision 근사·solver·마운트 질량은 별도 simulation 설정이다.
+111절의 접촉 시 역꺾임·mimic 오차는 여전히 미해결 기록이며 원본 hard limit 복원만으로
+해결됐다고 판단하지 않는다. 이번 검토는 이력과 현재 source의 일치 여부만 확인했다.
+
+## 118. 2026-11-07 — Compliant mimic의 접촉 유지력과 강성·감쇠 미적용 의심 검토
+
+사용자는 무하중 구동은 되지만 외부 접촉에서 자세 유지가 어려운 이유가 compliant mimic의
+stiffness/damping 미적용 또는 버그인지 확인하도록 요청했다. Symmetric source·기존111절
+시험 기록·공식 PhysX5.5.1/Omni Physics107.3 문서를 읽었다. 설정 변경·USD 변환·simulation·
+학습·play·GPU 진단은 실행하지 않았다. 아래는 원인 후보의 분류이며 새 접촉 시험 결과가 아니다.
+
+### Drive PD와 mimic compliance는 별도이다
+
+`config/ur5e/scene.py`의 `ImplicitActuatorCfg`는 독립6관절에 PD20/1, 종속6관절에0/0을
+설정한다. 종속 관절은 별도 모터 목표 대신 native mimic constraint로 연동된다. 따라서
+Drive PD0/0이 mimic의 복원 강성·감쇠까지0이라는 뜻은 아니다.
+
+Mimic은 `naturalFrequency`와 `dampingRatio`를 사용하는 별도의 spring–damper 모델이다.
+현재 후처리는 실제 API namespace의 두 값이 유한한 양수인지 검사하고 importer 값을 보존한다.
+기존97/111절의 backend 조사 값은25/약.005였다. 이번에는 runtime 값을 다시 조회하지 않았다.
+기존 `/tmp/hand_urdf_final_*.json`은 현재 경로에 없어 원자료 재검증 없이 durable 기록을 사용했다.
+
+자연주파수의 단위는 각주파수rad/s이므로25는 약3.98Hz이며, 감쇠비.005는 임계 감쇠의
+0.5%다. 이 수치를 master Drive stiffness20과 직접 비교할 수는 없다. 실제 등가 강성은
+해당 연동 방향의 articulation 유효 관성에 따라 달라진다. 감쇠를 높이면 진동을 줄일 수
+있지만 정지 상태의 상대 속도가0일 때 damping만으로 정적 하중 변형이 사라지지는 않는다.
+[공식 mimic 설명](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#mimic-joints),
+[주파수 단위 설명](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/guides/gripper_tuning_example.html#drive-stiffness-damping)
+
+### 접촉·한계·연동 제약이 경쟁하는 공식 사례와 일치한다
+
+Omni Physics107.3은 작은 finger inertia·강한 master Drive·수동 mimic·손끝 contact의
+경쟁을 직접 설명한다. Compliance는 이를 완화하지만 연동 오차를 허용하며, 조정 안내는
+감쇠비1 미만을 피하도록 권한다. 현재.005는 이 관점에서 점검할 값이지만 원인의 확정은 아니다.
+[공식 compliant mimic 가이드](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/rigid_bodies_articulations/articulations.html#articulation-mimic-joint-compliance)
+
+PhysX5.5.1의 Drive Stability 절은 손가락이 상자를 누를 때 proximal Drive·distal 하한0·
+contact가 경쟁해 하한을 위반하는 사례를 설명한다. 반복 solver에서 뒤의 제약이 앞의 보정을
+교란할 수 있어 모든 조건의 만족을 보장하지 않으며, 반복 수만 늘려도 해결되지 않을 수 있다.
+Mimic보다 limit/contact가 나중에 처리되므로 연동이 양보할 수 있다. 따라서 URDF 하한0이
+backend에 존재해도 접촉 중 음의 각도가 발생할 수 있다. 다만 이를 현실적인 유연성이나
+허용 가능한 결과로 받아들이지는 않는다.
+[공식 Drive 안정성 설명](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#articulation-drive-stability)
+
+### 현재 구성에서 구체적으로 확인한 경쟁 조건
+
+일반 손가락은 master/child 속도 상한이 각각1rad/s이고 multiplier는1.0843이다.
+Master1rad/s를 정확히 연동하려면 child1.0843rad/s가 필요해 child 상한과 충돌한다.
+두 상한과 연동을 동시에 지키는 master 속도는1/1.0843≈.922254rad/s 이하다.
+`hand_joint_limits()`는 이 호환 속도를 계산하지만 startup의 `configure_hand_action_limits()`는
+`positions, _`로 위치만 적용한다. 현재 `_configure_hand_joints()`는12개 모두 URDF 속도를 복원한다.
+
+공식 gripper 가이드는 특히 hard mimic에서 child의 낮은 최대 속도가 불안정을 만들 수 있어
+보통 master 상한이 gearing을 통해 전파되도록 하고 child 속도 상한을 별도로 좁히지 말라고
+설명한다. Literal URDF 보존과 수치적으로 호환되는 연동 속도 설정은 구분해야 한다.
+이 사실은 빠른 운동 중 제약 경쟁의 근거이며 정적 접촉 유지 실패의 단독 원인 증명은 아니다.
+이번에는 상한을 변경하지 않았다.
+[Maximum Joint Velocity](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/guides/gripper_tuning_example.html#maximum-joint-velocity)
+
+### Importer 결함과 남은 불확실성
+
+공식 Isaac Sim v5.1.0 공개 소스는 비기본축에서 `getJointAxis()`가 빈 문자열을 반환하고,
+`configureMimicAPI()`가 rotX instance를 선택하면서 compliance 이름은 rot:*로 작성하는
+경로를 갖는다. 공개 태그 importer2.4.30과 설치2.4.31은 동일 바이너리가 아니지만, 기존
+엄지 USD에서 관찰한 namespace 불일치와 같은 기작이다. 현재 scene 후처리가 기존 값을
+active namespace에 복사해 보정하므로 이 결함만으로 현재 접촉 문제를 설명할 수 없다.
+[공식 importer 소스](https://github.com/isaac-sim/IsaacSim/blob/v5.1.0/source/extensions/isaacsim.asset.importer.urdf/plugins/isaacsim.asset.importer.urdf/UrdfImporter.cpp#L772)
+
+111절의 현재 구성 시험은1N 접촉57/200frame·하한−.267557rad·mimic 오차.290112rad였다.
+무하중 개폐도 최종 복귀는 정상이나 과정의 최대 mimic 오차는1.012067rad였다. 따라서
+무하중에서 완벽한 연동이 입증됐다고 표현하지 않는다.110절에서는25/1·100/1·1000/1 등도
+비교했으므로 감쇠비만1로 바꾸면 해결된다고 주장하지 않는다. 과거 강체 후보도 속도 상한·
+motor envelope 등을 함께 바꿔 개선했기에 강체화 하나의 효과로 분리할 수 없다.
+
+다음 물리 검증에서는 같은 손·하중·목표에서 master 목표 추종 오차/Drive 포화와 child
+연동 오차/물리 한계 위반을 따로 측정해야 한다. 호환 속도·compliance·Drive·dt/solver는
+한 번에 하나씩 비교한다. 현재 판정은 **강성·감쇠 기능 누락은 확인되지 않았고, 낮은 감쇠와
+제약 경쟁이 유력한 점검 대상이며, 새로운 엔진 버그나 단일 원인은 확정하지 못했다**이다.
+
+## 119. 2026-11-07 — Symmetric의 Hand action 유지·mimic 제거·URDF 연동 Drive 적용
+
+사용자는 action 출력을 유지하면서 Hand의 mimic을 풀고 multiplier를 고려한 관절별 Drive로
+구동하도록 승인했다. 적용 대상은 메인 `contact_manipulation_symmetric`다. 원본·Parallel의
+production 설정은 변경하지 않았다. 새 파일 없이 기존 scene·UR5e cfg·테스트·문서를 수정했다.
+
+### 구동 경로
+
+- 정책 출력은 기존 Arm wrench6+Hand6의12D다. GNN/attention·Actor/Critic·PPO·관측·
+  accepted-action history·clipping·reward·termination은 이번 변경 대상이 아니다.
+- 공식 importer에 `set_parse_mimic(False)`를 전달한다. 설치된 converter에서는 이름이
+  혼동될 수 있는 `convert_mimic_joints_to_normal_joints=False`가 이 값에 해당한다.
+  원본 URDF의 `<mimic>`을 삭제하지 않고 명령각 매핑에 계속 사용한다.
+- `_configure_hand_joints()`는 PhysX mimic API가 남아 있으면 오류를 내고,12개 관절 모두
+  force-type Drive를 사용한다. 위치·속도·effort 상한은 URDF 원문 그대로다.
+- 공식 `ImplicitActuatorCfg`의 PD는 전12관절에20/1을 설정한다. 기존 master PD는 유지하고
+  이전0/0이던6개 child Drive를 활성화했다. URDF effort는 각 관절1N·m다.
+- `UrdfCoupledHandAction`은 공식 `JointPositionToLimitsAction`을 상속한다. Native6개
+  입력의 scale.5·clipping·live soft-limit rescale·raw/processed action 처리를 재사용한다.
+  그 뒤 `q_i_target = a_i * q_master_target + b_i`로12개 목표각을 펼치고 공식
+  `set_joint_position_target()`으로 제출한다. PD·torque 계산을 Python으로 재구현하지 않는다.
+- `hand_joint_mapping()`이 URDF chain을 처음에 한 번 해석한다. 엄지4의 목표는
+  `.891 * .8392 * thumb2_target = .7477272 * thumb2_target`이다. Signed multiplier와
+  offset도 누적하고, 순환·없는 reference·비유한 계수는 거부한다. 명령 목표각을 기준으로
+  하며 접촉으로 밀린 master 실측각을 따라 목표를 물러나게 하지 않는다.
+- Rollout에서는 미리 저장한 index·coefficient와12관절 target buffer를 사용한다.
+  환경 전체에 대해 GPU index-select·multiply·add를 policy step마다 수행하고, physics
+  substep에서는 target 제출만 한다. 환경별 Python 반복문·CPU 전송·새 IK는 없다.
+
+### Reset·센서·관측과 물리적 한계
+
+Hand action cfg의 `joint_names`는 기존 master6을 유지한다. 확장12관절 ID는 action 내부에서만
+관리하므로 실제 관측 가능한 joint state12(Arm6+Hand6)와 action history의 차원·순서가 같다.
+Startup의 master soft-limit 교집합도 유지한다. 기존 reset writer가 이미 전체 관절 pose·
+position target·velocity/effort target을 함께 복구하며 현재 URDF의 offset은 모두0이다.
+초기 Hand12개0rad와도 일치하여 reset·IK 코드를 변경하지 않았다.
+
+`merge_fixed_joints=False`,17개 tactile 이름·메시·ContactSensor·충돌 근사·self-collision
+필터·mount·F/T·UR5e actuator는 유지한다. Physics100Hz·policy50Hz·solver32/1도 그대로다.
+공유 `probe_hand_contact.py`는 Symmetric의 새 방식에서는12개 목표를 실제 mapper로 제출하고,
+원본을 선택하면 기존 native mimic·master6 구동을 유지한다. 새 모드 JSON에는 제어 방식·
+12관절 목표·추종 오차·명령각 연동 오차를 기록하며, native mimic의 원문 일치 판정은
+적용 불가(null)로 표시해 비어 있는 검사 결과를 통과로 오해하지 않도록 했다.
+
+이 모델은 실제6모터 기구와 역학적으로 같다는 주장이 아니다.12개의 독립 Drive는 추가
+구동 용량을 만들고, 실제 각도의 연동 등식이나 물리적 기어 반력 전달을 강제하지 않는다.
+이전보다 잘 버틴다면 mimic 제거와 추가 Drive의 효과를 분리해야 한다. 새 PD20/1은 기존
+master 수치를 사용하는 초기 설정이며, 실제 손의 하중–변형으로 검증한 값은 아니다.
+Checkpoint tensor/action 규격은 같지만 구동 동역학은 달라 이전과 동일 조건의 재생은 아니다.
+접촉 유지·역꺾임·물체에 전달되는 힘·연산 시간은 이번에 새 물리 실행으로 확인하지 않았다.
+
+### 검증
+
+관련 CPU16개가 먼저 통과했다. 이어 Symmetric의 `test_mdp.py`와 `test_learning.py` 전체는
+**556개 통과·환경 의존33개 생략·596개 subtest 통과(44.41초)**였다. CUDA 장치를 숨기고
+CPU thread1로 실행했으며, Kit·PhysX·학습·play는 실행하지 않았다.
+
+검사는 원문 물리 한계·전관절 force Drive·잔존 mimic 거부·17개 tactile 보존, 원문 재귀식과
+목표각 일치·엄지 chain·signed multiplier·offset·순환/없는 reference 거부, 실제 native
+6D 변환 재사용과12개 target 제출, 측정각 변화와 명령각 분리, partial reset·다른 환경 보존,
+host scalar/CPU 전송 없는 rollout, native actuator의12개 position target 전달을 포함한다.
+Scene·action·공유 probe의 AST 구문검사와 `git diff --check`도 통과했다.
+
+검사 로그는 `/tmp/contact_symmetric_urdf_drives_cpu.log`다. 최초 pytest 실행은 무관한 ROS
+자동 로드 plugin의 `lark` 누락으로 수집 전에 중단됐으며, plugin 자동 로드를 끈 뒤
+동일 두 파일 전체를 통과했다. 추가 설치나 production 설정 변경으로 우회하지 않았다.
+
+## 120. 2026-11-07 — 고정 박스 접촉 시 Symmetric 손가락 역꺾임 실제 검증
+
+사용자는 고정된 물체를 손가락이 누를 때 꺾이는지 실제 테스트하도록 요청했다. 기존
+`src/contact_manipulation/tests/probe_hand_contact.py`에 `--fixed-obstacle` 모드를 추가했다.
+새 production 파일·PD/물리 수치·reward·학습 코드는 변경하지 않았다.
+
+처음에는 원본1024환경 학습PID324627이 GPU 약11.7GiB를 사용하고 있어 동시 실행이 자동 승인
+검토에서 거부됐다. 사용자가 학습을 직접 종료한 뒤 진행하도록 답변했고, 해당PID 소멸·GPU618MiB·
+compute process 없음이 확인된 후 실행했다. 기존 학습을 에이전트가 종료하거나 재개하지 않았다.
+초기 launcher의 TERM=dumb 오류는 TERM=xterm으로 지정해 해결했다.
+
+### 실험 구성과 판정 범위
+
+- RTX3090·Isaac Sim5.1·GPU PhysX를 사용했다. 손만 fixed base·무중력으로 분리하고
+  production의12관절 implicit Drive20/1·각 effort1N·m·URDF 위치/속도 한계·collision 근사·
+  self-collision 필터·solver32/1·physics100Hz를 재사용했다. 실제 UR5e/센서 mount의 관성·
+  중력·정책·보상·OSC는 이 격리 시험에 포함하지 않는다.
+- 고정 상대는24×24×96mm kinematic 박스다. Native static actor와 구현 경로까지 같다고
+  주장하지 않는다. Physics 전 초기 pose만 설정하고 이후 teleport·외력·pose overwrite가 없다.
+- 선택한 motor와 URDF로 연결된 전체 체인의 양의 굽힘 방향을 합해 박스 방향을 정한다.
+  선택 손가락 전체 충돌 mesh에서1mm 간격을 확보한다. 다른 손가락은 열린 상태를 유지한다.
+  엄지는 opposition인 thumb1을0으로 유지하고 thumb2 flexion만 명령한다.
+- 열린 상태100step→press400step(200step ramp+200step hold)→reopen200step→release100step,
+  총800step/8초다. 목표는 해당 motor의 feasible soft 상한까지 올리며,12개 목표각은
+  production `hand_joint_mapping()`으로 생성한다. 느린 ramp의 최대 명령 속도는 일반
+  손가락에서 URDF 상한의.7382배, 엄지에서.1523배였다. 정책 rollout 주기를 재현하는 시험이
+  아니라 physics step마다 부드러운 목표를 직접 제출하는 접촉·고정 명령 시험이다.
+- 기존17개 tactile 외에 진단용 전체32body의 박스별 접촉 조회를 추가했다. 실제 관절각·
+  속도·12개 명령각·URDF 연동 오차·body별 접촉·박스 위치를 매step 기록한다. 목표 추종
+  오차 자체는 고정 장애물의 정상 저항일 수 있어 실패로 취급하지 않고, 실제 관절 하한 위반을 본다.
+
+### 초기 fixture 보완과 제외한 결과
+
+처음에는 선택 distal pad mesh의 support만 사용했다. 검지의 부모 `right_index_2` collider가
+pad보다 돌출되어 settle부터 접촉이100/100frame 발생했고 약3.79° 하한 위반이 관측됐다.
+이 값은 초기 간섭의 영향을 배제하지 못해 최종 결과에서 제외한다.
+`index_initial.json`·`index_before_initial_clearance.json`에 당시 기록을 보존했다.
+
+이후 선택 손가락 전체 충돌 mesh의 support로 박스를 옮겼으며, 최종5개 시험 모두 settle의
+실제 접촉0/100frame·하한 위반0을 확인했다. 이 변경은 테스트 초기 배치만 보완한 것이며
+학습 환경의 충돌 형상·contact offset·Drive 수치를 조정한 것이 아니다.
+
+### 최종 실측 결과
+
+아래는 **press 구간의 URDF 하한0 대비 최대 위반**이다. 마지막2초 hold의 접촉은 해당
+손가락 body와 박스 사이의 filtered force가0.1N을 넘는 step으로 계산했다.
+
+| 손가락 | 위반 관절 | 누르는 중 최저각 | Hold 접촉 | Hold 중 최대 하한 위반 |
+|---|---|---:|---:|---:|
+| 검지 | right_index_2_joint |−23.8043°|200/200step|23.8043°|
+| 중지 | 없음(press 기준) |0° 미만 없음|200/200step|0°|
+| 약지 | right_ring_2_joint |−23.8041°|200/200step|23.8041°|
+| 소지 | right_little_2_joint |−12.2018°|200/200step|12.2018°|
+| 엄지 | right_thumb_3_joint |−34.0133°|200/200step|34.0094°|
+
+네 손가락의 위반은 접촉 순간만의 이상치가 아니라 hold 구간에도 남았다. 중지도 재개방 중
+master에서 약−.29992°가 관측돼 전 과정에서 정확한 hard-limit 준수를 주장하지 않는다.
+엄지는 재개방까지 포함하면 최대 약−34.07474°다. 마지막 열린 상태에서 모든 선택 관절은
+0으로 복귀했다(최대 약4e−9° 수준).
+
+최종5개 시험은 모두 complete·800step이며 native mimic0개·12관절 PD20/1·effort1N·m,
+원문 URDF 물리 한계 일치를 backend에서 확인했다. 명령 multiplier/offset 잔차는 최대
+1.04e−7rad였고, 박스 위치 drift는 최대5.32e−9m였다. Nonfinite state나 CUDA/PhysX 오류는
+없었다. 따라서 명령 매핑 누락이나 박스 이동 없이도 역꺾임이 재현됐다.
+
+일반4손가락의 접촉은 주로 각 `*_2` 본체 collider에서 발생했다(소지는`*_1`도 접촉).
+이때 tactile17개가0인 것은 센서가 손가락 본체까지 감시한다는 의미가 아니기 때문이다.
+엄지에서는 thumb3/4 본체와 force_sensor2/3도 접촉했다. 이 실험은 손가락 충돌 접촉 시험이며,
+선택한 distal pad 표면만으로 누르는 시험이 검증됐다고 해석하지 않는다.
+보고된 contact force는 body별 resultant이므로 단순히1N·m/레버암과 비교하거나 임의로 dt를
+다시 곱해 실제 전달 힘을 추정하지 않는다.
+
+**판정: 전관절 Drive로 전환했지만 접촉 시 역꺾임은 해결되지 않았다.** 정책·reward 없이
+고정 목표만으로 재현되므로, 이 재현의 원인을 정책 action이나 학습 손실에 돌릴 수 없다.
+Drive·관절 한계/속도 제한·접촉 solver의 경쟁을 별도 인자로 분리하는 후속 실험이 필요하다.
+이번에는 production 수치를 더 조정하거나 손가락 pose를 강제로 덮어쓰지 않았다.
+
+### 원자료·재현·회귀 검사
+
+최종 원자료는 `logs/diagnostics/hand_fixed_contact_2026-11-07/`의
+`index.json`, `middle.json`, `ring.json`, `little.json`, `thumb.json`과 각 console log다.
+`summary.json`은 hold 접촉·위반 지속 step·명령 속도·원문 한계 일치를 요약한다.
+[관절각 그래프](figures/hand_fixed_obstacle_2026-11-07.png)는 초기 간섭을 제거한5개 시험이다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/tests/probe_hand_contact.py \
+  --package contact_manipulation_symmetric --fixed-obstacle --finger index \
+  --target-flexion 1 --ramp-steps 200 --settle-steps 100 --plateau-steps 400 \
+  --return-to-open-steps 200 --release-steps 100 --headless --device cuda:0 \
+  --output /tmp/hand_fixed_index.json
+```
+
+새 fixture의 CLI·step 합산·선택 motor만의 ramp·짧은 ramp 뒤 연속적인 reopen·전체 chain
+접선·돌출된 같은 손가락 housing과의 초기 간격·다른 손가락 제외·고정 상대에 외력/pose 쓰기
+없음을 CPU5개 검사로 확인했다. Symmetric 전체 두 파일은 **561개 통과·33개 생략·
+612개 subtest 통과(34.36초)**였다. 로그는 `/tmp/contact_symmetric_fixed_obstacle_cpu.log`다.
+
+## 121. 2026-11-07 — 고정 물체 손가락 접촉 영상
+
+사용자가120절의 시험을 영상으로 요청했다. GPU에 학습 process가 없는 것을 확인한 뒤
+Symmetric의 같은800step 시험을 각 손가락별로 다시 실행하며 실제 RGB를 녹화했다.
+저장된 관절각을 강제로 재생하거나 학습 checkpoint를 사용한 영상이 아니다.
+Stiffness20·damping1·URDF effort1N·m·solver·dt·고정 박스·목표각 순서는 변경하지 않았다.
+
+공유 `probe_hand_contact.py`에 선택적 `--video-output`과 `--video-fps`를 추가했다.
+녹화를 지정하면 AppLauncher 전에 camera 기능을 활성화하고, 공식 `CameraCfg`/`Camera`
+두 대를 이용해 전체 손과 선택 손가락의 접촉 확대 화면을 만든다. 내부 손가락은 옆
+손가락의 가림을 줄이도록 확대 시점만 조정했다. 선택 손가락 청록색·박스 주황색의
+visual material과 DomeLight를 추가했으며 collision·rigid body·drive 설정은 바꾸지 않았다.
+
+Physics100Hz에서4step마다 physics를 진행하지 않는 `sim.render()`를 호출하고 RGB를
+25fps MP4로 저장한다. Pillow overlay에 finger·close/hold/reopen 단계·simulation 시간·
+실제 관절각·접촉 여부·URDF 하한 위반각을 넣는다. 하한을1° 넘게 위반하면 빨간색이다.
+모든800step의 관절각은 기존 비녹화 시험과 **각 손가락 모두 정확히 일치했다(최대 차이0rad)**.
+기록 시작 전 접촉도 모두0/100step이며, 박스 drift는 최대5.32e−9m였다.
+
+산출물은 `docs/videos/hand_fixed_contact_2026-11-07/`에 있다.
+
+- `all_fingers.mp4`: 검지·중지·약지·소지·엄지 순서,40초·1000frame·1280×800·25fps·약6.38MB.
+- `index.mp4`, `middle.mp4`, `ring.mp4`, `little.mp4`, `thumb.mp4`: 각각8초·200frame.
+- 각 clip과 합친 영상의 모든 frame을 실제 decode해 frame 수·duration을 확인했다.
+  확대 화면도 각 손가락별로 확인했다. 실제 속도1×이며 느린 재생으로 바꾸지 않았다.
+
+새 원자료와 검증 요약은 `logs/diagnostics/hand_fixed_contact_video_2026-11-07/`의
+각 JSON과 `summary.json`이다. Console은 `/tmp/hand_fixed_contact_video_<finger>.log`다.
+재촬영 중 한 wrapper가 종료 신호143으로 중단됐으나 CUDA/PhysX 오류는 기록되지 않았고,
+남은 GPU process가 없는 것을 확인한 뒤 단일 시험으로 다시 완료했다. 원인은 확정하지 않는다.
+최종5개 시험은 모두 complete이며 GPU process가 남지 않은 것을 확인했다.
+
+재현은120절의 명령에 다음 옵션을 추가한다. 카메라는 이 진단 실행에만 생성된다.
+
+```bash
+--video-output /tmp/hand_fixed_index.mp4 --video-fps 25
+```
+
+CPU의 기존 고정 박스 회귀검사5개와16개 subtest가 통과했고 syntax·`git diff --check`도
+통과했다. 학습·policy·reward·production Hand 설정은 이번 녹화 작업에서 수정하지 않았다.
+
+
+## 122. 2026-11-07 — 접촉 영상에 프레임별 법선 접촉 힘 추가
+
+사용자가121절 영상에 접촉 당시 힘을 표시하도록 요청했다. 기존 RGB와 같은 실행의
+800step JSON을 이용해 CPU에서 주석을 추가했다. Isaac Sim·GPU·학습·물리 시험은
+실행하지 않았고 기존 영상도 보존했다.
+
+표시량은 공식 ContactSensor의 법선 접촉 합력 크기[N]다. `sphere_contact_force_N`은
+박스에 작용한 전체 법선 합력의 norm, `hand_body_contact_force_N`은 Hand body와 박스
+사이 filtered 법선 합력의 body별 norm이다. 마찰에 의한 접선힘·개별 접촉점 force·F/T
+wrench가 아니다. 서로 다른 링크의 norm을 더해 박스 합력으로 해석하지 않는다.
+
+영상 frame i(0부터)는 `samples[4*(i+1)-1]`에 대응한다. 첫 frame은0.04초·sample3,
+마지막은8초·sample799다.4step 구간의 평균이나 최댓값 대신 촬영한 마지막 physics
+step의 값을 표시했다. 박스 전체 합력은 공통0–12N 막대와 소수3자리 수치로,
+링크별 합력은0.001N을 넘는 링크를 크기순으로 표시한다. 마찰·개별점이 제외됨도 화면에 명시한다.
+
+기존 영상 아래160px 패널만 추가했고, encoding 전 원래800px의 모든 RGB 값이 그대로
+유지되는 것을1000frame 모두 확인했다. 향후 녹화도 같은 `annotate_contact_forces()`를
+호출한다. 기존 물리·제어 코드는 변경하지 않았다.
+
+산출물은 `docs/videos/hand_fixed_contact_2026-11-07/all_fingers_with_force.mp4`다.
+검지·중지·약지·소지·엄지 순서40초·25fps·1000frame·1280×960·약7.40MB이며,
+개별 `*_with_force.mp4`도 각각8초로 보존했다. 합친 영상1000frame을 decode해
+길이·해상도를 확인했고 검지·엄지의 실제 frame에서 힘 표시도 시각적으로 확인했다.
+검증 요약은 `logs/diagnostics/hand_fixed_contact_video_2026-11-07/force_overlay_summary.json`이다.
+syntax와 `git diff --check`가 통과했다.
+
+
+## 123. 2026-11-07 — 300g 물체 밀기: 기본 마찰에서 실제 녹화
+
+사용자가 움직일 수 있는 물체를 미는 테스트와 영상을 요청했고, 질량300g·기본 마찰을
+지정했다. 공유 `probe_hand_contact.py`에 `--push-object` 모드를 추가했으며 학습이나
+production Hand 설정은 바꾸지 않았다. 공식 Articulation·RigidObject·ContactSensor·Camera와
+native material·rigid body API를 사용했다.
+
+### 시험 구성
+
+- Symmetric Hand의12개 mapped implicit drive·stiffness20/damping1·URDF effort1N·m·
+  위치/속도 한계·solver32/1·physics100Hz·17개 tactile을 재사용한다. 실제 backend의12관절
+  설정과 mimic0개·원문 한계 일치를 최종5개 실행 모두 확인했다.
+- 박스는80×24×60mm·dynamic·중력−9.81m/s²이며 native mass readback은
+  0.3000000119kg이었다. 정지·동마찰0.5/0.5·반발0·average combine은
+  `RigidBodyMaterialCfg()`의 기본값을 그대로 썼다. 지지면에도 같은 기본 재질을 사용했다.
+  기존24×24×96mm 박스의 전도와 미끄러짐을 혼동하지 않도록 밀기 방향 폭을 늘렸다.
+- Hand 기부는 고정하고 자중을 제외했다. 각 손가락 chain의 초기 closing tangent를+X로,
+  palm-to-tip 방향을 수직으로 맞추는 root orientation을 physics 시작 전에1회 설정했다.
+  선택 손가락만 구동하며 실제 관절각·Box pose를 실행 중 덮어쓰거나 외력을 가하지 않는다.
+  UR5e·OSC·학습 policy를 포함한 밀기 시험이 아니다.
+- 박스는 수평 지지면 위0.5mm에서 시작한다. 초기 Hand–지지면 간격은 각 실행의 native
+  authored mesh 기준26.23–27.62mm였다. 선택 손가락–박스 초기 간격은1mm다.
+- 열린 상태1초→2초 ramp+2초 hold→재개방2초→열린 상태1초의800step이다.
+  공식 Camera 두 대로25fps·200frame·8초씩 녹화했다.
+
+### 지지면 필터 보완과 제외한 잠정 결과
+
+최초 collision-only static 지지면은 GPU에서 `GPU contact filter for collider '/World/Support'
+is not supported` 경고가 발생했다. 따라서 이때의 Hand–Table 접촉0을 비접촉 근거로 쓸 수
+없음을 사용자에게 정정했고, 잠정 검지·중지 JSON/영상과 관련 로그를
+`unsupported_static_support_filter/`에 보존했다. 최종 비교에는 포함하지 않는다.
+
+지지면을 공식 `RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True)`의
+움직이지 않는 rigid actor로 만들었다. Physics 전 초기 pose만 설정하며 이후 이동 명령은
+없다. 물체 질량·마찰·Hand 구동 설정은 유지했다. 이 구성으로5개를 모두 다시 실행했고,
+최종 로그에서 unsupported filter 경고·CUDA/PhysX error가 없었다. 검지는 이전 잠정 실행과
+관절각·물체 변위·접촉 힘800sample이 정확히 같았다.
+연속 실행 wrapper가 한번 종료 신호143으로 중단됐으나 CUDA 오류는 기록되지 않았고
+원인은 확정하지 않는다. 최종 실행은 clip별 process session을 분리해 순차 완료했다.
+
+### 최종 결과
+
+변위는 초기 Box pose 대비 XY 거리이며 누적 경로 길이가 아니다. 하한 위반은 누르는
+4초 동안 선택 손가락의 실제 URDF 하한 대비 최대 위반각이다. 힘은100Hz 측정의 Hand↔Box
+법선 합력 최대값이며,25fps 영상이 모든 짧은 peak를 보여주는 것은 아니다.
+
+| 손가락 | 누르는 중 최대 XY변위(mm) | 8초 후 XY변위(mm) | 최대 하한 위반(°) | 최대 법선 힘(N) | 마지막2초 접촉 |
+|---|---:|---:|---:|---:|---:|
+| 검지 | 0.19 | 0.19 | 42.05 | 1.304 | 200/200 |
+| 중지 | 22.99 | 22.99 | 35.53 | 2.182 | 135/200 |
+| 약지 | 0.25 | 0.27 | 41.97 | 1.344 | 200/200 |
+| 소지 | 21.60 | 38.74 | 31.70 | 1.698 | 200/200 |
+| 엄지 | 3.70 | 3.71 | 37.82 | 1.988 | 200/200 |
+
+최종5개 모두 settle100step의 Hand↔Box·Hand↔Table 접촉이0이었고, 전800step에서
+Hand↔Table 접촉도0이었다(0.1N 기준). 박스 최대 기울기는0.011° 미만이었다. 따라서
+이 결과를 박스 전도나 손의 지지면 접촉으로 설명할 근거는 없으며, 동적 물체를 접촉해
+누르는 상황에서도 관절 하한 위반이 남았다. 물체가 움직인 것만으로 정상 구동이라고
+판정하지 않는다. 원인이 특정 gain·effort·solver·bug 중 하나라고 확정한 시험도 아니다.
+
+### 힘·영상·검증
+
+박스의 native net force에는 약2.94N의 중량 지지력이 포함된다. 영상에는 이 값을 쓰지
+않고 Hand body→Box filter0의 힘을 벡터로 합한 뒤 norm을 취한
+`hand_box_normal_force_N`를 표시한다. 링크별 norm도 함께 보이되 서로 더하지 않는다.
+마찰력·개별 접촉점 force는 포함하지 않는다. Hand↔Support는 filter1로 별도 기록한다.
+기존 `sphere_contact_frames`는 지지면도 포함하므로 손가락 접촉 통계에 쓰지 않는다.
+
+영상은 `docs/videos/hand_push_300g_2026-11-07/all_fingers.mp4`이며, 검지·중지·약지·소지·
+엄지 순서40초·1000frame·1280×960·25fps·약15.06MB다. 각 손가락8초 clip도 보존했다.
+물체 변위·기울기·실제 관절각·URDF 하한 위반·법선 접촉 힘을 함께 표시한다.
+전체1000frame을 decode해 길이와 해상도를 검증하고 각 손가락의 실제 frame도 확인했다.
+원자료·최종 console log·요약은 `logs/diagnostics/hand_push_300g_2026-11-07/`에 있다.
+
+CPU 회귀검사6개·20개 subtest가 통과했다. 새 검사는300g push CLI·fixture 충돌 옵션과
+push 중 외력·pose overwrite가 없는 것을 확인한다. syntax·`git diff --check`도 통과했고,
+모든 테스트 종료 후 GPU compute process가 남지 않은 것을 확인했다.
+재현 명령은 Symmetric README의 `--push-object --mass .3` 예제를 따른다.
+
+
+## 124. 2026-11-07 — 관절 목표를 유지하고 Hand 전체를 이동해300g 박스 밀기
+
+사용자가 손가락 joint state를 유지한 채 손 전체를 이동시키는 시험을 요청했다.
+관절 상태를 강제로 덮어쓰면 접촉 변형이 감춰지므로 **12개 관절의 목표각을0rad로
+유지하고 기존 PD로 자세를 유지**하는 시험으로 수행했으며 이 해석을 사용자에게 설명했다.
+Production Hand·UR5e·OSC·reward·학습 설정은 수정하지 않았다.
+
+### 시험 장치와 제어
+
+공유 `probe_hand_contact.py`에 `--translate-hand`를 추가했다. `--push-object`와
+`--target-flexion 0`이 필요하고 기본 이동량은100mm다. 기존 고정 물체/손가락 굽힘 밀기는
+유지한다. Hand의 fixed root를 해제하고 floating articulation의 원래12관절을 그대로 둔다.
+URDF에서 실제 root link를 찾아 world와 연결한 공식 `UsdPhysics.PrismaticJoint`를 만들고
+`excludeFromArticulation=True`로 설정한다. Axis는 world+X이며 joint frame은 초기 root
+pose와 맞춘다. Simulation reset 후 실제 floating base 여부를 검사한다.
+
+기부는 공식 `UsdPhysics.DriveAPI`의 linear force drive로 이동한다. 장치 stiffness20,000N/m·
+damping500N·s/m·maxForce200N은 기부를 움직이는 시험 장치의 값이며, Hand 각 관절의
+PD20/1·effort1N·m를 바꾼 것이 아니다. Box에 외력을 직접 가하지 않는다. 매 step에는
+이 장치의 위치 목표와 동일한12개 손가락 위치 목표만 제출하며, root pose·관절 위치/속도는
+초기 설정 이후 덮어쓰지 않는다. Hand 자중 제외·Box 중력−9.81m/s² 조건을 유지한다.
+
+열린 자세1초→cubic smooth profile로100mm 전진2초→유지2초→복귀2초→정지1초다.
+기존 JSON phase 이름 `press`는 전진+유지, `reopen`은 이 모드에서 기부 복귀를 뜻한다.
+Physics100Hz·800sample, 영상25fps·200frame·8초다. Box80×24×60mm·질량300g,
+정지/동마찰0.5/0.5·반발0·평균 combine, 움직이지 않는 kinematic 지지면은123절과 같다.
+UR5e·OSC·학습 정책을 포함한 시험이 아니다.
+
+### 목표와 실제 상태 확인
+
+최종5개 실행 모두800sample×12관절의 제출 목표가 정확히0rad였고 URDF 연동 목표 오차도0이다.
+실제 backend에서12관절의 PD20/1·effort1N·m·원문 위치/속도 한계 일치와 native mimic0개를
+확인했다. 기부 실제 최대 X 이동은99.819–99.992mm, 전체 궤적의 최대 X 추종 오차는
+1.701mm 미만이다. 최대 YZ 이탈0.01782mm·회전 변화0.01279° 미만으로 직선 안내를 따랐다.
+기부 추종과 손가락 자세 유지를 구분해야 하며, 아래 하한 위반은 실제 측정각이다.
+
+| 초기 Box 위치 | 전진·유지 중 최대 XY변위(mm) | 복귀 후 최종 XY변위(mm) | 선택 손가락 최대 하한 위반(°) | 최대 Hand↔Box 법선 합력(N) |
+|---|---:|---:|---:|---:|
+| 검지 앞 | 7.47 | 7.46 | 51.51 | 1.452 |
+| 중지 앞 | 14.02 | 13.92 | 50.66 | 1.662 |
+| 약지 앞 | 82.41 | 82.41 | 5.11 | 1.962 |
+| 소지 앞 | 86.37 | 86.37 | 3.85 | 2.094 |
+| 엄지 앞 | 69.82 | 21.17 | 6.05 | 4.527 |
+
+선택 손가락의 최악 관절은 검지/중지/약지/소지의1번 joint와 엄지3번 joint다.
+이 표는 손가락 단독 성능 비교가 아니다. 손 전체 이동으로 중지 배치에는 검지,
+약지 배치에는 중지, 소지 배치에는 약지도 접촉한다. 엄지 배치는 복귀 중 검지 접촉으로
+Box가 되돌아오며, 전체12관절의 최대 목표 오차12.06°는 엄지가 아니라 복귀 중 검지1번에서
+발생했다. 다른4개 배치의 전체 관절 최대 오차는 표의 선택 손가락 하한 위반과 같았다.
+
+모두 초기 settle의 Hand↔Box 접촉0·전체 Hand↔Table 접촉0이며0.1N 기준이다.
+마지막 유지2초의 Hand↔Box 접촉은 모두200/200step이다. Box 전체 최대 기울기는
+중지 배치1.815° 미만, 나머지0.047° 미만이었다. 목표각을 바꾸지 않고 기부를 이동해도
+검지·중지가 크게 뒤로 꺾이는 현상은 재현됐다. 특정 gain·effort·solver·bug 중 하나를
+이 시험만으로 원인 확정하지 않는다.
+
+### 영상과 검증
+
+영상은 `docs/videos/hand_translate_300g_2026-11-07/all_fingers.mp4`다. 검지·중지·약지·소지·
+엄지 앞 배치 순서40초·1000frame·1280×960·25fps·약19.40MB이며 개별8초 clip도 보존했다.
+전체/접촉 확대 영상에 실제 관절각·URDF 하한 위반·물체 변위/기울기·법선 접촉 힘,
+손가락 목표0rad·기부 목표/실제 이동량·전체 관절 최대 목표 오차를 표시한다.
+힘은Hand→Box filtered force의 벡터 합 norm이며, 바닥 중량 지지력·마찰력·개별점 force는
+포함하지 않는다.100Hz force peak가25fps 영상에 모두 나타나는 것은 아니다.
+
+전체1000frame을 decode해 길이/해상도를 검증했고 각 배치의 실제 hold frame을 확인했다.
+5개 console log에 unsupported contact filter·CUDA/PhysX error가 없었다. 테스트 종료 후
+GPU compute process도 없었다. 원자료800sample·최종 console log·요약은
+`logs/diagnostics/hand_translate_300g_2026-11-07/`에 보존한다.
+
+CPU 회귀7개·24개 subtest가 통과했다. 새 검사는 CLI 조건과0rad 관절 목표 유지,
+전진·복귀 장치 목표, motion 중 외력/root pose/joint state overwrite가 없는 경로를 확인한다.
+Syntax·`git diff --check`도 통과했다. 재현 명령은 Symmetric README의
+`--push-object --translate-hand --target-flexion 0`을 따른다.
+
+
+## 125. 2026-11-07 — Hand stiffness20·50·100 동기화 비교 영상
+
+사용자가 stiffness 비교 영상을 요청했다.124절의 손 전체 이동 시험을 기준으로 Hand의
+12관절 Kp만20·50·100N·m/rad로 비교했다. Damping1N·m·s/rad·effort1N·m·URDF 위치/속도
+한계·mimic 제거·충돌 형상·17개 tactile·physics100Hz·solver32/1은 유지한다.
+300g Box·기본 마찰0.5/0.5·움직이지 않는 지지면·초기 배치·기부 drive20000/500/200N과
+목표 궤적도 유지했다.12관절 목표는 계속0rad이고 기부만100mm 전진2초·유지2초·복귀2초,
+앞뒤 정지1초씩 총8초다. 실제 관절각·root pose를 덮어쓰지 않는다.
+
+공유 진단 `probe_hand_contact.py`에 `--hand-stiffness`를 추가했다. 옵션이 없으면 production
+actuator 값을 상속하고, 지정하면 진단용으로 복사한 actuator의 stiffness만 변경한다.
+유한 양수만 허용하며 `diagnostic_overrides.hand_stiffness`와 실제 native gain을 JSON에
+기록한다. 학습용 actuator·PPO·reward·스폰 설정은 수정하지 않았다.
+
+Kp20은124절의 완료된5개 JSON/영상을 원본 그대로 재사용하고,50/100은 각 배치마다
+새로 실행해10개를 녹화했다. 모든15개에서 native12관절 gain이 지정값과 정확히 같고,
+damping/effort/속도·위치 한계·초기 fixture·프로토콜·관절 목표·기부 명령이 일치함을 확인했다.
+각 실행은800sample·200frame으로 완료했고 최초 Hand↔Box 접촉은 없었다.
+
+### 측정 결과
+
+전진·유지4초 동안 선택 손가락에서 발생한 실제 URDF 하한 위반의 최대값이다.
+
+| 초기 Box 위치 | Kp20(°) | Kp50(°) | Kp100(°) |
+|---|---:|---:|---:|
+| 검지 앞 | 51.506 | 51.500 | 51.500 |
+| 중지 앞 | 50.656 | 50.598 | 50.661 |
+| 약지 앞 | 5.106 | 5.107 | 5.106 |
+| 소지 앞 | 3.850 | 3.857 | 3.871 |
+| 엄지 앞 | 6.053 | 6.171 | 6.139 |
+
+같은 순서로1° 넘는 하한 위반이 지속된 시간은3.55·3.54·3.55·3.56·3.32초이며,
+각 배치의 세 Kp 조건에서 동일했다. 최대각 하나만 큰 짧은 transient였다고 해석할 수 없다.
+
+다음은 Box의 전진·유지 중 최대 XY변위 /8초 후 최종 XY변위다. 단위mm이며 누적 경로가 아니다.
+
+| 초기 Box 위치 | Kp20 최대/최종 | Kp50 최대/최종 | Kp100 최대/최종 |
+|---|---:|---:|---:|
+| 검지 앞 | 7.47 / 7.46 | 7.46 / 7.46 | 7.46 / 7.46 |
+| 중지 앞 | 14.02 / 13.92 | 14.16 / 14.06 | 14.01 / 13.91 |
+| 약지 앞 | 82.41 / 82.41 | 82.41 / 82.41 | 82.41 / 82.41 |
+| 소지 앞 | 86.37 / 86.37 | 86.37 / 86.37 | 86.38 / 86.38 |
+| 엄지 앞 | 69.82 / 21.17 | 69.75 / 20.31 | 69.78 / 20.44 |
+
+전15개에서 Hand↔Table 접촉은0이었다. 기부 최대 X 추종 오차는1.6746–1.7026mm이고,
+마지막 유지2초의 Hand↔Box 접촉은 모두200/200step였다. 엄지 배치는 복귀 중 검지도
+접촉해 물체가 되돌아오며, 전체12관절 최대 목표 오차는 약12°로 위 선택 엄지 표와 다르다.
+Hand 전체12관절의 Kp를 변경했으므로 이웃 손가락의 반응도 함께 바뀐다. 배치 간 결과를
+손가락 단독 유지력 비교로 해석하지 않는다.
+
+**각 배치에서 damping1·effort1N·m를 유지하고 Kp만20→50/100으로 높여도 큰 하한 위반은
+해결되지 않았다.** 현재 조건의 각1회 실행 결과이며 stiffness가 모든 상황에서 무효라는
+주장이나 실제 torque 포화가 원인이라는 확정은 아니다. Implicit drive 토크를 측정한 시험도
+아니다. 구동 토크 상한과 기계적 관절 위치 한계는 별도이므로 큰 하한 위반 조사를 계속해야 한다.
+
+### 산출물과 검증
+
+`docs/videos/hand_stiffness_2026-11-07/comparison.mp4`는 왼쪽부터 Kp20/50/100인
+1920×960·25fps·40초·1000frame·약36.55MB 비교 영상이다. 검지·중지·약지·소지·엄지 배치를 각8초씩
+동기화했고 frame i는 각 실행의 `samples[4*(i+1)-1]`에 대응한다. 실제 접촉 확대 RGB에
+선택 손가락 관절각·하한 위반·Box XY/기울기·Hand↔Box 법선 합력·기부 실제/목표 이동량·
+전체 관절 목표 오차를 표시한다. 힘은 마찰·바닥 지지력·개별 접촉점 힘을 포함하지 않는다.
+Kp20 원본 재사용과 이웃 손가락 접촉 가능성도 영상에 표시한다.
+
+원본50/100 영상은 같은 폴더의 `kp_50/`, `kp_100/`에 있고, 데이터·console log·전체 요약은
+`logs/diagnostics/hand_stiffness_2026-11-07/`에 보존한다. 신규10개 console log에
+CUDA/PhysX error·overflow·unsupported contact filter 경고는 없었다. 첫 순차 wrapper가
+종료 신호143을 받았으나 별도 session의 검지100 시험은 정상 완료했다. 완료 자료를 덮어쓰지
+않고 별도 recording driver로 나머지를 이어갔으며 `All 10 new recordings completed`를 확인했다.
+이 종료 신호를 CUDA 오류로 분류하지 않는다. 녹화 종료 후 GPU compute process는 없었다.
+
+CPU 회귀9개·36개 subtest와 syntax·`git diff --check`가 통과했다. 추가 검사는 CLI 유효성,
+진단 actuator 복사 독립성과 stiffness 외의 설정 보존을 확인한다. 비교 영상 전체1000frame을
+재디코딩해 길이·해상도를 확인하고 검지·약지·엄지의 실제 합성 frame도 시각적으로 검증했다.
+재현은 README의 손 전체 이동 명령에 `--hand-stiffness 50` 또는100을 추가한다.
+
+
+## 126. 2026-11-07 — 비교 repo gain1.2/0.06에서 Hand effort1·10 비교
+
+사용자가 비교 repo와 stiffness·damping을 맞춘 뒤 effort 상한1/10N·m 비교를 요청했다.
+공유 진단 스크립트에 `--hand-damping`·`--hand-effort-limit`을 추가해 복사한 actuator에만
+적용한다. Kp1.2·Kd0.06을 고정하고12관절 effort 상한을1 또는10N·m로 설정한다.
+학습용 actuator 설정은 바꾸지 않으며, URDF 원문 effort1N·m도 보존한다. 따라서10N·m
+실행의 source effort 일치0/12·전체 일치False는 의도한 override다. 위치·속도 한계는 유지한다.
+실제 native gain·상한과 요청값을 별도로 확인하며, 상한을 실제 출력 토크로 해석하지 않는다.
+
+### 준비 구간의 CUDA719 재발과 기록 보완
+
+최초 effort10 검지 실행은 `run_phase("settle") → advance → hand.update`에서
+2026-11-07T12:15:22Z PhysX CUDA719(NpScene.cpp3000)가 발생했고, DOF velocity 조회 실패로
+전파됐다. Process 종료 코드는134였고 cleanup에서도 abort가 있었다. 밀기 명령 전의
+준비 구간이며 영상 frame은 생성되지 않았다. 오류만 기록된 JSON이므로 최초 시도의 native
+상한·정상 sample을 사후 입증할 수 없다. 이 실행을 완료된 비교 결과에 포함하지 않는다.
+
+이전에 학습에서 관찰한 것과 같은 오류 코드이지만 동일 근본 원인임을 입증한 것은 아니다.
+이번에는 학습·PPO·GNN·OSC·대규모 scene reset 없이 Hand 단독 진단에서도 발생했다.
+정책의 큰 action이나 큰 접촉력 때문에 발생했다고 단정할 근거가 없다. 최초 console/JSON과
+driver log는 `logs/diagnostics/hand_effort_2026-11-07/failed_attempt_1/`에 보존했다.
+
+진단에 첫 물리 step 전의 관절 위치·속도·관절 목표·native gain/상한·source alignment를
+`.startup.json`으로 저장하고, 예외 시 이미 CPU로 복사된 sample·phase summary·시도 중인
+phase/step을 error JSON의 `partial`에 보존하도록 보완했다. 오류 후 GPU 값을 다시 읽지 않는다.
+정상 실행의 구동·스폰·물리 설정은 바꾸지 않는다. CPU 회귀11개·52개 subtest가 통과했다.
+
+새 프로세스에서 effort10 검지 재확인은800sample·200frame으로 정상 완료됐고 오류 로그가
+없었다. Native12관절 상한10N·m를 확인했으며 초기 최대 절댓값은 관절각2.51e−10rad·
+관절속도4.40e−7rad/s였다. 재시도 완료가 CUDA719 원인을 해결했다는 뜻은 아니다.
+검지의 effort1/10은 native 상한이 달라도800sample 전체가 같은 값이었고 최대 하한 위반은
+51.505463°, Box 최종 XY변위는7.467810mm였다. 실제 implicit drive 토크 측정은 아니므로
+이 결과를 특정 포화·solver 문제의 원인 확정으로 해석하지 않는다.
+
+### 완료된 두 상한 비교
+
+검지·중지·약지·소지·엄지 앞의5개 배치에서 각 상한1/10N·m를 순차 녹화해 정상10개
+실행을 완료했다. 각 실행은300g Box·마찰0.5/0.5·손 전체100mm 이동의124절 프로토콜이며,
+12개 관절 목표를0rad로 유지한다. Kp1.2·Kd0.06·위치/속도 한계·solver32/1·physics100Hz·
+초기 배치·기부 drive는 양쪽에서 같고 effort 상한만 다르다. 이는 비교 repo의 gain을 적용한
+현재 Hand 단독 진단이며, UR5e·OSC·학습을 포함한 비교나 그 repo 전체 물리 설정의 복제는 아니다.
+
+**다섯 배치 모두 effort1/10의800개 sample 전체와 phase summary가 정확히 일치했다.**
+별도 프로세스로 각각 실행했고 native 상한은 모든12관절에서 요청한1/10N·m로 구분됐다.
+설정 값의 차이를 확인한 것과 실제 출력 토크가 달라졌음을 입증하는 것은 다르다.
+
+| 초기 Box 위치 | 상한1 최대 하한 위반(°) | 상한10 최대 하한 위반(°) | 양쪽 Box 최대/최종 XY변위(mm) |
+|---|---:|---:|---:|
+| 검지 앞 | 51.505 | 51.505 | 7.469 / 7.468 |
+| 중지 앞 | 50.597 | 50.597 | 14.159 / 14.057 |
+| 약지 앞 | 5.105 | 5.105 | 82.409 / 82.407 |
+| 소지 앞 | 3.856 | 3.856 | 86.385 / 86.383 |
+| 엄지 앞 | 6.474 | 6.474 | 69.416 / 21.759 |
+
+하한 위반은 전진·유지4초 중 선택 손가락의 최대값이며, XY변위는 초기 Box pose 대비
+거리로 누적 경로가 아니다.1° 넘는 하한 위반 지속시간은 같은 순서로3.55·3.54·3.55·
+3.56·3.32초였다. 두 상한에서 같았으며 마지막 유지2초의 Hand↔Box 접촉도 모두200/200step다.
+Hand↔Table 접촉은 전실행0이고 최대 기부 X 추종 오차는1.675–1.704mm였다.
+약지·소지 등에는 이웃 손가락 접촉이 개입한다. 엄지 배치는 복귀 중 검지도 접촉해 물체가
+다시 돌아왔으며, 전체12관절 최대 목표 오차12.330°는 이때의 검지에서 발생했다.
+
+따라서 **이번 Kp1.2·Kd0.06과 각 초기 배치에서는 effort 상한을1→10N·m로 올려도 역꺾임이
+개선되지 않았다.** 이 결과만으로 effort 설정이 무시됐다거나 항상 의미 없다고 단정하지 않는다.
+실제 implicit drive 토크는 측정하지 않았으므로 토크 포화가 원인인지도 확정할 수 없다.
+큰 관절 하한 위반은 단순 목표 추종 오차와 구분해 계속 조사해야 한다.
+
+### 영상·원자료·검증
+
+`docs/videos/hand_effort_2026-11-07/comparison.mp4`는 왼쪽1·오른쪽10N·m,
+1280×960·25fps·40초·1000frame·약25.09MB다. 다섯 배치를 각8초씩 같은 시점으로 맞췄다.
+실제 접촉 확대 RGB와 관절각·하한 위반·Box XY/기울기·법선 합력·기부 목표/실제 이동·
+전체12관절 목표 오차를 표시하며, 상한과 실제 힘을 구분한다. 법선 합력은 마찰·바닥 지지력·
+개별 접촉점 힘을 포함하지 않는다. Frame i는 해당 실행의 `samples[4*(i+1)-1]`이다.
+
+원본 영상은 같은 폴더의 `effort_1/`, `effort_10/`에, JSON·startup·console log·요약은
+`logs/diagnostics/hand_effort_2026-11-07/`에 있다. 최초 실패는 별도 디렉터리에 보존하고
+summary의 `excluded_failed_attempts`로 명시했다. 최종10개 정상 실행 로그에는
+CUDA/PhysX error·unsupported contact filter 경고가 없었다. 녹화 후 GPU compute process는
+없었고 합성은 CPU에서만 수행했다. 영상 전체1000frame을 재디코딩해 길이·해상도를 확인하고
+검지·약지·엄지의 실제 합성 화면을 확인했다. CPU 회귀11개·52개 subtest, syntax와
+`git diff --check`도 통과했다. 학습용 gain·effort 설정은 변경하지 않았다.
+
+
+## 127. 2026-11-07 — 비교 repo와 Hand 접촉 역꺾임 원인 분리
+
+사용자가 비교 repo와의 차이를 실제 대조해 원인을 규명하도록 요청했다. 대상 repo는
+`7cmdehdrb/Contact-Rich-Manipulation`의 당시 main commit
+`79b5abf8748da5f92e0dfc61613ede2ad1ba1478`다. 비교 repo의 Hand는12개 implicit drive,
+Kp1.2·Kd0.06·armature0.0001이며 Relative task에서 effort10N·m를 사용한다.
+Self collision은False다. 별도 오른손 USD는 총질량790g으로 보정하며17개 tactile body의
+질량은 각각약0.899g이다. 우리 source URDF는 총약776.7g·링크별 질량과 관절 frame이
+다르고, 네 손가락 distal 상한도약84.59°로 peer약179.91°와 다르다. 이 상한 차이만으로
+음의 하한 위반을 설명하지 않는다. 두 repo의 전체 환경을 동일하게 복제한 시험은 아니다.
+
+### Native drive와 목표 전달 확인
+
+진단 스크립트의 native readback을 추가했다. 실제 backend `get_drive_types()`는
+None0·Force1·Acceleration2를 구분하고 `get_dof_armatures()`도 읽는다. 매 sample에서
+`get_dof_position_targets()`를 제출한12개 목표각과 비교한다. Joint enabled와 live USD의
+angular drive type도 기록한다. Gain·상한의 숫자를 읽은 것만으로 활성 drive를 입증했던
+이전 해석을 보완한다. 새로운 옵션은 복사한 진단 설정에만 적용하며 production은 유지한다.
+
+새 baseline에서12관절 모두 실제 Force1·joint enabledTrue·live USD typeforce였고,
+800step의 native 목표와 제출 목표 차이는0이었다. Armature는12개 모두0이었다.
+따라서 이번 재현에서 drive 누락·목표 전달 누락·runtime acceleration 오설정 가설은 배제된다.
+Importer cache의 초기 acceleration625와 live force override를 혼동하지 않는다.
+Peer의 실제 binary physics layer도 CPU로 읽었으며12개 Hand drive는 force·초기gain0/0·
+maxForce10으로 작성되어 있었다. 이것은 그 layer의 authoring 확인이며 peer runtime 측정은 아니다.
+
+### 단일 변수 비교: 같은 검지·300g Box·100Hz
+
+Kp1.2·Kd0.06·effort10N·m를 고정하고, 기존124절의 동일 검지 배치·마찰0.5/0.5·
+손 전체100mm 이동·solver32/1·12관절 목표0을 사용했다. 각 실행8초·800sample,
+전진2초와 유지2초를 press로 평가한다. 영상 렌더링은 생략했다.
+
+| 조건 | Native armature | Self collision | Joint 속도 상한(rad/s) | Press 최대 하한 위반(°) | Box 최대 XY변위(mm) |
+|---|---:|---|---|---:|---:|
+| 현재 baseline | 0 | On | 원본1/2 | 51.505463 | 7.469000 |
+| Self collision만 Off | 0 | Off | 원본1/2 | 51.505463 | 7.469000 |
+| Peer armature만 추가 | 0.0001 | On | 원본1/2 | 0.001564 | 89.152191 |
+| Armature추가+Self collision Off | 0.0001 | Off | 원본1/2 | 0.001564 | 89.152191 |
+| 속도 상한만 진단용 완화 | 0 | On | 1000 | 0.509115 | 72.493131 |
+
+Armature의 실제 FP32 readback은0.00009999999747이다. Native gain·effort·drive type·
+목표·원본 위치 한계·fixture·기부 목표 이력은 대조 조건에서 확인했다. Self collision Off는
+baseline과800sample 전체가 정확히 같고, armature+Off도 armature만 추가한 결과와 같다.
+따라서 이 검지 배치에서는 self collision이 큰 역꺾임의 설명이 되지 않는다.
+속도1000rad/s는 제약 경쟁을 분리하기 위한 진단값이며 학습의 권장값으로 적용하지 않는다.
+
+큰 위반 관절은 proximal `right_index_1_joint`다. 최초 접촉은1.43초·약0.490N이고,
+1.46초−1.29°·1.66초−10.24°·2.23초−40.07°·2.59초−51.505°로 진행한다.
+Distal 최대 하한 위반은0.002624°다. 따라서 distal 상한의 peer/우리 차이를 주원인으로
+삼는 해석은 이 재현과 맞지 않는다. Sample의 최종 qdot도 press 중 상한99%를 넘지 않아
+속도 제한에 계속 포화됐다고 단정하지 않는다. 속도 상한만 바꾼 대조 결과로 영향을 판단한다.
+
+### 확인된 원인과 해석의 범위
+
+이 시험에서 **armature0인 Hand의 작은 관성과 drive·관절 한계·접촉의 제약 경쟁**이
+주된 원인으로 좁혀졌다. Peer의 armature0.0001만 추가해 물리 위치 한계·속도 한계와
+토크 상한을 유지하면서 역꺾임이 크게 줄었다. 관성 모델이 바뀌어 제약 계산이 개선된
+것으로 해석하며, 단순히 solver 설정만 보정했다고 표현하지 않는다. 실제 solver 내부의
+개별 impulse를 측정한 것은 아니다. Armature는 joint-space 관성에 추가되는 값이며
+body 질량 변경과 구분한다.
+
+공식 [Isaac Lab armature 설명](https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.actuators.html#isaaclab.actuators.ActuatorBaseCfg.armature)과
+[PhysX Articulation Drive Stability](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#articulation-drive-stability)는
+각각 관성 추가에 의한 안정성 개선과 drive·위치/속도 한계·접촉 제약의 경쟁을 설명한다.
+Gain·effort 증가만으로 해결되지 않았던125–126절과도 일관되지만 실제 drive torque는
+여전히 측정하지 않았다. TGS의 마지막 substep qdot와 fullstep Δq/dt가 다를 수 있으므로
+마지막 q/qdot로 계산한 단순 PD 근사값을 실제 torque·포화 증거로 쓰지 않는다.
+
+### 기존 학습용 gain·effort에서의 재확인
+
+Kp20·Kd1·effort1N·m·원본 속도 한계·self collisionOn을 유지하고 armature0.0001만
+추가해 검지·중지·엄지를 재실행했다. 앞선124절의 production baseline과 같은 fixture·
+protocol·관절 위치/속도 한계·기부 명령임을 확인했다.
+
+| 배치 | 이전 최대 하한 위반(°) | Armature추가 후(°) | 이전 Box 최대 XY변위(mm) | 추가 후(mm) |
+|---|---:|---:|---:|---:|
+| 검지 앞 | 51.506248 | 0.001633 | 7.466173 | 89.139722 |
+| 중지 앞 | 50.656091 | 0.006304 | 14.022949 | 88.588376 |
+| 엄지 앞 | 6.052789 | 0.004616 | 69.818149 | 75.155775 |
+
+하한 위반은 선택 손가락의 press 최대값이다. 새3개 실행은 nativeForce1·Kp20·Kd1·
+effort1N·m·armature0.0001·12개 목표0을 실제로 확인했다. 이전3개 baseline은124절
+저장 자료를 재사용했으며 당시 armature·runtime drive type은 기록하지 않았다. 당시 설정은
+armature미지정이었다는 사실과 이번 새 baseline의 native0 확인을 구분한다. 이전 sample에서
+측정하지 않은 armature 값을 사후 측정한 것처럼 표현하지 않는다. 약지·소지의 추가 armature
+시험과 UR5e·OSC를 포함한 전체 학습 scene의 접촉 검증은 이번 범위에 포함하지 않는다.
+
+### 결과·재현·검증
+
+[원인 비교 그래프](figures/hand_cause_2026-11-07.png)의 위쪽은 새 검지 단일 변수 실험의
+관절각·Box변위, 아래쪽은 production gain의3개 배치다. 하한 위반 bar는 log축이다.
+원자료8개·각 startup/console·matrix/confirm driver log·summary는
+`logs/diagnostics/hand_cause_2026-11-07/`에 있다. Summary는 모든 입력 불변 조건·native
+설정·과거 자료의 기록 한계를 포함한다. 전체새8개가complete·800sample이고 CUDA/PhysX
+error·unsupported filter 오류가 없었다. 종료 후 GPU compute process가 없음을 확인했다.
+
+기존 README의 손 전체 이동 명령에서 `--video-output`을 생략하고
+`--hand-stiffness 1.2 --hand-damping .06 --hand-effort-limit 10`을 공통으로 사용한 뒤,
+`--hand-armature .0001` 또는 `--hand-self-collision off` 또는
+`--hand-velocity-limit 1000`을 별도 실행에 지정해 matrix를 재현한다. Production 재확인은
+gain·effort override를 모두 생략하고 `--hand-armature .0001`만 추가한다.
+
+CLI·복사 설정 독립성·다른 물리 설정 보존의 CPU검증14개·83subtest가 통과했고,
+분석 스크립트는8개 새 report와3개 과거 report의 불변 조건을 검증한 뒤 그래프·summary를
+생성했다. Production Hand 설정에는 아직 armature를 추가하지 않았으며 UR5e·reward·모델도
+이번 조사에서 바꾸지 않았다. 공식 `ImplicitActuatorCfg.armature`로 추가 관성을 설정하는
+방향이 이번 재현에서 유효했다. 실제 회전자 관성과의 정합은 추가 검증 대상이다.
+이 원인 분리를 과거 CUDA719의 원인 규명이나 해결로 확대하지 않는다.
+
+
+## 128. 2026-11-07 — Hand 임시 물리 설정과 실물 비교 필요 항목
+
+사용자는 공식 자료와 제공 URDF로 결정할 수 있는 값을 우선 따르고, 아직 확정할 수 없는
+구동 파라미터는 합리적인 임시값으로 정한 뒤 추후 실제 Hand와 비교 실험이 필요하다는 점을
+기록하도록 요청했다. 메인 프로젝트 `contact_manipulation_symmetric`의 첫 기준은 다음과 같다.
+
+| 항목 | 임시 기준 | 근거와 한계 |
+|---|---|---|
+| 관절 위치 한계·multiplier·offset | 제공 RH56E2 URDF 유지 | 종속 관절 한계까지 만족하는 master 목표 범위를 사용 |
+| 관절 effort 상한 | 12관절 각각1N·m | URDF 명시값이며 실제6개 구동기의 토크 배분을 확인한 값은 아님 |
+| 관절 속도 상한 | 엄지2rad/s·나머지1rad/s | URDF 유지. 제품의 손가락 속도·닫힘 시간과 좌표·stroke 정의를 먼저 대조해야 함 |
+| 링크 질량·COM·관성 | URDF 유지 | 제품 명목 총질량만으로 개별 링크 물리값을 재분배하지 않음 |
+| Stiffness·damping | 20N·m/rad·1N·m·s/rad | 현재 직접 시험한 구성의 기준값이며 실물 동특성에 정합된 값은 아님 |
+| Armature | 0.0001kg·m² | 127절의 접촉 비교 근거로 공식 `ImplicitActuatorCfg.armature`에 추가. 실제 회전자 관성으로 확인한 값은 아님 |
+
+이번 적용은 Symmetric Hand actuator에 armature 한 항목을 추가하는 것으로 제한했다.
+UR5e·reward·policy·action 변환은 변경하지 않았다. 127절의 "학습용 armature 미적용"은
+당시 상태의 기록이며, 현재 적용 여부는 이128절을 따른다. 원본·parallel 프로젝트는 유지한다.
+
+공식 [RH56E2 제품 사양](https://en.inspire-robots.com/product/rh56e2/)의 손끝 힘28–30N은
+관절별 토크 상한으로 직접 치환할 수 없다. 17개 tactile 모델의 명목 질량790±10g과 제공
+URDF 합계약776.7g도 모델 개정·부속품 포함 조건을 확인한 뒤 비교한다. 공식 손가락 속도와
+URDF 관절별 속도 한계도 같은 좌표량이라고 가정하지 않는다.
+[NVIDIA 구동 안정성 가이드](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/guides/articulation_stability_guide.html#drive-stability)는
+관성·고유주파수·감쇠비를 이용한 gain 설정 방법을 제공하지만 RH56E2의 권장 gain을 제시하지 않는다.
+
+**추후 실제 Hand와 비교 실험이 필요하다.** 정확한 Hand 개정·제어 모드·입력값·접촉 조건을
+맞추고, 자유공간의 목표/실제 관절각과 이동 시간, 중간 관절각에서의 접촉 하중에 따른 변형,
+접촉 해제 후 복귀 응답을 비교한다. 이를 바탕으로 stiffness·damping·armature와 구동 한계를
+다시 결정한다. 실제6개 구동기와12개 독립 drive의 힘 전달 차이, 하드웨어의 force protection도
+함께 확인해야 한다. 지금 임시 모델을 실물 동등 모델로 표현하지 않는다.
+
+127절 시험은 목표0rad가 물리 하한인 hard-stop 시험이므로 gain 최적화를 입증하지 않는다.
+공식 근거가 없는 접촉력5N·변형5°·추가0.2초·overshoot5%·한계오차0.1°를 확정된
+합격 기준으로 사용하지 않는다. 현재 damping1도 자유 추종을 지나치게 둔하게 만들 가능성이
+있으므로 중간 자세 시험을 거쳐 검토한다. 이번에는 새로운 GPU·시뮬레이션·학습을 실행하지 않는다.
+
+
+## 129. 2026-11-07 — Symmetric Hand action에서 native position drive까지의 경로 점검
+
+사용자는 정책 출력이 실제 Hand 제어로 변환되는 경로가 설계 의도와 일치하는지 확인하도록
+요청했다. `ur5e_env_cfg.py`의 action 선언·`UrdfCoupledHandAction`, startup soft-limit event,
+체크아웃의 공식 `JointPositionToLimitsAction`·`ImplicitActuator`·`Articulation`을 대조했다.
+이번 점검에서 action 의미·scale·범위·controller 구현은 수정하지 않았다.
+
+### 12D 정책 출력의 Hand6D와 절대 목표각
+
+전체 action의 앞6개는 sensor-frame Arm wrench이고 뒤6개는 순서대로 thumb1·thumb2·
+index1·middle1·ring1·little1의 master position 명령이다. Gaussian 출력은 wrapper에서
+별도 clipping하지 않는다. Hand의 `JointPositionToLimitsActionCfg`는 `scale=0.5`,
+`rescale_to_limits=True`, `preserve_order=True`다. 입력은 delta·속도·토크가 아니라
+절대 목표 관절각을 선택하는 정규화 좌표이며 실제 각도 변환은 공식 action이 수행한다.
+
+Master의 허용 목표 범위를 [l,u], 정책 raw Hand action을 a라 하면 다음과 같다.
+
+```text
+s = clamp(0.5 * a, -1, +1)
+q_target = (l + u) / 2 + (u - l) / 2 * s
+```
+
+| Raw Hand action | 허용 목표 범위에서의 위치 |
+|---:|---:|
+| -2 이하 | 하한0% |
+| -1 | 25% |
+| 0 | 중간50% |
+| +1 | 75% |
+| +2 이상 | 상한100% |
+
+즉 `scale=0.5`는0.5rad 증분이 아니다. URDF 관절각0rad와 raw action0도 구분해야 한다.
+초기/reset Hand 관절각과 native position target은0rad지만, 첫 policy action0은 그 자세를
+유지하는 명령이 아니라 중간 자세로 이동하라는 명령이다. 열린 하한 자세를 요구하려면
+현재 mapping에서 raw action -2 이하가 필요하다. 양의 action은 일반 손가락의 굽힘 목표를
+키우고, thumb1은 별도 엄지 회전 축이다. 큰 값은 native mapping에서 포화한다.
+
+Startup의 `configure_hand_action_limits`는 child까지 URDF hard limits를 만족하도록 master
+soft limits만 교집합으로 설정한다. 실제 hard limits는 원본대로 유지한다. 유효 범위는
+thumb1=[0,1.658]rad, thumb2=[0,0.6092207623]rad, 나머지4개=[0,1.3615918104]rad다.
+예를 들어 index1의 원본 상한1.4381rad보다 index2 상한1.476374rad/1.0843이 작으므로
+master action 상한을1.3615918104rad로 사용한다.
+
+### 6개 목표각을12개로 확장하고 PhysX에 전달
+
+`UrdfCoupledHandAction.process_actions`는 공식 superclass로6개 목표각을 만든 다음,
+GPU tensor `index_select`와 multiplier·offset으로12개 목표각을 한 번에 계산한다.
+현재 URDF의 offset은0이고 다음 관계를 적용한다.
+
+```text
+thumb3_target = 0.8392 * thumb2_target
+thumb4_target = 0.891 * thumb3_target = 0.7477272 * thumb2_target
+finger2_target = 1.0843 * finger1_target  # index / middle / ring / little
+```
+
+확장은 측정된 master 각도가 아니라 명령된 목표각을 기준으로 한다. PhysX mimic 제약을
+제거했으므로 접촉 중 실제 관절각이 multiplier 관계에서 벗어날 수 있다. 목표 관계를 맞춘
+것만으로 실제6개 actuator의 기계적 힘 전달까지 복원한 것은 아니다.
+
+`apply_actions`는 공식 `set_joint_position_target`에12개 목표를 제출한다. Native
+`Articulation.write_data_to_sim`이 PhysX position target buffer로 전달하고, 공식
+`ImplicitActuatorCfg`의 stiffness20·damping1·URDF effort/velocity와128절 armature를
+사용해 실제 drive를 실행한다. 위치 오차와 속도 오차로 작용하는 PD를 PhysX가 implicit하게
+계산하며 별도 수제 Hand PD 또는 Hand OSC를 사용하지 않는다. 목표 속도·feed-forward
+effort는 reset에서0으로 설정하며 이 Hand action은 position target만 갱신한다.
+
+현재 별도의 목표각 보간이나 목표각 변화율 제한은 없다. 매 policy step에 새 목표를 정하고
+그 사이 physics step에는 같은 목표를 유지한다. 물리 관절 속도·토크 제한은 목표 변화율
+제한과 구분한다. Observation의 previous action과 action-rate reward는 실제 포화 의미와
+같도록 raw Hand action을[-2,2]로 제한해 사용하며, radian 목표각을 넣는 것은 아니다.
+PPO/ActionManager의 원래 Gaussian 표본 이력은 유지한다.
+
+### 검증 범위
+
+CPU에서 기존 `HandUrdfBoundsTests`·`HandActionSoftLimitsTests`·
+`UrdfCoupledHandActionTests`·`NativeArmEffortLimitTests` 총16개가 통과했다.
+실제 체크아웃의 native 변환을 사용해 endpoint·포화·12개 child 목표·부분 reset·원래
+action tensor 보존·위치 목표의 backend 전달을 확인한다. 별도 CPU 계산으로 위 실효 각도
+범위와 thumb chain도 재확인했다. 이번 검증은 GPU·Kit·학습을 실행하지 않았으며128절
+armature 추가 이후 전체 학습 scene의 동역학을 새로 검증한 것은 아니다.
+
+
+## 130. 2026-11-07 — Symmetric OSC action·좌표·피드백·제어 주기 점검
+
+사용자가 Hand 다음으로 OSC 점검을 요청했다. 이번에는 action/controller를 수정하지 않고
+현재 체크아웃의 공식 OSC·Action·actuator와 프로젝트 adapter를 대조하고 CPU에서 검증했다.
+시뮬레이션·GPU·학습은 실행하지 않았다. 사용자 합의인 **정책 피드백+OSC 내부6축 F/T 오차
+보정**은114절을 따르며, 내부 루프는 아래와 같이 여전히 미구현이다.
+
+### 현재 실제 명령 경로
+
+`ur5e_env_cfg.py`에서 정책 앞6개 action은 sensor-origin 축의
+[Fx,Fy,Fz,Tx,Ty,Tz]다. `wrench_scale=(10,10,10,1,1,1)`이며 raw1은 각각10N·1N·m다.
+Raw를 먼저[-20,20]·[-20,20]·[-36,36]·[-8,8]·[-8,8]·[-8,8]로 제한하므로 sensor-origin
+물리 목표 범위는±200/200/360N·±8/8/8N·m다. 이 범위는 센서 명목 범위와 맞춘 **명령의
+상한**이지 실제 접촉 하중을 그 범위로 보장하는 물리적 제한은 아니다.
+
+`SensorFrameWrenchAction`은 센서 원점의 wrench를 native COM Jacobian과 맞도록 보정한 뒤
+공식 `OperationalSpaceControllerAction`·`OperationalSpaceController`에 맡긴다.
+현재 구성은 순수 `wrench_abs`, motion axes0·wrench axes1, gravity compensationOn,
+inertial decouplingOff, nullspaceNone, `contact_wrench_stiffness_task=None`이다.
+
+```text
+tau_raw = J_COM^T * W_COM + gravity
+tau_submitted = clamp(tau_raw, -joint_effort_limit, +joint_effort_limit)
+joint_effort_limit = [150, 150, 150, 28, 28, 28] N*m
+```
+
+팔의 공식 IdealPD stiffness/damping은0이므로 추가 position/velocity PD는 없다. Pure wrench
+분기는 pose 오차·속도 damping·operational-space inertia 역행렬을 사용하지 않는다.
+`impedance_mode=fixed`라는 이름만으로 motion damping이 작동한다고 해석하지 않는다.
+따라서 과거 pose OSC의 singular matrix inversion 실패 경로와 현재 경로를 구분한다.
+이는 과거CUDA719의 원인 해결을 뜻하지 않는다. Torque saturation은 중력 보상까지 포함한
+합산 토크에 적용되므로 Cartesian 목표 wrench를 항상 달성할 수 있는 것도 아니다.
+
+### Sensor 원점과 COM의 변환
+
+R을 sensor→base 회전, p를 base에서 sensor 원점 위치, c를 sensor축으로 표현한
+해당 link의 local COM offset이라 하면 다음 COM wrench가 필요하다.
+
+```text
+F_base = R * F_sensor
+M_COM_base = R * (M_sensor - c cross F_sensor)
+```
+
+Sensor distal link의 c는0이 아니라(0,0,0.0125)m다. `body_com_pos_b`는 robot base에서의
+COM 위치가 아니라 각 link frame에서의 local COM 위치다. Native OSC가 원래 더하는
+`p cross F_base`를 중복 적용하지 않도록 adapter는 먼저 sensor moment에서
+`(R^T*p+c) cross F_sensor`를 뺀다. Native 변환 후 위 식과 정확히 일치한다.
+PhysX Jacobian의 기준점이 link COM이라는 근거는
+[공식 Jacobian 설명](https://nvidia-omniverse.github.io/PhysX/physx/5.1.1/docs/Articulations.html#jacobian)에 있다.
+이동 기준점을 바꾼 뒤 moment가±8을 넘는 것만으로 clipping 오류라고 판단하지 않는다.
+±8N·m는 원래 sensor 원점의 한계다.
+
+### 미구현: OSC 내부 F/T 피드백
+
+`mdp/sensors.py`의 incoming joint wrench는 sensor joint의 parent→child reaction을 읽는다.
+Transition은 SI-200-8 clipping/resolution 모델 뒤 distal self-load를 빼서 정책 관측에 넣는다.
+이 값은 현재 action/controller에 전달되지 않는다. Observation에서의 자중·관성 제거와
+controller의 joint-space 중력 보상은 목적과 계산 경로가 다르다.
+
+공식 내부 gain을 켜는 것만으로는 원하는6축 센서 피드백이 구현되지 않는다.
+
+- Native controller의 `current_ee_force_b`는[N,3]이며 force feedback만 받는다.
+- Native controller는 measured moment에 desired moment를 대입하므로 torque 오차는0이다.
+- Native Action이 생성하는 ContactSensor는 제어 link인 sensor cylinder 자체의 접촉력이다.
+  Hand 전체가 sensor fixed joint를 통해 전달하는 하중이 아니다. Cylinder의 ContactReportAPI
+  누락 문제가 아니라 측정 대상이 다르다는 문제다.
+
+현재 incoming reaction 규약은 `reaction=self_load-external_on_hand`이므로 보상된 측정값의
+부호를 일반 ContactSensor의 force-on-body와 같다고 가정하지 않는다. 이후6축 보정 구현 시
+목표 wrench와 센서 측정의 원점·축·힘의 작용 방향을 먼저 맞춰야 한다. 114절에 기록한 대로
+기존 adapter에서 최신 보상된 F/T로 wrench를 보정하고 공식 OSC의J^T·중력·actuator는
+유지하는 방향이 남아 있다. 내부gain·보정 wrench 상한은 이번에 임의로 정하지 않았다.
+
+### 실제 주기와 sample/hold 의미
+
+현재 `sim.dt=0.01`, `decimation=2`이므로 physics·OSC100Hz, policy50Hz다.
+`shelf_manipulation_env_cfg.py`의 "Policy, physics and OSC all run at100Hz" 주석은 실제
+설정과 다르다. 이번에는 주기와 코드 주석을 수정하지 않고 차이를 기록했다.
+
+Native `process_actions`가 policy step에 sensor/task pose를 읽고 wrench를 base로 변환해
+`set_command`한다. 이후 physics substep에는 최신J·gravity를 사용하지만 원하는 wrench와
+축·COM moment 변환은 새로 하지 않는다. 따라서 policy 출력 시점의 sensor축으로 해석한
+명령을 base에서 유지하며, substep마다 변하는 현재 sensor축에 연속 추종하는 방식은 아니다.
+현재 sensor-frame 요구에 대한 시간적 의미를 내부 피드백 구현과 함께 명확히 해야 한다.
+Pure wrench0은 자세·속도 유지 명령이 아니며, 이를 정책이 학습하도록 한다는114절의 의도는
+유지한다. 이번에는 임의 pose 제어·감쇠 제어를 추가하지 않았다.
+
+### CPU 검증과 한계
+
+기존 `SensorFrameWrenchControllerTests`·`NativeArmEffortLimitTests`·`WrenchTests`·
+`SelfLoadCompensationTests` 총10개가 통과했다. 실제 체크아웃 controller/action을 실행하며
+1024개 회전·COM offset·환경 원점 변환, sensor clipping 순서, gravityOn/Off, 중복 moment
+반례와 effort 제출을 검증한다. 이는 새 physics 실험이 아니라 tensor 수준의 검증이다.
+
+추가 CPU 확인에서 J=identity·gravityOff·desired wrench=[1,2,3,4,5,6]일 때 현재None gain은
+measured force를[0,0,0]→[10,20,30]으로 바꾸어도 출력이 그대로였다. 공식gain을6축 모두2로
+준 진단에서는 force0→[3,6,9,4,5,6], force[0.5,1,1.5]→[2,4,6,4,5,6]으로 torque3개는
+측정 오차 보정을 받지 않음을 확인했다. `set_command` 없이 measured sensor pose만90°
+회전해도 desired base wrench가 유지됨을 확인했다. 실물/전체physics에서6축 힘 방향과
+추종 성능을 검증한 것으로 확대하지 않는다.
+
+
+## 131. 2026-11-07 — 설치된 OSC 옵션의 의미·기본값·현재 활성 경로
+
+사용자는 OSC 옵션을 구체적으로 분석하도록 요청했다. 현재 설치된
+`controllers/operational_space_cfg.py`·`operational_space.py`와
+`envs/mdp/actions/actions_cfg.py`·`task_space_actions.py`를 기준으로 확인했다.
+Controller·action·학습 설정은 변경하지 않았다. 새 GPU·시뮬레이션·학습도 실행하지 않았다.
+
+### ControllerCfg: 실제 제어 수식 선택
+
+| 옵션 | 설치된 기본값 | Symmetric 현재 값·효과 |
+|---|---|---|
+| `class_type` | `OperationalSpaceController` | 공식 controller |
+| `target_types` | 필수 지정 | `["wrench_abs"]`: 목표force3+moment3, pose target 없음 |
+| `motion_control_axes_task` | `(1,1,1,1,1,1)` | 전부0. task축의 병진/회전 pose 제어 선택 |
+| `contact_wrench_control_axes_task` | `(0,0,0,0,0,0)` | 전부1. task축의 force/moment 명령을 모두 적용하며 feedback 활성화 여부와는 별개 |
+| `inertial_dynamics_decoupling` | `False` | False. Pose motion 분기에서만 operational-space inertia를 곱함 |
+| `partial_inertial_dynamics_decoupling` | `False` | False. 위 motion 분기에서 병진/회전 inertia coupling을 무시하는 선택 |
+| `gravity_compensation` | `False` | True. 관절 중력 보상 토크를 합산 |
+| `impedance_mode` | `"fixed"` | fixed. Motion gain을 cfg값으로 고정. 정지/감쇠/중력보상의 동의어가 아님 |
+| `motion_stiffness_task` | 6축각100 | 기본값. Pose 목표가 없고 motion mask도0이므로 비활성 |
+| `motion_damping_ratio_task` | 6축각1 | 기본값. Motion에서 `Kd=2*sqrt(Kp)*zeta`. 현재 비활성 |
+| `motion_stiffness_limits_task` | `(0,1000)` | variable_kp/variable 입력 clipping용. 현재 비활성 |
+| `motion_damping_ratio_limits_task` | `(0,100)` | variable 입력 clipping용. 현재 비활성 |
+| `contact_wrench_stiffness_task` | `None` | None. Wrench P feedback이 꺼져 있음 |
+| `nullspace_control` | `"none"` | none. 공식구현은 position을 켜면 제어관절수>6을 요구 |
+| `nullspace_stiffness` | `10` | 기본값. 현재 비활성 |
+| `nullspace_damping_ratio` | `1` | 기본값. 현재 비활성 |
+
+`target_types`의 abs는 선택한 task frame에서 지정하는 절대 목표를 의미하며 world축 고정을
+의미하지 않는다. Pose relative만 지원하고 wrench relative target은 지원하지 않는다.
+Pose_abs는xyz+quaternion(wxyz)7D, pose_rel은delta_xyz+axis-angle3의6D,
+wrench_abs는force_xyz+moment_xyz6D다. 여러 target을 쓸 때는 list 순서로 연결한다.
+축 mask를0으로 해도 명령 채널 자체는 없어지지 않는다.
+
+`fixed`는 target 차원 그대로, `variable_kp`는 motion stiffness6개 추가,
+`variable`은 motion stiffness6개+damping ratio6개 추가다. Pure wrench에서는 각각
+Arm6/12/18D가 되지만 pose 목표가 없으므로 추가 motion gain은 torque에 효과가 없다.
+현재 프로젝트 adapter도 fixed+pure wrench만 허용하므로 mode 한 줄 변경으로 pose/hybrid
+제어 실험이 가능하지 않다. Sensor 원점 보정의 계약까지 재검토해야 한다.
+
+Pose motion이 있을 때의 제어 원리는 다음과 같다.
+
+```text
+u_motion = Kp * pose_error - Kd * current_ee_velocity
+W_motion = Lambda * u_motion   # inertia decoupling on
+W_motion = u_motion            # off
+tau_motion = J^T * S_motion * W_motion
+Lambda = inverse(J * inverse(M) * J^T)
+```
+
+Partial mode는 linear3x3와angular3x3를 따로 역행렬 계산하고 두 coupling을 무시한다.
+Full/partial 모두 damped inverse가 아니라 `torch.inverse`를 사용한다. 현재 wrench-only는
+`desired_ee_pose_b=None`이므로 이 분기에 들어가지 않는다. Decoupling을 켜는 것만으로
+force 제어에 관성 보상이 생기지 않는다. Controller에는 Coriolis/원심항과Jdot*qdot의 별도
+보상이 보이지 않으므로 이를 완전한 inverse-dynamics 보상이라고 설명하지 않는다.
+Motion gain의 물리 단위도 Lambda 사용에 따라 달라지며 Hand actuator stiffness와 혼동하지 않는다.
+
+Motion과wrench 축을 겹쳐 켜면 두 branch의 torque가 합산된다. 자동으로 한쪽을 우선하거나
+접촉 시 mode를 전환하는 기능이 아니다. 현재 순수 wrench 의도를 유지하면서 임의 pose
+목표나 속도 damping을 추가하지 않는다.
+
+### Force-feedback gain의 별도 의미
+
+`contact_wrench_stiffness_task`는 위치 오차에 곱하는 기계 stiffness가 아니라
+`W_cmd=W_desired+Kf*(W_desired-W_measured)`의 비례 gain이다. 같은 힘끼리 또는 같은
+moment끼리 비교하므로 무차원이다. `variable_kp`가 조절하는 motion gain과도 별개다.
+Native API는 measured force3만 받고 moment error를0으로 만들므로6개 gain을 주어도
+measured torque feedback은 생기지 않는다. Native Action의 direct-cylinder contact와
+우리 articulation-joint F/T가 다른 문제는130절을 따른다.
+
+Nullspace position은 controller에서6관절 이하를 명시적으로 거부한다. UR5e6관절에서 일부
+task축만 선택해도 이 검사를 통과하지 못하므로 singularity/self-collision 회피 옵션처럼
+켜서는 안 된다. Action의 nullspace target은none/zero/default/center이며 position mode와
+target 선택의 조합도 검사한다. 현재 none/none은 일관된다.
+
+### ActionCfg: 대상 frame과 policy 입력 해석
+
+| 옵션 | 현재 값·의미 |
+|---|---|
+| `class_type` | SensorFrameWrenchAction: sensor-origin clipping·COM 기준점 보정 |
+| `asset_name` | robot |
+| `joint_names` | torque를 받을 UR5e6관절 |
+| `body_name` | ToolForceTorqueLink: Jacobian/EEF 상태 대상 body |
+| `body_offset` | None. 가상 EEF offset을 쓰지 않으며 현재 adapter는 non-None을 거부 |
+| `task_frame_rel_path` | Robot/ToolForceTorqueLink. 명령과 axis mask 기준. 기본None은root/base |
+| `position_scale` | 기본1, 현재 pose가 없어 미사용 |
+| `orientation_scale` | 기본1, 현재 미사용. Pose_rel rotation-vector와pose_abs quaternion에 적용 |
+| `wrench_scale` | (10,10,10,1,1,1), raw1당10N/1N·m |
+| `stiffness_scale` | 기본1, variable_kp/variable에서만 입력 motion gain에 적용. 현재 미사용 |
+| `damping_ratio_scale` | 기본1, variable에서만 입력 damping ratio에 적용. 현재 미사용 |
+| `nullspace_joint_pos_target` | none |
+| `clip` | 상속필드 기본None. 설치된 native OSC Action은 wrench에 이 필드를 적용하지 않음 |
+| `debug_vis` | 상속필드 기본False. 해당 native Action의 별도 시각화 구현은 없음 |
+
+설치된 ActionCfg에는 force_scale/torque_scale 별도 필드가 없으며6축 `wrench_scale`을
+사용한다. Native wrench 입력에는 자동tanh·workspace clipping·wrench clipping이 없어서
+현재 adapter가 먼저 sensor-range clipping을 한다. Stiffness와damping ratio는 scale 후
+해당limit으로 clamp하고 controller에서도 다시 clamp한다.
+현재 adapter의 processed_actions 마지막3개는 native 변환에 필요한 기준점 보정을 포함한
+중간 moment이므로 이를 sensor-origin 목표 torque로 그대로 표시해서는 안 된다.
+
+### 공식 예제와 CPU 확인
+
+체크아웃 `scripts/tutorials/05_controllers/run_osc.py:127`은7관절Franka에서 pose_abs+wrench_abs,
+variable_kp, inertia decouplingOn, gravityOff를 사용한다. Motion은XY+회전, force는Z만
+선택하고 contact gainZ=0.1이다. TiltedWall에서 읽은 contact force를 전달하며 nullspace
+position도 사용한다. 이 값들을 그대로 UR5e6관절 순수wrench에 복사할 근거는 없다.
+
+추가 CPU 확인은 실제 controller class를 사용했다. J=identity, wrench=[1,2,3,4,5,6],
+gravityOff에서 motion Kp/zeta/mask 변경, full/partial inertia flag 활성화, variable_kp와
+variable 모두 같은 torque를 냈다. `torch.inverse` 호출을 금지한 상태로도 통과했다.
+Arm action dimension만 각각6/12/18로 달라졌다. Gravity vector를ones로 넣으면
+[2,3,4,5,6,7]이 되었고 wrench Z축만 선택하면[0,0,3,0,0,0]이었다. Nullspace position을
+6관절에서 켜면 공식 예외가 발생했다. 이는 현재 분기의 옵션 효과 확인이며 전체physics
+tracking이나 contact-force 제어를 새로 검증한 것은 아니다.
+
+### 후속 확인 — 최신3.0의6축 측정 피드백 지원 범위
+
+사용자가 버전 업그레이드로6축 피드백을 사용할 수 있는지 질문했다. GitHub API로 공식
+최신 GA가2026-10-20공개 `v3.0.0`임을 확인하고, 해당tag의 source와공식API 문서를 확인했다.
+기존 `isaaclab.controllers.OperationalSpaceController`는v3.0.0에서도 measured force3축을
+입력받고 measured moment를 desired moment로 채우므로 torque 오차는0이다.
+
+별도 공식 `isaaclab_newton.controllers.NewtonOperationalSpaceController`는
+`ee_wrench_des`·`ee_wrench`를각[N,6] force+moment로 받고 `use_wrench_feedback`·
+`wrench_stiffness`를 제공한다. 이controller 자체는 caller가Jacobian·dynamics를 제공하는
+model-free 방식이므로 문서상physics backend와 독립적이며 PhysX를 반드시Newton으로
+바꿔야 한다는 의미는 아니다.
+
+다만v3.0.0의 공식 `NewtonOperationalSpaceControllerAction`도 기본 측정 경로는
+ContactSensor의normal force3축이다. `newton_task_space_actions.py`에서 measured moment를
+desired moment로 채우므로 이Action을 그대로 쓰면 torque feedback은 여전히0이다.
+따라서 **새controller는6축을지원하지만버전또는ActionCfg교체만으로손목6축F/T가자동연결되지는
+않는다.** 실제 articulation-joint F/T를6D입력에 연결하고축·기준점·부호·보상을 맞춰야 한다.
+Newton Action의기본pose명령계약도현재purewrench action과다르므로drop-in교체로보지않는다.
+
+공식3.0release는IsaacSim6.2·Python3.12등을대상으로한다. 현재5.1환경에서이controller만
+가져오는호환성은시험하지않았다. 이번에는업그레이드·설치·코드변경·GPU실행을하지않았다.
+
+- [공식3.0릴리스](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0)
+- [6축NewtonOSC문서](https://isaac-sim.github.io/IsaacLab/v3.0.0/source/api/lab_newton/isaaclab_newton.controllers.html)
+- [기존OSC의3.0고정소스](https://github.com/isaac-sim/IsaacLab/blob/v3.0.0/source/isaaclab/isaaclab/controllers/operational_space.py)
+- [NewtonAction의측정연결](https://github.com/isaac-sim/IsaacLab/blob/v3.0.0/source/isaaclab_newton/isaaclab_newton/envs/mdp/actions/newton_task_space_actions.py)
+
+
+## 132. 2026-11-07 — 현재 버전 유지와6축 wrench 보정 구현 방향
+
+사용자는Newton적용의부담을고려해현재버전의공식OSC를활용하는방향을선택했다.
+이선택은프레임워크업그레이드나controller교체승인이아니다. 현재버전을유지하며기존
+`SensorFrameWrenchAction`에서6축오차보정만추가하고공식OSC의J^T·중력보상·IdealPD
+토크제한을계속사용하는안을검토했다. 아직실행코드는변경하지않았다.
+
+센서중심·축·부호를맞춘목표Wd와보상측정Wm에대해아래P보정을제안한다.
+
+```text
+Wm = calibrated_joint_reaction - distal_self_load
+Wc = clamp(Wd + K * (Wd - Wm), -sensor_command_limit, +sensor_command_limit)
+tau = native_OSC_Jt_mapping_and_gravity(Wc)
+```
+
+Force/torquegain은독립적으로설정한다. 공식 `contact_wrench_stiffness_task=None`을
+유지해native3축보정과중복적용하지않는다. 정책목표와내부보정명령을분리하고previous
+action·action-rate·PPO에는기존clipping된정책목표의의미를유지한다. Scale은한번만
+적용하고sensor원점의clipping뒤COM기준으로변환한다. 측정이무효인reset직후행에서는
+feedback만끄며무효측정을0으로대입해오차를증폭시키지않는다.
+
+현재보상측정은Hand가환경에가하는방향의reaction규약이다. 고정접촉의축별부호와
+negativefeedback여부를검증하기전gain을확정하지않는다. 자유공간에서보상측정0이면
+Wc=(I+K)Wd가되므로이보정이자동자세/속도유지나안정적인접근을보장하지는않는다.
+처음에는P만검토하며포화시적분누적이발생하는적분기는추가하지않는다.
+
+검증은현재sampled-basehold를유지한gain0기준선→force한축→force3축→torque한축→
+전체6축순서로구분한다. 현재sensorframe을매substep따라가는변경은gain0에서도기존
+동작과달라지므로별도비교해야한다. Target/측정을같은frame·원점으로환산하는것은필수다.
+공식예제의forceZ gain0.1은비교후보의근거일뿐torque권장값이나6축확정값이아니다.
+
+Physics주기의F/T루프는MDP전체transition/history나tactile17개조회경로를호출하지않는다.
+기존순수calibration/self-load함수를재사용하고질량·COM·관성은cache하며최신완료physics
+timestamp별로한번계산한측정값을controller와observation이공유하는방향이다. 추가비용은
+6축P수식보다SDK wrench/가속도취득과Hand self-load계산을실제측정해판단해야한다.
+설치된ArticulationData의incomingwrenchgetter는검사하는`timestamp`대신`time_stamp`를
+대입해같은시각의중복SDK조회가능성이있음을소스에서확인했다. 이문제는오래된측정값을
+반환한다는증거가아니며공식소스는이번에수정하지않았다. 자체공유timestampcache로
+중복조회를피하는방향을검토한다.
+
+이번에는문서기록과읽기전용설계검토만진행했다. Controller·gain·주기·frame동작을변경하거나
+GPU·시뮬레이션·학습을실행하지않았다.
+
+
+## 133. 2026-11-08 — 고정 wrench-feedback gain 선정안 기록과 현 상태 유지
+
+사용자는 고정 K의 결정 기준을 논의한 뒤 "일단 이건 기록해두고 현재 상태를 유지하자"고
+결정했다. 아래 내용은 후속 검토안이며 구현·gain 확정·실험 실행의 승인이 아니다.
+
+논의한 P 보정은 다음과 같다. 목표와 측정은 같은 sensor frame·원점·부호 규약을 사용한다.
+
+```text
+Wc = Wd + Kf * (Wd - Wm)
+Kf = diag(kFx, kFy, kFz, kTx, kTy, kTz)
+```
+
+`Kf`는 무차원 wrench 오차 보정 gain이다. 예를 들어 목표10N·측정8N에서 gain0.1이면
+명령은10.2N이다. Pose 변위에 대한 Cartesian stiffness(N/m, N·m/rad)나 motion Kp와는
+다르며, 정책이 Kf를 출력하는 것만으로 독립적인 stiffness·damping 제어가 되는 것은 아니다.
+고정 Kf라도 정책은 F/T 관측을 이용해 목표 wrench를 조절할 수 있지만, 내부 보정 gain 자체를
+선택하지는 못한다. 명시적인 compliance 학습의 정의와 action 확장은 아직 결정하지 않았다.
+
+Kf는 URDF의 관성만으로 유일하게 결정할 수 없다. 접촉 강성, 팔 자세별 유효 관성, Hand
+변형, 측정 잡음·보상 잔차·지연, 제어 주기와 관절 토크 포화가 함께 영향을 준다. 후속 선정은
+다음 기준으로 진행하는 안을 기록한다.
+
+1. Gain0 기준선에서 자유 공간의 보상 잔차·잡음과 접촉 시 축별 부호·기준점을 먼저 확인한다.
+2. 정책 대신 고정된 목표 wrench를 사용해 한 축씩 비교한다. 0·0.05·0.1·0.2는 탐색 후보이며
+   검증된 권장 범위나 확정값이 아니다. 힘과 토크 gain은 별도로 선정한다.
+3. 목표 도달 시간·정상상태 오차·overshoot·진동·관절 토크 포화를 함께 비교한다. 여러 팔
+   자세 및 고정 물체와 동적 물체 접촉에서 필요한 추종 성능을 만족하는 작은 gain을 고른다.
+4. 자유 공간에서 보상 측정이0이면 Wc=(I+Kf)Wd가 되어 가속 명령도 커진다. Gain 증가를
+   자동 자세 유지·정지 보장으로 해석하지 않으며, 포화 중 오차를 gain만으로 해결하지 않는다.
+
+공식 `scripts/tutorials/05_controllers/run_osc.py`는 hybrid pose+wrench 구성에서 force-Z에만
+gain0.1을 사용한다. 이는 초기 비교값의 근거이며 UR5e pure-wrench6축이나 torque gain의
+공식 적정값이 아니다. [공식 OSC 예제](https://isaac-sim.github.io/IsaacLab/v2.3.2/source/tutorials/05_controllers/run_osc.html)
+
+현재 실행 설정은 **Arm wrench6+Hand6, sensor frame, gravity compensation 활성,
+`contact_wrench_stiffness_task=None`**을 유지한다. 정책에는 자중·관성을 보상한 F/T가
+들어가지만 OSC 내부6축 오차 보정은 아직 미구현이다. 이번에는 문서만 갱신했으며 controller,
+gain, action 차원, 주기와 학습 설정을 변경하지 않고 GPU·시뮬레이션·학습도 실행하지 않았다.
+
+
+## 134. 2026-11-08 — F/T 사양과 자중·관성 보상 감사
+
+사용자는 메인 `contact_manipulation_symmetric`의 F/T가 SI-200-8 사양에 맞는지, 자중·관성
+보상이 의도대로 구현됐는지 검토하도록 요청했다. 실행 코드는 변경하지 않고 소스·공식 문서와
+기존 CPU 테스트를 확인했다. 실제 물리 실행에서 잔차를 측정한 검증과는 구분한다.
+
+### 측정 및 observation 경로
+
+`mdp/sensors.py:160`은 sensor distal link의 `body_incoming_joint_wrench_b`를 읽는다.
+Native Omni Physics107.3 문서는 child joint frame이라고 명시하며, 현재 scene은 그 원점과
+축을 sensor link 원점·축에 맞춘다. 로컬 Isaac Lab docstring의 parent-body-frame 문구만
+보고 추가 회전·모멘트 이동을 적용하면 안 된다. Known-load 물리 시험으로 부호도 확인해야 한다.
+
+```text
+ideal = incoming parent-on-child joint reaction, at sensor origin, sensor axes
+measured = round(clamp(ideal, -ranges, ranges) / resolution) * resolution
+observation_wrench = measured - modeled_distal_self_load
+observation = clamp(observation_wrench / ranges, -5, +5)
+```
+
+범위는force±(200,200,360)N, torque±(8,8,8)N·m, 분해능은force0.1N·torque0.005N·m로
+공식 SI-200-8 표와 일치한다. 포화 전 ideal 값으로 축별 overrange를 판정한다. 보상은 센서
+포화·양자화 뒤 적용하고 다시 양자화하지 않는다. 실제 센서 범위를 넘어 잃은 정보는 보상으로
+복원되지 않는다. 현재 finite한 overrange 표본도 observation에 들어가므로, 향후 내부 feedback
+도입 전 별도 유효성 정책을 정해야 한다.
+
+ATI 표의 분해능은 잡음을 고려한 유효 분해능이다. 현재 결정론적 반올림은 단순 근사이며
+잡음·bias·drift·축간 오차·필터·지연·복합하중은 모델링하지 않는다. 측정 범위와 기계적 파손/
+허용 과부하 한계도 다른 값이므로 현재 clamp를 물리적 파손 모델로 설명하지 않는다.
+
+### 자중·관성 보상 수식 확인
+
+`mdp/events.py:1165`는 sensor distal half와 모든 `/ROASRightHand/` body의 mass·COM·inertia를
+캐시한다. Proximal half는 sensing joint의 앞쪽이므로 제외한다. Native inertia는 COM 기준,
+link-prim 축의 column-major tensor이므로 현재 reshape·transpose와 link rotation이 맞다.
+COM principal rotation을 다시 곱하지 않는다.
+
+`mdp/observations.py:179`의 계산은 다음과 같다. 아래 F와 M은 world axes이며 마지막에
+sensor axes로 회전한다. Body COM 선형 가속도에는 구심 가속도가 이미 포함된다.
+
+```text
+Fi = mi * (ai_com - gravity)
+Mi_sensor = Ii_world * alpha_i + omega_i x (Ii_world * omega_i)
+            + (pi_com - p_sensor) x Fi
+Wself = sensor_rotation_inverse * [sum(Fi), sum(Mi_sensor)]
+```
+
+자중·병진/회전 관성·gyroscopic 항·모멘트 팔이 모두 포함돼 있으며 수식상 확인된 오류는
+없다. 입력 가속도는 native physics COM acceleration이고 reset pose의 차분이 아니다.
+보상 후 값은 이상적인 경우 Hand에 가해지는 외력의 반대 부호인 기존 reaction 규약을 유지한다.
+
+### 실제 보상 성능이 아직 입증되지 않은 지점
+
+- PhysX 반력은 한 physics step의 평균이며 보상은 현재 COM 가속도·angular velocity 표본을
+  사용한다. 급격한 운동·충격에서 시간 이산화 잔차가 남을 수 있다. 현재 policy50Hz는
+  physics100Hz의 마지막 표본을 사용하며 모든 중간 표본이나 실제 센서 대역폭을 재현하지 않는다.
+- PhysX는 armature를 외력과 유사한 항으로 취급한다. 새 Hand armature0.0001과 rigid-body
+  damping/clamping의 전달 하중을 rigid-link Newton–Euler만으로 완전히 제거한다고 단정할 수
+  없다. 실제 damping·gyro flag를 읽고 손가락만 가속하는 시험으로 잔차를 측정해야 한다.
+  임의의 armature*qddot 항을6축에 단순 합산하지 않는다.
+- 현재 센서는 length50mm·diameter50mm·mass0.20kg의 sensor/adapter proxy다. ATI 실물은
+  표준 plate 포함diameter82mm·height25.4mm·mass0.30kg이다. 기존5cm 연결부 요구에 따라
+  만든 근사이며 실물 datum·축·탄성·공진을 확인한 모델이 아니다. 이번에 형상·질량은 바꾸지 않았다.
+- Observation만 self-load를 제거한다. GUI와 F/T-growth reward, raw TensorBoard 측정은
+  보상 전 전체 반력이다. TensorBoard에는 보상 후 observation도 별도 항목으로 존재한다.
+  `previous_wrench`가 reset에서0이므로 첫 유효 표본의 자중도 growth로 계산될 수 있다.
+- 설치된 `ArticulationData`는 `.timestamp` 검사 뒤 `.time_stamp`를 대입한다. 동일 시각의
+  중복 SDK 조회 가능성이 있지만 자체 SensorReader cache가 정상 경로를 제한한다. 이는
+  보상 오차나 오래된 측정의 증거가 아니며 공식 소스도 변경하지 않았다.
+
+### 완료한 CPU 검증과 후속 물리 검증
+
+기존 검증31개가 통과했다: saturation/보상 수식·SensorReader·transition/cache13개,
+TensorBoard8개, GUI10개. 보상 수식은 별도 SciPy/NumPy oracle, 회전·이동 불변성과
+1024행 batch·subset·empty 및 hot path의 host 복사 부재를 포함한다. 실제 반력을 가상 입력한
+검증이므로 backend 잔차가 작다는 증거는 아니다. 중복 실행한 기본10개도 통과했으며31개에
+다시 더하지 않는다. `CUDA_VISIBLE_DEVICES=''`로 실행했고 Kit·GPU·시뮬레이션·학습은 실행하지 않았다.
+
+후속 물리 시험은 (1) 여러 sensor/Hand 자세에서 정지 중 중력과 모멘트, (2) 비접촉 arm
+병진·회전과 손가락 단독 가감속, (3) 알려진 외력 및 모멘트 팔을 가한 경우, (4) sensor 포화와
+reset 직후를 분리한다. 각 경우 ideal 반력·양자화 측정·예측 self-load·보상 잔차·overrange를
+같은 physics 시각으로 기록해야 한다. 현재 설정과 controller gain은 유지한다.
+
+- [ATI Axia80-M20 사양](https://www.ati-ia.com/products/ft/ft_models.aspx?id=Axia80-M20)
+- [ATI 매뉴얼](https://www.ati-ia.com/app_content/Documents/9620-05-B-Axia80.pdf)
+- [Native incoming-joint-force API](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/extensions/runtime/source/omni.physics.tensors/docs/api/python.html#omni.physics.tensors.impl.api.ArticulationView.get_link_incoming_joint_force)
+- [PhysX 반력의 포함 항과 시간 평균](https://nvidia-omniverse.github.io/PhysX/physx/5.5.1/docs/Articulations.html#link-incoming-joint-force)
+
+
+## 135. 2026-11-08 — Axia80-M20 형상·질량과 임시 연결 플랜지
+
+사용자는 실제 센서에 맞추되 길이가 미정인 연결 플랜지를 고려하도록 요청했다. 메인
+Symmetric만 수정하며 원본·parallel 프로젝트는 변경하지 않는다. 센서를 단순히 길게 늘리지
+않고 제조사 sensor assembly와 추가 custom flange를 구분한다.
+
+| 항목 | 설정 | 근거 |
+|---|---|---|
+| sensor assembly | Ø82mm·높이25.4mm·0.30kg | ATI 공식 사양, 표준 interface plate 포함 |
+| 추가 custom flange | 양쪽12.3mm·Ø50mm·총0.04kg | 기존 총50mm 간격 유지용 임시값, 실측 필요 |
+| 전체 tool–Hand 거리 | 50mm | 기존 장착 위치 유지 |
+| F/T reference | Tool Side 면 중심, tool 장착 시작점+37.7mm | 공식9230-05-1507 도면 |
+
+`scene.py` cfg의 `sensor_body_length=.0254`, `sensor_mount_radius=.041`,
+`sensor_mount_mass=.30`은 제조사 assembly의 치수·질량이다. `sensor_mount_length=.05`는
+전체 거리이며 플랜지의 한쪽 길이는 `(mount_length-body_length)/2`다.
+`sensor_flange_radius=.025`, `sensor_flange_mass=.04`는 추가 플랜지의 반경·총질량으로
+hardware 확인 후 바꿔야 한다. 내부 질량 분포는 공개되지 않아 균일 원통 근사를 유지한다.
+
+기존 proximal/distal 두 rigid link를 유지하고 각 링크에 센서 반쪽과 플랜지 한 개를 배치한다.
+질량은각0.17kg, COM과 COM 기준 관성은 질량 가중 평균·평행축 정리로 계산한다. 실제 Hand
+장착점은 tool 시작점+50mm 그대로다. COM·관성을 읽는 기존 보상과 OSC가 native 변경값을
+자동 사용하며 별도 hardcoded payload mass나 COM 보정은 추가하지 않는다.
+
+공식 도면을 이미지로 확인한 결과 sensing reference origin은 센서 중앙이 아니라 Tool Side
+면이다. 두 link actor frame과 equivalent incoming joint frame을 이 원점에 두고, geometry와
+COM offset을 함께−12.7mm 옮겨 실제 형상·질량 분포는 보존한다. Distal COM은sensor frame
+기준Z=−4.8794118mm, proximal은−20.5205882mm다. 센서 내부 strain-gauge 위치를 가정하는
+것이 아니라 제조사 기준점에서 wrench를 표현하는 fixed joint다. Sensor X/Y의 실물 장착 yaw는
+추후 확인해야 한다. 기준점 변경으로 기존 checkpoint의 action/observation 의미도 달라지므로
+그대로 play한 결과를 변경 전과 동일 조건으로 취급하지 않는다.
+
+기존 native API를 사용하며 F/T 범위·분해능·gravity compensation·IdealPD·Hand 구동,
+Arm6+Hand6 action, reward와 주기는 유지한다. OSC 내부 F/T feedback은 계속 OFF다.
+물리 mount·질량·좌표계 변경 관련14개 CPU 검증이 통과했다. 회전된5개 world frame에서
+reference·COM·형상·Hand 장착점의 일관성도 검사했다. 이후 영상 시험 결과는 별도 기록한다.
+
+- [ATI 물리 사양](https://www.ati-ia.com/products/ft/ft_models.aspx?id=Axia80-M20)
+- [공식 reference 도면](https://www.ati-ia.com/app_content/Documents/9230-05-1507.auto.pdf)
+
+
+## 136. 2026-11-08 — Armature 적용 후 Hand 전체 이동300g 밀기 영상
+
+사용자는 armature 변경 뒤 물체 밀기 영상도 남기도록 요청했다. 124절과 같은 protocol을
+현재 Symmetric Hand 설정으로 다시 실행했다. 상자300g·기본마찰0.5/0.5, 12관절 목표0rad
+유지, 기부 native prismatic drive로100mm 전진2초·유지2초·복귀2초와 앞뒤 정지1초씩이다.
+각 검지·중지·약지·소지·엄지 앞 배치를800step·8초씩 촬영했고 전체40초로 연결했다.
+
+Native backend12관절에서 Force drive·Kp20·Kd1·effort limit1N·m·armature0.0001kg·m²와
+URDF 속도 상한을 확인했다. 상태/root pose를 매 step 덮어쓰지 않으며 기존 진단 기부 drive의
+설정과 Hand 자중 제외 조건도 유지했다. 이 시험은 UR5e·OSC로 기부를 구동한 시험이 아니다.
+공유 probe의 영상 표시만 native 설정·armature가 항상 보이도록 보완했다.
+
+| 배치 | 최대 상자 XY 이동(mm) | 전체 Hand 최대 하한 위반(°) | 최대 Hand–상자 법선 합력(N) | 전진/유지400step 접촉 |
+|---|---:|---:|---:|---:|
+| Index | 89.140 | 0.001633 | 3.991 | 358 |
+| Middle | 88.588 | 0.006304 | 2.850 | 357 |
+| Ring | 88.973 | 0.000897 | 3.527 | 358 |
+| Little | 89.422 | 0.002113 | 2.670 | 359 |
+| Thumb | 75.156 | 0.004616 | 5.828 | 334 |
+
+모든 실행 status는complete이고 상한 위반은 없었다. Console에서 CUDA/PhysX failure나
+overflow는 발견되지 않았다. 영상에 native PD·effort·armature, 관절각·하한 위반, 기부
+실제/목표 위치, 상자 변위/기울기, 링크별 법선 접촉 합력을 표시한다. 접선 마찰력·개별 접촉점
+힘·측정 모터 torque로 해석하지 않는다.
+
+이전124절의 Index 이동 약7.47mm·하한 위반 약51.51°에 비해 현재89.14mm·0.00163°로
+개선됐다. 이는 해당0rad hard-stop·기부 이동 조건의 비교이며, 중간 flexion에서의 접촉 변형,
+실물 Hand의 강성/감쇠 일치, 학습 정책의 밀기 성능이나 CUDA719 해결을 입증하지 않는다.
+
+- 영상: `docs/videos/hand_armature_push_2026-11-08/all_fingers.mp4` (40s·25fps·1000frames).
+- 미리보기: `docs/videos/hand_armature_push_2026-11-08/preview.png`.
+- 원자료·요약·재현 명령: `logs/diagnostics/hand_armature_push_2026-11-08/`.
+- 모든 GPU 프로세스가 종료된 후 F/T 시험에 GPU를 넘겼다. 학습은 실행하지 않았다.
+
+
+## 137. 2026-11-08 — Production OSC로 흔들며 F/T 자중·관성 보상 촬영
+
+사용자는 센서 frame gizmo와 F/T 값을 동시에 보여주는 흔들기 영상, 특히 OSC로 명령하는
+시험을 요청했다. `src/contact_manipulation_symmetric/tests/probe_ft_compensation.py` 한 파일로
+재현용 진단을 추가했다. 학습용 robot assembly·질량·관성·armature·중력·공식 controller와
+생산용 `SensorFrameWrenchAction`·`UrdfCoupledHandAction`을 사용한다. Shelf·물체·policy·
+reward·termination은 없는 단일 articulation 시험이며 controller 설정은 바꾸지 않는다.
+
+Native OSC action은policy50Hz에 명령을 갱신하고 physics100Hz에 적용한다. SensorReader와
+기존 calibration/self_motion_wrench 함수로 실제 반력을 매 physics step 기록한다. 목표
+wrench와 측정 wrench는 서로 다른 의미다. 비접촉에서 목표 wrench는 운동을 유발하고,
+보상한 F/T는 외부 접촉이 없으므로0에 가까운 것이 기대된다. OSC 내부 F/T feedback은 OFF다.
+
+초기에는 native `write_joint_state_to_sim`으로 학습용 default pose/velocity를 한 번 적용한다.
+이후 모든 운동은 실제 제출 torque와 native dynamics에 의해 발생하며 q/root를 매 step
+덮어쓰지 않는다. 초기 bare Articulation에 default state를 쓰지 않은 예비 실행은 authored
+zero-q에서 시작한 진단 설정 오류였으며 `smoke_authored_zero_pose*`로 따로 보존했다.
+본 결과는 수정된 초기화와 실제 production 초기 관절각을 확인한 실행만 사용한다.
+
+### 명령·표시·실행 조건
+
+- 2초 zero-wrench → forceX/Y/Z 각2초 → torqueX/Y/Z 각2초 → 손가락 open/close5초 →
+  final zero-wrench2초, 합계21초·2100physics step.
+- 축별 명령은 `A*(cos(2*pi*f*t)-cos(4*pi*f*t))`, f=1Hz다. Force A=0.6N(절댓값≤1.2N),
+  torque A=0.012N·m(절댓값≤0.024N·m). Raw policy 단위로 환산한 뒤 생산용 action을 통과한다.
+- 2rad/s는 진단 중 과도한 arm 속도를 발견해 중단할 기준일 뿐 생산용 종료 조건 변경이 아니다.
+  실제 최대 arm 속도는1.50227rad/s였고 안전 중단은 없었다.
+- 0.17kg distal sensor body와 COM z=−0.0048794118m의 native readback을 확인했다.
+  실제41body USD 속성은linear damping0·angular damping0.05·gyroscopic forcesTrue였으며
+  어느 값도 진단을 위해 변경하지 않았다.
+- 영상은25fps·525frames·1280×1088·1배속이다. 전체 robot과 Hand/sensor 확대를 보여주고,
+  Tool Side reference 원점의 native frame gizmo(X/Y/Z=빨강/초록/파랑)와6축 그래프를 표시한다.
+  명령, 전체 센서 측정, 예측 self-load, 보상 후 observation 값을 함께 볼 수 있다.
+- Marker에 RigidBodyAPI/CollisionAPI가 없음을 runtime 검사했다. Camera와 gizmo는 시각화용이다.
+
+### 정량 결과
+
+아래 RMS는 초기1초 이후 모든 표본을 합산한 축별 값이다. 아래 최대 잔차는 전체21초에서도
+동일했다. 모든2100표본이 유한하고 overrange0·tactile 접촉0이었다.
+
+| 축 | 보상 전 측정 RMS | 보상 후 RMS | 보상 후 최대 절댓값 |
+|---|---:|---:|---:|
+| Fx (N) | 8.77908 | 0.027661 | 0.049942 |
+| Fy (N) | 0.85609 | 0.027226 | 0.049981 |
+| Fz (N) | 2.91843 | 0.027999 | 0.049940 |
+| Tx (N·m) | 0.10588 | 0.001501 | 0.002845 |
+| Ty (N·m) | 0.83014 | 0.001347 | 0.002860 |
+| Tz (N·m) | 0.10693 | 0.001834 | 0.004840 |
+
+양자화 전 ideal reaction에서 self-load를 뺀 힘 잔차 최대는6.20e−6N이었다. 힘은 현재
+0.1N 반올림의 절반 이내 잔차와 일치한다. Ideal torque 잔차 최대는0.002818N·m로 작지만
+0은 아니었다. 따라서 실제 링크 관성 보상이 이 운동 범위에서 작동함은 확인했으나
+armature·rigid-body damping·평균/현재 표본 차이의 각 기여를 개별 규명한 것은 아니다.
+
+고정된 default pose의 zero-wrench 구간(t=1–2s) sensor translation 범위는축별약20–27μm였다.
+Force 구간에서는 축별 수mm–약30mm 이동하고 rotation 약6–9°, torque-Z 약19°,
+손가락 운동 구간 약22°의 자세 변화가 기록됐다. Zero-wrench는 pose-hold controller를
+추가한 것이 아니며 운동 후 잔여 속도가 즉시 사라지는 조건도 아니다.
+
+### 검증 범위와 산출물
+
+초기 영상은 Hand가 팔 뒤로 가려져 카메라 각도와 marker scale만 조정해 다시 촬영했다.
+두 실행의 모든2100step에서 joint position·raw wrench·self-load·명령이 bit-exact하게
+동일했다. 최종 MP4의 프레임은 같은 시각의 최종 JSON 표본과 대응한다. 초기 영상은
+`first_view*`로 보존했다. 실제 외력을 알고 가한 교정 시험, 센서 full-scale/과부하, 물체 접촉
+추종, 실물 sensor 노이즈·지연·내부 탄성 검증으로 확대하지 않는다.
+
+- 최종 영상: `docs/videos/ft_compensation_2026-11-08/ft_shake.mp4`.
+- 최종 원자료: `logs/diagnostics/ft_compensation_2026-11-08/report.json`.
+- 실행 console/예비 결과: 같은 diagnostic directory. Sandbox에서 GPU가 보이지 않아 실패한
+  초기 실행은 `sandbox_no_device.log`이며 실제 GPU 고장으로 해석하지 않는다.
+- 기존 mount·wrench·보상 관련14개 CPU 검증과 진단 syntax/overlay 검증도 통과했다.
+  실제 학습이나 PPO update는 실행하지 않았다.
+
+재현:
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --headless --device cuda:0 --force-amplitude .6 --torque-amplitude .012
+```
+
+
+## 138. 2026-11-08 — 17개 Tactile의 실제 접촉·분리 영상
+
+사용자는 예전에 확인했던 tactile 시험도 영상으로 남기기를 요청했다. 기존
+`src/contact_manipulation_symmetric/tests/probe_ft_compensation.py`에 `--tactile-scan` mode를
+추가했다. 기본 F/T 흔들기 mode는 유지하며 새 진단 파일이나 학습용 sensor/controller 변경은 없다.
+전체 UR5e·센서 연결부·Hand, 현재 PD20/1·armature0.0001·URDF 한계와 production action을 사용한다.
+
+### 실제 측정 경로와 시험 방법
+
+- 순서는 Palm1, Thumb4, Index/Middle/Ring/Little 각3개로 총17개다. URDF의 Palm 이름
+  `right_plam_force_sensor` 철자는 원본 그대로 사용하며 canonical mapping을 runtime 확인한다.
+- Production grouped `ContactSensor`→`SensorReader`의 native `net_forces_w`를 canonical
+  순서로 정렬하고, 유한하고 유효한 값에서 `norm(force)>0.01N`이면 ON이다. 모든 물체에 대한
+  binary이며 Blocker 필터 reward를 시험한 것은 아니다. 강제로 특정 채널을 켜지 않는다.
+- 표시할 binary를 기존 `dynamic_sample()`에 전달하고 observation의 tactile slot37:54와
+  같은지 검사한다. 이는 slot/encoding 검사이며 전체 ManagerBased MDP transition 실행은 아니다.
+- 별도의 공식 rigid contact view를17sensor×1probe 필터로 생성한다. Sensor path 순서와
+  크기·유한성을 확인하며, 같은 시점의 해당 채널 binary ON과 probe-only 반력>0.01N을
+  동시에 요구해 자체 접촉에 의한 거짓 통과를 방지한다.
+- 외부 probe는 지름3mm·질량10g·중력 OFF인 동적 sphere다. World-anchored native
+  PrismaticJoint/DriveAPI(Kp200N/m·Kd2N·s/m·최대1N)로 실제 접근·복귀한다. 초기 표면 간격6mm,
+  추가 목표 stroke1.5mm이며 실제 접촉 변형·변위는 PhysX가 계산한다.
+- 각 pad는 baseline0.4초→approach0.7초→drive target hold0.8초→release0.7초→clear0.4초,
+  합계3초다. 각 시험 사이에만 robot/probe 초기 상태와 guide 기준을 native API로 복구한다.
+  접촉 중 q/root를 반복해서 덮어쓰지 않는다. Arm은 기존 zero-wrench OSC·gravity compensation,
+  Hand는 열린 목표를 유지하므로 접촉력으로 팔이 밀려나며 contact가 일찍 끝날 수 있다.
+  `hold`는 guide 목표 유지이며 지속 접촉 제어를 추가한 것이 아니다.
+- Sensor 기록은 physics100Hz, policy 표본은50Hz로 구분한다. 두 시점 모두 실제 ON이
+  있음을 확인했으며 영상은25fps·1배속이다. GUI용 camera와 색 marker/frame gizmo에는
+  RigidBodyAPI·CollisionAPI가 없음을 검사했다. 시험 구 자체에는 의도한 실제 물리가 있다.
+
+### 최종 결과
+
+동일 지름3mm 구를 사용한17개가 모두 baseline OFF→실제 probe 접촉 ON→분리 후 OFF를
+통과했다. 총5100physics 표본·51초다. 최종 MP4는1280×1040·25fps·1275frames이며
+실제 영상 metadata와 프레임 수를 별도로 확인했다. 모든 표본의 valid가True이고 힘이 유한했다.
+17개 모든 net force와 probe-only force의 norm 차이는 전체 표본에서0이었다. 각 시험에서
+ON이었던 채널은 선택한 pad 하나뿐이었으며, clear 마지막10표본은 모두 OFF였다.
+
+| 채널 | Pad | 최대 법선 합력(N) | 접촉 ON 표본(100Hz) | 정책 시점 ON 표본(50Hz) |
+|---|---|---:|---:|---:|
+| 0 | Palm | 0.155396 | 18 | 9 |
+| 1 | Thumb1 | 0.142506 | 21 | 11 |
+| 2 | Thumb2 | 0.145309 | 17 | 9 |
+| 3 | Thumb3 | 0.116685 | 13 | 7 |
+| 4 | Thumb4 | 0.187300 | 29 | 14 |
+| 5 | Index1 | 0.125213 | 16 | 8 |
+| 6 | Index2 | 0.102209 | 13 | 7 |
+| 7 | Index3 | 0.190025 | 22 | 11 |
+| 8 | Middle1 | 0.145386 | 17 | 8 |
+| 9 | Middle2 | 0.098908 | 13 | 6 |
+| 10 | Middle3 | 0.183358 | 24 | 12 |
+| 11 | Ring1 | 0.133027 | 15 | 7 |
+| 12 | Ring2 | 0.100454 | 12 | 6 |
+| 13 | Ring3 | 0.209241 | 23 | 11 |
+| 14 | Little1 | 0.110856 | 12 | 6 |
+| 15 | Little2 | 0.082529 | 10 | 5 |
+| 16 | Little3 | 0.092199 | 9 | 4 |
+
+영상은 손 전체와 접촉부 확대,17채널 ON/OFF/invalid, 선택 pad의 법선 합력과0.01N 기준선,
+sensor frame gizmo를 함께 표시한다. Green은 실제 ON, gray는 OFF, amber는 invalid이고
+cyan 테두리는 시험 대상으로서 접촉 표시와 구분한다. 값은 법선 합력이며 압력·접선 마찰력·
+개별 접촉점 힘으로 해석하지 않는다. PNG는 실제 ON인 렌더링 표본을 사용한다.
+
+### 시험 중 발견과 검증 범위
+
+초기 kinematic anchor 시험은 pose write 뒤 이전 주차 target으로 복귀하여 접촉이 생기지
+않았다. 별도의 `set_kinematic_targets()` 시도는 이 GPU backend에서 미구현 오류가 났다.
+최종 fixture는 kinematic anchor를 제거하고 world joint의 기준을 시험 사이에만 옮긴다.
+이 예비 실패를 학습 sensor의 고장이나 GPU launch failure로 해석하지 않는다.
+
+앞선 지름6mm 구의51초 시험은16/17만 통과하고 Little3는 반력이0이었다. 같은 표면 대표점과
+접근 방향에서 지름3mm로 바꾸자 Little3가 통과했고, 최종본은 모든 pad를 같은3mm로 다시
+촬영했다. Little3 pad의 원본 크기는약6.47×4.66mm다. CPU STL 분석에서6mm 구와 부모
+`right_little_2`의 여유가약0.395mm여서 주변 형상 선접촉 가능성을 뒷받침하나, cooked shape별
+접촉을 분리한 검증은 아니다. 단일 원인을 확정하지 않으며 production collider는 변경하지 않는다.
+큰 물체·넓은 접촉면·모든 pad 위치에서 감지된다는 보장이나 실물 tactile 교정 결과가 아니다.
+특히 접촉 coverage와 지속 접촉 제어는 후속 검토 대상으로 남긴다.
+
+- 최종 영상/PNG: `docs/videos/tactile_contact_2026-11-08/all_pads.mp4`, `preview.png`, `pad_00.png`–`pad_16.png`.
+- 최종 원자료·명령·console: `logs/diagnostics/tactile_contact_2026-11-08/`의 `report.json`, `commands.json`, `console.log`.
+- 예비 실패는 `smoke*`, 지름6mm 결과는 `first_pass_6mm_probe.json/.mp4`로 보존한다.
+- 기존 sensor/GUI 관련 CPU16개 검증과 진단 syntax·채널·실제 접촉 대조를 확인했다.
+  최종 console에 Error·CUDA error·overflow는 없었고 GPU 진단 프로세스도 모두 종료했다.
+  실제 학습이나 PPO update는 실행하지 않았다.
+
+재현:
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --tactile-scan --headless --device cuda:0
+```
+
+
+## 139. 2026-11-08 — UR5e·F/T·Hand 결합 시스템의 OSC 물체 밀기 영상
+
+사용자는 Hand 단독 기부 이동 시험을 넘어, 실제 UR5e·F/T·Hand 결합 시스템을 OSC로
+구동해 물체를 미는 영상을 요청했다. 기존 `probe_ft_compensation.py`에 `--osc-push`를
+추가했다. **학습된 policy의 성능 시험이 아니라 scripted 6D wrench를 실제 production
+`SensorFrameWrenchAction`·공식 OSC·IdealPD에 전달하는 통합 구동 시험**이다.
+학습용 robot·collider·질량·관성·Hand actuator·reward·termination·OSC 설정은 바꾸지 않았다.
+
+### 초기 기하와 명령 경로
+
+- Production default의 Palm은 아래를 향하므로, 초기화 때만 `wrist_3_joint`에 +π/2를
+  더해 pad 법선을 수평으로 맞췄다. Shoulder/elbow 초기각은 유지한다. Hand는 native
+  joint-limit mapping의 fraction0.15를6개 action으로 입력하고 URDF multiplier로12개
+  목표각을 만든다. 초기 joint state와 box pose/velocity만 한 번 배치하며 이후 덮어쓰지 않는다.
+- Box는220×180×200mm·0.300kg dynamic cuboid이며 중력 ON, 공식 기본 마찰계수
+  static/dynamic0.5/0.5다. 지지면은 높이1.36m의 never-moved kinematic cuboid다.
+  물체·Hand에 guide를 연결하거나 외부 body force로 이동시키지 않는다.
+- 원본 Hand collision container 아래 mesh를 실제 native body pose로 변환해 box의 초기
+  앞면을 배치했다. 초기 Hand 최저점은1.445879m로 지지면보다약85.9mm 높다. 초기 box
+  중심은 `(-0.641022, -0.154719, 1.460500)m`, 수평 밀기 방향은약
+  `(-0.247404, -0.968912, 0)`이다. 실제 물리 접촉 형상은 수정하지 않았다.
+- Baseline1.2초→approach1.6초→push1.6초→brake0.8초→settle2.4초, 총7.6초다.
+  최대 수평 힘1.8N을 부드럽게 명령하고 접촉 중 `r×F` 모멘트를 더한다. 물체가8cm
+  이동하면 이후 force schedule을 중단하고 −1N half-sine0.6초의 제동 명령으로 전환한다.
+- 자유 회전을 억제하기 위해 **진단용 명령 생성기에만** 초기 센서 자세에 대한 angular PD를
+  사용했다. 공식 `compute_pose_error()`의 회전 오차에 Kp0.5N·m/rad·Kd0.02N·m·s/rad를
+  적용하고 보정 torque norm을1.5N·m로 제한한다. 이는 목표6D wrench의 torque 성분을
+  만드는 시험 script이며 production OSC의 내부 pose/힘 controller를 바꾼 것이 아니다.
+  OSC 내부6축 F/T feedback은 계속 OFF이고, 이번 시험은 F/T 오차 추종 검증이 아니다.
+- 실제 제어는 physics/OSC100Hz·명령 갱신50Hz다. Sensor-origin wrench scale·clip·COM
+  변환과 gravity compensation·IdealPD150/28N·m 상한, Hand PD20/1·effort1N·m·
+  armature0.0001을 그대로 사용한다. Camera·frame gizmo·영상 overlay는 물리에 참여하지 않는다.
+
+### 최종 촬영의 실제 결과
+
+최종 `report.json`의760physics 표본을 기준으로 하며, 같은 설정의 예비 `smoke5.json`
+수치를 최종 촬영 결과로 대신 사용하지 않는다.
+최종 MP4는1280×1264·25fps·190frames·7.6초이며 실제 영상 metadata와 프레임 수를 확인했다.
+
+| 측정 항목 | 최종 촬영 결과 |
+|---|---:|
+| 최종 밀기 방향 변위 | 85.8038mm |
+| 최대 밀기 방향 변위 | 85.8045mm |
+| 최대 box 기울기 | 0.01978° |
+| 최저 OBB corner의 최소 높이 | 1.359997m |
+| 지지면 XY 경계 밖으로 나온 최대 거리 | 0m |
+| Hand–box 법선 합력 최대 | 2.09775N |
+| 12개 Hand 관절의 최대 목표 오차 | 0.43421° |
+| Hand URDF 위치 한계 최대 위반 | 0rad |
+| Arm 최대 관절 속도 | 1.34787rad/s |
+| SI-200-8 overrange 표본 | 0/760 |
+| 17개 tactile ON 표본 | 0/760 |
+
+**물체가 이동했지만17개 tactile은 모두 OFF였다.** 별도의 native Hand-body×box contact
+view에서 실제 접촉은 `right_middle_2`(최대1.59175N), `right_thumb_2`(1.73439N),
+`right_thumb_3`(2.09775N)에 기록됐고 모든 tactile body의 box 반력은0이었다. 각 body의
+최대치는 서로 다른 시점일 수 있으므로 합산하지 않는다. 이 결과는 Hand 본체로 힘을
+전달해 밀었음을 보여주며, pad면 접촉 유지·17채널 감지 coverage를 확인한 결과는 아니다.
+주변 collision 형상과 pad 노출 관계는138절의 소지 끝 문제와 함께 후속 검토 대상으로 남긴다.
+
+실제 raw OSC torque와 IdealPD 제출 torque는 모든 표본에서 같았고, 각 축 최대 절댓값은
+약 `[1.046, 13.823, 18.593, 2.621, 0.641, 0.087]N·m`로 상한에 도달하지 않았다.
+F/T 보상값은 이 접촉 중0이어야 하는 값이 아니다. 영상에는 명령·전체 측정·예측 self-load·
+보상 후6축, sensor frame gizmo, box 변위·기울기, Hand 오차·한계 위반,17개 실제 binary를
+동시에 표시한다. 명령 wrench·측정 F/T·법선 접촉 합력은 서로 다른 측정량으로 구분한다.
+
+### 예비 실행과 해석의 범위
+
+- `smoke2.json`: 열린 Hand·최대2.2N에서 물체가약335.4mm 이동해 진단 경계로 중단됐다.
+- `smoke3.json`: 제동으로 물체 이동은약109.3mm였지만 Hand가 크게 회전했다. Pure wrench의
+  zero command는 자세 유지 명령이 아니므로 이를 물체 밀기 성공의 충분한 기준으로 삼지 않았다.
+- `smoke4.json`: 진단 angular PD3/0.6에서 baseline11step 중 arm 속도3.004rad/s로 중단됐다.
+  Gain을 키우는 것만으로 자세가 안정된다고 판단하지 않는다. Production 설정은 변경하지 않았다.
+- `smoke5.json`: 진단 angular PD0.5/0.02·fraction0.15·최대1.8N에서86.2363mm 이동했다.
+  최종 영상은 같은 조건을 별도 실행한85.8038mm 결과다. 두 실행을 bit-exact하다고 주장하지 않는다.
+
+통합 시스템이 실제 OSC torque로 지지된 물체를 밀 수 있음을 확인한 시험이다. 학습 policy의
+rapid manipulation, pad로 지속 접촉, 모든 자세의 안정성, 센서 외력 교정, 실물 일치나
+과거 CUDA719의 원인 해결까지 검증한 것은 아니다. 학습이나 PPO update는 실행하지 않았다.
+
+- 영상: `docs/videos/osc_hand_push_2026-11-08/osc_push.mp4`.
+- 최종 원자료: `logs/diagnostics/osc_hand_push_2026-11-08/report.json`.
+- 예비 원자료는 같은 directory의 `smoke2.json`–`smoke5.json`으로 보존한다.
+- `path_order_check.json`의1step 추가 확인에서32개 Hand body와1개 box의 native contact
+  view 순서가 기록 이름과 일치함을 검사했다. 최종 영상과 실제 측정 표본을 대조하고
+  `summary.json`·`commands.json`·접촉 중 미리보기도 저장했다. Console에 Error·CUDA error·
+  overflow는 없었고 모든 GPU 진단 프로세스가 종료됐음을 확인했다.
+
+재현:
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-push --headless --device cuda:0 --push-force 1.8 --push-hand-fraction .15 \
+  --push-orientation-kp .5 --push-orientation-kd .02
+```
+
+
+## 140. 2026-11-08 — 사전 카탈로그 없는 9단계 순차 스폰 예시
+
+### 요청과 구현 범위
+
+사용자는 기존 배치를 교체할 후보로 Target 종류·yaw 선택 → Target 배치 → 정면 폭에
+margin을 더한 Clearance 설정 → Blocker 선택 → 정면 가로폭10–50% 겹침 배치 → 재배치 영역
+예약 → 남은 공간 채우기 → 정면 ray cast → 로봇 자세 randomization의9단계를 지정했다.
+가림은 실제 메시 실루엣 면적이 아닌 **정면 가로폭의 겹침 비율**로 확정했다. 추가로 재배치
+영역은 Clearance 좌우 경계에 붙어야 하며, 그 영역 앞에서 선반 정면까지 같은 폭을 비운다.
+
+`src/contact_manipulation_symmetric/tests/probe_sequential_spawn.py` 단일 진단 파일을 추가했다.
+학습용 환경 설정·reset·reward·termination·모델·제어 코드는 변경하지 않았다. 진단 cfg에서
+기존 reset 이벤트를 연결하지 않고 `generation_mode=sequential_probe`로 고정 자원을 초기화한다.
+카탈로그 초기화·기존 FFT·MILP 진입점은 호출하면 예외를 내도록 진단 프로세스에서만 막았다.
+USD 고정 형상, ray mesh BVH와 RobotPoseModel은 처음 한 번 준비하며 장면의 사전 도메인
+카탈로그는 읽거나 만들지 않는다. 이 고정 자원 준비와 생성9단계의 시간을 분리했다.
+
+### 실제 한 장면
+
+- Seed0, Clearance 좌우 margin은 각각10mm의 임시 예시 값.
+- Target: YCB003 cracker box1개, Blocker: cup_1.
+- 총25개: Target1, cup_1·bottle_1·can_1·mustard 각각5, mug_1은4개.
+- 최종 카메라의 정면 원근 투영에서 지정 Blocker와 Target의 가로폭 겹침은10.50963196%.
+  이는 실제 가려진 실루엣 면적이10.51%라는 뜻이 아니다.
+- 재배치 영역2개는 각각 Clearance 좌우 Y 경계와 정확히 접한다. Blocker 전체가 들어가는
+  공간이며 goal yaw는 초기 Blocker와 같다. 두 영역 앞의 같은 Y 폭 통로는 실제 선반
+  정면까지 비어 있다. 초기 Blocker도 이 영역·통로를 침범하지 않는다.
+- 실제 collision footprint의 모든 쌍에 초기 겹침이 없고, support 경계 밖 물체·주변 물체의
+  Clearance/예약 영역/앞 통로 침범이 없다. 독립 CPU SAT/거리 검증의 최소 물체 간격은4.069mm.
+- object-only64×48 ray cast에서 Target·Blocker를 포함해10개 유효 observation OBB를 얻었다.
+- 기존 batched IK의 검증된 anchor 이후 연속 위치·회전 후보를 새로 뽑았다. Anchor 후보1,
+  선택 후보5였고 anchor fallback은 없었다. 관절 한계·elbow-up·로봇 충돌 검사에 더해 실제
+  articulation FK 일치를 확인했다. 실제 physics integration이나 policy/PPO update는 실행하지 않았다.
+
+### 시간 측정
+
+RTX3090, CUDA0,1환경에서 `torch.cuda.synchronize()` 전후 wall time을 측정했다.
+배치는 CPU numpy 기하이며 ray cast와 batched IK는 CUDA다. 같은 seed·동일 장면을3회 더
+계산하고 좌표가 첫 장면과 같음을 assert했다. 아래는 첫 호출과 반복3회의 단계별 중앙값이다.
+렌더링을 단계 사이에 넣어 계산 시간을 부풀리지 않고, 먼저1–7단계를 저장한 후 각 중간 상태를 촬영했다.
+
+| 단계 | 첫 호출 ms | 반복 중앙값 ms |
+|---|---:|---:|
+| 1 Target 선택 | 0.167 | 0.154 |
+| 2 Target 배치 | 1.724 | 1.676 |
+| 3 Clearance | 0.215 | 0.206 |
+| 4 Blocker 선택 | 0.143 | 0.129 |
+| 5 Blocker 배치 | 0.623 | 0.595 |
+| 6 재배치 영역·앞 통로 | 0.444 | 0.420 |
+| 7 주변 물체 채우기 | 55.660 | 55.487 |
+| 8 ray observation | 86.369 | 12.092 |
+| 9 anchor·랜덤 IK·native FK 검증 | 1223.252 | 25.314 |
+
+첫 호출 합1368.598ms, 단계별 반복 중앙값 합96.073ms다. 후자는 한 번의 end-to-end
+reset 측정값이나1024환경 처리량이 아니다. 실제3회 전체 시간은 `report.json`에 남긴다.
+첫 ray/IK 호출에는 상수·kernel/CUDA graph 준비 비용이 포함된다. 이 실행의 앱 시작부터
+고정 자원 준비까지는40.544초(그중 native 환경21.783초, 형상/BVH/RobotPoseModel2.187초),
+9장 이미지의 임시 상태 반영·렌더링·PNG 저장 합은4.528초이며 모두 위 계산 시간과 별도다.
+Native 물체 state/활성 flag를 실제 학습 reset으로 쓰는 비용까지96ms에 포함됐다고 주장하지 않는다.
+
+### 빈 공간 표현과 예시의 제한
+
+초기 진단에서 비어 있는 stage1을 기존 `_episode_proposals`에 넘기는 보조 코드 오류를
+고쳤다. 이후 disjoint rectangle 분할은 큰 자유 공간을 조각내4개에서 채우기가 멈췄다.
+빈 공간을 서로 겹칠 수 있는 최대 빈 직사각형으로 유지하고, 배치 후 모든 구획에서 점유
+부분을 빼고 포함 관계를 정리하도록 고쳤다. 각 배치에서 들어가는 종류 중 개수가 적은
+종류를 선택하며, 한 종류가 안 들어간다고 즉시 전체를 중단하거나 작은 한 종류로만
+채우지 않는다. 장면 재생성·무작위 자세 재제안으로 결과를 고른 것은 아니다.
+최종 실행은 사용자 추가 요구인 인접 영역·앞 통로까지 적용한25개 장면이다. 예비4개
+그림과 보조 렌더링의 CUDA tensor→numpy 변환 오류 자료는 logs의 preliminary directory에 보존한다.
+
+예시는 완성된 production generator가 아니다. Target 배치가 뒤의 모든 종류를 위한 공간을
+보수적으로 예약하며, 각 미래 Blocker 종류의 임시 yaw를2단계에서 먼저 뽑는다. 종류는4단계에서
+균등하게 고른다. 주변 물체 yaw는0/90/180/270°만 사용하고, 구획·종류 선택은 CPU의 유한 반복이다.
+모든 종류 조합·독립적인360°·모든 seed·최소15개를 증명하지 않았으며 최대 수용량도 보장하지 않는다.
+목표 영역과 앞 통로가 비어 있어도 전체 밀기/pivot 경로가 실행 가능하다는 인증은 아니다.
+기존 Blocker95% 실루엣 가시성 gate나 시야 원뿔은 몰래 복원하지 않았다.
+
+### 산출물과 재현
+
+- `docs/figures/sequential_spawn_2026-11-08/01_step.png`–`09_step.png`, `overview.png`.
+- 같은 directory의 `timings.csv`, `report.json`, `layout_stages.json`, `resources.json`.
+- `logs/diagnostics/sequential_spawn_2026-11-08/console.log`, `independent_cpu_audit.json`.
+- 전체 collision support vertices를 포함한 최초 원자료는 같은 logs의
+  `full_report_with_collision_support.json.gz`에 보존하고 figure의 report는 resource 파일을 참조한다.
+- 시각화용 선·지지면에는 RigidBodyAPI/CollisionAPI가 없음을 검사했다. 촬영 프로세스 종료와
+  GPU compute process가 남지 않음을 확인했다. Prototype Python 구문 검사와 diff 검사를 통과했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_sequential_spawn.py \
+  --headless --device cuda:0 --seed 0
+```
+
+## 141. 2026-11-08 — 서로 다른30개 순차 배치와 회전 목적지 검증
+
+### 규칙과 구현 범위
+
+이번 요청은 물체30개가 아닌 **서로 다른 배치30개**다. 같은 진단 파일에 `--num-layouts`를
+추가하고 고정 USD·BVH·로봇 모델을 한 번 준비한 뒤 seed0–29를 순서대로 생성했다.
+각 장면의 물체 수는 기존15–25개 범위다. 배치·관측·IK를 측정했으며 학습/PPO나 실제 물리
+integration은 실행하지 않았다. Production scene/reset/reward/termination/제어 설정은 변경하지 않았다.
+
+- 주변 물체는 각 종류/배치 순서에서 연속 `[-π,π)` base yaw를 뽑고 그 yaw와+90°의
+  들어가는 구획을 계산한다. 최종 yaw가90° 단위로 제한되는 방식이 아니다.
+- 좌우 목적지는 각각1개씩이며, 목적지 yaw는 초기 Blocker yaw와 별도로 연속 각도에서 뽑는다.
+  두 목적지의 방향·종횡비·X 위치는 서로 다를 수 있다. 목표 방향으로 회전해서 들어간
+  Blocker 전체가 맞는 영역을 예약하며, 현재 자세를 유지한 옆 밀기만을 가정하지 않는다.
+- 초기 검사에서는 실제 collision·visual footprint만으로 목적지를 만들었다. 이때 일부
+  회전 OBB의 빈 모서리가 Clearance와 겹쳤다. 기존 MDP가 OBB로 Clearance/success를
+  계산하므로, 최종 규칙은 **회전된 전체 OBB와 실제 형상을 모두 감싸는 경계+4방향3mm**로 고쳤다.
+  이 축 정렬 예약 영역이 Clearance 좌우 경계에 접하되 면적은 겹치지 않는다.
+- 각 목적지에서 실제 선반 정면까지 같은 폭의 전방 띠도 비운다. 초기 Blocker와 주변
+  물체 모두 목적지·전방 띠를 침범하지 않는다. 전체 pushing/pivot 경로를 미리 비우지는 않는다.
+- Target 배치에서 가능한 미래 Blocker별 위치 구간을 계산한다. 공집합이 아닌 구간의
+  면적 가중 혼합에서 Target을 뽑고,4단계에서 그 위치에 양쪽 목적지가 성립하는 종류 중
+  Blocker를 선택한다. 모든 종류에 대한 최대 크기를 공통 예약하여 공간이 사라지는 문제를 피한다.
+- 주변 물체는 최대 빈 직사각형의 적합 구간에 직접 배치한다. 현재 최소 개수인 종류가
+  더 들어가지 않으면 특정 작은 종류로만 남은 공간을 채우지 않고 중단한다. 목표 개수는
+  수용량에 따라 줄 수 있지만 이번30개는 모두15–25개, non-Target 종류별 개수 차이≤1이었다.
+- 사전 배치 카탈로그·FFT·MILP·전체 장면 재생성은 없다. 위치/종류/yaw는 공간 조건에 따라
+  연동된다. 선반 전체의 균등 분포나 모든 종류 조합의 모든 각도, 모든 seed에서 최소15개를
+  일반적으로 보장했다는 뜻은 아니다.30개 장면의 검증 결과와 일반 보장을 구분한다.
+
+### 검증과 이미지
+
+최종 seed0–29 모두 물체15–25개·실제 종류4–10종·Target 종류1개를 유지했다. 물체 쌍의
+실제 collision footprint 겹침·선반 이탈·주변 물체의 예약 영역 침범이 없다. 독립 CPU 검사의
+최소 실제 footprint 간격은3.0000546mm였다. 목적지60개 모두 회전 OBB 전체가3mm 이상
+안쪽에 들어가고 Clearance와 면적 겹침이0이며, 영역 앞도 비어 있다. 표시 선·면은
+RigidBodyAPI/CollisionAPI가 없는 시각화다.
+
+30개 모두64×48 object-only ray에서 Target·Blocker의 유효 관측을 얻었다. 로봇은 기존
+batched IK로 anchor와 새로운 위치·회전 후보를 구해 elbow/관절/충돌 조건 및 실제 articulation
+FK를 확인했다.30개 모두 통과했고 anchor fallback은0이었다. 전도·settling·조작 성공·전체
+회전 경로의 충돌 여부를 physics로 검증한 결과는 아니다.
+
+- `docs/figures/sequential_spawn_layouts30_2026-11-08/all_top_views.png`:30개 정사영 top-view 모음.
+- 같은 directory의 `all_perspective_views.png`:30개 사선 시점 모음.
+- `layout_01`–`layout_30`의 `final_top_view.png`, `final_perspective.png`, `report.json`.
+  첫 장면에는1–9단계 그림도 남겼다. 초록 Target·빨강 Blocker·파랑 Clearance·노랑 목적지·주황 앞 통로다.
+- 전체 시간은 `timings.csv`, 통계·장면별 검증은 `summary.json`, 고정 기하는 `resources.json`.
+- 원자료: `logs/diagnostics/sequential_spawn_layouts30_2026-11-08/console.log`,
+  `independent_cpu_audit.json`, `goal_clearance_audit.json`.
+- 실제 footprint만 사용했던 첫30개 결과와 OBB 불일치 감사는 같은 logs의
+  `first_pass_actual_footprint/`에 보존한다. 최종 figures는 OBB까지 반영한 두 번째 결과다.
+
+### 시간
+
+RTX3090·CUDA0, native 환경1개 재사용, 각 단계 전후 CUDA synchronize를 포함한 wall time이다.
+배치1–7단계는 CPU numpy, ray/IK kernel은 CUDA를 사용한다. 같은 장면 반복 benchmark가
+아니라 서로 다른30개 장면을 각각 한 번 실행했으며, 초기 kernel/graph 준비도 포함한다.
+
+| 단계 | 평균 ms | 중앙값 ms |
+|---|---:|---:|
+| 1 Target 선택 | 0.166 | 0.158 |
+| 2 Target 위치·미래 공간 구간 | 5.182 | 5.144 |
+| 3 Clearance | 0.396 | 0.357 |
+| 4 Blocker 선택 | 0.245 | 0.238 |
+| 5 Blocker 배치 | 1.152 | 1.115 |
+| 6 회전 목적지·앞 통로 | 0.969 | 0.839 |
+| 7 주변 물체 채우기 | 36.849 | 33.800 |
+| 8 ray observation | 10.282 | 7.510 |
+| 9 로봇 검색·상태 적용·FK | 568.788 | 871.752 |
+
+기하1–7 합은 평균44.959ms, 전체1–9 합은 평균624.028ms·중앙923.624ms·p951094.803ms다.
+30장면의 전체 계산 합은18.721초다.9단계의 범위는22.444–1293.487ms로 넓다. anchor검색,
+연속 후보 검색, native joint/root 쓰기·forward·FK 검증까지 포함하므로 **순수 IK kernel 시간**으로
+해석하면 안 된다. 그 안에서 무엇이 변동을 만드는지는 이번 측정만으로 분리하지 않았다.
+
+고정 자원 준비는 앱 시작부터41.465초(그중 native 환경21.421초, 기하/BVH/로봇 모델3.005초).
+상태 반영·진단 RGB 렌더링·PNG 저장 합은25.554초로 위 계산과 별도다. 첫 장면의9단계 촬영
+4.963초를 포함하므로, 전체 렌더 평균851.813ms보다 최종2시점 기준 중앙716.571ms를 함께 본다.
+독립 audit·JSON 저장·모음 그림 작성은 별도이며 이 합을 전체 앱 wall time이라고 부르지 않는다.
+1024환경 reset/학습 iteration 성능으로 환산하지 않는다. Console에 CUDA/PhysX error가 없고
+진단 GPU 프로세스가 종료됐음을 확인했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_sequential_spawn.py \
+  --headless --device cuda:0 --seed 0 --num-layouts 30 --timing-repeats 0 \
+  --output docs/figures/sequential_spawn_layouts30_2026-11-08
+```
+
+
+## 142. 2026-11-08 — 목적지 최소 한쪽과 Target–Blocker 간격 랜덤화
+
+사용자는 양쪽 목적지를 필수로 만들 필요가 없으며 최소 한쪽이면 충분하다고 수정했다.
+또한 Target–Blocker 간격도 랜덤이어야 한다고 요청했다. 기존 순차 스폰 진단 파일만
+수정했고, 학습용 reset·reward·termination·모델·제어 설정은 변경하지 않았다.
+
+### 생성 규칙 변경
+
+- Target 위치를 정할 때 미래 Blocker 종류마다 **왼쪽만·오른쪽만·양쪽**의 유효 위치
+  구간을 각각 계산한다. 그 합집합에서 Target을 배치하고, Blocker를 고를 때 해당 위치에서
+  가능한 종류와 목적지 조합을 선택한다. 양쪽을 먼저 예약한 뒤 표시만 하나 지우는 방식이 아니다.
+- 선택하지 않은 쪽에는 목적지나 전방 띠를 예약하지 않는다. 주변 물체는 그 공간에도
+  배치될 수 있다. Target의 좌우 위치 구간에는10–50% 가림을 만드는 초기 Blocker가 들어갈
+  폭을 보수적으로 남기지만, 그 폭 자체를 빈 공간으로 빼지는 않는다.
+- 초기 Blocker X는 기존 `3–10mm` 간격 구간 대신, 선택한 목적지의 전방 공간이 성립하는
+  **계산된 연속 X 구간 전체**에서 균등 샘플링한다. 물체 실제/visual footprint를 감싼
+  축 정렬 외곽의 X 최저·최고를 사용하면 다음 범위다.
+
+```text
+B_x_min = Target_front + gap - Blocker_local_x_min
+B_x_max = shelf_front - Blocker_local_x_max - deepest_selected_pocket_depth - gap
+gap = 0.003 m
+pocket_depth = rotated_goal_envelope_depth + 2 * gap
+```
+
+이 상한은 초기 Blocker가 목적지의 Y 띠와 겹칠 때에도 그 앞에 목적지와 빈 전방 띠를 둘 수
+있도록 잡은 보수적인 예약 계획 범위다. 모든 가능한 XY 배치의 최대 범위와 같다는 뜻은 아니다.
+Y는 정면 투영 폭10–50% 가림과 Clearance 겹침을 동시에 만족하는 구간에서 직접 샘플링한다.
+장면 전체를 재생성하는 재시도나 사전 배치 카탈로그를 추가하지 않았다.
+
+목적지 yaw는 초기 Blocker와 별도의 연속 각도이며, 회전된 전체 OBB+실제 형상+4방향3mm
+여유를 포함한다. 목적지와 Clearance의 면적 겹침은0이고 경계만 접한다. 선택한 각 목적지 앞은
+실제 선반 정면까지 비우며, 주변 물체의 연속 yaw·Target 종류 단일성·종류별 개수 균형도 유지한다.
+
+### 새30개 장면과 독립 검증
+
+같은 고정 자원을 한 번 준비하고 seed0–29를 생성했다. 물체는 모두15–25개,
+non-Target 종류별 개수 차이는 최대1개였다.
+
+- 왼쪽만8개, 오른쪽만11개, 양쪽11개로 총 목적지41개.
+- 모든 장면에서 실제 충돌 footprint 겹침·선반 범위 이탈·주변 물체의 예약 공간 침범 없음.
+- 목적지41개 모두 실제 collision/visual 형상과 회전 OBB가 Clearance 밖이며, 영역 안쪽과
+  Clearance 측면에 최소3mm 여유가 있다. 초기 Blocker를 포함한 모든 물체가 목적지·앞 통로 밖이다.
+- 최소 물체 footprint 간격3.0000185mm. Native 결과와 별도 CPU 생성 결과가30/30 정확히 일치했다.
+- 30개 모두 Target·Blocker의 유효 ray 관측, batched IK의 새로운 시작 자세, 실제 articulation
+  FK를 통과했다. Anchor fallback은0개였다.
+
+| Target–Blocker 거리 | 최소 mm | 중앙 mm | 최대 mm |
+|---|---:|---:|---:|
+| X 방향 외곽 지지면 간격 | 3.327 | 26.220 | 104.436 |
+| 실제 collision footprint 사이의 최단 유클리드 거리 | 6.079 | 48.896 | 127.096 |
+
+두 거리는 다르다. X 구간을 랜덤 샘플링하며, 형상과 yaw 및 Y 위치가 함께 정해진 뒤 실제
+최단거리가 결정된다. 위 실제 최단거리가 균등분포가 되도록 샘플링했다는 뜻은 아니다.
+30개 중25개는 X 간격도10mm보다 컸다. 가능한 조합/각도/위치의 조건부 샘플링이며
+모든 seed·종류 조합에 대해 같은 수용량을 일반적으로 증명한 것은 아니다.
+
+### 시간과 산출물
+
+RTX3090·CUDA0·단일 native 환경 재사용, 단계 전후 CUDA 동기화 wall time이다.
+
+| 계산 범위 | 배치당 평균 ms | 중앙 ms |
+|---|---:|---:|
+| 1–7 배치 기하 생성 | 48.558 | 48.019 |
+| 8 ray observation | 9.607 | 6.678 |
+| 9 로봇 검색·상태 적용·FK | 514.474 | 907.618 |
+| 1–9 합 | 572.639 | 949.055 |
+
+30개 계산 합17.179초, 별도 촬영·상태 반영·PNG 저장 합24.550초, 앱 시작부터 고정 자원
+준비까지40.717초였다. 첫 장면은9단계를 촬영하고 나머지는 최종2시점을 촬영한다.
+로봇 단계는 순수 IK kernel뿐 아니라 anchor·랜덤 후보 검색과 native state/forward/FK를 포함한다.
+기하 계산은 CPU numpy, ray/IK kernel은 CUDA다.1024환경 학습 iteration 시간으로 환산하지 않는다.
+물리 integration·정책/PPO 실행·실제 밀기 경로 검증은 하지 않았다.
+
+- 최종 이미지/원자료: `docs/figures/sequential_spawn_layouts30_variable_2026-11-08/`.
+  `all_top_views.png`, `all_perspective_views.png`, `layout_01`–`layout_30`의 개별 이미지·report,
+  전체 `timings.csv`, `summary.json`, `resources.json`을 저장했다.
+- CSV와 summary에 목적지 쪽과 Target–Blocker X 간격도 남겼다.
+- 독립 감사: `logs/diagnostics/sequential_spawn_layouts30_variable_2026-11-08/`의
+  `independent_cpu_audit.json`, `independent_geometry_audit.json`, `goal_gap_audit.json`.
+- Native 실행 로그는 같은 directory의 `console.log`, 생성 코드 snapshot은 `probe_sequential_spawn.py`다.
+- 이전 양쪽 필수 예시와141절 결과는 덮어쓰지 않았다. Overlay에는 물리 API가 없고,
+  최종 console에 CUDA/PhysX error가 없으며 진단 GPU 프로세스가 종료됐음을 확인했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_sequential_spawn.py \
+  --headless --device cuda:0 --seed 0 --num-layouts 30 --timing-repeats 0 \
+  --output docs/figures/sequential_spawn_layouts30_variable_2026-11-08
+```
+
+
+## 143. 2026-11-08 — 초기 Blocker 앞의 접근 통로 예약
+
+사용자 요청으로142절 규칙에 **초기 Blocker 앞도 비우는 조건**을 추가했다.
+`tests/probe_sequential_spawn.py`의 순차 생성 예시만 수정했으며 학습용 reset에는 연결하지 않았다.
+
+- 5단계에서 초기 Blocker yaw의 전체 OBB와 실제 collision/visual 형상을 감싼 XY 외곽을 구한다.
+- 통로 X는 그 외곽의 앞면부터 실제 선반 정면까지다. Y는 전체 외곽 폭에 좌우3mm를 더하고,
+  선반 실제 Y 경계 밖으로 나간 부분만 자른다. 손 전체 폭이나 전체 재배치 경로를 예약한 것은 아니다.
+- 7단계의 빈 구획에서 이 통로를 추가로 제외한다. 목적지·목적지 앞 통로와 겹치는 것은 허용한다.
+  모두 비워두는 공간이므로 이를 이유로 장면을 다시 생성하거나 다른 목적지를 고르지 않는다.
+- Marker는 **분홍색**, 기존 목적지 앞은 주황색이다. 선과 바닥 표시에는 물리 API가 없다.
+- 난수 호출을 추가하지 않았다. seed0–29 모두 기존142절과 Target·Blocker 종류/yaw/pose,
+  Clearance·목적지·카메라가 정확히 같고, 새 예약 공간에 따라 주변 물체 배치만 달라진다.
+
+### 30개 장면 검증과 측정
+
+30개 모두 물체15–25개와 non-Target 종류별 개수 차이≤1을 유지했다. 목적지는 이전과 같은
+왼쪽8개·오른쪽11개·양쪽11개(합41개)다. Blocker 전방 띠에 초기 Blocker·Target을 포함한
+어떤 활성 물체의 collision/visual footprint도 면적으로 겹치지 않는다. 초기 Blocker의
+외곽과 통로의 접촉 경계는 허용한다. 기존 목적지41개의 회전 OBB와 Clearance 비중복·각 방향
+3mm 여유·목적지 앞 공백, 전체 물체 충돌/선반 범위 검사를 통과했다. 최소 실제 footprint
+간격은3.00000075mm이며 Target–Blocker 간격 분포는142절과 같다.
+
+Native object-only ray에서30개 모두 Target·Blocker 유효 관측을 얻었고, 로봇 시작 자세의
+batched IK·충돌·실제 articulation FK도30/30 통과했다. Anchor fallback은0개였다.
+실제 physics integration·정책/PPO 실행·밀기 경로의 실행 가능성을 검증한 것은 아니다.
+
+RTX3090·CUDA0·단일 native 환경의 서로 다른30개 장면을 단계별 CUDA 동기화 wall time으로 측정했다.
+
+| 계산 범위 | 배치당 평균 ms | 중앙 ms |
+|---|---:|---:|
+| 1–7 배치 기하 생성 | 48.693 | 48.889 |
+| 8 ray observation | 9.944 | 7.325 |
+| 9 로봇 검색·상태 적용·FK | 384.213 | 25.360 |
+| 1–9 합 | 442.850 | 96.847 |
+
+30개 계산 합13.286초, 촬영·상태 반영·PNG 저장 합24.899초, 앱 시작부터 고정 자원 준비까지
+39.535초였다. 기하는 CPU numpy, ray/IK kernel은 CUDA다. 로봇 단계는21.581–1143.256ms로
+변동이 크며 순수 IK kernel 시간만이 아니다. 이전 실행과 평균 차이를 이 예약 공간 추가의
+최적화 효과로 해석하지 않는다.1024환경 reset/학습 iteration benchmark로 환산하지 않는다.
+
+- 최종 이미지/원자료: `docs/figures/sequential_spawn_layouts30_blocker_front_2026-11-08/`.
+  `all_top_views.png`, `all_perspective_views.png`, `layout_01`–`layout_30`의 개별 이미지·report,
+  `timings.csv`, `summary.json`, `resources.json`을 남겼다.
+- 독립 감사 및 실행 로그: `logs/diagnostics/sequential_spawn_layouts30_blocker_front_2026-11-08/`의
+  `independent_cpu_audit.json`, `independent_geometry_audit.json`, `blocker_front_audit.json`, `console.log`.
+  생성 코드 snapshot은 같은 directory의 `probe_sequential_spawn.py`다.
+- 구문·산출물·독립 기하 검사와 diff 검사를 통과했다. Console에 CUDA/PhysX error가 없으며
+  진단 GPU 프로세스가 종료됐음을 확인했다. 이전140–142절 이미지와 원자료는 보존했다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_sequential_spawn.py \
+  --headless --device cuda:0 --seed 0 --num-layouts 30 --timing-repeats 0 \
+  --output docs/figures/sequential_spawn_layouts30_blocker_front_2026-11-08
+```
+
+
+## 144. 2026-11-08 — 순차 스폰 규칙을 Symmetric 학습 환경에 적용
+
+사용자 요청으로143절의 규칙을 **`contact_manipulation_symmetric`의 실제 reset**에 연결했다.
+`shelf_manipulation_env_cfg.py`의 기본 모드는 `sequential`이다. 배치 생성 구현을
+`mdp/events.py`의 `SequentialSceneGenerator`로 옮겨 학습과 이미지 진단이 함께 호출한다.
+생성 규칙을 위한 별도 production 파일은 추가하지 않았다. 기존 두 프로젝트는 변경하지 않았다.
+
+### 실제 reset 흐름과 관측·보상 연결
+
+1. Target 종류/yaw와 배치 가능한 연속 위치 구간에서 위치를 정한다. 후속 Blocker·목적지가
+   들어갈 수 있는 공간을 미리 계산하되 완성 장면이나 역할 조합을 사전 저장하지 않는다.
+2. Target의 정면 실제 visual 폭에 좌우10mm를 더한 Clearance를 만들고, 다른 종류의
+   Blocker를 정면 투영 가로폭10–50% 겹침과 Clearance 겹침이 성립하는 구간에 직접 배치한다.
+   앞뒤 간격은3mm부터 목적지 깊이를 남길 수 있는 연속 상한까지 랜덤화한다.
+3. Clearance 옆에 붙은 목적지를 왼쪽만·오른쪽만·양쪽 중 최소1개 생성한다. 목적지 yaw는
+   초기 Blocker와 별도로 연속 샘플링하며, 실제 형상과 전체 회전 OBB 및 각 방향3mm 여유를
+   포함한다. Clearance와 면적 겹침은 없고 목적지 앞은 선반 정면까지 비운다.
+4. 초기 Blocker의 전체 회전 외곽 앞면부터 선반 정면까지도 같은 폭+좌우3mm로 비운다.
+   Target·Clearance·Blocker·목적지·두 종류 전방 통로를 제외한 빈 구획에 주변 물체를 채운다.
+   Target 종류는 한 개, non-Target 종류별 개수 차이는 최대1개다. 전체 push/pivot 경로는
+   예약하지 않는다. 기존143절의30개 배치에서 역할·목적지·주변 pose가 유지됨을 확인했다.
+5. Target 정면의 생성된 가상 시점에서 물체 메시만 ray cast한다. 기존64×48 해상도와
+   관측 최대10물체·역할 우선 슬롯·모델 입력 구조는 유지한다. 시점·배치 후보를 재평가하는
+   기존 `_capture_constructive_views`나 사전 visibility catalog 경로는 호출하지 않는다.
+6. 기존 batched IK·elbow-up·충돌 검사와 실제 articulation FK 검증으로 로봇 시작 자세를
+   정하고 native 상태 writer로 반영한다. 잘못된 규칙을 숨기기 위한 장면 재추첨은 없다.
+
+새 가림 기준은 사용자 선택인 **정면 가로폭 겹침**이다. 단독 실루엣 면적 대비 가시성 비율은
+이 경로에서 계산하지 않으며, 그 진단 필드는0이나 추정치를 넣는 대신 `(-1,-1)`로 표시한다.
+실제 ray 관측에서 Target·Blocker의 유효 표면 정보가 없으면 오류를 보고하고 장면을 재생성하지
+않는다. 생성 결과의 실제 역할 ID를 배치 tensor에 기록해 물리·관측·접촉 보상과 일치시켰다.
+Blocker만 종류를 고정한 경우에는 Target 후보에서 그 종류를 제외하며, pool의 첫 번째가 아닌
+Blocker ID도 배경에서 중복 사용하지 않는다.
+
+재배치 reward의 영역은 **새 생성기의 목적지 사각형만** 사용한다. 전방 접근 통로는 reward의
+목적지에 넣지 않는다. Blocker 중심과 영역은 모두 환경 원점 기준 XY다. 보상 수식·weight·
+종료 조건·모델·PPO·로봇 제어 및 물리 주기는 변경하지 않았다. Actor vision 주기도 현재 설정인
+`0`(reset-only)을 유지한다. 과거10Hz 실험 설정으로 자동 변경하지 않았다.
+
+### 병렬 reset과 물체 수
+
+새 장면은 env0에서 배치1회·ray query1회 준비한 뒤 전체 환경에 공유한다. 중간 종료 환경의
+부분 reset은 같은 배치·관측을 복원하고 로봇 시작 자세만 새로 뽑는다. 기존 미사용 body의
+kinematic 전환·native manager/writer·반복 난수 스트림·IK 실패 행 복구 경로를 유지한다.
+
+기본 요청 수는15–25개이며, 빈 구획과 종류 균형의 수용량에 따라 요청 수보다 적을 수 있다.
+추가 검사에서 seed189는 연속 base yaw와 그+90°만으로14개에서 멈췄다. 이 경우에 한해
+현재 최소15개보다 적고 최소 개수인 종류가 들어가지 못할 때, 남은 빈 구획에 맞는 **연속 yaw
+허용 구간을 해석적으로 계산**하도록 보완했다. 각도 grid나 기존 장면 재생성은 사용하지 않는다.
+기존14개의 ID·pose·yaw와 역할·목적지·카메라를 그대로 두고 Tomato 한 개를 추가해15개가 됐다.
+
+최초30개 배치의 기하 상태는 동일하며 진단 metadata4개만 추가됐다. 추가256개 seed30–285는
+모두15–25개, 생성 예외0이었다. 이 표본으로 모든 seed의 하한을 증명하지는 않는다.
+`minimum_count_shortfall`, `minimum_count_remaining_capacity_reason`,
+`minimum_count_yaw_recoveries`에 부족 수·사유·보완 내역을 남긴다. 별도 self-contained 회귀
+장면에서도29→30개를 채우며 기존29개·카메라·목적지를 보존하는지 검사했다.
+
+### 실제 Isaac Lab 검증
+
+RTX3090·headless·기존 physics10ms/decimation2 설정에서 **4환경과1,024환경 각각3장면**의
+native reset을 실행했다. 매 장면 절반 환경을 부분 reset하고, zero wrench/손 중간 목표의
+진단 action으로8control step씩 총24step을 진행했다. PPO 학습·정책 밀기 성능 검사는 아니다.
+장기 episode를 기다리는 대신 진단 코드에서 shared-scene cache 만료 시점만 당겨 장면 교체를
+유발했으며, common_step_counter나 학습 소스의 종료 조건은 바꾸지 않았다.
+
+- 두 실행 모두 실제 역할 ID·초기 유효 ray 관측·새 목적지 map·관측 `[N,232]`를 확인했다.
+  Actor/Critic 관측 전체는 bit-exact이고 step의 관측·reward는 유한했다.
+- 각 실행의3장면에서 배치 생성3회·ray query3회, 매 query 요청 수는1이었다.
+  부분 reset과 이후 auto-reset에서는 layout/ray 호출 수가 증가하지 않았다.
+- 1,024환경의 매 장면512행 모두 새 로봇 자세를 얻었으며 anchor fallback0이었다.
+  미선택512행의 관절 상태·reset count와 전체 물체 상태·공유 비전이 유지됐다.
+- 장면별 물체 수22·19·21, 목적지 수1·2·1, 정면 폭 겹침11.34%·40.33%·25.12%였다.
+- 최종 console에서 CUDA/PhysX 오류가 없었다. 이 검사는 장기 CUDA 장애 재발이나 실제 조작
+  성공률을 보증하지 않는다.
+
+1,024환경 실행의 동기화 wall time이다. 아래 full reset은 기하 생성뿐 아니라 ray·IK·전체 상태
+반영을 포함하며, PPO collection/iteration 시간이 아니다.
+
+| 장면 | 전체 reset ms | 512행 부분 reset ms | 배치 생성 ms | ray query ms |
+|---|---:|---:|---:|---:|
+| 최초 준비 포함 | 6183.280 | 54.453 | 68.721 | 112.359 |
+| 다음 장면1 | 1482.597 | 85.515 | 48.530 | 5.283 |
+| 다음 장면2 | 1348.039 | 44.415 | 42.203 | 4.657 |
+
+원자료는 `logs/diagnostics/sequential_training_reset_2026-11-08/`의 `native4.json`,
+`native1024.json`, 각 `*_console.log`, `native_reset_smoke.py`, `geometry_scan.json`이다.
+최초 진단의 counter 직접 변경으로 transition guard가 거부한 자료는 `native4_attempt1*`에
+별도 보존했다. 진단 방식을 cache 만료로 고친 후 최종 두 실행을 완료했으며 production의
+transition 검사를 제거하거나 완화하지 않았다.
+
+최종 CPU 회귀는 MDP533개 중512통과·CUDA/Kit전용21생략, learning76개 중74통과·
+CUDA전용2생략이다. 전체609개 중586통과·23생략이며 구문·`git diff --check`도 통과했다.
+검사 범위는 배치 불변조건·연속 yaw 해석·역할 ID·한 번의 ray query·실패 시 무재추첨·
+goal-only map·부분 reset/rollback과 기존 관측/학습 계약이다. 실행한 진단 GPU 프로세스는
+모두 종료했다. 학습 시작 전 검토할320D readout 대 attention-only128D 비교 과제는 기존대로
+미결이며 이번 스폰 적용에서 모델 구조를 바꾸지 않았다.

@@ -208,6 +208,129 @@ class DynamicObservationTests(unittest.TestCase):
         torch.testing.assert_close(measured, values["measured_wrench"])
 
 
+class SensorMountMassTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/config/ur5e/scene.py'
+        tree = ast.parse(path.read_text())
+        node = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == '_sensor_mount_half_properties')
+        namespace = dict(math=math)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
+        cls.properties = staticmethod(namespace[node.name])
+        config = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == 'Ur5eHandSpawnerCfg')
+        cls.defaults = {node.target.id: ast.literal_eval(node.value) for node in config.body
+                        if isinstance(node, ast.AnnAssign) and node.target.id.startswith('sensor_')}
+        cls.mount = next(node for node in tree.body
+                         if isinstance(node, ast.FunctionDef) and node.name == '_create_sensor_mount')
+
+    def test_published_tool_face_datum_preserves_physical_assembly_and_hand_spacing(self):
+        # Execute the production geometry/frame expressions on CPU vectors,
+        # without importing Kit. The integration probe checks their authored
+        # USD/PhysX realization separately.
+        cfg = self.defaults
+        length, body_length = cfg['sensor_mount_length'], cfg['sensor_body_length']
+        flange, _, center_z, _, _ = self.properties(
+            length, cfg['sensor_mount_radius'], cfg['sensor_mount_mass'], body_length,
+            cfg['sensor_flange_radius'], cfg['sensor_flange_mass'])
+        origin_statement = next(node for node in self.mount.body
+                                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                                and isinstance(node.value.func, ast.Attribute)
+                                and node.value.func.attr == 'SetTranslateOnly')
+        com_call = next(node for node in ast.walk(self.mount) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == 'CreateCenterOfMassAttr')
+        cylinder_statement = next(node for node in ast.walk(self.mount)
+                                  if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                                  and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'Set'
+                                  and isinstance(node.value.func.value, ast.Call)
+                                  and isinstance(node.value.func.value.func, ast.Attribute)
+                                  and node.value.func.value.func.attr == 'AddTranslateOp')
+        hand_return = next(node for node in self.mount.body if isinstance(node, ast.Return))
+        start = np.array([.21, -.38, .94])
+        for rotation in (np.eye(3), *Rotation.random(4, random_state=18).as_matrix()):
+            reference = []
+            sensor_world = SimpleNamespace(TransformDir=lambda vector: rotation @ vector,
+                                           SetTranslateOnly=lambda vector: reference.append(vector))
+            namespace = dict(sensor_world=sensor_world, start_world=start,
+                             length=length, body_length=body_length, reference_shift=body_length * .5,
+                             Gf=SimpleNamespace(Vec3d=lambda *values: np.array(values),
+                                                Vec3f=lambda *values: np.array(values)))
+            exec(compile(ast.Module(body=[origin_statement], type_ignores=[]), '<sensor-reference>', 'exec'), namespace)
+            np.testing.assert_allclose(reference[0], start + rotation[:, 2] * .0377, atol=1e-15)
+            for direction in (-1., 1.):
+                com = []
+                namespace.update(direction=direction, center_z=center_z,
+                                 mass_api=SimpleNamespace(CreateCenterOfMassAttr=lambda value: com.append(value)))
+                eval(compile(ast.Expression(body=com_call), '<sensor-com>', 'eval'), namespace)
+                np.testing.assert_allclose(reference[0] + rotation @ com[0],
+                                           start + rotation[:, 2] * (.025 + direction * center_z), atol=1e-15)
+                for part_center in (body_length * .25, body_length * .5 + flange * .5):
+                    local = []
+                    namespace.update(part_center=part_center,
+                                     cylinder=SimpleNamespace(AddTranslateOp=lambda: SimpleNamespace(
+                                         Set=lambda value: local.append(value))))
+                    exec(compile(ast.Module(body=[cylinder_statement], type_ignores=[]),
+                                 '<sensor-part>', 'exec'), namespace)
+                    np.testing.assert_allclose(reference[0] + rotation @ local[0],
+                                               start + rotation[:, 2] * (.025 + direction * part_center), atol=1e-15)
+            namespace.update(displacement=rotation[:, 2] * length, distal=None)
+            hand_anchor, _ = eval(compile(ast.Expression(body=hand_return.value), '<hand-anchor>', 'eval'), namespace)
+            np.testing.assert_allclose(hand_anchor, start + rotation[:, 2] * .05, atol=1e-15)
+
+    def test_real_sensor_and_provisional_flange_mass_have_correct_compound_center(self):
+        cfg = self.defaults
+        self.assertEqual(cfg['sensor_body_length'], .0254)
+        self.assertEqual(cfg['sensor_mount_radius'], .041)
+        self.assertEqual(cfg['sensor_mount_mass'], .30)
+        flange, half_mass, center, transverse, axial = self.properties(
+            cfg['sensor_mount_length'], cfg['sensor_mount_radius'], cfg['sensor_mount_mass'],
+            cfg['sensor_body_length'], cfg['sensor_flange_radius'], cfg['sensor_flange_mass'])
+        self.assertAlmostEqual(flange, .0123)
+        self.assertAlmostEqual(half_mass, .17)
+        self.assertAlmostEqual(center, .007820588235294118)
+        # Recombine both mirrored halves at the geometric center. This equals
+        # the independent inertia of the full sensor plus the two end flanges.
+        sensor_transverse = .30 * (3 * .041**2 + .0254**2) / 12
+        flange_center = (.0254 + .0123) * .5
+        flange_transverse = .04 * ((3 * .025**2 + .0123**2) / 12 + flange_center**2)
+        self.assertAlmostEqual(2 * (transverse + half_mass * center**2),
+                               sensor_transverse + flange_transverse, places=15)
+        self.assertAlmostEqual(2 * axial, (.30 * .041**2 + .04 * .025**2) * .5, places=15)
+
+    def test_identical_cylinders_recombine_to_a_single_uniform_cylinder(self):
+        # A physically equivalent single cylinder tests the parallel-axis terms
+        # without relying on the sensor's particular component dimensions.
+        height, diameter_radius, mass = .06, .02, .42
+        flange, half_mass, center, transverse, axial = self.properties(
+            height, diameter_radius, mass / 3, height / 3,
+            diameter_radius, mass * 2 / 3)
+        self.assertAlmostEqual(half_mass, mass * .5)
+        self.assertAlmostEqual(center, height * .25)
+        self.assertAlmostEqual(transverse, half_mass * (3 * diameter_radius**2 + (height * .5)**2) / 12)
+        self.assertAlmostEqual(axial, half_mass * diameter_radius**2 * .5)
+        self.assertAlmostEqual(flange, height / 3)
+
+    def test_sensor_without_flange_uses_actual_half_cylinder_inertia(self):
+        flange, mass, center, transverse, axial = self.properties(.0254, .041, .30, .0254, .025, 0.)
+        self.assertEqual(flange, 0.)
+        self.assertEqual(mass, .15)
+        self.assertEqual(center, .00635)
+        self.assertAlmostEqual(transverse, .15 * (3 * .041**2 + .0127**2) / 12)
+        self.assertAlmostEqual(axial, .15 * .041**2 / 2)
+
+    def test_invalid_geometry_or_mass_is_rejected_before_spawning(self):
+        valid = [.05, .041, .30, .0254, .025, .04]
+        for index, value in ((0, .02), (1, 0.), (2, -.1), (3, float('nan')),
+                             (4, float('inf')), (5, -.01)):
+            args = valid.copy()
+            args[index] = value
+            with self.subTest(index=index, value=value), self.assertRaises(ValueError):
+                self.properties(*args)
+        with self.assertRaisesRegex(ValueError, 'zero-length flange'):
+            self.properties(.0254, .041, .30, .0254, .025, .04)
+
+
 class WrenchTests(unittest.TestCase):
     def test_saturation_resolution_and_overload_apply_to_sensor_frame_measurement(self):
         ideal = torch.tensor([[200.2, -.14, 360.0, 8.2, .011, -.014]], dtype=torch.float64)
@@ -2341,7 +2464,7 @@ class HandUrdfBoundsTests(unittest.TestCase):
         tree = ast.parse(path.read_text())
         nodes = [node for node in tree.body
                  if (isinstance(node, ast.FunctionDef)
-                     and node.name in ('hand_joint_limits', '_configure_hand_joints'))
+                     and node.name in ('hand_joint_limits', 'hand_joint_mapping', '_configure_hand_joints'))
                  or (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
                      and node.targets[0].id == 'HAND_JOINT_NAMES')]
         urdf = root / ('assets/robots/Roas_provided_inspire_urdf/RH56E2 URDF/'
@@ -2386,9 +2509,8 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 self.attributes = {f'{prefix}:naturalFrequency': 123., f'{prefix}:dampingRatio': .7}
                 self.attribute_writes = {}
                 self.applied_apis = []
-                self.mimic_apis = [] if source.find('mimic') is None else [SimpleNamespace(
-                    reference=object(), gearing=-1.0843, offset=.25,
-                    GetGearingAttr=lambda: SimpleNamespace(GetNamespace=lambda: self.mimic_namespace))]
+                # parse_mimic=False leaves all twelve physical joints independent.
+                self.mimic_apis = []
 
             def IsA(self, schema):
                 return schema is RevoluteJoint
@@ -2406,11 +2528,7 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 return ImportedAttribute(self, name)
 
             def CreateAttribute(self, name, value_type):
-                allowed = {f'{self.mimic_namespace}:naturalFrequency', f'{self.mimic_namespace}:dampingRatio'}
-                if (self.source.find('mimic') is None or name not in allowed
-                        or value_type is not float_type or name in self.attributes):
-                    raise AssertionError('Only missing active-axis compliance may copy the importer value.')
-                return ImportedAttribute(self, name, writable=True)
+                raise AssertionError('Independent drives must not create mimic compliance attributes.')
 
         class RevoluteJoint:
             def __init__(self, prim):
@@ -2426,8 +2544,6 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 joint_attribute(self.prim, 'upper', value)
 
         def joint_attribute(prim, kind, value):
-            if prim.source.find('mimic') is not None and kind == 'drive_type':
-                raise AssertionError('Dependent drive type must retain the importer default.')
             writes.setdefault(prim.name, {})[kind] = value
 
         def drive(prim, axis):
@@ -2455,7 +2571,7 @@ class HandUrdfBoundsTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
         return namespace, stage, urdf, sources, prims, writes, mimic_reads
 
-    def test_literal_urdf_limits_and_imported_compliance_preserve_native_linkage(self):
+    def test_all_twelve_drives_restore_literal_urdf_limits_without_mimic_constraints(self):
         namespace, stage, urdf, sources, prims, writes, mimic_reads = self.imported_hand_fixture()
         imported = {name: (dict(prim.imported), [vars(api).copy() for api in prim.mimic_apis],
                            dict(prim.attributes))
@@ -2465,66 +2581,35 @@ class HandUrdfBoundsTests(unittest.TestCase):
         masters = namespace['HAND_JOINT_NAMES']
         children = {name for name, source in sources.items() if source.find('mimic') is not None}
         self.assertEqual(len(children), 6)
-        self.assertEqual(set(mimic_reads), children)
-        self.assertEqual(len(mimic_reads), 6)
+        self.assertEqual(set(mimic_reads), set(sources))
+        self.assertEqual(len(mimic_reads), 12)
         self.assertEqual(set(writes), set(masters) | children)
         for name, source in sources.items():
             with self.subTest(joint=name):
                 limit = source.find('limit').attrib
                 expected = {key: math.degrees(float(limit[key])) for key in ('lower', 'upper', 'velocity')}
                 expected['effort'] = float(limit['effort'])
-                if name in masters:
-                    expected['drive_type'] = 'force'
+                expected['drive_type'] = 'force'
                 self.assertEqual(writes[name], expected)
         for name, prim in prims.items():
             with self.subTest(imported_joint=name):
                 self.assertEqual(prim.imported, imported[name][0])
                 self.assertEqual([vars(api) for api in prim.mimic_apis], imported[name][1])
-                expected = {f'{prim.mimic_namespace}:{attribute}': imported[name][2][f'physxMimicJoint:rot:{attribute}']
-                            for attribute in ('naturalFrequency', 'dampingRatio')} if (
-                                name in children and name.startswith('right_thumb_')) else {}
-                self.assertEqual(prim.attribute_writes, expected)
-                self.assertEqual(prim.attributes, imported[name][2] | expected)
+                self.assertEqual(prim.attribute_writes, {})
+                self.assertEqual(prim.attributes, imported[name][2])
                 self.assertEqual(prim.applied_apis, [])
 
-    def test_existing_active_thumb_compliance_is_not_replaced_by_legacy_values(self):
-        namespace, stage, urdf, _, prims, _, _ = self.imported_hand_fixture()
-        thumbs = [prim for name, prim in prims.items() if name in ('right_thumb_3_joint', 'right_thumb_4_joint')]
-        for prim in thumbs:
-            prim.attributes[f'{prim.mimic_namespace}:naturalFrequency'] = 987.
-            prim.attributes[f'{prim.mimic_namespace}:dampingRatio'] = .42
-        before = [dict(prim.attributes) for prim in thumbs]
-        namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
-        for prim, expected in zip(thumbs, before):
-            self.assertEqual(prim.attributes, expected)
-            self.assertEqual(prim.attribute_writes, {})
-
-    def test_missing_or_nonpositive_imported_compliance_is_rejected_instead_of_forced_rigid(self):
-        for value in (None, 0., -1., math.nan, math.inf):
-            with self.subTest(natural_frequency=value):
-                namespace, stage, urdf, _, prims, _, _ = self.imported_hand_fixture()
-                prim = prims['right_index_2_joint']
-                key = f'{prim.mimic_namespace}:naturalFrequency'
-                if value is None:
-                    del prim.attributes[key]
-                else:
-                    prim.attributes[key] = value
-                with self.assertRaisesRegex(RuntimeError, 'Native importer must provide compliant mimic'):
-                    namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
-                self.assertEqual(prim.attribute_writes, {})
-
-    def test_missing_or_duplicate_native_mimic_is_rejected_instead_of_reconstructed(self):
-        for count in (0, 2):
-            with self.subTest(native_mimic_count=count):
+    def test_remaining_physical_mimics_are_rejected_on_master_or_child(self):
+        for name in ('right_thumb_1_joint', 'right_thumb_3_joint', 'right_index_2_joint'):
+            with self.subTest(joint=name):
                 namespace, stage, urdf, sources, prims, writes, mimic_reads = self.imported_hand_fixture()
-                child = next(name for name, source in sources.items() if source.find('mimic') is not None)
-                prims[child].mimic_apis = [SimpleNamespace()] * count
-                with self.assertRaisesRegex(RuntimeError, 'importer must preserve one mimic constraint'):
+                prims[name].mimic_apis = [SimpleNamespace()]
+                with self.assertRaisesRegex(RuntimeError, '(?i)mimic'):
                     namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
-                self.assertNotIn(child, writes)
-                self.assertEqual(prims[child].attribute_writes, {})
+                self.assertNotIn(name, writes)
+                self.assertEqual(prims[name].attribute_writes, {})
 
-    def test_converter_keeps_native_mimic_parsing_and_default_drive_configuration(self):
+    def test_converter_disables_physical_mimics_and_keeps_all_seventeen_tactile_links(self):
         root = Path(__file__).resolve().parents[3]
         source = root / 'src/contact_manipulation_symmetric/contact_manipulation_symmetric/config/ur5e/scene.py'
         converters = [node for node in ast.walk(ast.parse(source.read_text()))
@@ -2532,8 +2617,16 @@ class HandUrdfBoundsTests(unittest.TestCase):
                       and node.func.attr == 'UrdfFileCfg']
         self.assertEqual(len(converters), 1)
         keywords = {keyword.arg: keyword.value for keyword in converters[0].keywords}
-        self.assertIs(ast.literal_eval(keywords['convert_mimic_joints_to_normal_joints']), True)
+        self.assertIs(ast.literal_eval(keywords['convert_mimic_joints_to_normal_joints']), False)
         self.assertIsNone(ast.literal_eval(keywords['joint_drive']))
+        self.assertIs(ast.literal_eval(keywords['merge_fixed_joints']), False)
+        self.assertIs(ast.literal_eval(keywords['activate_contact_sensors']), True)
+        from xml.etree import ElementTree
+        _, _, urdf, _, _, _, _ = self.imported_hand_fixture()
+        tactile = [link for link in ElementTree.parse(urdf).findall('link')
+                   if 'force_sensor' in link.attrib['name']]
+        self.assertEqual(len(tactile), 17)
+        self.assertTrue(all(link.find('collision/geometry/mesh') is not None for link in tactile))
 
     def test_native_action_endpoints_satisfy_every_coupled_urdf_joint_limit(self):
         from xml.etree import ElementTree
@@ -2578,6 +2671,80 @@ class HandUrdfBoundsTests(unittest.TestCase):
             child = name.replace('_1_joint', '_2_joint')
             self.assertLessEqual(velocities[name] * float(joints[child].find('mimic').attrib['multiplier']),
                                  float(joints[child].find('limit').attrib['velocity']) + 1.e-10)
+
+    def test_all_joint_mapping_matches_recursive_urdf_targets_and_thumb_chain(self):
+        namespace, _, urdf, joints, _, _, _ = self.imported_hand_fixture()
+        names, masters, slopes, offsets = namespace['hand_joint_mapping'](str(urdf))
+        self.assertEqual(names, tuple(joints))
+        self.assertEqual(len(names), 12)
+        self.assertEqual(set(masters), set(range(6)))
+        commands = dict(zip(namespace['HAND_JOINT_NAMES'], (.1, .4, .7, .3, .9, .5)))
+
+        def target(name):
+            mimic = joints[name].find('mimic')
+            if mimic is None:
+                return commands[name]
+            return (float(mimic.attrib.get('multiplier', 1.)) * target(mimic.attrib['joint'])
+                    + float(mimic.attrib.get('offset', 0.)))
+
+        for name, master, slope, offset in zip(names, masters, slopes, offsets):
+            self.assertAlmostEqual(slope * commands[namespace['HAND_JOINT_NAMES'][master]] + offset,
+                                   target(name), places=13)
+        thumb = names.index('right_thumb_4_joint')
+        self.assertEqual(masters[thumb], namespace['HAND_JOINT_NAMES'].index('right_thumb_2_joint'))
+        self.assertAlmostEqual(slopes[thumb], .8392 * .891, places=14)
+
+    def test_mapping_accumulates_signed_chains_offsets_and_constant_targets_in_any_source_order(self):
+        from tempfile import TemporaryDirectory
+        from xml.etree import ElementTree
+
+        namespace, _, urdf, _, _, _, _ = self.imported_hand_fixture()
+        document = ElementTree.parse(urdf)
+        root = document.getroot()
+        joints = {joint.attrib['name']: joint for joint in root.findall('joint')}
+        third = joints['right_thumb_3_joint']
+        fourth = joints['right_thumb_4_joint']
+        third.find('mimic').set('multiplier', '-.4')
+        third.find('mimic').set('offset', '.2')
+        fourth.find('mimic').set('multiplier', '-1.5')
+        fourth.find('mimic').set('offset', '-.1')
+        constant = joints['right_index_2_joint'].find('mimic')
+        constant.set('multiplier', '0')
+        constant.set('offset', '.3')
+        # A descendant can precede its reference joint in URDF source order.
+        root.remove(fourth)
+        root.insert(0, fourth)
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / 'signed.urdf'
+            document.write(source)
+            names, masters, slopes, offsets = namespace['hand_joint_mapping'](str(source))
+        by_name = {name: (master, slope, offset)
+                   for name, master, slope, offset in zip(names, masters, slopes, offsets)}
+        self.assertEqual(names[0], 'right_thumb_4_joint')
+        master, slope, offset = by_name['right_thumb_4_joint']
+        self.assertEqual(master, 1)
+        self.assertAlmostEqual(slope, .6)
+        self.assertAlmostEqual(offset, -.4)
+        self.assertEqual(by_name['right_index_2_joint'], (2, 0., .3))
+
+    def test_mapping_rejects_cycles_missing_references_and_nonfinite_coefficients(self):
+        from tempfile import TemporaryDirectory
+        from xml.etree import ElementTree
+
+        namespace, _, urdf, _, _, _, _ = self.imported_hand_fixture()
+        cases = ({'joint': 'right_thumb_4_joint'}, {'joint': 'missing_joint'},
+                 {'multiplier': 'nan'}, {'offset': 'inf'})
+        with TemporaryDirectory() as directory:
+            for changes in cases:
+                with self.subTest(changes=changes):
+                    document = ElementTree.parse(urdf)
+                    child = next(joint for joint in document.findall('joint')
+                                 if joint.attrib['name'] == 'right_thumb_3_joint')
+                    child.find('mimic').attrib.update(changes)
+                    source = Path(directory) / 'invalid.urdf'
+                    document.write(source)
+                    with self.assertRaises(ValueError):
+                        namespace['hand_joint_mapping'](str(source))
 
 
 class HandActionSoftLimitsTests(unittest.TestCase):
@@ -2689,6 +2856,127 @@ class HandActionSoftLimitsTests(unittest.TestCase):
         self.assertEqual(ast.literal_eval(keywords['mode']), 'startup')
 
 
+class UrdfCoupledHandActionTests(unittest.TestCase):
+    """Exercise the real native angle mapping and six-to-twelve adapter on CPU."""
+
+    @staticmethod
+    def fixture(master_order=None):
+        env, robot, mapping, names, modules = HandActionSoftLimitsTests.fixture()
+        env.num_envs, env.device = 4, 'cpu'
+        robot.num_joints = len(names)
+        robot.data.joint_pos = torch.full((4, len(names)), -123.)
+        with patch.dict(sys.modules, modules):
+            task.configure_hand_action_limits(env)
+
+        class ActionTerm:
+            def __init__(self, cfg, env):
+                self.cfg, self.num_envs, self.device = cfg, env.num_envs, env.device
+                self._asset = env.scene[cfg.asset_name]
+
+        def load_class(path, name, namespace):
+            definition = next(node for node in ast.parse(path.read_text()).body
+                              if isinstance(node, ast.ClassDef) and node.name == name)
+            syntax = ast.Module(body=[ast.ImportFrom(module='__future__',
+                names=[ast.alias(name='annotations')], level=0), definition], type_ignores=[])
+            exec(compile(ast.fix_missing_locations(syntax), str(path), 'exec'), namespace)
+            return namespace[name]
+
+        root = Path(__file__).resolve().parents[3]
+        native = load_class(root / 'IsaacLab/source/isaaclab/isaaclab/envs/mdp/actions/joint_actions_to_limits.py',
+            'JointPositionToLimitsAction', dict(torch=torch, ActionTerm=ActionTerm,
+                logger=SimpleNamespace(info=lambda *args: None), math_utils=sys.modules['isaaclab.utils.math']))
+        adapter = load_class(root / 'src/contact_manipulation_symmetric/contact_manipulation_symmetric/config/ur5e/ur5e_env_cfg.py',
+            'UrdfCoupledHandAction', dict(torch=torch, JointPositionToLimitsAction=native,
+                HAND_JOINT_NAMES=mapping['HAND_JOINT_NAMES'], hand_joint_mapping=mapping['hand_joint_mapping']))
+        cfg = SimpleNamespace(asset_name='robot', joint_names=list(master_order or mapping['HAND_JOINT_NAMES']),
+                              preserve_order=True, scale=.5, clip=None, rescale_to_limits=True)
+        return adapter(cfg, env), robot, names, mapping
+
+    @staticmethod
+    def expected_targets(action, robot, names):
+        from xml.etree import ElementTree
+
+        joints = {joint.attrib['name']: joint for joint in ElementTree.parse(
+            robot.cfg.spawn.hand_urdf_path).findall('joint') if joint.attrib['type'] == 'revolute'}
+        masters = dict(zip(action._joint_names, action.processed_actions.unbind(-1)))
+
+        def angle(name):
+            mimic = joints[name].find('mimic')
+            if mimic is None:
+                return masters[name]
+            return (float(mimic.attrib.get('multiplier', 1.)) * angle(mimic.attrib['joint'])
+                    + float(mimic.attrib.get('offset', 0.)))
+
+        driven_names = [names[index] for index in action._driven_joint_ids]
+        return torch.stack([angle(name) for name in driven_names], dim=-1)
+
+    def test_native_six_motor_angles_expand_to_all_twelve_commanded_targets(self):
+        action, robot, names, _ = self.fixture()
+        raw = torch.tensor([[-2.] * 6, [0.] * 6, [2.] * 6,
+                            [100., -100., -.25, .25, -1., 1.]])
+        saved = raw.clone()
+        with patch.object(torch.Tensor, 'item', side_effect=AssertionError('Host scalar read')), \
+             patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('Host condition')), \
+             patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('Host transfer')):
+            action.process_actions(raw)
+            action.apply_actions()
+        self.assertEqual(action.action_dim, 6)
+        self.assertEqual(action.processed_actions.shape, (4, 6))
+        self.assertEqual(len(action._driven_joint_ids), 12)
+        bounds = robot.data.soft_joint_pos_limits[:, action._joint_ids]
+        expected_masters = torch.lerp(bounds[..., 0], bounds[..., 1],
+                                      (raw.to(bounds.dtype) * .5).clamp(-1., 1.) * .5 + .5)
+        torch.testing.assert_close(action.processed_actions, expected_masters.to(raw.dtype))
+        torch.testing.assert_close(robot.set_joint_position_target.call_args.args[0],
+                                   self.expected_targets(action, robot, names))
+        self.assertEqual(robot.set_joint_position_target.call_args.kwargs['joint_ids'], action._driven_joint_ids)
+        torch.testing.assert_close(raw, saved, rtol=0, atol=0)
+        torch.testing.assert_close(action.raw_actions, saved, rtol=0, atol=0)
+        actual = robot.set_joint_position_target.call_args.args[0]
+        limits = robot.data.joint_pos_limits[:, action._driven_joint_ids]
+        self.assertTrue((actual >= limits[..., 0] - 1.e-6).all())
+        self.assertTrue((actual <= limits[..., 1] + 1.e-6).all())
+
+    def test_child_targets_follow_commands_instead_of_contact_displaced_measurements(self):
+        action, robot, names, _ = self.fixture()
+        raw = torch.tensor([[.1, .8, -1., .2, 1., -.4]]).expand(4, -1).clone()
+        action.process_actions(raw)
+        action.apply_actions()
+        before = robot.set_joint_position_target.call_args.args[0].clone()
+        # A loaded joint may move even though its commanded motor angle is unchanged.
+        robot.data.joint_pos.fill_(999.)
+        action.process_actions(raw)
+        action.apply_actions()
+        torch.testing.assert_close(robot.set_joint_position_target.call_args.args[0], before, rtol=0, atol=0)
+        torch.testing.assert_close(before, self.expected_targets(action, robot, names))
+        action.process_actions(raw.clamp(-2., 2.))
+        torch.testing.assert_close(action._driven_targets, before, rtol=0, atol=0)
+
+    def test_partial_native_reset_preserves_other_rows_and_next_command_refreshes_children(self):
+        action, robot, names, _ = self.fixture()
+        raw = torch.linspace(-2., 2., 24).reshape(4, 6)
+        action.process_actions(raw)
+        before_raw, before_targets = action.raw_actions.clone(), action._driven_targets.clone()
+        robot.set_joint_position_target.reset_mock()
+        action.reset(torch.tensor([1, 3]))
+        torch.testing.assert_close(action.raw_actions[[0, 2]], before_raw[[0, 2]], rtol=0, atol=0)
+        torch.testing.assert_close(action.raw_actions[[1, 3]], torch.zeros(2, 6), rtol=0, atol=0)
+        torch.testing.assert_close(action._driven_targets[[0, 2]], before_targets[[0, 2]], rtol=0, atol=0)
+        robot.set_joint_position_target.assert_not_called()
+        next_raw = raw.clone()
+        next_raw[[1, 3]] = 0.
+        action.process_actions(next_raw)
+        action.apply_actions()
+        torch.testing.assert_close(action._driven_targets, self.expected_targets(action, robot, names))
+        torch.testing.assert_close(action._driven_targets[[0, 2]], before_targets[[0, 2]], rtol=0, atol=0)
+        self.assertFalse(torch.equal(action._driven_targets[[1, 3]], before_targets[[1, 3]]))
+
+    def test_reordered_motor_channels_are_rejected_before_ambiguous_target_expansion(self):
+        _, _, mapping, _, _ = HandActionSoftLimitsTests.fixture()
+        with self.assertRaisesRegex(ValueError, 'canonical order'):
+            self.fixture(tuple(reversed(mapping['HAND_JOINT_NAMES'])))
+
+
 class NativeArmEffortLimitTests(unittest.TestCase):
     def test_explicit_arm_clips_physx_submission_while_implicit_hand_keeps_position_targets(self):
         from unittest.mock import Mock
@@ -2734,19 +3022,21 @@ class NativeArmEffortLimitTests(unittest.TestCase):
         self.assertEqual(list(arm_cfg.velocity_limit_sim.values()), [3.14]*3 + [6.28]*3)
         self.assertEqual((arm_cfg.stiffness, arm_cfg.damping), (0., 0.))
         self.assertEqual((hand_cfg.effort_limit_sim, hand_cfg.velocity_limit_sim), (None, None))
+        self.assertEqual((hand_cfg.stiffness, hand_cfg.damping), (20., 1.))
 
         clip = native_method('actuators/actuator_base.py', 'ActuatorBase', '_clip_effort')
         arm_compute = native_method('actuators/actuator_pd.py', 'IdealPDActuator', 'compute')
         hand_compute = native_method('actuators/actuator_pd.py', 'ImplicitActuator', 'compute')
-        arm_ids, hand_ids = torch.arange(0, 12, 2), torch.arange(1, 12, 2)
+        arm_ids = torch.arange(0, 18, 3)
+        hand_ids = torch.tensor([index for index in range(18) if index % 3])
         arm = SimpleNamespace(joint_indices=arm_ids, stiffness=arm_cfg.stiffness,
                               damping=arm_cfg.damping, effort_limit=torch.tensor(list(expected_limits.values())),
                               velocity_limit=torch.tensor(list(arm_cfg.velocity_limit_sim.values())))
         # Native initialization resolves None from the imported URDF/USD limits.
-        hand = SimpleNamespace(joint_indices=hand_ids, effort_limit=torch.ones(6),
-                               velocity_limit=torch.tensor([2., 2., 1., 1., 1., 1.]),
-                               stiffness=torch.tensor([hand_cfg.stiffness[n] for n in namespace['HAND_JOINT_NAMES']]),
-                               damping=torch.tensor([hand_cfg.damping[n] for n in namespace['HAND_JOINT_NAMES']]))
+        hand = SimpleNamespace(joint_indices=hand_ids, effort_limit=torch.ones(12),
+                               velocity_limit=torch.tensor([2.] * 4 + [1.] * 8),
+                               stiffness=torch.full((12,), hand_cfg.stiffness),
+                               damping=torch.full((12,), hand_cfg.damping))
         for actuator, compute in ((arm, arm_compute), (hand, hand_compute)):
             actuator.compute = types.MethodType(compute, actuator)
             actuator._clip_effort = types.MethodType(clip, actuator)
@@ -2756,18 +3046,18 @@ class NativeArmEffortLimitTests(unittest.TestCase):
         expected = torch.tensor([[150., -150., 100., -28., 28., -28.],
                                  [-150., 150., -149., 27., -27., 0.],
                                  [1., -1., 0., 28., -28., 28.]])
-        data = SimpleNamespace(joint_pos_target=torch.full((3, 12), .8),
-                               joint_vel_target=torch.full((3, 12), .4),
-                               **{name: torch.zeros(3, 12) for name in (
+        data = SimpleNamespace(joint_pos_target=torch.full((3, 18), .8),
+                               joint_vel_target=torch.full((3, 18), .4),
+                               **{name: torch.zeros(3, 18) for name in (
                                    'joint_pos', 'joint_vel', 'joint_effort_target', 'computed_torque',
                                    'applied_torque', 'soft_joint_vel_limits')})
         data.joint_effort_target[:, arm_ids] = raw
         view = SimpleNamespace(set_dof_actuation_forces=Mock(), set_dof_position_targets=Mock(),
                                set_dof_velocity_targets=Mock())
         asset = SimpleNamespace(_data=data, actuators={'arm': arm, 'hand': hand}, root_physx_view=view,
-                                _joint_effort_target_sim=torch.zeros(3, 12),
-                                _joint_pos_target_sim=torch.full((3, 12), -123.),
-                                _joint_vel_target_sim=torch.full((3, 12), -321.),
+                                _joint_effort_target_sim=torch.zeros(3, 18),
+                                _joint_pos_target_sim=torch.full((3, 18), -123.),
+                                _joint_vel_target_sim=torch.full((3, 18), -321.),
                                 _has_implicit_actuators=True, _ALL_INDICES=torch.arange(3),
                                 _instantaneous_wrench_composer=SimpleNamespace(active=False, reset=Mock()),
                                 _permanent_wrench_composer=SimpleNamespace(active=False))
@@ -2781,9 +3071,9 @@ class NativeArmEffortLimitTests(unittest.TestCase):
         torch.testing.assert_close(data.joint_effort_target[:, arm_ids], raw)
         torch.testing.assert_close(data.applied_torque[:, arm_ids], expected)
         # Hand's implicit PD stays in PhysX: telemetry is clipped, feed-forward remains zero.
-        torch.testing.assert_close(data.computed_torque[:, hand_ids], torch.full((3, 6), 16.4))
-        torch.testing.assert_close(data.applied_torque[:, hand_ids], torch.ones(3, 6))
-        torch.testing.assert_close(submitted[:, hand_ids], torch.zeros(3, 6))
+        torch.testing.assert_close(data.computed_torque[:, hand_ids], torch.full((3, 12), 16.4))
+        torch.testing.assert_close(data.applied_torque[:, hand_ids], torch.ones(3, 12))
+        torch.testing.assert_close(submitted[:, hand_ids], torch.zeros(3, 12))
         for method, field in ((view.set_dof_position_targets, 'joint_pos_target'),
                               (view.set_dof_velocity_targets, 'joint_vel_target')):
             torch.testing.assert_close(method.call_args.args[0][:, hand_ids], getattr(data, field)[:, hand_ids])
@@ -7019,6 +7309,379 @@ def episode_reset_fixture(batch=5, selected=2):
         seeds=rows + 43,
     )
     return env, episodes
+
+
+class SequentialSceneGenerationTests(unittest.TestCase):
+    """Independent geometry and native reset-buffer invariants, without Kit."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Source-local off-center shapes exercise the complete rotated OBB,
+        # including the triangle's unoccupied corner, without USD/cache files.
+        cls.geometries = tuple(dataclasses.replace(geometry,
+            collision_footprint_vertices=((geometry.lower[0], geometry.lower[1]),
+                (geometry.upper[0], geometry.lower[1]), (geometry.lower[0], geometry.upper[1])),
+            visual_footprint_vertices=((geometry.lower[0], geometry.lower[1]),
+                (geometry.upper[0], geometry.lower[1]), (geometry.lower[0], geometry.upper[1])))
+            for geometry in EpisodeLayoutTests.catalog(copies=8))
+        cls.rules = task.SpawnRules(generation_mode='sequential', min_objects=30, max_objects=30,
+                                    x_range=(-1.2, -.5), y_range=(-.455, .455))
+
+    @staticmethod
+    def polygon(geometry, position, yaw, *, visual=False, full_obb=False):
+        """Independent SciPy rotation of source vertices about the local OBB center."""
+        lower, upper = np.asarray(geometry.lower[:2]), np.asarray(geometry.upper[:2])
+        source = (geometry.visual_footprint_vertices if visual else geometry.collision_footprint_vertices)
+        if full_obb or not source:
+            vertices = np.array([(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)]) * (upper-lower) * .5
+        else:
+            vertices = np.asarray(source) - (lower+upper) * .5
+        return Rotation.from_euler('z', yaw).apply(
+            np.column_stack((vertices, np.zeros(len(vertices)))))[:, :2] + np.asarray(position[:2])
+
+    @staticmethod
+    def bounds(polygon):
+        return np.asarray((polygon[:, 0].min(), polygon[:, 0].max(),
+                           polygon[:, 1].min(), polygon[:, 1].max()))
+
+    @staticmethod
+    def separation(first, second):
+        dx = max(first[0]-second[1], second[0]-first[1], 0.)
+        dy = max(first[2]-second[3], second[2]-first[3], 0.)
+        return math.hypot(dx, dy)
+
+    def sample(self, seed):
+        import random
+
+        return task.sample_scene(self.geometries, self.rules, random.Random(seed))
+
+    def test_seeded_asset_layouts_have_supported_disjoint_geometry_and_a_unique_target(self):
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                sample = self.sample(seed)
+                self.assertEqual(sample.clearance_kind, 'sequential')
+                self.assertEqual(len(sample.active_ids), len(set(sample.active_ids)))
+                self.assertGreaterEqual(len(sample.active_ids), 2)
+                self.assertLessEqual(len(sample.active_ids), self.rules.max_objects)
+                self.assertNotEqual(self.geometries[sample.target_id].asset_name,
+                                    self.geometries[sample.blocker_id].asset_name)
+                self.assertEqual(sum(self.geometries[index].asset_name
+                                     == self.geometries[sample.target_id].asset_name
+                                     for index in sample.active_ids), 1)
+                bounds = {}
+                for index in sample.active_ids:
+                    geometry = self.geometries[index]
+                    polygon = np.concatenate([self.polygon(geometry, sample.positions[index], sample.yaws[index],
+                                                          visual=visual) for visual in (False, True)])
+                    bounds[index] = self.bounds(polygon)
+                    x0, x1, y0, y1 = bounds[index]
+                    self.assertGreaterEqual(x0, self.rules.x_range[0]+self.rules.edge_margin-1.e-9)
+                    self.assertLessEqual(x1, self.rules.x_range[1]-self.rules.edge_margin+1.e-9)
+                    self.assertGreaterEqual(y0, self.rules.y_range[0]+self.rules.edge_margin-1.e-9)
+                    self.assertLessEqual(y1, self.rules.y_range[1]-self.rules.edge_margin+1.e-9)
+                    self.assertAlmostEqual(sample.positions[index][2]+geometry.lower[2], self.rules.shelf_top)
+                pair_gaps = []
+                for slot, first in enumerate(sample.active_ids):
+                    for second in sample.active_ids[slot+1:]:
+                        distance = self.separation(bounds[first], bounds[second])
+                        pair_gaps.append(distance)
+                        self.assertGreaterEqual(distance, self.rules.gap-1.e-9,
+                                                msg=f'asset pair {first}/{second}')
+                self.assertLessEqual(min(pair_gaps), self.rules.max_neighbor_gap+1.e-9)
+                metadata = sample.parameter_certificate
+                self.assertFalse(metadata['catalog_used'])
+                self.assertEqual(metadata['layout_resampling'], 0)
+                self.assertEqual(metadata['pose_rejection'], 0)
+                self.assertEqual(metadata['actual_count'], len(sample.active_ids))
+
+    def test_every_destination_fits_the_full_rotated_blocker_obb_outside_a0_and_stays_empty(self):
+        observed_sides, gaps = set(), []
+        for seed in range(16):
+            sample = self.sample(seed)
+            state = sample.parameter_certificate['sequential_state']
+            pockets, goals = state['pockets'], state['pocket_goals']
+            self.assertEqual(tuple(map(tuple, pockets)), sample.reserved_regions)
+            self.assertEqual(len(pockets), len(goals))
+            self.assertIn(len(pockets), (1, 2))
+            a0 = sample.access_region
+            for pocket, goal in zip(pockets, goals):
+                polygon = self.polygon(self.geometries[sample.blocker_id], goal[:3], goal[3], full_obb=True)
+                bounds = self.bounds(polygon)
+                self.assertGreaterEqual(bounds[0], pocket[0]+self.rules.gap-1.e-9)
+                self.assertLessEqual(bounds[1], pocket[1]-self.rules.gap+1.e-9)
+                self.assertGreaterEqual(bounds[2], pocket[2]+self.rules.gap-1.e-9)
+                self.assertLessEqual(bounds[3], pocket[3]-self.rules.gap+1.e-9)
+                if pocket[3] <= a0[2]+1.e-9:
+                    observed_sides.add(-1)
+                    self.assertLessEqual(bounds[3], a0[2]-self.rules.gap+1.e-9)
+                else:
+                    observed_sides.add(1)
+                    self.assertGreaterEqual(bounds[2], a0[3]+self.rules.gap-1.e-9)
+                for index in sample.active_ids:
+                    other = np.concatenate([self.polygon(self.geometries[index], sample.positions[index],
+                        sample.yaws[index], visual=visual) for visual in (False, True)])
+                    self.assertGreaterEqual(self.separation(pocket, self.bounds(other)), self.rules.gap-1.e-9)
+            corridor = state['blocker_front_corridor']
+            blocker = self.polygon(self.geometries[sample.blocker_id], sample.positions[sample.blocker_id],
+                                   sample.yaws[sample.blocker_id], full_obb=True)
+            self.assertGreaterEqual(corridor[0], float(blocker[:, 0].max())-1.e-9)
+            self.assertAlmostEqual(corridor[1], self.rules.x_range[1])
+            for index in sample.active_ids:
+                if index in (sample.target_id, sample.blocker_id):
+                    continue
+                bounds = self.bounds(np.concatenate([self.polygon(self.geometries[index], sample.positions[index],
+                    sample.yaws[index], visual=visual) for visual in (False, True)]))
+                self.assertGreaterEqual(self.separation(corridor, bounds), self.rules.gap-1.e-9)
+                self.assertGreaterEqual(self.separation(a0, bounds), self.rules.gap-1.e-9)
+            gaps.append(sample.parameter_certificate['target_blocker_depth_gap_m'])
+        self.assertEqual(observed_sides, {-1, 1})
+        self.assertGreater(max(gaps)-min(gaps), .02)
+
+    def test_single_and_batched_dispatch_preserve_seeded_results_without_old_layout_search(self):
+        import random
+
+        roles = [(0, 8), (18, 25), (35, 41)]
+        with patch.object(task, 'construct_scene', side_effect=AssertionError('Old constructive layout')), \
+             patch.object(task, '_scene_proposals', side_effect=AssertionError('Layout rejection sampling')):
+            singles = [task.sample_scene(self.geometries, self.rules, random.Random(seed), *role)
+                       for seed, role in zip((4, 11, 23), roles)]
+            batched = task.sample_scenes(self.geometries, self.rules,
+                [random.Random(seed) for seed in (4, 11, 23)], roles, [None]*3, device='cpu')
+        for single, batch in zip(singles, batched):
+            self.assertEqual(single.active_ids, batch.active_ids)
+            self.assertEqual(len(single.active_ids), len(set(single.active_ids)))
+            self.assertEqual(single.positions, batch.positions)
+            self.assertEqual(single.yaws, batch.yaws)
+            self.assertEqual(single.camera_pose, batch.camera_pose)
+            self.assertEqual(single.reserved_regions, batch.reserved_regions)
+        self.assertEqual([(sample.target_id, sample.blocker_id) for sample in batched], roles)
+
+    def test_forced_blocker_excludes_its_species_from_random_target_draws(self):
+        import random
+        from collections import Counter
+
+        targets = set()
+        for seed in range(32):
+            with self.subTest(seed=seed):
+                sample = task.sample_scene(self.geometries, self.rules, random.Random(seed), blocker_id=25)
+                self.assertEqual(sample.blocker_id, 25)
+                self.assertNotEqual(self.geometries[sample.target_id].asset_name,
+                                    self.geometries[25].asset_name)
+                counts = Counter(self.geometries[index].asset_name for index in sample.active_ids)
+                self.assertEqual(counts[self.geometries[sample.target_id].asset_name], 1)
+                self.assertEqual(len(sample.active_ids), len(set(sample.active_ids)))
+                targets.add(self.geometries[sample.target_id].asset_name)
+        self.assertGreater(len(targets), 4)
+
+    def test_analytic_fitting_yaw_intervals_match_independent_rotated_rectangle_extents(self):
+        cases = ((.20, .04, .18, .16), (.20, .04, .04, .20),
+                 (.20, .04, .20, .04), (.20, .10, .05, .05), (.05, .05, .20, .20))
+        random = np.random.default_rng(4152)
+        cases += tuple(tuple(random.uniform(.025, .25, size=4)) for _ in range(24))
+        grid = (np.arange(7200)+.5)*(2*math.pi/7200)
+        for width, depth, free_width, free_depth in cases:
+            with self.subTest(shape=(width, depth), free=(free_width, free_depth)):
+                intervals = task._sequential_fitting_yaw_intervals(width, depth, free_width, free_depth)
+                contained = np.zeros(len(grid), dtype=bool)
+                for low, high in intervals:
+                    self.assertTrue(0. <= low < high <= 2*math.pi)
+                    contained |= (grid >= low) & (grid <= high)
+                    local = np.asarray(((-1., -1., 0.), (1., -1., 0.),
+                                        (1., 1., 0.), (-1., 1., 0.))) * (width/2, depth/2, 1.)
+                    for angle in (low, (low+high)/2, high):
+                        rotated = Rotation.from_euler('z', angle).apply(local)
+                        extent = np.ptp(rotated[:, :2], axis=0)
+                        self.assertLessEqual(extent[0], free_width+1.e-11)
+                        self.assertLessEqual(extent[1], free_depth+1.e-11)
+                # Dense samples are only an independent test oracle; production
+                # derives continuous boundaries without evaluating an angle grid.
+                extents_x = width*np.abs(np.cos(grid))+depth*np.abs(np.sin(grid))
+                extents_y = width*np.abs(np.sin(grid))+depth*np.abs(np.cos(grid))
+                expected = (extents_x < free_width-3.e-9) & (extents_y < free_depth-3.e-9)
+                np.testing.assert_array_equal(contained, expected)
+        # Neither principal orientation fits, while a continuous interior range does.
+        recovered = task._sequential_fitting_yaw_intervals(.20, .04, .18, .16)
+        self.assertTrue(recovered)
+        self.assertFalse(any(low <= angle <= high for low, high in recovered for angle in (0., math.pi/2)))
+
+    def test_narrow_space_recovery_adds_only_the_missing_object_without_recreating_the_layout(self):
+        import random
+        from collections import Counter
+
+        rules = dataclasses.replace(self.rules, x_range=(-1., -.5))
+        with patch.object(task, '_sequential_fitting_yaw_intervals', return_value=()):
+            stalled = task.sample_scene(self.geometries, rules, random.Random(8))
+        recovered = task.sample_scene(self.geometries, rules, random.Random(8))
+        self.assertLess(len(stalled.active_ids), rules.min_objects)
+        self.assertEqual(len(recovered.active_ids), rules.min_objects)
+        self.assertEqual(recovered.active_ids[:-1], stalled.active_ids)
+        self.assertEqual({index: recovered.positions[index] for index in stalled.active_ids}, stalled.positions)
+        self.assertEqual({index: recovered.yaws[index] for index in stalled.active_ids}, stalled.yaws)
+        self.assertEqual(recovered.camera_pose, stalled.camera_pose)
+        self.assertEqual(recovered.reserved_regions, stalled.reserved_regions)
+        metadata = recovered.parameter_certificate
+        self.assertEqual(metadata['minimum_count_shortfall'], 0)
+        self.assertEqual(metadata['layout_resampling'], 0)
+        self.assertEqual(len(metadata['minimum_count_yaw_recoveries']), 1)
+        record = metadata['minimum_count_yaw_recoveries'][0]
+        self.assertEqual(record['count_before'], len(stalled.active_ids))
+        index, free = record['object_id'], record['free_rectangle']
+        self.assertEqual(index, recovered.active_ids[-1])
+        self.assertTrue(any(low <= record['selected_yaw'] <= high
+                            for low, high in record['feasible_yaw_intervals']))
+        polygon = np.concatenate([self.polygon(self.geometries[index], recovered.positions[index],
+            recovered.yaws[index], visual=visual) for visual in (False, True)])
+        bounds = self.bounds(polygon)
+        self.assertGreaterEqual(bounds[0], free[0]-1.e-10)
+        self.assertLessEqual(bounds[1], free[1]+1.e-10)
+        self.assertGreaterEqual(bounds[2], free[2]-1.e-10)
+        self.assertLessEqual(bounds[3], free[3]+1.e-10)
+        for other in stalled.active_ids:
+            existing = np.concatenate([self.polygon(self.geometries[other], stalled.positions[other],
+                stalled.yaws[other], visual=visual) for visual in (False, True)])
+            self.assertGreaterEqual(self.separation(bounds, self.bounds(existing)), rules.gap-1.e-9)
+        counts = Counter(self.geometries[index].asset_name for index in recovered.active_ids
+                         if index != recovered.target_id)
+        self.assertLessEqual(max(counts.values())-min(counts.values()), 1)
+
+    def test_relocation_reward_uses_only_constructed_goal_pockets_not_front_corridors(self):
+        sample = self.sample(7)
+        state = sample.parameter_certificate['sequential_state']
+        regions, counts, valid = task.build_initial_relocation_regions(
+            sample, self.geometries, self.rules, device='cpu', dtype=torch.float64)
+        self.assertEqual(regions.shape, (len(sample.reserved_regions), 4, 2))
+        self.assertTrue(valid.all())
+        torch.testing.assert_close(counts, torch.full_like(counts, 4))
+        for polygon, expected in zip(regions.numpy(), sample.reserved_regions):
+            np.testing.assert_allclose(self.bounds(polygon), expected, atol=1.e-12, rtol=0.)
+        self.assertNotEqual(tuple(map(tuple, state['pocket_front_corridors'])), sample.reserved_regions)
+
+    @staticmethod
+    def builder_fixture():
+        import random
+        from unittest.mock import Mock
+
+        env, propose, starts, snapshot = EpisodeResetTests.builder_fixture()
+        env.spawn_rules.generation_mode = 'sequential'
+        env.cfg.initial_vision.max_layout_attempts = 99
+        camera = (-.02, .07, 1.29, .5, -.5, -.5, .5)
+        generated = []
+
+        def generate(geometries, rules, rng=None, *, seed=None, target_id=None, blocker_id=None, **kwargs):
+            sample = dataclasses.replace(propose(geometries, rules, rng or random.Random(seed),
+                target_id=0 if target_id is None else target_id,
+                blocker_id=1 if blocker_id is None else blocker_id, active_ids=None),
+                camera_pose=camera, clearance_kind='sequential')
+            generated.append(sample)
+            return sample
+
+        def observe(requests, cameras, *, object_poses, root_poses):
+            result = [snapshot(request['env_id'], pose) for request, pose in zip(requests, object_poses)]
+            for value, pose in zip(result, cameras):
+                value.camera_pose_w = pose.clone()
+            return result
+
+        env._episode_reset.vision.observe_at_viewpoint = Mock(side_effect=observe)
+        return env, generate, starts, generated
+
+    def test_builder_evaluates_the_supplied_camera_once_without_catalog_or_view_candidates(self):
+        env, generate, starts, generated = self.builder_fixture()
+        vision = env._episode_reset.vision
+        ids = torch.tensor([4, 1])
+        before = env.scene['object_collection'].state.clone()
+        with patch.object(task, 'sample_sequential_scene', side_effect=generate) as sample, \
+             patch.object(task, 'sample_scenes', side_effect=AssertionError('Old batch layout path')), \
+             patch.object(task, '_capture_constructive_views', side_effect=AssertionError('Old view-domain search')), \
+             patch.object(task, 'initialize_certified_catalog', side_effect=AssertionError('Catalog lookup')), \
+             patch.object(task, '_sample_robot_starts', side_effect=starts), \
+             patch.object(task, '_check_physical_robot_starts', return_value=torch.ones(2, dtype=torch.bool)):
+            batch = task._build_episode_batch(env, env._episode_reset, ids)
+        self.assertEqual(sample.call_count, len(ids))
+        self.assertEqual(vision.observe_at_viewpoint.call_count, 1)
+        vision.capture_batch.assert_not_called()
+        vision.capture_view_domain.assert_not_called()
+        expected = torch.tensor([value.camera_pose for value in generated])
+        expected[:, :3] += env.scene.env_origins[ids]
+        torch.testing.assert_close(vision.observe_at_viewpoint.call_args.args[1], expected)
+        torch.testing.assert_close(batch.camera_pose, expected)
+        torch.testing.assert_close(env.scene['object_collection'].state, before)
+
+    def test_failed_visibility_reports_the_invariant_once_without_resampling_or_ik(self):
+        env, generate, _, _ = self.builder_fixture()
+        env._episode_reset.vision.observe_at_viewpoint.side_effect = lambda requests, *a, **kw: [None]*len(requests)
+        before = env.scene['object_collection'].state.clone()
+        with patch.object(task, 'sample_sequential_scene', side_effect=generate) as sample, \
+             patch.object(task, '_capture_constructive_views', side_effect=AssertionError('Old view-domain search')), \
+             patch.object(task, '_sample_robot_starts') as ik:
+            with self.assertRaisesRegex(RuntimeError, 'no layout resampling'):
+                task._build_episode_batch(env, env._episode_reset, torch.tensor([4, 1]))
+        self.assertEqual(sample.call_count, 2)  # One generation per requested environment, no retry.
+        self.assertEqual(env._episode_reset.vision.observe_at_viewpoint.call_count, 1)
+        ik.assert_not_called()
+        torch.testing.assert_close(env.scene['object_collection'].state, before)
+
+    def test_unmeasured_silhouette_visibility_is_unknown_and_not_fabricated(self):
+        env, generate, starts, _ = self.builder_fixture()
+        vision = env._episode_reset.vision
+        observe = vision.observe_at_viewpoint.side_effect
+
+        def without_fraction(*args, **kwargs):
+            snapshots = observe(*args, **kwargs)
+            for snapshot in snapshots:
+                snapshot.visible_fractions = None
+            return snapshots
+
+        vision.observe_at_viewpoint.side_effect = without_fraction
+        with patch.object(task, 'sample_sequential_scene', side_effect=generate), \
+             patch.object(task, '_sample_robot_starts', side_effect=starts), \
+             patch.object(task, '_check_physical_robot_starts', return_value=torch.ones(2, dtype=torch.bool)):
+            batch = task._build_episode_batch(env, env._episode_reset, torch.tensor([4, 1]))
+        torch.testing.assert_close(batch.visibility, torch.full((2, 2), -1.))
+        self.assertTrue(batch.geometry_valid[:, :2].all())
+
+    def test_missing_target_or_blocker_obb_rejects_once_before_any_robot_search(self):
+        for missing in (0, 1):
+            with self.subTest(slot=missing):
+                env, generate, _, _ = self.builder_fixture()
+                vision = env._episode_reset.vision
+                observe = vision.observe_at_viewpoint.side_effect
+
+                def missing_role(*args, **kwargs):
+                    snapshots = observe(*args, **kwargs)
+                    for snapshot in snapshots:
+                        snapshot.valid[missing] = False
+                    return snapshots
+
+                vision.observe_at_viewpoint.side_effect = missing_role
+                with patch.object(task, 'sample_sequential_scene', side_effect=generate) as sample, \
+                     patch.object(task, '_sample_robot_starts') as ik:
+                    with self.assertRaisesRegex(RuntimeError, 'no layout resampling'):
+                        task._build_episode_batch(env, env._episode_reset, torch.tensor([4, 1]))
+                self.assertEqual(sample.call_count, 2)
+                self.assertEqual(vision.observe_at_viewpoint.call_count, 1)
+                ik.assert_not_called()
+
+    def test_shared_and_partial_resets_reuse_sequential_layout_camera_and_goal_regions(self):
+        env, template, source = EpisodeResetTests.shared_fixture()
+        sample = dataclasses.replace(source, clearance_kind='sequential', reserved_regions=((-.8, -.7, .2, .3),))
+        env.spawn_rules.generation_mode = 'sequential'
+        with patch.object(task, '_build_episode_batch', return_value=(template, sample)) as build, \
+             patch.object(task, '_sample_robot_starts', side_effect=EpisodeResetTests.shared_starts), \
+             patch.object(task, 'sample_sequential_scene', side_effect=AssertionError('Partial reset regenerated scene')):
+            task.reset_scene(env)
+            objects, joints = env.scene['object_collection'].state.clone(), env.scene['robot'].position.clone()
+            camera = env._episode_reset.camera_pose.clone()
+            regions = env.task_scene_data.relocation_regions
+            env.scene['object_collection'].state[4, :, :3] += .1
+            env.common_step_counter = 17
+            task.reset_scene(env, torch.tensor([4, 1]))
+        self.assertEqual(build.call_count, 1)
+        self.assertIs(env.task_scene_data.relocation_regions, regions)
+        self.assertEqual(regions.shape[1:], (1, 4, 2))
+        torch.testing.assert_close(env.scene['object_collection'].state, objects)
+        torch.testing.assert_close(env._episode_reset.camera_pose, camera)
+        torch.testing.assert_close(env.scene['robot'].position[[0, 2, 3]], joints[[0, 2, 3]])
+        self.assertFalse(torch.equal(env.scene['robot'].position[[4, 1]], joints[[4, 1]]))
 
 
 class EpisodeResetTests(unittest.TestCase):
@@ -12724,6 +13387,485 @@ class BundledCatalogTransferTests(unittest.TestCase):
                     task._bundled_catalog_directory(fingerprint, cache, bundle_directory=bundle)
                 self.assertFalse((cache/f"bundled_{manifest['archive_sha256']}").exists())
                 self.assertEqual([path.name for path in cache.iterdir()], ['existing_user_cache.json'])
+
+
+class FixedObstacleHandProbeTests(unittest.TestCase):
+    """Execute isolated probe control/geometry code on CPU, without AppLauncher."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = Path(__file__).resolve().parents[3] / 'src/contact_manipulation/tests/probe_hand_contact.py'
+        cls.syntax = ast.parse(cls.path.read_text())
+        cls.probe = next(node for node in cls.syntax.body
+                         if isinstance(node, ast.FunctionDef) and node.name == 'run_probe')
+
+    @classmethod
+    def execute(cls, statements, namespace):
+        exec(compile(ast.Module(body=statements, type_ignores=[]), str(cls.path), 'exec'), namespace)
+
+    @classmethod
+    def function(cls, name, namespace, *, nested=True):
+        source = cls.probe.body if nested else cls.syntax.body
+        definition = next(node for node in source if isinstance(node, ast.FunctionDef) and node.name == name)
+        cls.execute([definition], namespace)
+        return namespace[name]
+
+    def test_fixed_obstacle_cli_requires_a_closing_command_and_counts_press_steps(self):
+        import argparse
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        namespace = dict(argparse=argparse, math=math, Path=Path, __doc__='CPU probe argument check',
+                         AppLauncher=SimpleNamespace(add_app_launcher_args=lambda parser: None))
+        parse = self.function('parse_args', namespace, nested=False)
+        options = ['probe', '--fixed-obstacle', '--target-flexion', '.5', '--settle-steps', '0',
+                   '--plateau-steps', '4', '--release-steps', '0', '--return-to-open-steps', '0']
+        for finger in ('index', 'middle', 'ring', 'little', 'thumb'):
+            with self.subTest(finger=finger), patch.object(sys, 'argv', options + ['--finger', finger]):
+                args = parse()
+                self.assertTrue(args.fixed_obstacle)
+                self.assertEqual(args.loads, [])
+                self.assertEqual(args.finger, finger)
+                self.assertEqual(args.plateau_steps, 4)
+        for invalid in (['--fixed-obstacle'],
+                        ['--fixed-obstacle', '--target-flexion', '.5', '--prismatic-guide'],
+                        ['--fixed-obstacle', '--target-flexion', 'nan'],
+                        ['--fixed-obstacle', '--target-flexion', '.5', '--settle-steps', '0',
+                         '--plateau-steps', '0', '--release-steps', '0']):
+            with self.subTest(options=invalid), patch.object(sys, 'argv', ['probe'] + invalid), \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit) as error:
+                parse()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_stiffness_comparison_cli_preserves_default_and_rejects_nonphysical_values(self):
+        import argparse
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        namespace = dict(argparse=argparse, math=math, Path=Path, __doc__='CPU stiffness argument check',
+                         AppLauncher=SimpleNamespace(add_app_launcher_args=lambda parser: None))
+        parse = self.function('parse_args', namespace, nested=False)
+        with patch.object(sys, 'argv', ['probe']):
+            self.assertIsNone(parse().hand_stiffness)
+        for value in (20., 50., 100.):
+            with self.subTest(stiffness=value), patch.object(sys, 'argv',
+                    ['probe', '--hand-stiffness', str(value)]):
+                self.assertEqual(parse().hand_stiffness, value)
+        for value in ('0', '-1', 'nan', 'inf', '-inf'):
+            with self.subTest(stiffness=value), patch.object(sys, 'argv',
+                    ['probe', '--hand-stiffness='+value]), redirect_stderr(StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                parse()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_stiffness_override_changes_only_the_copied_probe_actuator(self):
+        from copy import deepcopy
+
+        assignment = next(node for node in self.probe.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'hand_actuator'
+                                  for target in node.targets))
+        override = next(node for node in self.probe.body if isinstance(node, ast.If)
+                        and any(isinstance(child, ast.Assign) and any(
+                            isinstance(target, ast.Attribute) and target.attr == 'stiffness'
+                            and isinstance(target.value, ast.Name) and target.value.id == 'hand_actuator'
+                            for target in child.targets) for child in node.body))
+        articulation = next(node for node in ast.walk(self.probe) if isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name) and node.func.id == 'ArticulationCfg')
+        actuator_argument = next(keyword.value for keyword in articulation.keywords if keyword.arg == 'actuators')
+        self.assertIsInstance(actuator_argument, ast.Dict)
+        self.assertEqual(ast.literal_eval(actuator_argument.keys[0]), 'hand')
+        self.assertEqual(actuator_argument.values[0].id, 'hand_actuator')
+
+        class Actuator(SimpleNamespace):
+            def copy(self):
+                return deepcopy(self)
+
+        original = dict(stiffness={'right_.*': 20.}, damping={'right_.*': 1.}, effort_limit=None,
+                        effort_limit_sim={'right_.*': 1.}, velocity_limit_sim={'right_.*': 1.},
+                        joint_names_expr=['right_.*'], armature=0.0001)
+        for value in (None, 20., 50., 100.):
+            with self.subTest(stiffness=value):
+                source = Actuator(**deepcopy(original))
+                namespace = dict(production=SimpleNamespace(actuators={'hand': source}),
+                                 args=SimpleNamespace(hand_stiffness=value))
+                self.execute([assignment, override], namespace)
+                actual = namespace['hand_actuator']
+                self.assertIsNot(actual, source)
+                self.assertEqual(vars(source), original)
+                expected = deepcopy(original)
+                if value is not None:
+                    expected['stiffness'] = value
+                self.assertEqual(vars(actual), expected)
+                actual.effort_limit_sim['right_.*'] = 99.
+                self.assertEqual(source.effort_limit_sim, original['effort_limit_sim'])
+
+    def test_damping_and_effort_comparison_cli_preserves_defaults_and_physical_ranges(self):
+        import argparse
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        namespace = dict(argparse=argparse, math=math, Path=Path, __doc__='CPU effort argument check',
+                         AppLauncher=SimpleNamespace(add_app_launcher_args=lambda parser: None))
+        parse = self.function('parse_args', namespace, nested=False)
+        with patch.object(sys, 'argv', ['probe']):
+            inherited = parse()
+        self.assertIsNone(inherited.hand_damping)
+        self.assertIsNone(inherited.hand_effort_limit)
+        for effort in (1., 10.):
+            with self.subTest(effort=effort), patch.object(sys, 'argv', ['probe', '--hand-stiffness', '1.2',
+                    '--hand-damping', '.06', '--hand-effort-limit', str(effort)]):
+                actual = parse()
+                self.assertEqual(actual.hand_stiffness, 1.2)
+                self.assertEqual(actual.hand_damping, .06)
+                self.assertEqual(actual.hand_effort_limit, effort)
+        with patch.object(sys, 'argv', ['probe', '--hand-damping', '0']):
+            self.assertEqual(parse().hand_damping, 0.)
+        for option, values in (('--hand-damping', ('-1', 'nan', 'inf', '-inf')),
+                               ('--hand-effort-limit', ('0', '-1', 'nan', 'inf', '-inf'))):
+            for value in values:
+                with self.subTest(option=option, value=value), patch.object(sys, 'argv',
+                        ['probe', option+'='+value]), redirect_stderr(StringIO()), \
+                        self.assertRaises(SystemExit) as error:
+                    parse()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_gain_and_effort_overrides_keep_production_and_other_actuator_fields_unchanged(self):
+        from copy import deepcopy
+
+        assignment = next(node for node in self.probe.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'hand_actuator'
+                                  for target in node.targets))
+        attributes = {'stiffness', 'damping', 'effort_limit_sim'}
+        overrides = [node for node in self.probe.body if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Assign) and any(
+                         isinstance(target, ast.Attribute) and target.attr in attributes
+                         and isinstance(target.value, ast.Name) and target.value.id == 'hand_actuator'
+                         for target in child.targets) for child in node.body)]
+        self.assertEqual(len(overrides), 3)
+
+        class Actuator(SimpleNamespace):
+            def copy(self):
+                return deepcopy(self)
+
+        original = dict(stiffness={'right_.*': 20.}, damping={'right_.*': 1.}, effort_limit=None,
+                        effort_limit_sim={'right_.*': 1.}, velocity_limit_sim={'right_.*': 1.},
+                        joint_names_expr=['right_.*'], armature=.0001)
+        for stiffness, damping, effort in ((None, None, None), (1.2, .06, 1.), (1.2, .06, 10.),
+                                          (None, 0., None), (None, None, 10.)):
+            with self.subTest(stiffness=stiffness, damping=damping, effort=effort):
+                source = Actuator(**deepcopy(original))
+                namespace = dict(production=SimpleNamespace(actuators={'hand': source}),
+                                 args=SimpleNamespace(hand_stiffness=stiffness, hand_damping=damping,
+                                                      hand_effort_limit=effort))
+                self.execute([assignment, *overrides], namespace)
+                actual = namespace['hand_actuator']
+                self.assertIsNot(actual, source)
+                self.assertEqual(vars(source), original)
+                expected = deepcopy(original)
+                for name, value in (('stiffness', stiffness), ('damping', damping), ('effort_limit_sim', effort)):
+                    if value is not None:
+                        expected[name] = value
+                self.assertEqual(vars(actual), expected)
+                self.assertIsNone(actual.effort_limit)
+                actual.joint_names_expr.append('diagnostic_only')
+                self.assertEqual(source.joint_names_expr, original['joint_names_expr'])
+
+    def test_armature_velocity_and_self_collision_cli_inherits_defaults_and_rejects_invalid_options(self):
+        import argparse
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        namespace = dict(argparse=argparse, math=math, Path=Path, __doc__='CPU armature argument check',
+                         AppLauncher=SimpleNamespace(add_app_launcher_args=lambda parser: None))
+        parse = self.function('parse_args', namespace, nested=False)
+        with patch.object(sys, 'argv', ['probe']):
+            inherited = parse()
+        self.assertIsNone(inherited.hand_armature)
+        self.assertIsNone(inherited.hand_velocity_limit)
+        self.assertEqual(inherited.hand_self_collision, 'inherit')
+        for value in (0., .0001, .01):
+            with self.subTest(armature=value), patch.object(sys, 'argv',
+                    ['probe', '--hand-armature', str(value)]):
+                self.assertEqual(parse().hand_armature, value)
+        for value in (1., 1000.):
+            with self.subTest(velocity_limit=value), patch.object(sys, 'argv',
+                    ['probe', '--hand-velocity-limit', str(value)]):
+                self.assertEqual(parse().hand_velocity_limit, value)
+        for choice in ('inherit', 'on', 'off'):
+            with self.subTest(self_collision=choice), patch.object(sys, 'argv',
+                    ['probe', '--hand-self-collision', choice]):
+                self.assertEqual(parse().hand_self_collision, choice)
+        invalid = [['--hand-armature='+value] for value in ('-1', 'nan', 'inf', '-inf')]
+        invalid.extend([['--hand-velocity-limit='+value] for value in ('0', '-1', 'nan', 'inf', '-inf')])
+        invalid.append(['--hand-self-collision', 'true'])
+        for options in invalid:
+            with self.subTest(options=options), patch.object(sys, 'argv', ['probe']+options), \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit) as error:
+                parse()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_armature_and_velocity_overrides_change_only_the_copied_actuator_property(self):
+        from copy import deepcopy
+
+        assignment = next(node for node in self.probe.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'hand_actuator'
+                                  for target in node.targets))
+        overrides = [node for node in self.probe.body if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Assign) and any(
+                         isinstance(target, ast.Attribute) and target.attr in {'armature', 'velocity_limit_sim'}
+                         and isinstance(target.value, ast.Name) and target.value.id == 'hand_actuator'
+                         for target in child.targets) for child in node.body)]
+        self.assertEqual(len(overrides), 2)
+
+        class Actuator(SimpleNamespace):
+            def copy(self):
+                return deepcopy(self)
+
+        original = dict(stiffness=1.2, damping=.06, effort_limit=None, effort_limit_sim=10.,
+                        velocity_limit_sim={'right_.*': 1.}, joint_names_expr=['right_.*'], armature=.0001)
+        for attribute, option, values in (('armature', 'hand_armature', (None, 0., .0001, .01)),
+                                          ('velocity_limit_sim', 'hand_velocity_limit', (None, 1., 1000.))):
+            for value in values:
+                with self.subTest(attribute=attribute, value=value):
+                    source = Actuator(**deepcopy(original))
+                    args = SimpleNamespace(hand_armature=None, hand_velocity_limit=None)
+                    setattr(args, option, value)
+                    namespace = dict(production=SimpleNamespace(actuators={'hand': source}), args=args)
+                    self.execute([assignment, *overrides], namespace)
+                    actual = namespace['hand_actuator']
+                    self.assertIsNot(actual, source)
+                    self.assertEqual(vars(source), original)
+                    expected = deepcopy(original)
+                    if value is not None:
+                        expected[attribute] = value
+                    self.assertEqual(vars(actual), expected)
+
+    def test_self_collision_override_changes_only_the_copied_articulation_properties(self):
+        from copy import deepcopy
+
+        assignment = next(node for node in self.probe.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == 'articulation_props'
+                                  for target in node.targets))
+        override = next(node for node in self.probe.body if isinstance(node, ast.If)
+                        and any(isinstance(child, ast.Assign) and any(
+                            isinstance(target, ast.Attribute) and target.attr == 'enabled_self_collisions'
+                            and isinstance(target.value, ast.Name) and target.value.id == 'articulation_props'
+                            for target in child.targets) for child in node.body))
+
+        class Properties(SimpleNamespace):
+            def copy(self):
+                return deepcopy(self)
+
+        for original_enabled in (False, True):
+            original = dict(enabled_self_collisions=original_enabled, fix_root_link=True,
+                            solver_position_iteration_count=16, solver_velocity_iteration_count=2)
+            for choice in ('inherit', 'on', 'off'):
+                with self.subTest(original=original_enabled, self_collision=choice):
+                    source = Properties(**original)
+                    namespace = dict(production=SimpleNamespace(spawn=SimpleNamespace(articulation_props=source)),
+                                     args=SimpleNamespace(hand_self_collision=choice))
+                    self.execute([assignment, override], namespace)
+                    actual = namespace['articulation_props']
+                    self.assertIsNot(actual, source)
+                    self.assertEqual(vars(source), original)
+                    enabled = original_enabled if choice == 'inherit' else choice == 'on'
+                    self.assertEqual(vars(actual), dict(original, enabled_self_collisions=enabled))
+
+    def test_only_selected_master_closes_holds_and_reopens_with_zero_external_load(self):
+        press = next(node for node in self.probe.body if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == 'selected_id' for target in child.targets)
+                         for child in node.body))
+        names = [f'right_{finger}_{joint}_joint' for finger, joint in
+                 (('index', 1), ('middle', 1), ('ring', 1), ('little', 1), ('thumb', 1), ('thumb', 2))]
+        for selected in (names[0], names[1], names[2], names[3], names[5]):
+            with self.subTest(selected=selected):
+                bounds = np.column_stack((np.zeros(6), np.linspace(.6, 1.6, 6)))
+                targets = torch.zeros((1, 6), dtype=torch.float64)
+                snapshots, records = [], []
+                namespace = dict(args=SimpleNamespace(fixed_obstacle=True, target_flexion=.5,
+                    plateau_steps=4, return_to_open_steps=4, ramp_steps=2), names=names,
+                    selected_motor=selected, soft_limits=bounds, targets=targets, stop_reason=None,
+                    advance=lambda: snapshots.append(targets.clone()),
+                    capture=lambda *args: records.append(args))
+                self.execute(press.body, namespace)
+                index = names.index(selected)
+                peak = bounds[index, 1] * .5
+                actual = torch.cat(snapshots)
+                expected = torch.zeros((8, 6), dtype=actual.dtype)
+                expected[:, index] = torch.tensor([.5, 1., 1., 1., .5, 0., 0., 0.]) * peak
+                torch.testing.assert_close(actual, expected)
+                self.assertEqual([row[0] for row in records], ['press'] * 4 + ['reopen'] * 4)
+                self.assertTrue(all(row[2] == 0. for row in records))
+                self.assertTrue((actual >= torch.as_tensor(bounds[:, 0])).all())
+                self.assertTrue((actual <= torch.as_tensor(bounds[:, 1])).all())
+
+    def test_dynamic_push_disables_external_loads_and_rejects_conflicting_fixtures(self):
+        import argparse
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        namespace = dict(argparse=argparse, math=math, Path=Path, __doc__='CPU push argument check',
+                         AppLauncher=SimpleNamespace(add_app_launcher_args=lambda parser: None))
+        parse = self.function('parse_args', namespace, nested=False)
+        options = ['probe', '--push-object', '--target-flexion', '1', '--mass', '.3']
+        with patch.object(sys, 'argv', options):
+            args = parse()
+        self.assertTrue(args.push_object)
+        self.assertFalse(args.fixed_obstacle)
+        self.assertEqual(args.loads, [])
+        self.assertAlmostEqual(args.mass, .3)
+        with patch.object(sys, 'argv', ['probe', '--push-object', '--translate-hand', '--mass', '.3']):
+            translated = parse()
+        self.assertTrue(translated.translate_hand)
+        self.assertEqual(translated.target_flexion, 0.)
+        self.assertEqual(translated.loads, [])
+        for extra in (['--fixed-obstacle'], ['--prismatic-guide'], ['--target-flexion', '0']):
+            with self.subTest(extra=extra), patch.object(sys, 'argv', options+extra), \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parse()
+        for invalid in (['--translate-hand'], ['--push-object', '--translate-hand', '--target-flexion', '.5'],
+                        ['--push-object', '--translate-hand', '--translation-distance', 'nan']):
+            with self.subTest(invalid=invalid), patch.object(sys, 'argv', ['probe']+invalid), \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parse()
+
+    def test_reopen_starts_from_the_reached_command_after_an_incomplete_closing_ramp(self):
+        press = next(node for node in self.probe.body if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == 'selected_id' for target in child.targets)
+                         for child in node.body))
+        targets, snapshots = torch.zeros((1, 1)), []
+        namespace = dict(args=SimpleNamespace(fixed_obstacle=True, target_flexion=1.,
+            plateau_steps=1, return_to_open_steps=4, ramp_steps=4), names=['selected'],
+            selected_motor='selected', soft_limits=np.array([[0., 1.]]), targets=targets, stop_reason=None,
+            advance=lambda: snapshots.append(targets.clone()), capture=lambda *args: None)
+        self.execute(press.body, namespace)
+        actual = torch.cat(snapshots)[:, 0]
+        torch.testing.assert_close(actual, torch.tensor([.25, .1875, .125, .0625, 0.]))
+        self.assertTrue((actual[1:] <= actual[:-1]).all())
+
+    def test_whole_hand_translation_holds_joint_targets_and_moves_only_the_guide_target(self):
+        press = next(node for node in self.probe.body if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == 'selected_id' for target in child.targets)
+                         for child in node.body))
+        targets, positions, joint_targets = torch.zeros((1, 1)), [], []
+        namespace = dict(args=SimpleNamespace(target_flexion=0., translate_hand=True, translation_distance=.1,
+            plateau_steps=4, return_to_open_steps=4, ramp_steps=2), names=['selected'], selected_motor='selected',
+            soft_limits=np.array([[0., 1.]]), targets=targets, stop_reason=None, translation_target=0.,
+            capture=lambda *args: None)
+        def record():
+            positions.append(namespace['translation_target'])
+            joint_targets.append(targets.clone())
+        namespace['advance'] = record
+        self.execute(press.body, namespace)
+        np.testing.assert_allclose(positions, [.05, .1, .1, .1, .05, 0., 0., 0.])
+        torch.testing.assert_close(torch.cat(joint_targets), torch.zeros((8, 1)))
+
+    def test_fixed_fixture_normal_uses_the_whole_commanded_chain_and_keeps_one_mm_gap(self):
+        from xml.etree import ElementTree
+
+        rotation = Rotation.from_euler('xyz', [.3, -.5, .7]).as_matrix()
+        offset = np.array([.3, -.2, .1])
+        parent_positions = {'root_parent': np.zeros(3), 'middle_parent': np.array([1., 0., 0.]),
+                            'distal_parent': np.array([1.5, 0., 0.]), 'other_parent': np.zeros(3)}
+        center = np.array([2., 1., 0.])
+        points = np.array(list(product((-.02, .02), (-.01, .01), (-.005, .005))))
+        tangent_local = np.array([-3., 3.25, 0.])
+        tangent_local /= np.linalg.norm(tangent_local)
+        pad_name = 'right_index_force_sensor_3'
+        body_centers = {pad_name: center, 'right_index_2': center + .04 * tangent_local,
+                        'right_middle_force_sensor_3': center + 2. * tangent_local}
+        joint_parents = dict(master='root_parent', middle='middle_parent', distal='distal_parent',
+                             other='other_parent')
+        joints = {}
+        for name, parent in joint_parents.items():
+            value = lambda data: SimpleNamespace(Get=lambda: data)
+            quaternion = SimpleNamespace(GetReal=lambda: 1., GetImaginary=lambda: (0., 0., 0.))
+            joints[name] = SimpleNamespace(GetBody0Rel=lambda parent=parent: SimpleNamespace(
+                GetTargets=lambda: [parent]), GetLocalRot0Attr=lambda q=quaternion: value(q),
+                GetAxisAttr=lambda: value('Z'), GetLocalPos0Attr=lambda: value(np.zeros(3)))
+        sources = {node.attrib['name']: node for node in ElementTree.fromstring(
+            '<robot><joint name="master"/><joint name="middle"><mimic joint="master" multiplier="0.5"/>'
+            '</joint><joint name="distal"><mimic joint="middle" multiplier="3" offset="0.1"/>'
+            '</joint><joint name="other"/></robot>')}
+        def pose(name):
+            return (offset + rotation @ (body_centers[name] if name in body_centers else parent_positions[name]),
+                    rotation)
+        namespace = dict(np=np, args=SimpleNamespace(fixed_obstacle=True, radius=.012, finger='index'),
+            loaded_joint=joints['distal'], selected_motor='master', joints=joints, source_joints=sources,
+            pad_name=pad_name, pad_points=points, bodies=body_centers,
+            collision_points_local=lambda name: points, quaternion_matrix=lambda q: np.eye(3),
+            stage=SimpleNamespace(GetPrimAtPath=lambda path: SimpleNamespace(GetName=lambda: path)))
+        geometry = self.function('fixture_geometry', namespace)(pose)
+        expected_tangent = rotation @ tangent_local
+        np.testing.assert_allclose(-geometry[1], expected_tangent, atol=1.e-14)
+        np.testing.assert_allclose(geometry[4], offset + rotation @ center, atol=1.e-14)
+        namespace['authored_geometry'] = geometry
+        index = next(i for i, node in enumerate(self.probe.body) if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'fixture_orientation'
+                             for target in node.targets))
+        namespace['Rotation'] = Rotation
+        self.execute(self.probe.body[index:index+3], namespace)
+        box_rotation = Rotation.from_quat(np.asarray(namespace['fixture_orientation'])[[1, 2, 3, 0]]).as_matrix()
+        np.testing.assert_allclose(box_rotation[:, 0], expected_tangent, atol=1.e-14)
+        np.testing.assert_allclose(box_rotation.T @ box_rotation, np.eye(3), atol=1.e-14)
+        self.assertAlmostEqual(float(np.linalg.det(box_rotation)), 1.)
+        # A housing collider protrudes 4 cm past the pad. The whole selected
+        # finger must start clear; a different finger must not shift the box.
+        world_points = np.concatenate([points @ rotation.T + pose(name)[0]
+                                       for name in (pad_name, 'right_index_2')])
+        finger_front = np.max(world_points @ expected_tangent)
+        pad_front = np.max((points @ rotation.T + geometry[4]) @ expected_tangent)
+        obstacle_front = geometry[0] @ expected_tangent - namespace['fixed_box_size'][0] / 2.
+        self.assertAlmostEqual(float(obstacle_front - finger_front), .001, places=13)
+        self.assertAlmostEqual(float(obstacle_front - pad_front), .041, places=13)
+        # The dynamic load probe intentionally retains its single-distal-joint direction.
+        namespace['args'].fixed_obstacle = False
+        old_geometry = namespace['fixture_geometry'](pose)
+        distal_tangent = rotation @ np.array([-1., .5, 0.])
+        distal_tangent /= np.linalg.norm(distal_tangent)
+        np.testing.assert_allclose(-old_geometry[1], distal_tangent, atol=1.e-14)
+
+    def test_fixed_advance_expands_command_targets_but_never_applies_load_or_teleports(self):
+        from unittest.mock import Mock
+
+        for fixed, push, translate in ((False, False, False), (True, False, False), (False, True, False), (False, True, True)):
+            with self.subTest(fixed=fixed, push=push, translate=translate):
+                hand, sphere, sim = Mock(), Mock(), Mock()
+                targets = torch.tensor([[.2, .6, -99., -99.]])
+                pad_sensor, obstacle_sensor = Mock(), Mock()
+                hand_contact = Mock() if fixed or push else None
+                driven = torch.empty((1, 4))
+                drive = Mock()
+                namespace = dict(torch=torch, mapped_drives=True, args=SimpleNamespace(fixed_obstacle=fixed, push_object=push, translate_hand=translate),
+                    translation_drive=drive, translation_target=.05,
+                    targets=targets, master_ids=[0, 1], driven_ids=[0, 1, 2, 3],
+                    mapped_indices=torch.tensor([0, 1, 0, 1]), mapped_multipliers=torch.tensor([1., 1., .5, 2.]),
+                    mapped_offsets=torch.tensor([0., 0., .1, -.2]), driven_targets=driven,
+                    hand=hand, sphere=sphere, sim=sim, dt=.01, force_tensor=torch.ones((1, 1, 3)),
+                    sensors={'pad': pad_sensor}, sphere_sensor=obstacle_sensor, hand_contact=hand_contact)
+                self.function('advance', namespace)()
+                torch.testing.assert_close(hand.set_joint_position_target.call_args.args[0],
+                                           torch.tensor([[.2, .6, .2, 1.]]))
+                self.assertEqual(hand.set_joint_position_target.call_args.kwargs['joint_ids'], [0, 1, 2, 3])
+                hand.write_data_to_sim.assert_called_once_with()
+                sim.step.assert_called_once_with(render=False)
+                for asset in (hand, sphere, pad_sensor, obstacle_sensor):
+                    asset.update.assert_called_once_with(.01)
+                if hand_contact is not None:
+                    hand_contact.update.assert_called_once_with(.01)
+                self.assertEqual(sphere.permanent_wrench_composer.set_forces_and_torques.call_count, int(not (fixed or push)))
+                self.assertEqual(sphere.write_data_to_sim.call_count, int(not (fixed or push)))
+                self.assertEqual(drive.GetTargetPositionAttr.return_value.Set.call_count, int(translate))
+                if translate:
+                    drive.GetTargetPositionAttr.return_value.Set.assert_called_once_with(.05)
+                for asset in (hand, sphere):
+                    for call in asset.mock_calls:
+                        self.assertFalse(any(part in call[0] for part in ('write_root', 'write_joint_state',
+                                                                         'write_joint_position', 'set_world_pose')),
+                                         f'Probe must not overwrite physical state: {call}')
 
 
 if __name__ == "__main__":

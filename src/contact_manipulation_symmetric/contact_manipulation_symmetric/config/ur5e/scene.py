@@ -224,6 +224,40 @@ def validate_hand_urdf_assets(urdf_path: str) -> None:
         )
 
 
+def hand_joint_mapping(urdf_path: str) -> tuple[tuple, tuple, tuple, tuple]:
+    """Map the six commanded motor angles to every URDF revolute joint.
+
+    Mimic tags describe targets only; the simulator imports ordinary joints.
+    Resolve chains once on startup, including signed multipliers and offsets.
+    """
+    joints = {joint.attrib["name"]: joint for joint in ElementTree.parse(urdf_path).findall("joint")
+              if joint.attrib["type"] == "revolute"}
+    master_ids = {name: index for index, name in enumerate(HAND_JOINT_NAMES)}
+    indices, multipliers, offsets = [], [], []
+    for joint in joints.values():
+        current, multiplier, offset, seen = joint, 1.0, 0.0, set()
+        while (mimic := current.find("mimic")) is not None:
+            name = current.attrib["name"]
+            if name in seen:
+                raise ValueError(f"Cyclic hand mimic relationship at {name}.")
+            seen.add(name)
+            offset += multiplier * float(mimic.attrib.get("offset", 0.0))
+            multiplier *= float(mimic.attrib.get("multiplier", 1.0))
+            reference = mimic.attrib["joint"]
+            if reference not in joints:
+                raise ValueError(f"Hand mimic references a missing revolute joint: {reference}.")
+            current = joints[reference]
+        master = current.attrib["name"]
+        if master not in master_ids or not math.isfinite(multiplier) or not math.isfinite(offset):
+            raise ValueError(f"Hand joint {joint.attrib['name']} needs a finite mapping to a commanded motor.")
+        indices.append(master_ids[master])
+        multipliers.append(multiplier)
+        offsets.append(offset)
+    if not set(HAND_JOINT_NAMES).issubset(joints):
+        raise ValueError("Hand URDF must contain all six commanded motor joints.")
+    return tuple(joints), tuple(indices), tuple(multipliers), tuple(offsets)
+
+
 def hand_joint_limits(urdf_path: str) -> tuple[dict[str, tuple[float, float]], dict[str, float]]:
     """Resolve master position/velocity bounds from the coupled URDF constraints.
 
@@ -351,6 +385,34 @@ def _create_fixed_joint(
     joint.CreateCollisionEnabledAttr().Set(False)
 
 
+def _sensor_mount_half_properties(length, radius, mass, body_length, flange_radius, flange_mass):
+    """Mass, distal COM and principal inertia of one sensor/flange half.
+
+    The returned COM is measured from the sensor's geometric center. Internal
+    sensor construction is unavailable, so each component is modeled as a
+    uniform cylinder. Flange dimensions and mass are provisional inputs.
+    """
+    if not all(math.isfinite(value) and value > 0.0
+               for value in (length, radius, mass, body_length, flange_radius)):
+        raise ValueError("Sensor mount dimensions and sensor mass must be finite and positive.")
+    if not math.isfinite(flange_mass) or flange_mass < 0.0 or length < body_length:
+        raise ValueError("Flange mass must be finite/nonnegative and mount length must fit the sensor.")
+    flange_length = (length - body_length) * 0.5
+    if flange_length == 0.0 and flange_mass != 0.0:
+        raise ValueError("A zero-length flange must have zero mass.")
+    components = ((mass * 0.5, radius, body_length * 0.5, body_length * 0.25),
+                  (flange_mass * 0.5, flange_radius, flange_length,
+                   body_length * 0.5 + flange_length * 0.5))
+    half_mass = (mass + flange_mass) * 0.5
+    center_z = sum(part_mass * center for part_mass, _, _, center in components) / half_mass
+    inertia_radial = sum(part_mass * ((3.0 * part_radius**2 + height**2) / 12.0
+                                      + (center - center_z)**2)
+                         for part_mass, part_radius, height, center in components)
+    inertia_axial = sum(part_mass * part_radius**2 * 0.5
+                        for part_mass, part_radius, _, _ in components)
+    return flange_length, half_mass, center_z, inertia_radial, inertia_axial
+
+
 def _create_sensor_mount(
     robot_root: Usd.Prim,
     tool_body: Usd.Prim,
@@ -358,52 +420,65 @@ def _create_sensor_mount(
     length: float,
     radius: float,
     mass: float,
+    body_length: float,
+    flange_radius: float,
+    flange_mass: float,
 ) -> tuple[Gf.Vec3d, Usd.Prim]:
-    """Split the spacer at a fixed articulation load-cell joint at its center.
+    """Join the sensor/adapter assembly and report wrench at its tool-side face.
 
     Both halves are separate links so their mass/inertia are explicit without
     modifying the supplied wrist mass. The distal link's actor frame and its
-    incoming joint's child frame both originate at the sensor center and align
-    with physical wrist/tool XYZ. All hand loads cross this single fixed joint.
+    incoming joint's child frame use the manufacturer's tool-side reference
+    origin and align with physical wrist/tool XYZ. The geometric split remains
+    at the sensor center; the equivalent fixed-joint wrench is referenced at
+    its tool-side face, without assuming the internal strain-gauge plane.
+    Each link contains half the sensor and one
+    extra flange. All hand loads cross this single fixed joint; custom adapter
+    mass remains separate from the manufacturer's sensor assembly mass, which
+    already includes its standard interface plates.
     """
+    flange_length, half_mass, center_z, inertia_radial, inertia_axial = _sensor_mount_half_properties(
+        length, radius, mass, body_length, flange_radius, flange_mass)
     stage = robot_root.GetStage()
     sensor_world = Gf.Matrix4d(1.0)
     sensor_world.SetRotate(Gf.Transform(_world_transform(tool_body)).GetRotation())
     displacement = sensor_world.TransformDir(Gf.Vec3d(0.0, 0.0, length))
-    sensor_world.SetTranslateOnly(start_world + displacement * 0.5)
-    half_length, half_mass = length * 0.5, mass * 0.5
-    inertia_radial = half_mass * (3.0 * radius**2 + half_length**2) / 12.0
-    inertia_axial = half_mass * radius**2 / 2.0
+    reference_shift = body_length * 0.5
+    sensor_world.SetTranslateOnly(start_world + sensor_world.TransformDir(
+        Gf.Vec3d(0.0, 0.0, (length + body_length) * 0.5)))
 
-    def half_link(name: str, world: Gf.Matrix4d, center_z: float, color: tuple[float, float, float]):
+    def half_link(name: str, direction: float, color: tuple[float, float, float]):
         body = UsdGeom.Xform.Define(stage, robot_root.GetPath().AppendChild(name)).GetPrim()
-        _set_world_transform_on_reference_root(body, world)
+        _set_world_transform_on_reference_root(body, sensor_world)
         UsdPhysics.RigidBodyAPI.Apply(body).CreateRigidBodyEnabledAttr(True)
         PhysxSchema.PhysxRigidBodyAPI.Apply(body).CreateDisableGravityAttr(False)
         PhysxSchema.PhysxContactReportAPI.Apply(body).CreateThresholdAttr(0.0)
         mass_api = UsdPhysics.MassAPI.Apply(body)
         mass_api.CreateMassAttr(half_mass)
-        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(0.0, 0.0, center_z))
+        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(0.0, 0.0, direction * center_z - reference_shift))
         mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(inertia_radial, inertia_radial, inertia_axial))
         mass_api.CreatePrincipalAxesAttr(Gf.Quatf(1.0))
-        cylinder = UsdGeom.Cylinder.Define(stage, body.GetPath().AppendChild("Cylinder"))
-        cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
-        cylinder.CreateHeightAttr(half_length)
-        cylinder.CreateRadiusAttr(radius)
-        cylinder.CreateExtentAttr([
-            Gf.Vec3f(-radius, -radius, -half_length * 0.5),
-            Gf.Vec3f(radius, radius, half_length * 0.5),
-        ])
-        cylinder.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, center_z))
-        cylinder.CreateDisplayColorAttr([Gf.Vec3f(*color)])
-        UsdPhysics.CollisionAPI.Apply(cylinder.GetPrim()).CreateCollisionEnabledAttr(True)
-        PhysxSchema.PhysxCollisionAPI.Apply(cylinder.GetPrim())
+        parts = (("Sensor", body_length * 0.5, radius, body_length * 0.25, color),)
+        if flange_length > 0.0:
+            parts += (("Flange", flange_length, flange_radius,
+                       body_length * 0.5 + flange_length * 0.5, (0.42, 0.44, 0.47)),)
+        for part_name, height, part_radius, part_center, part_color in parts:
+            cylinder = UsdGeom.Cylinder.Define(stage, body.GetPath().AppendChild(part_name))
+            cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
+            cylinder.CreateHeightAttr(height)
+            cylinder.CreateRadiusAttr(part_radius)
+            cylinder.CreateExtentAttr([
+                Gf.Vec3f(-part_radius, -part_radius, -height * 0.5),
+                Gf.Vec3f(part_radius, part_radius, height * 0.5),
+            ])
+            cylinder.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, direction * part_center - reference_shift))
+            cylinder.CreateDisplayColorAttr([Gf.Vec3f(*part_color)])
+            UsdPhysics.CollisionAPI.Apply(cylinder.GetPrim()).CreateCollisionEnabledAttr(True)
+            PhysxSchema.PhysxCollisionAPI.Apply(cylinder.GetPrim())
         return body
 
-    proximal_world = Gf.Matrix4d(sensor_world)
-    proximal_world.SetTranslateOnly(start_world + displacement * 0.25)
-    proximal = half_link(FORCE_TORQUE_PROXIMAL_BODY_NAME, proximal_world, 0.0, (0.18, 0.20, 0.23))
-    distal = half_link(FORCE_TORQUE_BODY_NAME, sensor_world, length * 0.25, (0.24, 0.27, 0.30))
+    proximal = half_link(FORCE_TORQUE_PROXIMAL_BODY_NAME, -1.0, (0.65, 0.67, 0.70))
+    distal = half_link(FORCE_TORQUE_BODY_NAME, 1.0, (0.74, 0.76, 0.79))
     proximal_joint_world = Gf.Matrix4d(sensor_world)
     proximal_joint_world.SetTranslateOnly(start_world)
     _create_fixed_joint(stage, str(robot_root.GetPath().AppendChild(TOOL_SENSOR_MOUNT_JOINT_NAME)),
@@ -437,13 +512,7 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
 
 
 def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> None:
-    """Restore declared URDF joint limits without forcing rigid mimic behavior.
-
-    Native hard position/velocity bounds and drive effort use the source URDF.
-    Mimic references, gearing, offsets and imported compliance are preserved.
-    The thumb importer namespace defect is repaired by copying existing values,
-    never by inventing stiffness/damping or overwriting joint state.
-    """
+    """Use ordinary force-driven joints with the declared URDF physical bounds."""
     joints = {prim.GetName(): UsdPhysics.RevoluteJoint(prim)
               for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.IsA(UsdPhysics.RevoluteJoint)}
     for source in ElementTree.parse(urdf_path).findall("joint"):
@@ -451,33 +520,15 @@ def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> 
             continue
         joint = joints[source.attrib["name"]]
         prim = joint.GetPrim()
-        mimic = source.find("mimic")
-        if mimic is not None:
-            apis = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
-            if len(apis) != 1:
-                raise RuntimeError(f"Native URDF importer must preserve one mimic constraint on {prim.GetPath()}.")
+        if PhysxSchema.PhysxMimicJointAPI.GetAll(prim):
+            raise RuntimeError(f"Hand joint must be imported without a native mimic constraint: {prim.GetPath()}.")
         limit = source.find("limit")
         joint.CreateLowerLimitAttr(math.degrees(float(limit.attrib["lower"])))
         joint.CreateUpperLimitAttr(math.degrees(float(limit.attrib["upper"])))
         PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr(math.degrees(float(limit.attrib["velocity"])))
         drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
         drive.CreateMaxForceAttr(float(limit.attrib["effort"]))
-        if mimic is None:
-            drive.CreateTypeAttr("force")
-            continue
-        namespace = apis[0].GetGearingAttr().GetNamespace()
-        for name in ("naturalFrequency", "dampingRatio"):
-            active = prim.GetAttribute(f"{namespace}:{name}")
-            if not active or not active.HasAuthoredValueOpinion():
-                # Importer 2.4.31 writes non-cardinal thumb compliance under
-                # 'rot' although its native mimic instance is 'rotX'.
-                legacy = prim.GetAttribute(f"physxMimicJoint:rot:{name}")
-                if legacy and legacy.HasAuthoredValueOpinion():
-                    active = prim.CreateAttribute(f"{namespace}:{name}", legacy.GetTypeName())
-                    active.Set(legacy.Get())
-            value = active.Get() if active else None
-            if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
-                raise RuntimeError(f"Native importer must provide compliant mimic {name} on {prim.GetPath()}.")
+        drive.CreateTypeAttr("force")
 
 
 def _configure_hand_collisions(stage: Usd.Stage, hand_path: str) -> None:
@@ -537,10 +588,8 @@ def spawn_ur5e_hand(
 ) -> Usd.Prim:
     """Spawn UR5e, import the RH56E2 right-hand URDF, and join them as one articulation."""
     del kwargs
-    if not all(math.isfinite(value) and value > 0.0 for value in (
-        cfg.sensor_mount_length, cfg.sensor_mount_radius, cfg.sensor_mount_mass
-    )):
-        raise ValueError("Sensor mount length, radius and mass must be finite and positive.")
+    _sensor_mount_half_properties(cfg.sensor_mount_length, cfg.sensor_mount_radius, cfg.sensor_mount_mass,
+                                 cfg.sensor_body_length, cfg.sensor_flange_radius, cfg.sensor_flange_mass)
     validate_hand_urdf_assets(cfg.hand_urdf_path)
 
     stage = get_current_stage()
@@ -558,14 +607,14 @@ def spawn_ur5e_hand(
         fix_base=False,
         merge_fixed_joints=False,
         # This installed converter forwards the flag to set_parse_mimic().
-        # True preserves the URDF's native PhysX mimic constraints here.
-        convert_mimic_joints_to_normal_joints=True,
+        # False ignores mimic tags in PhysX; the action maps their URDF targets.
+        convert_mimic_joints_to_normal_joints=False,
         make_instanceable=False,
         self_collision=False,
         collider_type="convex_hull",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=0.1),
         activate_contact_sensors=True,
-        # Preserve importer mimic drive types; the native actuator sets gains.
+        # The native implicit actuator sets all twelve position-drive gains.
         joint_drive=None,
     )
     hand_cfg.func(hand_path, hand_cfg)
@@ -600,7 +649,8 @@ def spawn_ur5e_hand(
     mount_world = mount_offset * attachment_in_tool_body * tool_roll * tool_body_world
     hand_anchor, sensor_body = _create_sensor_mount(
         robot_root, tool_body, mount_world.ExtractTranslation(), cfg.sensor_mount_length,
-        cfg.sensor_mount_radius, cfg.sensor_mount_mass,
+        cfg.sensor_mount_radius, cfg.sensor_mount_mass, cfg.sensor_body_length,
+        cfg.sensor_flange_radius, cfg.sensor_flange_mass,
     )
     mount_world.SetTranslateOnly(hand_anchor)
     desired_hand_root_world = hand_base_relative_to_root.GetInverse() * mount_world
@@ -624,7 +674,7 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     )
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = sim_utils.ArticulationRootPropertiesCfg(
         enabled_self_collisions=True,
-        # Native hand mimic/contact constraints need this convergence budget.
+        # Preserve the existing contact/drive convergence budget.
         solver_position_iteration_count=32,
         solver_velocity_iteration_count=1,
     )
@@ -636,11 +686,17 @@ class Ur5eHandSpawnerCfg(RigidObjectSpawnerCfg):
     # along the flange's forward direction rather than back into the arm.
     mount_rotation_deg: tuple[float, float, float] = (0.0, -90.0, 0.0)
     mount_tool_roll_deg: float = -90.0
-    # Sensor and adapter proxy; 50 mm diameter matches the hand's base flange.
+    # Axia80-M20 assembly dimensions/mass, including standard interface plates.
+    # Its internal mass distribution is approximated by a uniform cylinder.
+    # The measurement datum follows the drawing's tool-side reference origin.
+    sensor_body_length: float = 0.0254
+    sensor_mount_radius: float = 0.041
+    sensor_mount_mass: float = 0.30
+    # Preserve the 50 mm tool-to-hand spacing. The remaining 24.6 mm is split
+    # between two flanges; their radius and total mass await hardware measurement.
     sensor_mount_length: float = 0.05
-    sensor_mount_radius: float = 0.025
-    # Nominal sensor/adapter mass pending hardware measurement; split equally.
-    sensor_mount_mass: float = 0.20
+    sensor_flange_radius: float = 0.025
+    sensor_flange_mass: float = 0.04
 
 
 def make_ur5e_hand_cfg() -> ArticulationCfg:
@@ -706,17 +762,13 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=[".*(thumb|index|middle|ring|little).*"],
                 # Inherit source URDF effort/velocity limits for all 12 joints.
-                # Dependent gains stay zero; only six independent motors act.
+                # URDF-coupled targets drive all joints, without mimic constraints.
                 effort_limit_sim=None,
                 velocity_limit_sim=None,
-                stiffness={
-                    "(?!(?:" + "|".join(HAND_JOINT_NAMES) + ")$).*(thumb|index|middle|ring|little).*": 0.0,
-                    **{name: 20.0 for name in HAND_JOINT_NAMES},
-                },
-                damping={
-                    "(?!(?:" + "|".join(HAND_JOINT_NAMES) + ")$).*(thumb|index|middle|ring|little).*": 0.0,
-                    **{name: 1.0 for name in HAND_JOINT_NAMES},
-                },
+                stiffness=20.0,
+                damping=1.0,
+                # Contact-tested provisional inertia; requires hardware comparison.
+                armature=0.0001,
             ),
         },
     )

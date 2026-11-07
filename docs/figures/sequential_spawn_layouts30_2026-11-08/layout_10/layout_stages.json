@@ -1,0 +1,1878 @@
+[
+  {
+    "step": 1,
+    "core_ms": 0.15834099031053483,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [],
+      "positions": {},
+      "yaws": {},
+      "clearance": null,
+      "pockets": [],
+      "pocket_goals": [],
+      "pocket_front_corridors": [],
+      "target_id": 56,
+      "blocker_id": null,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ]
+      }
+    }
+  },
+  {
+    "step": 2,
+    "core_ms": 4.6002420131117105,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176
+      },
+      "clearance": null,
+      "pockets": [],
+      "pocket_goals": [],
+      "pocket_front_corridors": [],
+      "target_id": 56,
+      "blocker_id": null,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw"
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ]
+    }
+  },
+  {
+    "step": 3,
+    "core_ms": 0.30077199335210025,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176
+      },
+      "clearance": [
+        -0.6986632677844329,
+        -0.514999988079071,
+        0.16361813724542024,
+        0.2698036013734137
+      ],
+      "pockets": [],
+      "pocket_goals": [],
+      "pocket_front_corridors": [],
+      "target_id": 56,
+      "blocker_id": null,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw",
+        "target_frontal_world_width_m": 0.08618546412799347
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ],
+      "camera_pose": [
+        0.25000001192092897,
+        0.21663148924767867,
+        1.23,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "step": 4,
+    "core_ms": 0.21874200319871306,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176
+      },
+      "clearance": [
+        -0.6986632677844329,
+        -0.514999988079071,
+        0.16361813724542024,
+        0.2698036013734137
+      ],
+      "pockets": [],
+      "pocket_goals": [],
+      "pocket_front_corridors": [],
+      "target_id": 56,
+      "blocker_id": 64,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw",
+        "target_frontal_world_width_m": 0.08618546412799347,
+        "blocker_asset": "ycb_005_tomato_soup_can",
+        "blocker_yaw": 2.74189326857232,
+        "blocker_type_selection": "uniform among non-Target types feasible at the sampled Target pose"
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ],
+      "camera_pose": [
+        0.25000001192092897,
+        0.21663148924767867,
+        1.23,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "step": 5,
+    "core_ms": 0.8624279871582985,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56,
+        64
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ],
+        "64": [
+          -0.6697684927997861,
+          0.1774562872563889,
+          1.100928000265479
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176,
+        "64": 2.74189326857232
+      },
+      "clearance": [
+        -0.6986632677844329,
+        -0.514999988079071,
+        0.16361813724542024,
+        0.2698036013734137
+      ],
+      "pockets": [],
+      "pocket_goals": [],
+      "pocket_front_corridors": [],
+      "target_id": 56,
+      "blocker_id": 64,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw",
+        "target_frontal_world_width_m": 0.08618546412799347,
+        "blocker_asset": "ycb_005_tomato_soup_can",
+        "blocker_yaw": 2.74189326857232,
+        "blocker_type_selection": "uniform among non-Target types feasible at the sampled Target pose",
+        "frontal_overlap_ratio": 0.4200857979497584,
+        "overlap_kind": "perspective frontal horizontal visual extent",
+        "target_horizontal_projection": [
+          -0.041822562098493644,
+          0.043745801012208506
+        ],
+        "blocker_horizontal_projection": [
+          -0.07955391277899465,
+          -0.005876508001879661
+        ],
+        "blocker_y_interval": [
+          -0.18375735154871486,
+          -0.15217041276809423
+        ],
+        "blocker_y_interval_reflection": -1,
+        "blocker_x_interval": [
+          -0.6717367837053781,
+          -0.6647367837053781
+        ]
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ],
+      "camera_pose": [
+        0.25000001192092897,
+        0.21663148924767867,
+        1.23,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "step": 6,
+    "core_ms": 0.8288980170618743,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56,
+        64
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ],
+        "64": [
+          -0.6697684927997861,
+          0.1774562872563889,
+          1.100928000265479
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176,
+        "64": 2.74189326857232
+      },
+      "clearance": [
+        -0.6986632677844329,
+        -0.514999988079071,
+        0.16361813724542024,
+        0.2698036013734137
+      ],
+      "pockets": [
+        [
+          -0.6153173001852813,
+          -0.5172317995189999,
+          0.06551147344832714,
+          0.16361813724542024
+        ],
+        [
+          -0.6162222105515333,
+          -0.526308727087836,
+          0.2698036013734137,
+          0.3596797125480176
+        ]
+      ],
+      "pocket_goals": [
+        [
+          -0.5662745498521407,
+          0.11456480534687369,
+          1.100928000265479,
+          2.632374571397464
+        ],
+        [
+          -0.5712654688196847,
+          0.31474165696071565,
+          1.100928000265479,
+          -1.85379023730523
+        ]
+      ],
+      "pocket_front_corridors": [
+        [
+          -0.5172317995189999,
+          -0.49999998807907103,
+          0.06551147344832714,
+          0.16361813724542024
+        ],
+        [
+          -0.526308727087836,
+          -0.49999998807907103,
+          0.2698036013734137,
+          0.3596797125480176
+        ]
+      ],
+      "target_id": 56,
+      "blocker_id": 64,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw",
+        "target_frontal_world_width_m": 0.08618546412799347,
+        "blocker_asset": "ycb_005_tomato_soup_can",
+        "blocker_yaw": 2.74189326857232,
+        "blocker_type_selection": "uniform among non-Target types feasible at the sampled Target pose",
+        "frontal_overlap_ratio": 0.4200857979497584,
+        "overlap_kind": "perspective frontal horizontal visual extent",
+        "target_horizontal_projection": [
+          -0.041822562098493644,
+          0.043745801012208506
+        ],
+        "blocker_horizontal_projection": [
+          -0.07955391277899465,
+          -0.005876508001879661
+        ],
+        "blocker_y_interval": [
+          -0.18375735154871486,
+          -0.15217041276809423
+        ],
+        "blocker_y_interval_reflection": -1,
+        "blocker_x_interval": [
+          -0.6717367837053781,
+          -0.6647367837053781
+        ],
+        "pocket_count": 2,
+        "pocket_goal_yaw": "independent continuous uniform [-pi,pi) per side; not based on initial Blocker yaw",
+        "pocket_options": [
+          {
+            "side": -1,
+            "selected_yaw": 2.632374571397464,
+            "relative_to_initial_yaw_rad": -0.10951869717485607,
+            "width_m": 0.0981066637970931,
+            "depth_m": 0.0980855006662814,
+            "x_interval": [
+              -0.6327316697018996,
+              -0.6130854887453524
+            ],
+            "sampled_x": -0.6153173001852813,
+            "feasible_candidates": [
+              {
+                "yaw": 2.632374571397464,
+                "width_m": 0.0981066637970931,
+                "depth_m": 0.0980855006662814,
+                "x_interval": [
+                  -0.6327316697018996,
+                  -0.6130854887453524
+                ]
+              }
+            ]
+          },
+          {
+            "side": 1,
+            "selected_yaw": -1.85379023730523,
+            "relative_to_initial_yaw_rad": -4.59568350587755,
+            "width_m": 0.08987611117460391,
+            "depth_m": 0.08991348346369721,
+            "x_interval": [
+              -0.6986632677844329,
+              -0.6049134715427682
+            ],
+            "sampled_x": -0.6162222105515333,
+            "feasible_candidates": [
+              {
+                "yaw": -1.85379023730523,
+                "width_m": 0.08987611117460391,
+                "depth_m": 0.08991348346369721,
+                "x_interval": [
+                  -0.6986632677844329,
+                  -0.6049134715427682
+                ]
+              }
+            ]
+          }
+        ],
+        "pocket_adjoins_clearance": true,
+        "pocket_front_corridors_reserved": true,
+        "pocket_per_side": 1,
+        "pocket_x_sampling": "uniform across complete feasible interval",
+        "full_blocker_route_reserved": false,
+        "destination_envelope": "union of actual collision/visual footprint and rotated full local OBB; 3mm per side"
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ],
+      "camera_pose": [
+        0.25000001192092897,
+        0.21663148924767867,
+        1.23,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "step": 7,
+    "core_ms": 23.48976698704064,
+    "compute_device": "CPU numpy geometry",
+    "snapshot": {
+      "seed": 9,
+      "active_ids": [
+        56,
+        64,
+        48,
+        24,
+        72,
+        8,
+        0,
+        49,
+        25,
+        73,
+        9,
+        1,
+        65,
+        50,
+        26
+      ],
+      "positions": {
+        "56": [
+          -0.7584969748886424,
+          0.21663148924767867,
+          1.138126686033755
+        ],
+        "64": [
+          -0.6697684927997861,
+          0.1774562872563889,
+          1.100928000265479
+        ],
+        "48": [
+          -0.8418543061186303,
+          0.3518978695402457,
+          1.156717994211957
+        ],
+        "24": [
+          -0.742392718398711,
+          0.334014396668482,
+          1.0500000000000005
+        ],
+        "72": [
+          -0.6613527406659793,
+          0.3183025167558592,
+          1.1456509950238989
+        ],
+        "8": [
+          -0.8460182011593511,
+          -0.40101821711850705,
+          1.0500000058261918
+        ],
+        "0": [
+          -0.5819883151334702,
+          0.3996456806918631,
+          1.0500000000000005
+        ],
+        "49": [
+          -0.7608907322791907,
+          -0.3550803181956665,
+          1.156717994211957
+        ],
+        "25": [
+          -0.6614291445592713,
+          -0.3729637910674302,
+          1.0500000000000005
+        ],
+        "73": [
+          -0.668711089049415,
+          -0.2651657613540456,
+          1.1456509950238989
+        ],
+        "9": [
+          -0.5812303867472497,
+          -0.26511759031239646,
+          1.0500000058261918
+        ],
+        "1": [
+          -0.582373718385406,
+          -0.4034365466213658,
+          1.0500000000000005
+        ],
+        "65": [
+          -0.666434469360305,
+          0.40119088269411185,
+          1.100928000265479
+        ],
+        "50": [
+          -0.5770664917065289,
+          -0.1382161269806632,
+          1.156717994211957
+        ],
+        "26": [
+          -0.8179637791465013,
+          -0.011190079283441852,
+          1.0500000000000005
+        ]
+      },
+      "yaws": {
+        "56": 0.7113522897077176,
+        "64": 2.74189326857232,
+        "48": 1.6610426232680293,
+        "24": -0.3287969055490141,
+        "72": 2.20371175863957,
+        "8": 2.915476900751706,
+        "0": -3.1172476781002105,
+        "49": 1.6610426232680293,
+        "25": -0.3287969055490141,
+        "73": 3.7745080854344666,
+        "9": 2.915476900751706,
+        "1": -1.546451351305314,
+        "65": 3.055095803753469,
+        "50": 1.6610426232680293,
+        "26": -1.8995932323439106
+      },
+      "clearance": [
+        -0.6986632677844329,
+        -0.514999988079071,
+        0.16361813724542024,
+        0.2698036013734137
+      ],
+      "pockets": [
+        [
+          -0.6153173001852813,
+          -0.5172317995189999,
+          0.06551147344832714,
+          0.16361813724542024
+        ],
+        [
+          -0.6162222105515333,
+          -0.526308727087836,
+          0.2698036013734137,
+          0.3596797125480176
+        ]
+      ],
+      "pocket_goals": [
+        [
+          -0.5662745498521407,
+          0.11456480534687369,
+          1.100928000265479,
+          2.632374571397464
+        ],
+        [
+          -0.5712654688196847,
+          0.31474165696071565,
+          1.100928000265479,
+          -1.85379023730523
+        ]
+      ],
+      "pocket_front_corridors": [
+        [
+          -0.5172317995189999,
+          -0.49999998807907103,
+          0.06551147344832714,
+          0.16361813724542024
+        ],
+        [
+          -0.526308727087836,
+          -0.49999998807907103,
+          0.2698036013734137,
+          0.3596797125480176
+        ]
+      ],
+      "target_id": 56,
+      "blocker_id": 64,
+      "metadata": {
+        "catalog_used": false,
+        "layout_resampling": 0,
+        "pose_rejection": 0,
+        "target_width_margin_m": 0.01,
+        "target_asset": "ycb_004_sugar_box",
+        "target_yaw": 0.7113522897077176,
+        "asset_types": [
+          "bottle_1",
+          "cup_1",
+          "cup_2",
+          "mug_1",
+          "mug_2",
+          "can_1",
+          "ycb_003_cracker_box",
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_origin_domain_component": [
+          -0.8351662809748615,
+          -0.735928295977405,
+          -0.26784688510794097,
+          0.2637412093061714
+        ],
+        "target_origin_domains_by_future_blocker": {
+          "bottle_1": [
+            -0.8351662809748615,
+            -0.7646946131469984,
+            -0.2894753600760688,
+            0.27204303730554064
+          ],
+          "cup_1": [
+            -0.8351662809748615,
+            -0.7722339926773752,
+            -0.26998801054543764,
+            0.2714354634556956
+          ],
+          "cup_2": [
+            -0.8351662809748615,
+            -0.7620123535889212,
+            -0.27403685605052686,
+            0.27312272985786645
+          ],
+          "mug_2": [
+            -0.8351662809748615,
+            -0.8273015246531663,
+            -0.2240595405730358,
+            0.24706499734711052
+          ],
+          "can_1": [
+            -0.8351662809748615,
+            -0.7461750955997407,
+            -0.284218604698476,
+            0.28376081478602244
+          ],
+          "ycb_005_tomato_soup_can": [
+            -0.8351662809748615,
+            -0.7508825030265032,
+            -0.2798799842006484,
+            0.287951776699661
+          ],
+          "ycb_006_mustard_bottle": [
+            -0.8351662809748615,
+            -0.735928295977405,
+            -0.26784688510794097,
+            0.2637412093061714
+          ]
+        },
+        "allowed_blockers_at_target": [
+          "can_1",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle"
+        ],
+        "target_sampling": "area-weighted union components, then uniform XY; overlaps receive mixture weight",
+        "blocker_type_feasibility_conditioned": true,
+        "blocker_orientation_draw_stage": 2,
+        "initial_blocker_yaws": {
+          "bottle_1": -1.46313758071362,
+          "cup_1": -1.9720094107081323,
+          "cup_2": 1.1098842543839709,
+          "mug_1": -1.015830769527338,
+          "mug_2": -0.22794431610510157,
+          "can_1": 0.6578421032385937,
+          "ycb_003_cracker_box": -1.0428579094545274,
+          "ycb_005_tomato_soup_can": 2.74189326857232,
+          "ycb_006_mustard_bottle": 1.2572546909787699
+        },
+        "destination_yaws_by_future_blocker": {
+          "bottle_1": [
+            1.433774100508769,
+            -2.0771318090891953
+          ],
+          "cup_1": [
+            2.80365429160888,
+            2.8354205522913167
+          ],
+          "cup_2": [
+            -0.48640223084853673,
+            -2.0833284709828384
+          ],
+          "mug_1": [
+            -2.8190514663353676,
+            -2.3095382404673788
+          ],
+          "mug_2": [
+            2.335619725879475,
+            3.084940862619818
+          ],
+          "can_1": [
+            -2.74369378644014,
+            1.1840081074843578
+          ],
+          "ycb_003_cracker_box": [
+            1.8195786654408153,
+            2.4332512353715146
+          ],
+          "ycb_005_tomato_soup_can": [
+            2.632374571397464,
+            -1.85379023730523
+          ],
+          "ycb_006_mustard_bottle": [
+            -1.73226743236608,
+            1.8409459615030812
+          ]
+        },
+        "destination_orientation_sampling": "independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw",
+        "target_frontal_world_width_m": 0.08618546412799347,
+        "blocker_asset": "ycb_005_tomato_soup_can",
+        "blocker_yaw": 2.74189326857232,
+        "blocker_type_selection": "uniform among non-Target types feasible at the sampled Target pose",
+        "frontal_overlap_ratio": 0.4200857979497584,
+        "overlap_kind": "perspective frontal horizontal visual extent",
+        "target_horizontal_projection": [
+          -0.041822562098493644,
+          0.043745801012208506
+        ],
+        "blocker_horizontal_projection": [
+          -0.07955391277899465,
+          -0.005876508001879661
+        ],
+        "blocker_y_interval": [
+          -0.18375735154871486,
+          -0.15217041276809423
+        ],
+        "blocker_y_interval_reflection": -1,
+        "blocker_x_interval": [
+          -0.6717367837053781,
+          -0.6647367837053781
+        ],
+        "pocket_count": 2,
+        "pocket_goal_yaw": "independent continuous uniform [-pi,pi) per side; not based on initial Blocker yaw",
+        "pocket_options": [
+          {
+            "side": -1,
+            "selected_yaw": 2.632374571397464,
+            "relative_to_initial_yaw_rad": -0.10951869717485607,
+            "width_m": 0.0981066637970931,
+            "depth_m": 0.0980855006662814,
+            "x_interval": [
+              -0.6327316697018996,
+              -0.6130854887453524
+            ],
+            "sampled_x": -0.6153173001852813,
+            "feasible_candidates": [
+              {
+                "yaw": 2.632374571397464,
+                "width_m": 0.0981066637970931,
+                "depth_m": 0.0980855006662814,
+                "x_interval": [
+                  -0.6327316697018996,
+                  -0.6130854887453524
+                ]
+              }
+            ]
+          },
+          {
+            "side": 1,
+            "selected_yaw": -1.85379023730523,
+            "relative_to_initial_yaw_rad": -4.59568350587755,
+            "width_m": 0.08987611117460391,
+            "depth_m": 0.08991348346369721,
+            "x_interval": [
+              -0.6986632677844329,
+              -0.6049134715427682
+            ],
+            "sampled_x": -0.6162222105515333,
+            "feasible_candidates": [
+              {
+                "yaw": -1.85379023730523,
+                "width_m": 0.08987611117460391,
+                "depth_m": 0.08991348346369721,
+                "x_interval": [
+                  -0.6986632677844329,
+                  -0.6049134715427682
+                ]
+              }
+            ]
+          }
+        ],
+        "pocket_adjoins_clearance": true,
+        "pocket_front_corridors_reserved": true,
+        "pocket_per_side": 1,
+        "pocket_x_sampling": "uniform across complete feasible interval",
+        "full_blocker_route_reserved": false,
+        "destination_envelope": "union of actual collision/visual footprint and rotated full local OBB; 3mm per side",
+        "requested_count": 15,
+        "actual_count": 15,
+        "selected_types": [
+          "ycb_004_sugar_box",
+          "ycb_005_tomato_soup_can",
+          "ycb_006_mustard_bottle",
+          "cup_1",
+          "bottle_1",
+          "ycb_003_cracker_box",
+          "mug_1"
+        ],
+        "non_target_counts": {
+          "ycb_005_tomato_soup_can": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3
+        },
+        "background_stop_reason": null,
+        "free_rectangle_count": 25,
+        "background_domains": [
+          {
+            "asset": "ycb_003_cracker_box",
+            "free_rectangle": [
+              -0.884999988079071,
+              -0.7016632677844329,
+              0.26697818773591225,
+              0.43999999999999995
+            ],
+            "yaw": 1.6610426232680293,
+            "x_domain": [
+              -0.8418543061186303,
+              -0.7448089497448735
+            ],
+            "y_domain": [
+              0.3518978695402457,
+              0.3550803181956665
+            ]
+          },
+          {
+            "asset": "mug_1",
+            "free_rectangle": [
+              -0.7957086241581898,
+              -0.7016632677844329,
+              0.26697818773591225,
+              0.43999999999999995
+            ],
+            "yaw": -0.3287969055490141,
+            "x_domain": [
+              -0.742392718398711,
+              -0.7407696336773207
+            ],
+            "y_domain": [
+              0.334014396668482,
+              0.3741355821264591
+            ]
+          },
+          {
+            "asset": "ycb_006_mustard_bottle",
+            "free_rectangle": [
+              -0.700286352505823,
+              -0.6192222105515333,
+              0.2728036013734137,
+              0.43999999999999995
+            ],
+            "yaw": 2.20371175863957,
+            "x_domain": [
+              -0.6613527406659793,
+              -0.6590231827054083
+            ],
+            "y_domain": [
+              0.3183025167558592,
+              0.39396603873066494
+            ]
+          },
+          {
+            "asset": "cup_1",
+            "free_rectangle": [
+              -0.884999988079071,
+              -0.7066949768788409,
+              -0.43999999999999995,
+              0.16628479075944508
+            ],
+            "yaw": 2.915476900751706,
+            "x_domain": [
+              -0.8460182011593511,
+              -0.7456767637985607
+            ],
+            "y_domain": [
+              -0.40101821711850705,
+              0.12730300923204524
+            ]
+          },
+          {
+            "asset": "bottle_1",
+            "free_rectangle": [
+              -0.6185517685121044,
+              -0.514999988079071,
+              0.3626797125480176,
+              0.43999999999999995
+            ],
+            "yaw": -3.1172476781002105,
+            "x_domain": [
+              -0.5819883151334702,
+              -0.5515765656632083
+            ],
+            "y_domain": [
+              0.3996456806918631,
+              0.4030509397190225
+            ]
+          },
+          {
+            "asset": "ycb_003_cracker_box",
+            "free_rectangle": [
+              -0.8040364142396312,
+              -0.7066949768788409,
+              -0.43999999999999995,
+              0.16628479075944508
+            ],
+            "yaw": 1.6610426232680293,
+            "x_domain": [
+              -0.7608907322791907,
+              -0.7498406588392815
+            ],
+            "y_domain": [
+              -0.3550803181956665,
+              0.08136510895511163
+            ]
+          },
+          {
+            "asset": "mug_1",
+            "free_rectangle": [
+              -0.71474505031875,
+              -0.6183173001852813,
+              -0.43999999999999995,
+              0.14064434483149676
+            ],
+            "yaw": -0.3287969055490141,
+            "x_domain": [
+              -0.6614291445592713,
+              -0.6574236660781692
+            ],
+            "y_domain": [
+              -0.3729637910674302,
+              0.0747799269579559
+            ]
+          },
+          {
+            "asset": "ycb_006_mustard_bottle",
+            "free_rectangle": [
+              -0.71474505031875,
+              -0.6183173001852813,
+              -0.30409937319388936,
+              0.14064434483149676
+            ],
+            "yaw": 3.7745080854344666,
+            "x_domain": [
+              -0.668711089049415,
+              -0.6638162155677269
+            ],
+            "y_domain": [
+              -0.2651657613540456,
+              0.1008433726776218
+            ]
+          },
+          {
+            "asset": "cup_1",
+            "free_rectangle": [
+              -0.6202121736669696,
+              -0.514999988079071,
+              -0.30409937319388936,
+              0.06251147344832714
+            ],
+            "yaw": 2.915476900751706,
+            "x_domain": [
+              -0.5812303867472497,
+              -0.5539817749987909
+            ],
+            "y_domain": [
+              -0.26511759031239646,
+              0.02352969192092729
+            ]
+          },
+          {
+            "asset": "bottle_1",
+            "free_rectangle": [
+              -0.6193227786663834,
+              -0.514999988079071,
+              -0.43999999999999995,
+              -0.30709937319388936
+            ],
+            "yaw": -1.546451351305314,
+            "x_domain": [
+              -0.582373718385406,
+              -0.5519659562229166
+            ],
+            "y_domain": [
+              -0.4034365466213658,
+              -0.3436759507780267
+            ]
+          },
+          {
+            "asset": "ycb_005_tomato_soup_can",
+            "free_rectangle": [
+              -0.700286352505823,
+              -0.6215517685121044,
+              0.3673364780251942,
+              0.43999999999999995
+            ],
+            "yaw": 3.055095803753469,
+            "x_domain": [
+              -0.666434469360305,
+              -0.6552870212657997
+            ],
+            "y_domain": [
+              0.40119088269411185,
+              0.406165382224059
+            ]
+          },
+          {
+            "asset": "ycb_003_cracker_box",
+            "free_rectangle": [
+              -0.6202121736669696,
+              -0.514999988079071,
+              -0.22313580878499664,
+              0.06251147344832714
+            ],
+            "yaw": 1.6610426232680293,
+            "x_domain": [
+              -0.5770664917065289,
+              -0.5581456700395117
+            ],
+            "y_domain": [
+              -0.1382161269806632,
+              -0.022408208356006307
+            ]
+          },
+          {
+            "asset": "mug_1",
+            "free_rectangle": [
+              -0.884999988079071,
+              -0.514999988079071,
+              -0.05029644517632975,
+              0.06251147344832714
+            ],
+            "yaw": -1.8995932323439106,
+            "x_domain": [
+              -0.8179637791465013,
+              -0.5808644059526118
+            ],
+            "y_domain": [
+              -0.011190079283441852,
+              0.009195567688848376
+            ]
+          }
+        ],
+        "background_yaws": "continuous uniform base yaw per type; base + 90 degree arrival option",
+        "background_base_yaws": {
+          "ycb_005_tomato_soup_can": 1.4842994769585722,
+          "ycb_006_mustard_bottle": 2.20371175863957,
+          "cup_1": 2.915476900751706,
+          "bottle_1": -3.1172476781002105,
+          "ycb_003_cracker_box": 1.6610426232680293,
+          "mug_1": -1.8995932323439106
+        },
+        "background_free_space": "overlapping maximal empty rectangles; containment pruned",
+        "background_corner": "deterministic lower X / lower Y; zero positional jitter",
+        "background_all_asset_types": false,
+        "background_nonfitting_types": [],
+        "non_target_count_spread": 1,
+        "minimum_count_guaranteed": false,
+        "globally_optimal_capacity_claimed": false,
+        "background_type_selection": "random type count",
+        "background_tie_break": "largest footprint among currently least-populated fitting types"
+      },
+      "shelf_bounds": [
+        -0.884999988079071,
+        -0.514999988079071,
+        -0.43999999999999995,
+        0.43999999999999995
+      ],
+      "camera_pose": [
+        0.25000001192092897,
+        0.21663148924767867,
+        1.23,
+        0.5,
+        -0.5,
+        -0.5,
+        0.5
+      ],
+      "free_rectangles": [
+        [
+          -0.884999988079071,
+          -0.811330681992852,
+          0.04512582647603691,
+          0.26397818773591225
+        ],
+        [
+          -0.7056632677844329,
+          -0.7016632677844329,
+          0.21421512958280023,
+          0.26397818773591225
+        ],
+        [
+          -0.884999988079071,
+          -0.8070364142396312,
+          -0.3590364355911072,
+          -0.053296445176329754
+        ],
+        [
+          -0.7490993612729604,
+          -0.71774505031875,
+          -0.26716063639133303,
+          0.16628479075944508
+        ],
+        [
+          -0.884999988079071,
+          -0.71774505031875,
+          -0.26716063639133303,
+          -0.053296445176329754
+        ],
+        [
+          -0.7490993612729604,
+          -0.7066949768788409,
+          -0.22236478920017064,
+          0.16628479075944508
+        ],
+        [
+          -0.884999988079071,
+          -0.7066949768788409,
+          0.04512582647603691,
+          0.16628479075944508
+        ],
+        [
+          -0.6327316697018996,
+          -0.6232121736669696,
+          -0.22236478920017064,
+          0.16061813724542023
+        ],
+        [
+          -0.6327316697018996,
+          -0.6183173001852813,
+          -0.05029644517632975,
+          0.16061813724542023
+        ],
+        [
+          -0.7490993612729604,
+          -0.6232121736669696,
+          -0.22236478920017064,
+          0.14064434483149676
+        ],
+        [
+          -0.884999988079071,
+          -0.6232121736669696,
+          -0.22236478920017064,
+          -0.053296445176329754
+        ],
+        [
+          -0.7490993612729604,
+          -0.6183173001852813,
+          -0.05029644517632975,
+          0.14064434483149676
+        ],
+        [
+          -0.884999988079071,
+          -0.6183173001852813,
+          0.04512582647603691,
+          0.14064434483149676
+        ],
+        [
+          -0.5309208097460884,
+          -0.514999988079071,
+          -0.43999999999999995,
+          0.06251147344832714
+        ],
+        [
+          -0.5392485998275298,
+          -0.514999988079071,
+          -0.43999999999999995,
+          -0.22613580878499664
+        ],
+        [
+          -0.5424077502415604,
+          -0.514999988079071,
+          -0.43999999999999995,
+          -0.30709937319388936
+        ],
+        [
+          -0.6193227786663834,
+          -0.514999988079071,
+          -0.36385996903722845,
+          -0.30709937319388936
+        ],
+        [
+          -0.7490993612729604,
+          -0.514999988079071,
+          -0.05029644517632975,
+          0.06251147344832714
+        ],
+        [
+          -0.884999988079071,
+          -0.514999988079071,
+          0.04512582647603691,
+          0.06251147344832714
+        ],
+        [
+          -0.5424117375493328,
+          -0.514999988079071,
+          0.3626797125480176,
+          0.43999999999999995
+        ],
+        [
+          -0.6296992166066097,
+          -0.6215517685121044,
+          0.3673364780251942,
+          0.43999999999999995
+        ],
+        [
+          -0.7957086241581898,
+          -0.703286352505823,
+          0.40287881454202285,
+          0.43999999999999995
+        ],
+        [
+          -0.7957086241581898,
+          -0.6215517685121044,
+          0.4380255004700528,
+          0.43999999999999995
+        ],
+        [
+          -0.7957086241581898,
+          -0.514999988079071,
+          0.4395947409728406,
+          0.43999999999999995
+        ],
+        [
+          -0.884999988079071,
+          -0.514999988079071,
+          0.4398175513445791,
+          0.43999999999999995
+        ]
+      ]
+    }
+  }
+]

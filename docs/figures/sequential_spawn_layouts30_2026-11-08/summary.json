@@ -1,0 +1,4134 @@
+{
+  "setup": {
+    "native_environment_ms": 21421.20974199497,
+    "geometry_mesh_bvh_robot_model_ms": 3004.53143400955,
+    "launch_through_fixed_resources_ms": 41465.124467009446
+  },
+  "layouts": [
+    {
+      "layout": 1,
+      "seed": 0,
+      "objects": 25,
+      "step_ms": [
+        0.2445319842081517,
+        6.587020994629711,
+        0.42891400516964495,
+        0.34196299384348094,
+        1.9751380023080856,
+        1.7927259905263782,
+        87.70360102062114,
+        88.35475699743256,
+        1293.4872010082472
+      ],
+      "total_core_ms": 1480.9158529969864,
+      "render_commit_png_ms": 4962.745013996027,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_003_cracker_box": 1,
+          "cup_2": 3,
+          "mug_1": 3,
+          "mug_2": 3,
+          "ycb_004_sugar_box": 3,
+          "cup_1": 3,
+          "bottle_1": 3,
+          "ycb_005_tomato_soup_can": 3,
+          "can_1": 3
+        },
+        "frontal_overlap_ratio": 0.4355225079126496
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.3260743618011475,
+            -2.045603036880493,
+            1.9516170024871826,
+            0.6033095121383667,
+            0.26935097575187683,
+            -0.32508665323257446,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2989424169063568,
+          0.045908570289611816,
+          0.20590856671333313,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.4322126507759094,
+          0.09661358594894409,
+          1.2527767419815063
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 2,
+      "seed": 1,
+      "objects": 23,
+      "step_ms": [
+        0.15284097753465176,
+        4.531490994850174,
+        0.5186049966141582,
+        0.2382520178798586,
+        1.3178930093999952,
+        0.7247269968502223,
+        50.113192992284894,
+        7.691361999604851,
+        1023.6252230242826
+      ],
+      "total_core_ms": 1088.9135870093014,
+      "render_commit_png_ms": 733.8555339956656,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_2": 1,
+          "ycb_006_mustard_bottle": 3,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "ycb_004_sugar_box": 3,
+          "cup_1": 3,
+          "bottle_1": 3,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 2
+        },
+        "frontal_overlap_ratio": 0.11910221788352246
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 17,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.45841681957244873,
+            -2.2574269771575928,
+            1.9809776544570923,
+            0.3398997485637665,
+            1.1474627256393433,
+            0.03574550524353981,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2651228606700897,
+          -0.1187460869550705,
+          0.041253913193941116,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.41914528608322144,
+          -0.07760864496231079,
+          1.2793498039245605
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 3,
+      "seed": 2,
+      "objects": 23,
+      "step_ms": [
+        0.15498101129196584,
+        5.9719550190493464,
+        0.4589449963532388,
+        0.24033201043494046,
+        1.1512610071804374,
+        0.8489479951094836,
+        59.74290199810639,
+        8.08229501126334,
+        23.5538269917015
+      ],
+      "total_core_ms": 100.20544604049064,
+      "render_commit_png_ms": 736.9902319915127,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "bottle_1": 1,
+          "ycb_005_tomato_soup_can": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "mug_2": 3,
+          "cup_1": 3,
+          "ycb_004_sugar_box": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_2": 2,
+          "can_1": 2
+        },
+        "frontal_overlap_ratio": 0.10192237096846932
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.2192925363779068,
+            -2.198383331298828,
+            1.942185401916504,
+            0.2450038194656372,
+            1.2855465412139893,
+            0.12756913900375366,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.27583155035972595,
+          -0.20926563441753387,
+          -0.04926563799381256,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.4245976209640503,
+          -0.13149325549602509,
+          1.3060386180877686
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 4,
+      "seed": 3,
+      "objects": 15,
+      "step_ms": [
+        0.15216099563986063,
+        4.64088300941512,
+        0.4832239937968552,
+        0.2536120009608567,
+        1.2785919825546443,
+        1.1725209769792855,
+        22.970392019487917,
+        5.789773014839739,
+        988.8874790049158
+      ],
+      "total_core_ms": 1025.62863699859,
+      "render_commit_png_ms": 695.0076439825352,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_1": 1,
+          "can_1": 3,
+          "ycb_006_mustard_bottle": 4,
+          "cup_1": 4,
+          "cup_2": 3
+        },
+        "frontal_overlap_ratio": 0.11434552565189554
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.4742436408996582,
+            -1.9460583925247192,
+            1.794508457183838,
+            0.21945084631443024,
+            0.2376699000597,
+            -0.03528042137622833,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.27185413241386414,
+          0.14104565978050232,
+          0.30104565620422363,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42262959480285645,
+          0.23683294653892517,
+          1.3091599941253662
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 5,
+      "seed": 4,
+      "objects": 23,
+      "step_ms": [
+        0.15782201080583036,
+        5.472621007356793,
+        0.3348739992361516,
+        0.24372199550271034,
+        0.7842780032660812,
+        0.6743060075677931,
+        27.783616998931393,
+        6.8354730028659105,
+        24.37363498029299
+      ],
+      "total_core_ms": 66.66034800582565,
+      "render_commit_png_ms": 717.7795629831962,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_1": 1,
+          "ycb_004_sugar_box": 6,
+          "mug_2": 6,
+          "ycb_005_tomato_soup_can": 5,
+          "can_1": 5
+        },
+        "frontal_overlap_ratio": 0.13639220119344728
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.27437490224838257,
+            -1.9990909099578857,
+            1.8773301839828491,
+            0.21821604669094086,
+            1.7846084833145142,
+            -0.08432364463806152,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.24210670590400696,
+          -0.24122114479541779,
+          -0.08122114837169647,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.4261797070503235,
+          -0.21156780421733856,
+          1.2663094997406006
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 6,
+      "seed": 5,
+      "objects": 18,
+      "step_ms": [
+        0.16436100122518837,
+        5.878744996152818,
+        0.34498400054872036,
+        0.23662199964746833,
+        0.8068979950621724,
+        0.6693059985991567,
+        35.463087988318875,
+        8.28432699199766,
+        1047.7726399840321
+      ],
+      "total_core_ms": 1099.6209709555842,
+      "render_commit_png_ms": 720.6925889768172,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_006_mustard_bottle": 1,
+          "ycb_004_sugar_box": 3,
+          "mug_1": 3,
+          "mug_2": 3,
+          "cup_1": 3,
+          "bottle_1": 3,
+          "cup_2": 2
+        },
+        "frontal_overlap_ratio": 0.2843106124516757
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 5,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.761241614818573,
+            -2.1032614707946777,
+            2.124634027481079,
+            -0.3103691339492798,
+            2.2742714881896973,
+            -0.2839733958244324,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.24395880103111267,
+          -0.3463098406791687,
+          -0.1863098293542862,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.31860339641571045,
+          -0.2597041726112366,
+          1.2775025367736816
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 7,
+      "seed": 6,
+      "objects": 18,
+      "step_ms": [
+        0.15673099551349878,
+        5.146187992068008,
+        0.353512994479388,
+        0.22909199469722807,
+        1.3578130165114999,
+        1.7332959978375584,
+        43.30272998777218,
+        6.774092995328829,
+        24.54146699164994
+      ],
+      "total_core_ms": 83.59492296585813,
+      "render_commit_png_ms": 730.5796989821829,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_006_mustard_bottle": 1,
+          "bottle_1": 2,
+          "mug_1": 3,
+          "ycb_003_cracker_box": 3,
+          "mug_2": 3,
+          "cup_1": 2,
+          "cup_2": 2,
+          "can_1": 2
+        },
+        "frontal_overlap_ratio": 0.1688181625887777
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.5430256724357605,
+            -2.0816118717193604,
+            1.8875672817230225,
+            0.2542937397956848,
+            2.157519817352295,
+            -0.036176834255456924,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2783278524875641,
+          -0.25051164627075195,
+          -0.09051166474819183,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3466900587081909,
+          -0.20282626152038574,
+          1.2904198169708252
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 8,
+      "seed": 7,
+      "objects": 23,
+      "step_ms": [
+        0.15445100143551826,
+        5.3017679892946035,
+        0.49863499589264393,
+        0.30662299832329154,
+        1.5429049963131547,
+        1.1068900057580322,
+        36.584137997124344,
+        6.296157982433215,
+        22.490206989459693
+      ],
+      "total_core_ms": 74.2817749560345,
+      "render_commit_png_ms": 732.6619569794275,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "can_1": 1,
+          "bottle_1": 3,
+          "ycb_003_cracker_box": 4,
+          "mug_1": 4,
+          "mug_2": 4,
+          "ycb_004_sugar_box": 4,
+          "ycb_005_tomato_soup_can": 3
+        },
+        "frontal_overlap_ratio": 0.27416299999824945
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 5,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.8468949794769287,
+            -2.2280590534210205,
+            2.163238286972046,
+            -0.3056569993495941,
+            2.3435580730438232,
+            -0.34787648916244507,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2588941752910614,
+          -0.32403236627578735,
+          -0.16403238475322723,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.2707676887512207,
+          -0.23644328117370605,
+          1.2956310510635376
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 9,
+      "seed": 8,
+      "objects": 18,
+      "step_ms": [
+        0.1511109876446426,
+        5.34368900116533,
+        0.44595400686375797,
+        0.22821198217570782,
+        0.7571169990114868,
+        0.6502359756268561,
+        19.955603987909853,
+        8.997263008495793,
+        23.815339984139428
+      ],
+      "total_core_ms": 60.344525933032855,
+      "render_commit_png_ms": 718.4948360081762,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_1": 1,
+          "ycb_004_sugar_box": 5,
+          "ycb_003_cracker_box": 4,
+          "ycb_006_mustard_bottle": 4,
+          "can_1": 4
+        },
+        "frontal_overlap_ratio": 0.25731339137442866
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 2,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.55290687084198,
+            -2.2701990604400635,
+            2.3522632122039795,
+            -1.6380969285964966,
+            0.15628688037395477,
+            1.703413486480713,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.25509944558143616,
+          0.0547613650560379,
+          0.21476136147975922,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.40252214670181274,
+          0.19831158220767975,
+          1.2931920289993286
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 10,
+      "seed": 9,
+      "objects": 15,
+      "step_ms": [
+        0.15834099031053483,
+        4.6002420131117105,
+        0.30077199335210025,
+        0.21874200319871306,
+        0.8624279871582985,
+        0.8288980170618743,
+        23.48976698704064,
+        7.439078995957971,
+        23.84033999987878
+      ],
+      "total_core_ms": 61.73860898707062,
+      "render_commit_png_ms": 721.8852569931187,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_004_sugar_box": 1,
+          "ycb_005_tomato_soup_can": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 2
+        },
+        "frontal_overlap_ratio": 0.4200857979497584
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.5103591680526733,
+            -1.99854576587677,
+            2.0368125438690186,
+            0.7685294151306152,
+            0.05801577866077423,
+            -0.7022871971130371,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.22543016076087952,
+          0.09745629131793976,
+          0.25745630264282227,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.41046249866485596,
+          0.11766383051872253,
+          1.250645399093628
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 11,
+      "seed": 10,
+      "objects": 16,
+      "step_ms": [
+        0.19436198635958135,
+        5.446830007713288,
+        0.327473011566326,
+        0.2187320205848664,
+        0.7798080041538924,
+        0.643956009298563,
+        33.08306500548497,
+        6.1285169795155525,
+        1000.5933479988016
+      ],
+      "total_core_ms": 1047.4160910234787,
+      "render_commit_png_ms": 712.1168159937952,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_006_mustard_bottle": 1,
+          "ycb_004_sugar_box": 2,
+          "ycb_003_cracker_box": 2,
+          "mug_1": 2,
+          "mug_2": 2,
+          "cup_1": 2,
+          "bottle_1": 2,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 1
+        },
+        "frontal_overlap_ratio": 0.3742544780174199
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 6,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.695935606956482,
+            -2.4914424419403076,
+            2.545642852783203,
+            -2.189586877822876,
+            0.11611878871917725,
+            2.0038034915924072,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.276130348443985,
+          0.11691117286682129,
+          0.2769111692905426,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3833627700805664,
+          0.15772998332977295,
+          1.2719731330871582
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 12,
+      "seed": 11,
+      "objects": 16,
+      "step_ms": [
+        0.25035199359990656,
+        5.578320997301489,
+        0.3608939878176898,
+        0.2630429808050394,
+        1.6359550063498318,
+        1.5201850037556142,
+        41.43049198319204,
+        5.373560008592904,
+        24.882169003831223
+      ],
+      "total_core_ms": 81.29497096524574,
+      "render_commit_png_ms": 697.989664011402,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_004_sugar_box": 1,
+          "cup_2": 2,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 2,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 1
+        },
+        "frontal_overlap_ratio": 0.31701424536540923
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.25110533833503723,
+            -2.056279182434082,
+            1.9917696714401245,
+            0.03444432467222214,
+            1.9103060960769653,
+            0.129655659198761,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2847079336643219,
+          -0.2773829400539398,
+          -0.1173829436302185,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42584294080734253,
+          -0.16612248122692108,
+          1.2687747478485107
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 13,
+      "seed": 12,
+      "objects": 22,
+      "step_ms": [
+        0.1518620119895786,
+        5.35084999864921,
+        0.3152230056002736,
+        0.2394230104982853,
+        1.6769350040704012,
+        1.5318039804697037,
+        62.59892802336253,
+        9.775320999324322,
+        974.2666330130305
+      ],
+      "total_core_ms": 1055.9069790469948,
+      "render_commit_png_ms": 721.4264899957925,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_004_sugar_box": 1,
+          "cup_2": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 3,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 3
+        },
+        "frontal_overlap_ratio": 0.10951792927773145
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 29,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.0312650203704834,
+            -2.3490660190582275,
+            2.009657144546509,
+            0.3067331910133362,
+            0.6050114631652832,
+            0.027387596666812897,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.3184449374675751,
+          -0.06231566518545151,
+          0.0976843312382698,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42212358117103577,
+          0.0008930936455726624,
+          1.2965092658996582
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 14,
+      "seed": 13,
+      "objects": 25,
+      "step_ms": [
+        0.15187199460342526,
+        4.591431992594153,
+        0.2847319992724806,
+        0.21509200450964272,
+        0.9489090007264167,
+        0.8758979965932667,
+        32.263708009850234,
+        7.957203983096406,
+        932.8101989813149
+      ],
+      "total_core_ms": 980.0990459625609,
+      "render_commit_png_ms": 725.7324079982936,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_2": 1,
+          "can_1": 4,
+          "ycb_003_cracker_box": 5,
+          "cup_1": 5,
+          "ycb_006_mustard_bottle": 5,
+          "ycb_005_tomato_soup_can": 5
+        },
+        "frontal_overlap_ratio": 0.2378102209863022
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.6211706399917603,
+            -1.9461392164230347,
+            2.059666872024536,
+            -1.005894422531128,
+            0.12765158712863922,
+            0.9272546768188477,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2450731098651886,
+          0.24025632441043854,
+          0.40025633573532104,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3845521807670593,
+          0.34055936336517334,
+          1.2734863758087158
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 15,
+      "seed": 14,
+      "objects": 16,
+      "step_ms": [
+        0.17397201736457646,
+        4.94382600300014,
+        0.3212729934602976,
+        0.23238200810737908,
+        0.836906983749941,
+        0.7606270082760602,
+        39.491213974542916,
+        10.142652987269685,
+        24.532196985092014
+      ],
+      "total_core_ms": 81.43505096086301,
+      "render_commit_png_ms": 699.1440920101013,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_1": 1,
+          "ycb_006_mustard_bottle": 2,
+          "ycb_003_cracker_box": 2,
+          "mug_1": 2,
+          "ycb_004_sugar_box": 2,
+          "bottle_1": 2,
+          "cup_2": 2,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 1
+        },
+        "frontal_overlap_ratio": 0.26848782423411544
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.5929865837097168,
+            -2.3929836750030518,
+            1.9991586208343506,
+            -0.8029542565345764,
+            -0.18217870593070984,
+            1.2766796350479126,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.24442490935325623,
+          0.1035948246717453,
+          0.2635948061943054,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3948459029197693,
+          0.12237733602523804,
+          1.3168810606002808
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 16,
+      "seed": 15,
+      "objects": 17,
+      "step_ms": [
+        0.16424100613221526,
+        4.850304976571351,
+        0.34055300056934357,
+        0.2825130068231374,
+        0.8330080017913133,
+        1.1314110015518963,
+        40.144380007404834,
+        10.357826016843319,
+        911.714290996315
+      ],
+      "total_core_ms": 969.8185280140024,
+      "render_commit_png_ms": 705.7793019921519,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_1": 1,
+          "ycb_006_mustard_bottle": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_2": 3,
+          "bottle_1": 2,
+          "cup_2": 2,
+          "can_1": 2,
+          "ycb_005_tomato_soup_can": 2
+        },
+        "frontal_overlap_ratio": 0.3038973898911151
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.3978932201862335,
+            -2.3194773197174072,
+            2.140759229660034,
+            0.020282281562685966,
+            1.2967201471328735,
+            0.11971160024404526,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.26987674832344055,
+          -0.19090735912322998,
+          -0.030907362699508667,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42068877816200256,
+          -0.05951341614127159,
+          1.2823477983474731
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 17,
+      "seed": 16,
+      "objects": 15,
+      "step_ms": [
+        0.1575710193719715,
+        5.529871006729081,
+        0.4419739998411387,
+        0.263352005276829,
+        0.9902289893943816,
+        0.7301970035769045,
+        26.466064009582624,
+        7.425629009958357,
+        1042.613416997483
+      ],
+      "total_core_ms": 1084.6183040412143,
+      "render_commit_png_ms": 730.4346780001651,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "can_1": 1,
+          "ycb_005_tomato_soup_can": 2,
+          "ycb_003_cracker_box": 2,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_004_sugar_box": 2,
+          "cup_1": 2,
+          "cup_2": 2
+        },
+        "frontal_overlap_ratio": 0.38688048132096403
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 5,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.0711326003074646,
+            -2.1494593620300293,
+            2.105381488800049,
+            -0.07504161447286606,
+            1.6456665992736816,
+            -0.3234887421131134,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.274382084608078,
+          -0.2961103916168213,
+          -0.13611039519309998,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42908692359924316,
+          -0.1557961106300354,
+          1.260117530822754
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 18,
+      "seed": 17,
+      "objects": 20,
+      "step_ms": [
+        0.159810995683074,
+        5.60650197439827,
+        0.41393400169909,
+        0.2687330124899745,
+        1.082630013115704,
+        0.8818880014587194,
+        31.028846016852185,
+        11.545316985575482,
+        1032.7265039959457
+      ],
+      "total_core_ms": 1083.7141649972182,
+      "render_commit_png_ms": 699.5325720054097,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_005_tomato_soup_can": 1,
+          "can_1": 6,
+          "ycb_004_sugar_box": 7,
+          "cup_2": 6
+        },
+        "frontal_overlap_ratio": 0.22694100737451398
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.26947593688964844,
+            -2.410601854324341,
+            2.1599411964416504,
+            0.1092546135187149,
+            1.3644784688949585,
+            0.20228688418865204,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.29663965106010437,
+          -0.128770112991333,
+          0.031229887157678604,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.37678852677345276,
+          -0.10359295457601547,
+          1.2794530391693115
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 19,
+      "seed": 18,
+      "objects": 22,
+      "step_ms": [
+        0.15166099183261395,
+        5.14115797705017,
+        0.5427050055004656,
+        0.22130200522951782,
+        1.255701994523406,
+        0.7061869837343693,
+        42.15039900736883,
+        7.580789999337867,
+        973.7067779933568
+      ],
+      "total_core_ms": 1031.456681957934,
+      "render_commit_png_ms": 698.4354200249072,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_2": 1,
+          "ycb_005_tomato_soup_can": 3,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "mug_2": 3,
+          "cup_1": 3,
+          "bottle_1": 3,
+          "can_1": 3
+        },
+        "frontal_overlap_ratio": 0.2600279399492461
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.30993422865867615,
+            -2.369720220565796,
+            2.0226454734802246,
+            0.2928334176540375,
+            1.3987574577331543,
+            -0.01528292614966631,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.27884790301322937,
+          -0.11960761249065399,
+          0.04039238765835762,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3749569058418274,
+          -0.08100266754627228,
+          1.3022756576538086
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 20,
+      "seed": 19,
+      "objects": 18,
+      "step_ms": [
+        0.156601017806679,
+        6.098565994761884,
+        0.5012339970562607,
+        0.2270620025228709,
+        1.1465699935797602,
+        0.7551670132670552,
+        32.12017600890249,
+        7.15367600787431,
+        962.7165450074244
+      ],
+      "total_core_ms": 1010.8755970431957,
+      "render_commit_png_ms": 715.3623760095797,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "bottle_1": 1,
+          "ycb_006_mustard_bottle": 3,
+          "mug_2": 3,
+          "ycb_004_sugar_box": 3,
+          "cup_1": 3,
+          "cup_2": 3,
+          "ycb_005_tomato_soup_can": 2
+        },
+        "frontal_overlap_ratio": 0.4068634814778184
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.4026248455047607,
+            -2.073967695236206,
+            1.9867987632751465,
+            -0.16775819659233093,
+            0.3242773711681366,
+            0.341758131980896,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.2840408384799957,
+          0.15007461607456207,
+          0.3100746273994446,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.43383824825286865,
+          0.212661474943161,
+          1.2907543182373047
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 21,
+      "seed": 20,
+      "objects": 17,
+      "step_ms": [
+        0.15564198838546872,
+        5.563020997215062,
+        0.5389949947129935,
+        0.2401919919066131,
+        1.241161982761696,
+        0.716626993380487,
+        21.16887501324527,
+        6.231377017684281,
+        1020.2899239957333
+      ],
+      "total_core_ms": 1056.1458149750251,
+      "render_commit_png_ms": 737.4875780078582,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_2": 1,
+          "ycb_006_mustard_bottle": 4,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "cup_1": 3,
+          "can_1": 3
+        },
+        "frontal_overlap_ratio": 0.2704275600982623
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 5,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.6818113923072815,
+            -1.8348956108093262,
+            1.940819501876831,
+            -0.4915633499622345,
+            2.3264403343200684,
+            -0.5954335927963257,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.3167252242565155,
+          -0.4115719199180603,
+          -0.2515719532966614,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.4213637113571167,
+          -0.2856608033180237,
+          1.3042423725128174
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 22,
+      "seed": 21,
+      "objects": 22,
+      "step_ms": [
+        0.16952201258391142,
+        4.678473022067919,
+        0.5179950094316155,
+        0.22976199397817254,
+        1.6385350027121603,
+        1.2010810023639351,
+        52.58341401349753,
+        7.996923988685012,
+        25.004339986480772
+      ],
+      "total_core_ms": 94.02004603180103,
+      "render_commit_png_ms": 726.3226739887614,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_2": 1,
+          "bottle_1": 2,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 3,
+          "mug_2": 3,
+          "ycb_004_sugar_box": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "ycb_005_tomato_soup_can": 2,
+          "can_1": 2
+        },
+        "frontal_overlap_ratio": 0.33938645716622595
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 2,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.6069626808166504,
+            -1.6941629648208618,
+            1.8443031311035156,
+            0.5795536041259766,
+            -0.24508750438690186,
+            -0.6802311539649963,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.31031855940818787,
+          0.14179891347885132,
+          0.30179890990257263,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.38429275155067444,
+          0.22233422100543976,
+          1.2906663417816162
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 23,
+      "seed": 22,
+      "objects": 19,
+      "step_ms": [
+        0.17443200340494514,
+        4.725873994175345,
+        0.5507449968717992,
+        0.24068300263024867,
+        1.325341989286244,
+        0.7723169983364642,
+        18.40633901883848,
+        5.224038002779707,
+        946.1932480044197
+      ],
+      "total_core_ms": 977.613018010743,
+      "render_commit_png_ms": 732.8326239949092,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_2": 1,
+          "ycb_006_mustard_bottle": 6,
+          "ycb_003_cracker_box": 6,
+          "can_1": 6
+        },
+        "frontal_overlap_ratio": 0.3881896441423118
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 5,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.12386900931596756,
+            -2.316624641418457,
+            1.8764065504074097,
+            0.5708151459693909,
+            1.8492814302444458,
+            0.13795925676822662,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.29685530066490173,
+          -0.16184037923812866,
+          -0.0018403753638267517,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3024556040763855,
+          -0.10916368663311005,
+          1.3059004545211792
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 24,
+      "seed": 23,
+      "objects": 20,
+      "step_ms": [
+        0.16468201647512615,
+        4.931275005219504,
+        0.28835301054641604,
+        0.269701995421201,
+        0.7993670005816966,
+        0.7248269976116717,
+        34.51760800089687,
+        9.294096002122387,
+        866.0106280003674
+      ],
+      "total_core_ms": 917.0005380292423,
+      "render_commit_png_ms": 711.087461997522,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_2": 1,
+          "ycb_005_tomato_soup_can": 4,
+          "ycb_003_cracker_box": 3,
+          "mug_1": 4,
+          "bottle_1": 4,
+          "can_1": 4
+        },
+        "frontal_overlap_ratio": 0.22971029090172512
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.1223528385162354,
+            -2.314817428588867,
+            2.0199530124664307,
+            0.43320149183273315,
+            0.4038938581943512,
+            -0.03942197561264038,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.30335482954978943,
+          -0.033820923417806625,
+          0.1261790692806244,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.420058012008667,
+          -0.01649320125579834,
+          1.2723287343978882
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 25,
+      "seed": 24,
+      "objects": 17,
+      "step_ms": [
+        0.1571109751239419,
+        5.5130709952209145,
+        0.3003730089403689,
+        0.2281320048496127,
+        0.796217005699873,
+        0.7290969952009618,
+        46.243186021456495,
+        6.691602000501007,
+        24.35859400429763
+      ],
+      "total_core_ms": 85.0173830112908,
+      "render_commit_png_ms": 676.5005819906946,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_003_cracker_box": 1,
+          "ycb_005_tomato_soup_can": 1,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_004_sugar_box": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 2,
+          "cup_2": 2,
+          "can_1": 1
+        },
+        "frontal_overlap_ratio": 0.3449292171560095
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 9,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.4697638750076294,
+            -2.0615251064300537,
+            2.0087645053863525,
+            0.066889688372612,
+            0.15564678609371185,
+            -0.12066000699996948,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.22304925322532654,
+          0.06406649947166443,
+          0.22406649589538574,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.42124587297439575,
+          0.17798671126365662,
+          1.2518551349639893
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 26,
+      "seed": 25,
+      "objects": 16,
+      "step_ms": [
+        0.15940101002343,
+        4.705352999735624,
+        0.34416301059536636,
+        0.2408130094408989,
+        1.0080990032292902,
+        0.9469090146012604,
+        38.37941400706768,
+        6.970054004341364,
+        877.4935319961514
+      ],
+      "total_core_ms": 930.2477380551863,
+      "render_commit_png_ms": 675.1931890030392,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_003_cracker_box": 1,
+          "can_1": 1,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_004_sugar_box": 2,
+          "ycb_006_mustard_bottle": 2,
+          "cup_1": 2,
+          "bottle_1": 2,
+          "cup_2": 1,
+          "ycb_005_tomato_soup_can": 1
+        },
+        "frontal_overlap_ratio": 0.1909210433029625
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 5,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.565669059753418,
+            -1.9243580102920532,
+            2.007978916168213,
+            -0.32621079683303833,
+            2.2572386264801025,
+            -0.39171603322029114,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.24130740761756897,
+          -0.36275047063827515,
+          -0.20275045931339264,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.41867393255233765,
+          -0.2321448028087616,
+          1.2742679119110107
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 27,
+      "seed": 26,
+      "objects": 17,
+      "step_ms": [
+        0.1571809989400208,
+        4.884875001152977,
+        0.37059400347061455,
+        0.2384719846304506,
+        1.0655299993231893,
+        0.9328480227850378,
+        15.79774499987252,
+        8.182926016161218,
+        22.443527006544173
+      ],
+      "total_core_ms": 54.0736980328802,
+      "render_commit_png_ms": 684.1262099915184,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "mug_1": 1,
+          "can_1": 5,
+          "ycb_003_cracker_box": 5,
+          "cup_1": 6
+        },
+        "frontal_overlap_ratio": 0.17358889737802716
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 9,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -1.6157788038253784,
+            -2.249826431274414,
+            1.9387935400009155,
+            -0.34425169229507446,
+            -0.2172839492559433,
+            0.5070124268531799,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.25161805748939514,
+          0.06884418427944183,
+          0.22884418070316315,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.3885840177536011,
+          0.1267905980348587,
+          1.2925913333892822
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 28,
+      "seed": 27,
+      "objects": 17,
+      "step_ms": [
+        0.15500100562348962,
+        4.662602994358167,
+        0.3226029803045094,
+        0.23720200988464057,
+        1.4468640147242695,
+        1.3167819997761399,
+        28.670434025116265,
+        5.440720997285098,
+        23.954030009917915
+      ],
+      "total_core_ms": 66.2062400369905,
+      "render_commit_png_ms": 689.4576489867177,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_004_sugar_box": 1,
+          "cup_2": 3,
+          "ycb_003_cracker_box": 4,
+          "ycb_006_mustard_bottle": 3,
+          "cup_1": 3,
+          "bottle_1": 3
+        },
+        "frontal_overlap_ratio": 0.18967230182893793
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 13,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.1453806459903717,
+            -2.098341703414917,
+            1.9907665252685547,
+            -0.03225519135594368,
+            1.7712851762771606,
+            -0.13238584995269775,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.30820783972740173,
+          -0.20989564061164856,
+          -0.049895644187927246,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.4356321692466736,
+          -0.1564408540725708,
+          1.304013729095459
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 29,
+      "seed": 28,
+      "objects": 18,
+      "step_ms": [
+        0.15812201309017837,
+        4.61928200093098,
+        0.2910819894168526,
+        0.22864199127070606,
+        0.779067020630464,
+        0.7175260107032955,
+        30.17772699240595,
+        8.453488000668585,
+        858.3881730155554
+      ],
+      "total_core_ms": 903.8131090346724,
+      "render_commit_png_ms": 673.7261329835746,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "cup_1": 1,
+          "ycb_005_tomato_soup_can": 3,
+          "ycb_003_cracker_box": 4,
+          "mug_2": 3,
+          "bottle_1": 4,
+          "cup_2": 3
+        },
+        "frontal_overlap_ratio": 0.20974016748720684
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 1,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            -0.2978871762752533,
+            -2.2202508449554443,
+            1.9934937953948975,
+            0.05515000969171524,
+            1.1417781114578247,
+            0.08250198513269424,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.25347092747688293,
+          -0.25571030378341675,
+          -0.09571030735969543,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.43672841787338257,
+          -0.13412462174892426,
+          1.3282594680786133
+        ],
+        "physical_fk_valid": true
+      }
+    },
+    {
+      "layout": 30,
+      "seed": 29,
+      "objects": 16,
+      "step_ms": [
+        0.1756020064931363,
+        4.555952007649466,
+        0.3316329966764897,
+        0.23464200785383582,
+        1.4363829977810383,
+        1.2745110143441707,
+        31.628101016394794,
+        5.983034992823377,
+        22.543758008396253
+      ],
+      "total_core_ms": 68.16361704841256,
+      "render_commit_png_ms": 671.0164280084427,
+      "audit": {
+        "valid": true,
+        "overlapping_object_pairs": [],
+        "objects_outside_support": [],
+        "background_in_reserved_regions": [],
+        "pockets": [
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          },
+          {
+            "blocker_fits": true,
+            "empty": true,
+            "outside_clearance": true,
+            "rotated_obb_outside_clearance": true,
+            "obb_padding_sufficient": true,
+            "rotated_goal_outside_clearance": true,
+            "entire_region_outside_clearance": true,
+            "adjoining_clearance": true,
+            "front_corridor_empty": true
+          }
+        ],
+        "target_type_unique": true,
+        "exactly_one_goal_per_side": true,
+        "count_in_requested_range": true,
+        "non_target_type_counts_balanced": true,
+        "type_counts": {
+          "ycb_005_tomato_soup_can": 1,
+          "cup_2": 2,
+          "ycb_003_cracker_box": 2,
+          "mug_1": 2,
+          "mug_2": 2,
+          "ycb_004_sugar_box": 2,
+          "cup_1": 2,
+          "ycb_006_mustard_bottle": 2,
+          "can_1": 1
+        },
+        "frontal_overlap_ratio": 0.3410683341638421
+      },
+      "vision_valid": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "robot_start": {
+        "anchor_fallback": false,
+        "anchor_candidate": 1,
+        "chosen_candidate": 9,
+        "joint_names": [
+          "shoulder_pan_joint",
+          "shoulder_lift_joint",
+          "elbow_joint",
+          "wrist_1_joint",
+          "wrist_2_joint",
+          "wrist_3_joint",
+          "right_index_1_joint",
+          "right_little_1_joint",
+          "right_middle_1_joint",
+          "right_ring_1_joint",
+          "right_thumb_1_joint",
+          "right_index_2_joint",
+          "right_little_2_joint",
+          "right_middle_2_joint",
+          "right_ring_2_joint",
+          "right_thumb_2_joint",
+          "right_thumb_3_joint",
+          "right_thumb_4_joint"
+        ],
+        "joint_positions": [
+          [
+            0.364681601524353,
+            -2.251631021499634,
+            1.8383923768997192,
+            0.5283191800117493,
+            2.101533889770508,
+            0.0776255875825882,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "region": [
+          -0.4399999976158142,
+          -0.27309563755989075,
+          -0.23914529383182526,
+          -0.07914529740810394,
+          1.25,
+          1.3300000429153442
+        ],
+        "palm_tcp": [
+          -0.2935962677001953,
+          -0.12020322680473328,
+          1.3201947212219238
+        ],
+        "physical_fk_valid": true
+      }
+    }
+  ],
+  "statistics": {
+    "layout_steps_1_7_ms": {
+      "mean": 44.95862543893357,
+      "median": 41.350595027324744,
+      "p95": 70.38195958593859,
+      "min": 23.44724501017481,
+      "max": 99.07389499130659,
+      "sum": 1348.7587631680071
+    },
+    "raycast_ms": {
+      "mean": 10.281777800022004,
+      "median": 7.509934497647919,
+      "p95": 11.010946049646005,
+      "min": 5.224038002779707,
+      "max": 88.35475699743256,
+      "sum": 308.4533340006601
+    },
+    "robot_search_write_fk_ms": {
+      "mean": 568.7876397986353,
+      "median": 871.7520799982594,
+      "p95": 1045.450989640085,
+      "min": 22.443527006544173,
+      "max": 1293.4872010082472,
+      "sum": 17063.62919395906
+    },
+    "core_steps_1_9_ms": {
+      "mean": 624.0280430375909,
+      "median": 923.6241380422143,
+      "p95": 1094.802648179757,
+      "min": 54.0736980328802,
+      "max": 1480.9158529969864,
+      "sum": 18720.841291127726
+    },
+    "render_commit_png_ms": {
+      "mean": 851.8132223961098,
+      "median": 716.570969496388,
+      "p95": 737.2637723005028,
+      "min": 671.0164280084427,
+      "max": 4962.745013996027,
+      "sum": 25554.396671883296
+    },
+    "per_step_mean_ms": [
+      0.1662111006832371,
+      5.181734765452954,
+      0.3958316995219017,
+      0.24523493484593928,
+      1.1519180668983608,
+      0.9690566337667406,
+      36.84863823776444,
+      10.281777800022004,
+      568.7876397986353
+    ],
+    "per_step_median_ms": [
+      0.15769651508890092,
+      5.143672984559089,
+      0.3572034911485389,
+      0.2383620012551546,
+      1.1146000033477321,
+      0.8389230060856789,
+      33.80033650319092,
+      7.509934497647919,
+      871.7520799982594
+    ]
+  }
+}

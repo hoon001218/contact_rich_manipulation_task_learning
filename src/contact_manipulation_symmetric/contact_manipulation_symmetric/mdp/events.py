@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import lru_cache
+import copy
 import math
 import random
 import json
@@ -940,7 +941,8 @@ class SensorBatch:
     """Latest completed physics sample, supplied by env.task_sensor_reader().
 
     The reader binds the native articulation and contact sensors. Ideal
-    wrench is parent-on-child joint reaction at the sensor center, sensor axes.
+    wrench is parent-on-child joint reaction at the sensor's tool-side datum,
+    expressed in sensor axes.
     """
 
     ideal_wrench: torch.Tensor           # N,6; before SI-200-8 measurement model
@@ -3928,6 +3930,10 @@ def _free_relocation_rectangles(obstacles, bounds, footprint_sizes):
 def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype):
     """Initial free patches on either Y side of A0, in fixed environment XY.
 
+    Sequential scenes use their reserved empty destination rectangles, which
+    already enclose a rotated full goal OBB. Front corridors are not goals.
+    The legacy extraction below reconstructs and checks its pocket polygons.
+
     Regions are physical empty patches large enough for the Blocker at one of
     its principal footprint orientations. They are deliberately NOT eroded
     center-feasibility sets: the reward's plateau begins when its center enters
@@ -3940,6 +3946,16 @@ def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype
     from certified pocket metadata and independently checked before inclusion.
     Return padded convex vertices [K,V,2], vertex counts [K], validity [K].
     """
+    if rules.generation_mode == 'sequential':
+        # The generator already reserved empty patches for independently
+        # rotated goal OBBs. Approach strips are not relocation destinations.
+        regions = sample.reserved_regions
+        if not regions or any(len(r) != 4 or not all(math.isfinite(v) for v in r)
+                              or r[1] <= r[0] or r[3] <= r[2] for r in regions):
+            raise ValueError('Sequential scenes require nonempty valid relocation patches.')
+        polygon = torch.tensor([rectangle_polygon(region) for region in regions], device=device, dtype=dtype)
+        return (polygon, torch.full((len(regions),), 4, device=device, dtype=torch.long),
+                torch.ones(len(regions), device=device, dtype=torch.bool))
     ids = tuple(index for index in sample.active_ids if index != sample.blocker_id)
     local = tuple(_collision_polygon(geometries[index], 0.) for index in ids)
     capacity = max((len(polygon) for polygon in local), default=3)
@@ -5155,10 +5171,563 @@ def construct_scene(geometries, rules, rng, target_id=None, blocker_id=None, act
                    visibility_variants=(base,) if guards else ())
 
 
+_SEQUENTIAL_EPS = 1e-9
+
+
+def _sequential_attr(obj, name, default=None):
+    return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+
+def _sequential_rect(points):
+    a = np.asarray(points, dtype=np.float64)
+    return (float(a[:, 0].min()), float(a[:, 0].max()), float(a[:, 1].min()), float(a[:, 1].max()))
+
+
+def _sequential_rot(points, yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.asarray(points, dtype=np.float64) @ np.array(((c, s), (-s, c)))
+
+
+def _sequential_corners(rect):
+    x0, x1, y0, y1 = rect
+    return np.array(((x0,y0),(x1,y0),(x1,y1),(x0,y1)), dtype=np.float64)
+
+
+def _sequential_translate(rect, x, y):
+    return (rect[0]+x, rect[1]+x, rect[2]+y, rect[3]+y)
+
+
+def _sequential_inflate(rect, gap):
+    return (rect[0]-gap,rect[1]+gap,rect[2]-gap,rect[3]+gap)
+
+
+def _sequential_maxrects_cut_all(rectangles, obstacle):
+    """Keep overlapping maximal empty rectangles, all individually obstacle-free.
+
+    Overlap is intentional: a later object is subtracted from *every* free
+    rectangle. This preserves a wide/tall placement domain across artificial
+    partition boundaries without testing or rejecting any random object pose.
+    """
+    result=[]
+    for r in rectangles:
+        x0,x1,y0,y1=r;a0,a1,b0,b1=obstacle
+        if a1<=x0 or a0>=x1 or b1<=y0 or b0>=y1:
+            result.append(r);continue
+        for q in ((x0,min(x1,a0),y0,y1),(max(x0,a1),x1,y0,y1),
+                  (x0,x1,y0,min(y1,b0)),(x0,x1,max(y0,b1),y1)):
+            if q[1]-q[0]>_SEQUENTIAL_EPS and q[3]-q[2]>_SEQUENTIAL_EPS:
+                result.append(tuple(map(float,q)))
+    # Deterministic duplicate/containment pruning, not scene acceptance.
+    unique=list(dict.fromkeys(result));kept=[]
+    for i,r in enumerate(unique):
+        contained=any(i!=j and r[0]>=q[0]-_SEQUENTIAL_EPS and r[1]<=q[1]+_SEQUENTIAL_EPS
+                      and r[2]>=q[2]-_SEQUENTIAL_EPS and r[3]<=q[3]+_SEQUENTIAL_EPS
+                      for j,q in enumerate(unique))
+        if not contained:kept.append(r)
+    return kept
+
+
+def _sequential_fitting_yaw_intervals(width, depth, free_width, free_depth):
+    """Continuous angles whose enclosing rectangle fits a free rectangle.
+
+    In one quadrant the two extents are ``w*cos(t)+d*sin(t)`` and
+    ``w*sin(t)+d*cos(t)``. Remove the analytically forbidden cosine intervals,
+    then reflect the remaining intervals through all four quadrants. This is
+    conservative for the actual footprint and uses no angular grid or search.
+    """
+    amplitude=math.hypot(width,depth)
+    intervals=[(0.,math.pi/2)]
+    for cosine,sine,limit in ((width,depth,free_width-2.e-9),
+                              (depth,width,free_depth-2.e-9)):
+        if limit<=0:
+            return ()
+        if limit>=amplitude:
+            continue
+        phase=math.atan2(sine,cosine)
+        half_width=math.acos(max(-1.,min(1.,limit/amplitude)))
+        lower,upper=phase-half_width,phase+half_width
+        remaining=[]
+        for start,end in intervals:
+            if end<=lower or start>=upper:
+                remaining.append((start,end))
+            else:
+                if start<lower:
+                    remaining.append((start,min(end,lower)))
+                if end>upper:
+                    remaining.append((max(start,upper),end))
+        intervals=remaining
+    result=[]
+    for start,end in intervals:
+        # Positive-width intervals only; endpoints are inset for roundoff.
+        if end-start<=4.e-12:
+            continue
+        for lo,hi in ((start,end),(math.pi-end,math.pi-start),
+                      (math.pi+start,math.pi+end),(2*math.pi-end,2*math.pi-start)):
+            result.append((lo+1.e-12,hi-1.e-12))
+    return tuple(sorted(result))
+
+
+class SequentialSceneGenerator:
+    """Direct seeded layout shared by training resets and the rendering probe.
+
+    Rays and robot IK remain native reset steps outside this CPU layout.
+    The finite free-rectangle decomposition never redraws a whole scene.
+    """
+    def __init__(self, geometries, rules, seed=0, margin=.01, blocker_asset=None, *,
+                 rng=None, target_id=None, blocker_id=None, capture_snapshots=True):
+        self.geometries=geometries; self.rules=rules; self.blocker_asset=blocker_asset
+        self.rng=random.Random(seed) if rng is None else rng
+        self.seed=None if seed is None else int(seed); self.margin=float(margin)
+        self.capture_snapshots=bool(capture_snapshots)
+        self.requested_target_id=target_id;self.requested_blocker_id=blocker_id
+        for role_id in (target_id,blocker_id):
+            if role_id is not None and not 0<=role_id<len(geometries):
+                raise ValueError('Explicit sequential role ID is outside the object pool.')
+        if not math.isfinite(self.margin) or self.margin<0:
+            raise ValueError('Sequential Target width margin must be finite and nonnegative.')
+        if blocker_id is not None:
+            geometry=geometries[blocker_id]
+            selected=_sequential_attr(geometry,'asset_name') or _sequential_attr(geometry,'name')
+            if blocker_asset is not None and blocker_asset!=selected:
+                raise ValueError('Explicit Blocker ID and asset name disagree.')
+            self.blocker_asset=selected
+        self.state=dict(seed=self.seed,active_ids=[],positions={},yaws={},clearance=None,
+                        pockets=[],pocket_goals=[],pocket_front_corridors=[],blocker_front_corridor=None,target_id=None,blocker_id=None,
+                        metadata=dict(catalog_used=False,layout_resampling=0,pose_rejection=0,
+                                      target_width_margin_m=float(margin)))
+        self.types=None; self.by_type=None; self.shapes={}
+
+    def _shape(self, index, yaw):
+        geo=self.geometries[index]
+        lo=np.asarray(_sequential_attr(geo,'lower'),dtype=float); hi=np.asarray(_sequential_attr(geo,'upper'),dtype=float)
+        fallback=_sequential_corners((lo[0],hi[0],lo[1],hi[1]))
+        collision=_sequential_attr(geo,'collision_footprint_vertices',())
+        visual=_sequential_attr(geo,'visual_footprint_vertices',())
+        midpoint=(lo[:2]+hi[:2])*.5
+        collision=_sequential_rot(np.asarray(collision if len(collision) else fallback)-midpoint,yaw)
+        visual=_sequential_rot(np.asarray(visual if len(visual) else fallback)-midpoint,yaw)
+        # Conservatively enclose both collision and visual geometry for support/packing.
+        outer=_sequential_rect(np.concatenate((collision,visual)))
+        return dict(collision=collision,visual=visual,bounds=outer,collision_bounds=_sequential_rect(collision),
+                    visual_bounds=_sequential_rect(visual),z=float(_sequential_attr(self.rules,'shelf_top')-lo[2]))
+
+    def _goal_shape(self,index,yaw):
+        # Reward/success use the complete local OBB, including its empty
+        # corners. Reserve its rotated envelope as well as actual geometry.
+        shape=self._shape(index,yaw)
+        geo=self.geometries[index]
+        half=(np.asarray(_sequential_attr(geo,'upper'),dtype=float)[:2]
+              -np.asarray(_sequential_attr(geo,'lower'),dtype=float)[:2])*.5
+        obb=_sequential_rot(_sequential_corners((-half[0],half[0],-half[1],half[1])),yaw)
+        shape['goal_obb']=obb
+        shape['bounds']=_sequential_rect(np.concatenate((shape['collision'],shape['visual'],obb)))
+        return shape
+
+    def _add(self,index,x,y,yaw):
+        self.state['active_ids'].append(int(index))
+        shape=self._shape(index,yaw)
+        self.state['positions'][int(index)]=(float(x),float(y),shape['z'])
+        self.state['yaws'][int(index)]=float(yaw)
+        return shape
+
+    def _world_rect(self,index):
+        x,y,_=self.state['positions'][index]
+        return _sequential_translate(self._shape(index,self.state['yaws'][index])['bounds'],x,y)
+
+    def snapshot(self):
+        return copy.deepcopy(self.state) if self.capture_snapshots else self.state
+
+    def step1_target(self):
+        self.by_type={}
+        for i,g in enumerate(self.geometries):
+            asset=_sequential_attr(g,'asset_name') or _sequential_attr(g,'name')
+            self.by_type.setdefault(asset,[]).append(i)
+        self.types=tuple(self.by_type)
+        if self.requested_target_id is None:
+            eligible=tuple(name for name in self.types if name!=self.blocker_asset)
+            if not eligible:
+                raise ValueError('Sequential Target requires an asset type different from the Blocker.')
+            target_type=self.rng.choice(eligible)
+            self.target=self.by_type[target_type][0]
+        else:
+            self.target=int(self.requested_target_id)
+            geometry=self.geometries[self.target]
+            target_type=_sequential_attr(geometry,'asset_name') or _sequential_attr(geometry,'name')
+        if target_type==self.blocker_asset:
+            raise ValueError('Sequential Target and Blocker must use different asset types.')
+        self.target_type=target_type
+        self.target_yaw=self.rng.uniform(-math.pi,math.pi)
+        self.state['target_id']=self.target
+        self.state['metadata'].update(target_asset=target_type,target_yaw=self.target_yaw,
+                                      asset_types=list(self.types))
+        return self.snapshot()
+
+    def step2_place_target(self):
+        edge=float(_sequential_attr(self.rules,'edge_margin',.015))
+        x0,x1=_sequential_attr(self.rules,'x_range');y0,y1=_sequential_attr(self.rules,'y_range')
+        self.shelf=(float(x0+edge),float(x1-edge),float(y0+edge),float(y1-edge))
+        self.blocker_yaws={name:self.rng.uniform(-math.pi,math.pi)
+                           for name in self.types if name!=self.target_type}
+        candidates=(tuple(self.blocker_yaws) if self.blocker_asset is None else (self.blocker_asset,))
+        if any(name not in self.blocker_yaws for name in candidates):
+            raise ValueError('Explicit Blocker must be a known non-Target type.')
+        t=self._shape(self.target,self.target_yaw);a,b,c,d=t['bounds']
+        va,vb,vc,vd=t['visual_bounds']
+        gap=float(_sequential_attr(self.rules,'gap',.003));start_gap=float(_sequential_attr(self.rules,'approach_margin',.01))
+        self.target_domains={}
+        self.destination_yaws={name:(self.rng.uniform(-math.pi,math.pi),self.rng.uniform(-math.pi,math.pi))
+                               for name in candidates}
+        self.arrival_shapes={name:{side:self._goal_shape(self.by_type[name][0],yaw)
+                                  for side,yaw in zip((-1,1),self.destination_yaws[name])}
+                             for name in candidates}
+        for name in candidates:
+            initial=self._shape(self.by_type[name][0],self.blocker_yaws[name])
+            initial_depth=initial['bounds'][1]-initial['bounds'][0]
+            initial_width=initial['bounds'][3]-initial['bounds'][2]
+            for sides in ((-1,),(1,),(-1,1)):
+                arrivals=[self.arrival_shapes[name][side] for side in sides]
+                # This plan leaves a selected destination in front of the
+                # initial Blocker whenever their Y strips overlap. The later
+                # X sampler uses this entire continuous reserved-plan domain.
+                depth=(initial_depth+max(g['bounds'][1]-g['bounds'][0] for g in arrivals)+3*gap)
+                width={side:(self.arrival_shapes[name][side]['bounds'][3]
+                             -self.arrival_shapes[name][side]['bounds'][2]+2*gap)
+                       for side in sides}
+                # Initial Blocker must also fit when it occludes either side.
+                # This is pose-placement room, not an unselected goal reserve.
+                left_width=max(initial_width+gap,width.get(-1,0.))
+                right_width=max(initial_width+gap,width.get(1,0.))
+                tx0=self.shelf[0]-a
+                tx1=self.shelf[1]-max(b,vb)-depth-start_gap
+                ty0=max(self.shelf[2]-c,self.shelf[2]+left_width+3*gap-vc+self.margin)
+                ty1=min(self.shelf[3]-d,self.shelf[3]-right_width-3*gap-vd-self.margin)
+                if tx1>tx0+_SEQUENTIAL_EPS and ty1>ty0+_SEQUENTIAL_EPS:
+                    self.target_domains[(name,sides)]=(float(tx0),float(tx1),float(ty0),float(ty1))
+        if not self.target_domains:
+            raise ValueError('No positive Target domain for any Blocker and one/two destination plan; no resampling.')
+        domains=tuple(self.target_domains.values())
+        weights=[(r[1]-r[0])*(r[3]-r[2]) for r in domains]
+        component=self.rng.choices(domains,weights=weights,k=1)[0]
+        tx=self.rng.uniform(component[0],component[1]);ty=self.rng.uniform(component[2],component[3])
+        self.allowed_destination_sides={}
+        for (name,sides),r in self.target_domains.items():
+            if r[0]-_SEQUENTIAL_EPS<=tx<=r[1]+_SEQUENTIAL_EPS and r[2]-_SEQUENTIAL_EPS<=ty<=r[3]+_SEQUENTIAL_EPS:
+                self.allowed_destination_sides.setdefault(name,[]).append(sides)
+        self.allowed_blockers=tuple(self.allowed_destination_sides)
+        self._add(self.target,tx,ty,self.target_yaw)
+        self.state['shelf_bounds']=self.shelf
+        self.state['metadata'].update(target_origin_domain_component=component,
+            target_origin_domains_by_plan=[dict(asset=name,sides=sides,bounds=r)
+                for (name,sides),r in self.target_domains.items()],
+            allowed_blockers_at_target=self.allowed_blockers,
+            allowed_destination_sides_at_target=self.allowed_destination_sides,
+            target_sampling='area-weighted union of Blocker/side-plan components, then uniform XY; overlaps receive mixture weight',
+            blocker_type_feasibility_conditioned=True,blocker_orientation_draw_stage=2,
+            initial_blocker_yaws=self.blocker_yaws,
+            destination_yaws_by_future_blocker=self.destination_yaws,
+            destination_orientation_sampling='independent continuous uniform [-pi,pi) for left and right; independent of initial Blocker yaw')
+        self.camera=(float(x1+.75),float(ty),float(_sequential_attr(self.rules,'shelf_top')+.18),.5,-.5,-.5,.5)
+        return self.snapshot()
+
+    def step3_clearance(self):
+        tx,ty,_=self.state['positions'][self.target]
+        t=self._shape(self.target,self.target_yaw)
+        front=tx+max(t['bounds'][1],t['visual_bounds'][1])+float(_sequential_attr(self.rules,'approach_margin',.01))
+        self.state['clearance']=(float(front),float(self.shelf[1]),
+                                float(ty+t['visual_bounds'][2]-self.margin),
+                                float(ty+t['visual_bounds'][3]+self.margin))
+        self.state['camera_pose']=self.camera
+        self.state['metadata']['target_frontal_world_width_m']=t['visual_bounds'][3]-t['visual_bounds'][2]
+        return self.snapshot()
+
+    def step4_blocker(self):
+        self.blocker_type=(self.blocker_asset if self.blocker_asset is not None
+                           else self.rng.choice(self.allowed_blockers))
+        self.destination_sides=self.rng.choice(self.allowed_destination_sides[self.blocker_type])
+        self.blocker=(self.by_type[self.blocker_type][0] if self.requested_blocker_id is None
+                      else int(self.requested_blocker_id))
+        self.blocker_yaw=self.blocker_yaws[self.blocker_type]
+        self.state['blocker_id']=self.blocker
+        self.state['metadata'].update(blocker_asset=self.blocker_type,blocker_yaw=self.blocker_yaw,
+                                      destination_sides=self.destination_sides,destination_count=len(self.destination_sides),
+                                      blocker_type_selection=('explicit diagnostic Blocker' if self.blocker_asset else 'uniform among non-Target types feasible at the sampled Target pose'))
+        return self.snapshot()
+
+    def _projection(self,index,x,y,yaw):
+        points=self._shape(index,yaw)['visual']+np.array((x,y))
+        u=(points[:,1]-self.camera[1])/(self.camera[0]-points[:,0])
+        return (float(u.min()),float(u.max()))
+
+    def step5_place_blocker(self):
+        tx,ty,_=self.state['positions'][self.target]
+        t=self._shape(self.target,self.target_yaw)
+        b=self._shape(self.blocker,self.blocker_yaw)
+        gap=float(_sequential_attr(self.rules,'gap',.003))
+        front=tx+t['bounds'][1]
+        bx0=front+gap-b['bounds'][0]
+        selected_depth=max(self.arrival_shapes[self.blocker_type][side]['bounds'][1]
+                           -self.arrival_shapes[self.blocker_type][side]['bounds'][0]+2*gap
+                           for side in self.destination_sides)
+        bx1=self.shelf[1]-b['bounds'][1]-selected_depth-gap
+        if bx1<bx0:
+            raise ValueError('Blocker front depth interval empty; no resampling.')
+        # Uniform across the entire computed X interval, retaining forward
+        # room for every selected goal if its strip crosses initial Blocker.
+        # This is a conservative reserved-plan domain, not all possible XY plans.
+        bx=self.rng.uniform(bx0,bx1)
+        tl,tr=self._projection(self.target,tx,ty,self.target_yaw)
+        tw=tr-tl; ex,ey=self.camera[:2]; visual=b['visual']; di=ex-bx-visual[:,0]
+        if np.any(di<=0):
+            raise ValueError('Blocker crosses virtual camera plane.')
+        options=[]
+        for side in (-1,1):
+            # Reflect Y for the left solution: the right-hand overlap problem
+            # then has exactly the same linear interval boundaries.
+            yy=side*visual[:,1]; eye=side*ey
+            target_right=tr if side==1 else -tl
+            lower=target_right-.5*tw; upper=target_right-.1*tw
+            lo=max(float(np.max(lower*di-yy+eye)),
+                   float(np.min(target_right*di-yy+eye)))
+            hi=float(np.max(upper*di-yy+eye))
+            if side==1:
+                lo=max(lo,self.shelf[2]-b['bounds'][2])
+                hi=min(hi,self.shelf[3]-b['bounds'][3])
+                # Actual world XY intersection with the clearance rectangle.
+                lo=max(lo,self.state['clearance'][2]-b['bounds'][3]+1e-6)
+                hi=min(hi,self.state['clearance'][3]-b['bounds'][2]-1e-6)
+            else:
+                lo=max(lo,-self.shelf[3]+b['bounds'][3])
+                hi=min(hi,-self.shelf[2]+b['bounds'][2])
+                lo=max(lo,-self.state['clearance'][3]+b['bounds'][2]+1e-6)
+                hi=min(hi,-self.state['clearance'][2]+b['bounds'][3]-1e-6)
+            if hi>=lo:
+                options.append((side,float(lo),float(hi)))
+        if not options:
+            raise ValueError('No analytical frontal-width overlap interval; no resampling.')
+        side,lo,hi=self.rng.choice(options); by=side*self.rng.uniform(lo,hi)
+        self._add(self.blocker,bx,by,self.blocker_yaw)
+        bl,br=self._projection(self.blocker,bx,by,self.blocker_yaw)
+        overlap=max(0.,min(tr,br)-max(tl,bl))/tw
+        if not .1-1e-8<=overlap<=.5+1e-8:
+            raise AssertionError(f'Analytic overlap implementation failure: {overlap}')
+        self.state['metadata'].update(frontal_overlap_ratio=overlap,
+             overlap_kind='perspective frontal horizontal visual extent',
+             target_horizontal_projection=(tl,tr),blocker_horizontal_projection=(bl,br),
+             blocker_y_interval=(lo,hi),blocker_y_interval_reflection=side,
+             blocker_x_interval=(bx0,bx1),
+             blocker_x_sampling='uniform across full reserved-plan feasible interval',
+             target_blocker_depth_gap_m=bx+b['bounds'][0]-front,
+             target_blocker_depth_gap_interval_m=(gap,bx1+b['bounds'][0]-front),
+             depth_gap_definition='world X AABB support-plane gap of actual collision/visual envelopes; not Euclidean closest distance')
+        self.blocker_side=side
+        envelope=self._goal_shape(self.blocker,self.blocker_yaw)['bounds']
+        raw_corridor=(bx+envelope[1],float(_sequential_attr(self.rules,'x_range')[1]),
+                      by+envelope[2]-gap,by+envelope[3]+gap)
+        shelf_y0,shelf_y1=_sequential_attr(self.rules,'y_range')
+        corridor=(raw_corridor[0],raw_corridor[1],
+                  max(float(shelf_y0),raw_corridor[2]),min(float(shelf_y1),raw_corridor[3]))
+        self.state['blocker_front_corridor']=tuple(map(float,corridor))
+        self.state['metadata'].update(blocker_front_corridor_reserved=True,
+            blocker_front_corridor_unclipped=raw_corridor,
+            blocker_front_corridor_definition='from initial Blocker full rotated local OBB/collision/visual front envelope to physical shelf front; full Y envelope plus 3mm each side; Y clipped only at actual shelf edges',
+            blocker_front_corridor_has_no_back_extension=True)
+        return self.snapshot()
+
+    def step6_pockets(self):
+        a=self.state['clearance'];s=self.shelf
+        gap=float(_sequential_attr(self.rules,'gap',.003))
+        blocker=_sequential_inflate(self._world_rect(self.blocker),gap)
+        reports=[]
+        for side in self.destination_sides:
+            slot=0 if side<0 else 1
+            # Arrival yaw is independent of initial Blocker orientation.
+            yaw=self.destination_yaws[self.blocker_type][slot]
+            shape=self._goal_shape(self.blocker,yaw)
+            bx0,bx1,by0,by1=shape['bounds']
+            width=by1-by0+2*gap;depth=bx1-bx0+2*gap
+            bottom,top=((a[2]-width,a[2]) if side<0 else (a[3],a[3]+width))
+            lo=max(a[0],s[0]);hi=min(a[1],s[1])-depth
+            if top>blocker[2] and bottom<blocker[3]:lo=max(lo,blocker[1])
+            if bottom<s[2]-_SEQUENTIAL_EPS or top>s[3]+_SEQUENTIAL_EPS or hi<lo:
+                raise ValueError(f'No adjoining destination for side {side}; upstream domain guarantee failed; no resampling.')
+            left=self.rng.uniform(lo,hi)
+            pocket=(left,left+depth,bottom,top)
+            goal=(left+gap-bx0,bottom+gap-by0,shape['z'],yaw)
+            self.state['pockets'].append(tuple(map(float,pocket)))
+            self.state['pocket_goals'].append(tuple(map(float,goal)))
+            self.state['pocket_front_corridors'].append((float(left+depth),
+                float(_sequential_attr(self.rules,'x_range')[1]),float(bottom),float(top)))
+            reports.append(dict(side=side,selected_yaw=yaw,relative_to_initial_yaw_rad=yaw-self.blocker_yaw,
+                width_m=width,depth_m=depth,x_interval=(lo,hi),sampled_x=left,
+                feasible_candidates=[dict(yaw=yaw,width_m=width,depth_m=depth,x_interval=(lo,hi))]))
+        self.state['metadata'].update(pocket_count=len(self.destination_sides),
+            pocket_goal_yaw='independent continuous uniform [-pi,pi) per side; not based on initial Blocker yaw',
+            pocket_options=reports,pocket_adjoins_clearance=True,pocket_front_corridors_reserved=True,
+            pocket_per_selected_side=1,pocket_x_sampling='uniform across complete feasible interval',
+            full_blocker_route_reserved=False,
+            destination_envelope='union of actual collision/visual footprint and rotated full local OBB; 3mm per side')
+        return self.snapshot()
+
+    def step7_background(self):
+        gap=float(_sequential_attr(self.rules,'gap',.003))
+        free=[self.shelf]
+        exclusions=[self._world_rect(self.target),self.state['clearance'],self._world_rect(self.blocker)]+self.state['pockets']+self.state['pocket_front_corridors']
+        if self.state['blocker_front_corridor'] is not None:
+            exclusions.append(self.state['blocker_front_corridor'])
+        for rectangle in exclusions:
+            free=_sequential_maxrects_cut_all(free,_sequential_inflate(rectangle,gap))
+        requested=self.rng.randint(int(_sequential_attr(self.rules,'min_objects',15)),int(_sequential_attr(self.rules,'max_objects',25)))
+        copies=min(len(v) for name,v in self.by_type.items() if name!=self.target_type)
+        minimum_types=max(int(_sequential_attr(self.rules,'min_asset_types',4)),math.ceil((requested-1)/copies)+1)
+        k=(min(int(_sequential_attr(self.rules,'max_asset_types',10)),len(self.types))
+           if _sequential_attr(self.rules,'all_asset_types',False)
+           else self.rng.randint(minimum_types,min(int(_sequential_attr(self.rules,'max_asset_types',10)),len(self.types))))
+        extras=[t for t in self.types if t not in (self.target_type,self.blocker_type)]
+        selected=[self.blocker_type]+self.rng.sample(extras,k-2)
+        self.background_base_yaws={name:self.rng.uniform(-math.pi,math.pi) for name in selected}
+        counts={name:int(name==self.blocker_type) for name in selected}
+        next_copy={name:int(name==self.blocker_type) for name in selected}
+        background_ids={name:[i for i in self.by_type[name] if i!=self.blocker] for name in selected}
+        placed=[];stopped=None;domains=[];skipped=[]
+        minimum=int(_sequential_attr(self.rules,'min_objects',15))
+        recovery_attempted=False;recoveries=[]
+        for ordinal in range(max(0,requested-2)):
+            available=[name for name in selected if next_copy[name]-int(name==self.blocker_type)<len(background_ids[name])]
+            if not available:
+                stopped='Selected type pool capacity exhausted';break
+            # Evaluate all type/orientation/free-rectangle domains once. Choose
+            # among fitting types with the smallest count; a non-fitting large
+            # type never causes an immediate stop while other types still fit.
+            type_choices={}
+            for name in available:
+                index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                base=self.background_base_yaws[name];choices=[]
+                for yaw in (base,base+math.pi/2):
+                    shape=self._shape(index,yaw);r0=shape['bounds'];dx=r0[1]-r0[0];dy=r0[3]-r0[2]
+                    for j,r in enumerate(free):
+                        sx=r[1]-r[0]-dx;sy=r[3]-r[2]-dy
+                        if sx>=0 and sy>=0:
+                            score=((r[1]-r[0])*(r[3]-r[2])-dx*dy,min(sx,sy),max(sx,sy))
+                            choices.append((score,j,yaw,r0,dx,dy))
+                if choices:type_choices[name]=min(choices,key=lambda item:item[0])
+                else:skipped.append(dict(placement_ordinal=ordinal,asset=name,count=counts[name],
+                    reason='No free rectangle fits either evaluated orientation'))
+            least=min(counts.values())
+            balanced=[name for name in type_choices if counts[name]==least]
+            if not balanced and len(self.state['active_ids'])<minimum:
+                recovery_attempted=True
+                alternatives={}
+                for name in available:
+                    if counts[name]!=least:
+                        continue
+                    index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                    bounds=self._shape(index,0.)['bounds']
+                    width,depth=bounds[1]-bounds[0],bounds[3]-bounds[2]
+                    candidates=[]
+                    for j,r in enumerate(free):
+                        angles=_sequential_fitting_yaw_intervals(width,depth,r[1]-r[0],r[3]-r[2])
+                        if angles:
+                            candidates.append(((r[1]-r[0])*(r[3]-r[2])-width*depth,j,angles))
+                    if candidates:
+                        alternatives[name]=(width*depth,min(candidates,key=lambda item:item[0]))
+                if alternatives:
+                    name=max(alternatives,key=lambda name:alternatives[name][0])
+                    _,(_,j,angles)=alternatives[name]
+                    lo,hi=self.rng.choices(angles,weights=[b-a for a,b in angles],k=1)[0]
+                    yaw=self.rng.uniform(lo,hi)
+                    index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                    r0=self._shape(index,yaw)['bounds'];dx=r0[1]-r0[0];dy=r0[3]-r0[2];r=free[j]
+                    sx,sy=r[1]-r[0]-dx,r[3]-r[2]-dy
+                    score=((r[1]-r[0])*(r[3]-r[2])-dx*dy,min(sx,sy),max(sx,sy))
+                    type_choices[name]=(score,j,yaw,r0,dx,dy)
+                    balanced=[name]
+                    recoveries.append(dict(asset=name,object_id=index,free_rectangle=r,
+                        feasible_yaw_intervals=angles,selected_yaw=yaw,
+                        count_before=len(self.state['active_ids'])))
+            if not balanced:
+                stopped=('No least-populated type has a continuous enclosing-box yaw domain in the remaining free space'
+                         if len(self.state['active_ids'])<minimum else
+                         'No currently least-populated type fits; stop to preserve count balance' if type_choices else
+                         'No selected non-Target type fits any remaining free rectangle')
+                break
+            name=max(balanced,key=lambda name:type_choices[name][-2]*type_choices[name][-1])
+            index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+            _,j,yaw,r0,dx,dy=type_choices[name]
+            r=free[j];slackx=r[1]-r[0]-dx;slacky=r[3]-r[2]-dy
+            # Compact at a real free-rectangle corner. No throwaway RNG draws.
+            left=r[0]
+            bottom=r[2]
+            x=left-r0[0];y=bottom-r0[2]
+            self._add(index,x,y,yaw)
+            occupied=(left,left+dx,bottom,bottom+dy)
+            domains.append(dict(asset=name,free_rectangle=r,yaw=yaw,x_domain=[r[0]-r0[0],r[1]-r0[1]],
+                                y_domain=[r[2]-r0[2],r[3]-r0[3]]))
+            free=_sequential_maxrects_cut_all(free,_sequential_inflate(occupied,gap))
+            placed.append(index);counts[name]+=1;next_copy[name]+=1
+        self.state['metadata'].update(requested_count=requested,actual_count=len(self.state['active_ids']),
+            selected_types=[self.target_type]+selected,non_target_counts=counts,
+            background_stop_reason=stopped,free_rectangle_count=len(free),
+            background_domains=domains,background_yaws='continuous uniform base yaw per type; base + 90 degree arrival option',
+            background_base_yaws=self.background_base_yaws,
+            background_free_space='overlapping maximal empty rectangles; containment pruned',
+            background_corner='deterministic lower X / lower Y; zero positional jitter',
+            background_all_asset_types=bool(_sequential_attr(self.rules,'all_asset_types',False)),
+            background_nonfitting_types=skipped,non_target_count_spread=max(counts.values())-min(counts.values()),
+            minimum_count_guaranteed=False,globally_optimal_capacity_claimed=False,
+            minimum_count_recovery_attempted=recovery_attempted,
+            minimum_count_yaw_recoveries=recoveries,
+            minimum_count_shortfall=max(0,minimum-len(self.state['active_ids'])),
+            minimum_count_remaining_capacity_reason=(stopped if len(self.state['active_ids'])<minimum else None),
+            background_type_selection='all types' if _sequential_attr(self.rules,'all_asset_types',False) else 'random type count',
+            background_tie_break='largest footprint among currently least-populated fitting types')
+        if recoveries:
+            self.state['metadata']['background_yaws']+='; minimum-count recovery uses analytic continuous fitting intervals'
+        self.state['free_rectangles']=free
+        return self.snapshot()
+
+    def as_sample(self, sample_type=None):
+        """Return an immutable layout snapshot with goal-only reserved regions."""
+        if sample_type is None:
+            sample_type=SceneSample
+        state=copy.deepcopy(self.state)
+        certificate=dict(state['metadata'])
+        certificate['sequential_state']=state
+        return sample_type(tuple(state['active_ids']),state['target_id'],state['blocker_id'],
+            state['positions'],state['yaws'],state['clearance'],tuple(state['pocket_goals'][0][:2]),
+            clearance_kind='sequential',reserved_regions=tuple(state['pockets']),
+            camera_pose=tuple(state['camera_pose']),parameter_certificate=certificate)
+
+
+def sample_sequential_scene(geometries, rules, rng=None, *, seed=None,
+                            target_id=None, blocker_id=None, active_ids=None, margin=.01):
+    """Generate one layout directly; no visibility catalog or scene retry.
+
+    ``seed`` matches the diagnostic generator exactly. A supplied RNG supports
+    the generic scene-sampling API without deriving or resetting its stream.
+    Explicit roles are supported; a fixed legacy composition is intentionally
+    rejected because this rule chooses its balanced count from remaining space.
+    """
+    if active_ids is not None:
+        raise ValueError('Sequential scenes choose their own composition; active_ids is unsupported.')
+    _check_inputs(geometries,rules)
+    if rng is None and seed is None:
+        seed=0
+    builder=SequentialSceneGenerator(geometries,rules,seed=seed,margin=margin,rng=rng,
+        target_id=target_id,blocker_id=blocker_id,capture_snapshots=False)
+    for step in (builder.step1_target,builder.step2_place_target,builder.step3_clearance,
+                 builder.step4_blocker,builder.step5_place_blocker,builder.step6_pockets,
+                 builder.step7_background):
+        step()
+    return builder.as_sample()
+
+
 def sample_scene(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rng: random.Random,
                  target_id: int | None = None, blocker_id: int | None = None,
                  active_ids: Sequence[int] | None = None) -> SceneSample:
     """Single CPU scene using the same constructive packer as batched resets."""
+    if rules.generation_mode == 'sequential':
+        return sample_sequential_scene(geometries,rules,rng,target_id=target_id,
+                                       blocker_id=blocker_id,active_ids=active_ids)
     if rules.generation_mode in ('parameterized', 'clutter'):
         raise ValueError("Parameterized scenes require a startup-certified catalog; use sample_certified_episode.")
     if rules.generation_mode == "constructive":
@@ -5184,6 +5753,10 @@ def sample_scenes(geometries, rules, streams, roles, active_ids, *, device="cpu"
     if not (len(streams) == len(roles) == len(active_ids)) or batch_size < 1:
         raise ValueError("Layout requests need aligned seeds/roles/compositions and a positive batch size.")
     _check_inputs(geometries, rules)
+    if rules.generation_mode == 'sequential':
+        return [sample_sequential_scene(geometries,rules,rng,target_id=role[0],
+                                        blocker_id=role[1],active_ids=active)
+                for rng,role,active in zip(streams,roles,active_ids)]
     if rules.generation_mode in ('parameterized', 'clutter'):
         raise ValueError("Parameterized scenes require a startup-certified catalog; use sample_certified_episode.")
     if rules.generation_mode == "constructive":
@@ -8057,9 +8630,10 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
     objects, robot = env.scene["object_collection"], env.scene["robot"]
     scene, specs, m = env.task_scene_data, runtime.specs, ids.numel()
     capacity, observation_capacity = _active_object_capacity(env), env.cfg.mdp.max_objects
+    sequential = env.spawn_rules.generation_mode == 'sequential'
     clutter = env.spawn_rules.generation_mode == 'clutter'
     parameterized = env.spawn_rules.generation_mode in ('parameterized', 'clutter')
-    constructive = parameterized or env.spawn_rules.generation_mode == "constructive"
+    constructive = sequential or parameterized or env.spawn_rules.generation_mode == "constructive"
     layout_budget = 1 if constructive else env.cfg.initial_vision.max_layout_attempts
     selected = ids.tolist()
     counts = runtime.reset_counts[ids].tolist()
@@ -8069,19 +8643,29 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
         counts = [scene_generation]
     seeds = [_episode_seed(int(env.cfg.seed), index, count) for index, count in zip(selected, counts)]
     streams = [random.Random(seed) for seed in seeds]
-    targets = [index for index, spec in enumerate(specs)
-               if (env.cfg.target_asset is None or spec.asset_name == env.cfg.target_asset)
-               and (env.cfg.blocker_asset is None or spec.asset_name != env.cfg.blocker_asset)]
-    if not targets:
-        raise ValueError("No Target type satisfies the configured episode roles.")
     roles = []
-    for rng in streams:
-        target = rng.choice(targets)
-        blockers = [index for index, spec in enumerate(specs) if spec.asset_name != specs[target].asset_name
-                    and (env.cfg.blocker_asset is None or spec.asset_name == env.cfg.blocker_asset)]
-        if not blockers:
-            raise ValueError("Blocker must have a different type from the unique Target.")
-        roles.append((target, rng.choice(blockers)))
+    if sequential:
+        forced = []
+        for role in ('target_asset', 'blocker_asset'):
+            asset = getattr(env.cfg, role)
+            index = next((i for i, spec in enumerate(specs) if spec.asset_name == asset), None)
+            if asset is not None and index is None:
+                raise ValueError(f'Unknown {role}: {asset}.')
+            forced.append(index)
+        roles = [tuple(forced)] * m
+    else:
+        targets = [index for index, spec in enumerate(specs)
+                   if (env.cfg.target_asset is None or spec.asset_name == env.cfg.target_asset)
+                   and (env.cfg.blocker_asset is None or spec.asset_name != env.cfg.blocker_asset)]
+        if not targets:
+            raise ValueError("No Target type satisfies the configured episode roles.")
+        for rng in streams:
+            target = rng.choice(targets)
+            blockers = [index for index, spec in enumerate(specs) if spec.asset_name != specs[target].asset_name
+                        and (env.cfg.blocker_asset is None or spec.asset_name == env.cfg.blocker_asset)]
+            if not blockers:
+                raise ValueError("Blocker must have a different type from the unique Target.")
+            roles.append((target, rng.choice(blockers)))
     saved = (robot.data.root_state_w[ids].clone(),
              robot.data.joint_pos[ids].clone(), robot.data.joint_vel[ids].clone(),
              robot.data.joint_pos_target[ids].clone(), robot.data.joint_vel_target[ids].clone(),
@@ -8095,8 +8679,8 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
         object_state=default.new_zeros((m, len(specs), 13)),
         object_ids=torch.full((m, capacity), -1, device=env.device, dtype=torch.long),
         active=torch.zeros((m, len(specs)), device=env.device, dtype=torch.bool),
-        target_id=torch.tensor([role[0] for role in roles], device=env.device),
-        blocker_id=torch.tensor([role[1] for role in roles], device=env.device),
+        target_id=torch.tensor([-1 if role[0] is None else role[0] for role in roles], device=env.device),
+        blocker_id=torch.tensor([-1 if role[1] is None else role[1] for role in roles], device=env.device),
         access_region=default.new_zeros((m, 4)), joint_positions=torch.zeros_like(saved[1]),
         geometry_b=default.new_zeros((m, observation_capacity, 10)),
         geometry_valid=torch.zeros((m, observation_capacity), device=env.device, dtype=torch.bool),
@@ -8114,7 +8698,10 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
             for attempt in range(layout_budget):
                 candidates, samples = [], []
                 # print(f"[Episode reset] sampling {len(pending)} independent episodes, proposal {attempt + 1}", flush=True)
-                if clutter:
+                if sequential:
+                    proposals = [sample_sequential_scene(env.spawn_geometries, env.spawn_rules,
+                        seed=seeds[row], target_id=roles[row][0], blocker_id=roles[row][1]) for row in pending]
+                elif clutter:
                     proposals = [sample_clutter_episode(runtime.parameter_catalog, env.spawn_geometries,
                         env.spawn_rules, streams[row], *roles[row], device=env.device,
                         front_range=env.cfg.initial_vision.front_distance_range,
@@ -8149,7 +8736,7 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                     workspace_bounds=(*env.spawn_rules.x_range, *env.spawn_rules.y_range),
                     shelf_top=env.spawn_rules.shelf_top, seed=seeds[row] + 7_919 * (attempt + 1))
                     for row, sample in zip(candidates, samples)]
-                if constructive and not parameterized:
+                if constructive and not parameterized and not sequential:
                     samples, snapshots, proposed, states, active, slots = _capture_constructive_views(
                         env, runtime, samples, requests, default, origins[rows], roots)
                 else:
@@ -8159,19 +8746,21 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                                                                scene.upright, proposals=proposed)
                     vision_poses = states[..., :7].clone()
                     vision_poses[..., :3] += origins[rows, None]
-                    if parameterized:
+                    if parameterized or sequential:
                         cameras = default.new_tensor([sample.camera_pose for sample in samples])
                         cameras[:, :3] += origins[rows]
                         snapshots = runtime.vision.observe_at_viewpoint(requests, cameras,
                             object_poses=vision_poses, root_poses=roots)
                     else:
                         snapshots = runtime.vision.capture_batch(requests, object_poses=vision_poses, root_poses=roots)
-                visible = [index for index, snapshot in enumerate(snapshots) if snapshot is not None]
+                visible = [index for index, snapshot in enumerate(snapshots) if snapshot is not None
+                           and (not sequential or bool(snapshot.valid[:2].all()))]
                 diagnostics = getattr(runtime.vision, "last_diagnostics", ())
                 for index, (row, snapshot) in enumerate(zip(candidates, snapshots)):
-                    if snapshot is None:
+                    if snapshot is None or (sequential and index not in visible):
                         detail = diagnostics[index] if isinstance(diagnostics, (list, tuple)) and index < len(diagnostics) else None
-                        errors[row] = (f"Initial geometric visibility/depth invariant rejected: {detail}"
+                        errors[row] = ("Initial Target/Blocker did not yield valid visible-surface observations."
+                                       if sequential else f"Initial geometric visibility/depth invariant rejected: {detail}"
                                        if detail is not None else "Initial geometric visibility/depth requirements were not met.")
                 if not visible:
                     continue
@@ -8222,6 +8811,8 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                 states, active, slots = states[selection], active[selection], slots[selection]
                 positions = torch.stack([torch.as_tensor(start[0], device=env.device, dtype=default.dtype) for start in starts])
                 batch.object_state[rows], batch.active[rows], batch.object_ids[rows] = states, active, slots
+                batch.target_id[rows] = torch.tensor([sample.target_id for sample in samples], device=env.device)
+                batch.blocker_id[rows] = torch.tensor([sample.blocker_id for sample in samples], device=env.device)
                 batch.joint_positions[rows] = positions
                 batch.access_region[rows] = default.new_tensor([sample.access_region for sample in samples])
                 batch.robot_regions[rows] = torch.stack([torch.as_tensor(start[1],device=env.device,dtype=default.dtype) for start in starts])
@@ -8255,8 +8846,12 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                         getattr(batch, name)[accepted_ids] = torch.stack([getattr(s, source) for s in accepted_snapshots])
                     predicted = {row: sample.parameter_certificate['predicted_role_visibility']
                         for row, sample in zip(candidates, samples)} if parameterized else {}
+                    # Direct observation does not render an unoccluded role
+                    # silhouette. Mark that diagnostic as unknown; width
+                    # overlap is not a measured silhouette visibility ratio.
                     batch.visibility[accepted_ids] = default.new_tensor([
-                        snapshot.visible_fractions if snapshot.visible_fractions is not None else predicted[row]
+                        snapshot.visible_fractions if snapshot.visible_fractions is not None
+                        else (-1.0, -1.0) if sequential else predicted[row]
                         for row, snapshot in zip(accepted_rows, accepted_snapshots)])
                 pending = [row for row in pending if row not in accepted]
                 if not pending:

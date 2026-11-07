@@ -198,8 +198,9 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     # Fraction of max_iterations; None keeps the configured Time weight from the start.
     time_penalty_start_fraction: float | None = 0.5
     mdp: MdpCfg = MdpCfg()
+    # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(
-        generation_mode="clutter", min_objects=15,
+        generation_mode="sequential", min_objects=15,
         max_objects=int(os.environ.get("CONTACT_MANIPULATION_NUM_OBJECTS", "25")),
     )
     robot_start: RobotStartRules = RobotStartRules()

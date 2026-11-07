@@ -759,7 +759,7 @@ class NativeLearningTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(81)
 
-    def test_training_configuration_matches_original_with_separate_model_paths_and_logs(self):
+    def test_training_configuration_matches_original_except_head_activation_paths_and_logs(self):
         workspace = Path(__file__).resolve().parents[3]
         baseline = workspace / "src/contact_manipulation/contact_manipulation/config/ur5e/agents/rsl_rl_ppo_cfg.py"
         production = Path(__file__).resolve().parents[1] / "contact_manipulation_symmetric/config/ur5e/agents/rsl_rl_ppo_cfg.py"
@@ -799,10 +799,11 @@ class NativeLearningTests(unittest.TestCase):
         original_actor = class_settings(baseline, "ContactActorCfg")
         original_actor["class_name"] = original_actor["class_name"].replace(
             "contact_manipulation.", "contact_manipulation_symmetric.")
+        original_actor["activation"] = "elu"  # Deliberate native-head-only experiment.
         self.assertEqual(actor, original_actor)
-        # Both research feature extractors and final heads are deliberate exceptions.
+        # Scene features keep their ReLU contract; only the native heads use ELU.
         self.assertEqual(actor["hidden_dims"], [256, 128])
-        self.assertEqual(actor["activation"], "relu")
+        self.assertEqual(actor["activation"], "elu")
         critic = class_settings(production, "ContactCriticCfg")
         self.assertEqual(critic["class_name"], f"{AGENTS}.model:NativeContactCritic")
         self.assertIsNone(critic["distribution_cfg"])

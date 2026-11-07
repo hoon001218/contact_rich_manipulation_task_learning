@@ -13,7 +13,8 @@ class ContactActorCfg(RslRlMLPModelCfg):
     class_name: str = "contact_manipulation_symmetric.config.ur5e.agents.model:NativeContactActor"
     model_cfg: dict = asdict(ModelCfg())
     hidden_dims = [256, 128]
-    activation = "relu"
+    # Native actor/critic MLP heads follow the examples; scene GNN stays ReLU.
+    activation = "elu"
     max_forward_batch_size: int = 8192
     # Compile tensor features; keep Triton CUDA graph replay disabled in the model.
     compile_model: bool = True

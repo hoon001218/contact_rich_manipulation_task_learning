@@ -8,6 +8,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers import OperationalSpaceControllerCfg
 from isaaclab.envs.mdp import JointPositionToLimitsActionCfg, OperationalSpaceControllerActionCfg
+from isaaclab.envs.mdp.actions.joint_actions_to_limits import JointPositionToLimitsAction
 from isaaclab.envs.mdp.actions.task_space_actions import OperationalSpaceControllerAction
 from isaaclab.managers import EventTermCfg
 from isaaclab.sensors import FrameTransformerCfg
@@ -21,7 +22,39 @@ from ...mdp.observations import wrench_action_limits
 from .scene import (
     DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES, FORCE_TORQUE_BODY_NAME,
     make_object_collection_cfg, make_ur5e_hand_cfg, spawn_shelf, SharedGeometryCfg,
+    HAND_JOINT_NAMES, hand_joint_mapping,
 )
+
+
+class UrdfCoupledHandAction(JointPositionToLimitsAction):
+    """Keep native six-motor actions and expand URDF-coupled position targets.
+
+    All twelve joints have ordinary implicit drives. Only target expansion is
+    task-specific; scaling, limits, policy history and PD execution stay native.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        if tuple(self._joint_names) != HAND_JOINT_NAMES:
+            raise ValueError("Hand actions require the six URDF motor joints in their canonical order.")
+        names, indices, multipliers, offsets = hand_joint_mapping(str(self._asset.cfg.spawn.hand_urdf_path))
+        self._driven_joint_ids, resolved = self._asset.find_joints(list(names), preserve_order=True)
+        if tuple(resolved) != names:
+            raise ValueError("Hand drives require every URDF revolute joint in mapping order.")
+        self._master_indices = torch.tensor(indices, dtype=torch.long, device=self.device)
+        self._multipliers = self.raw_actions.new_tensor(multipliers)
+        self._offsets = self.raw_actions.new_tensor(offsets)
+        self._driven_targets = self.raw_actions.new_zeros((self.num_envs, len(names)))
+
+    def process_actions(self, actions):
+        super().process_actions(actions)
+        # Expand the commanded angles, not measured angles displaced by contact.
+        # Work on all environments at once; parsing and ID lookup happen only once.
+        torch.index_select(self.processed_actions, 1, self._master_indices, out=self._driven_targets)
+        self._driven_targets.mul_(self._multipliers).add_(self._offsets)
+
+    def apply_actions(self):
+        self._asset.set_joint_position_target(self._driven_targets, joint_ids=self._driven_joint_ids)
 
 
 class SensorFrameWrenchAction(OperationalSpaceControllerAction):
@@ -108,7 +141,7 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
                 "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
             ],
             body_name=FORCE_TORQUE_BODY_NAME,
-            # The load-cell center defines control axes and all EEF observations.
+            # The load-cell's tool-side datum defines control and EEF observations.
             task_frame_rel_path=f"Robot/{FORCE_TORQUE_BODY_NAME}",
             wrench_scale=(10.0, 10.0, 10.0, 1.0, 1.0, 1.0),
             controller_cfg=OperationalSpaceControllerCfg(
@@ -125,6 +158,7 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             nullspace_joint_pos_target="none",
         )
         self.actions.hand_action = JointPositionToLimitsActionCfg(
+            class_type=UrdfCoupledHandAction,
             asset_name="robot",
             joint_names=[
                 "right_thumb_1_joint", "right_thumb_2_joint", "right_index_1_joint",
