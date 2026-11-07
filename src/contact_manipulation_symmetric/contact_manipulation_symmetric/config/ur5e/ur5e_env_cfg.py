@@ -9,12 +9,14 @@ from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers import OperationalSpaceControllerCfg
 from isaaclab.envs.mdp import JointPositionToLimitsActionCfg, OperationalSpaceControllerActionCfg
 from isaaclab.envs.mdp.actions.task_space_actions import OperationalSpaceControllerAction
+from isaaclab.managers import EventTermCfg
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply_inverse
 
 from ...shelf_manipulation_env_cfg import ShelfManipulationEnvCfg, ShelfManipulationSceneCfg
 from ...mdp.sensors import make_tactile_contact_cfg
+from ...mdp.events import configure_hand_action_limits
 from ...mdp.observations import wrench_action_limits
 from .scene import (
     DEFAULT_SHELF_USD_PATH, SHELF_POSITION, TACTILE_BODY_NAMES, FORCE_TORQUE_BODY_NAME,
@@ -132,6 +134,7 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             preserve_order=True,
             rescale_to_limits=True,
         )
+        self.events.hand_action_limits = EventTermCfg(func=configure_hand_action_limits, mode="startup")
         # If enabled, velocity cost covers twelve independent joints; overspeed is arm-only.
         velocity_reward = getattr(self.rewards, "motion_joint_velocity", None)
         if velocity_reward is not None:

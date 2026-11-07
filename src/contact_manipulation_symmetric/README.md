@@ -72,6 +72,16 @@ Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정
 Hand scale.5·native joint-limit mapping, 적용 action 이력·action-rate를 그대로 사용한다.
 Transition/support/robot-start의 진단용 CUDA graph 스위치도 원본과 동일하게 제공한다.
 
+손 설정은 원본과 동일하게 URDF 정의값 보존을 기준으로 한다. 강체0/0 강제·10rad/s 상한·
+motor envelope를 제거하고12관절의 원문 위치·속도·drive effort를 복원했다. Native mimic의
+연동 관계와 importer compliance를 보존하며, 엄지 namespace 오류는 기존 값의 복사로 보정한다.
+공식 startup event는 독립6관절의 학습용 soft position limit에만 연동 가능 범위를 적용한다.
+기존 action 매핑·master PD20/1·child0/0·100Hz/solver32·1을 유지한다. 설정 일치가 실제 접촉
+안정성의 보장은 아니며 역꺾임·연동 오차는 아직 미해결이다. 상세 내용은 원본 README와
+`docs/TRAINING_LOG.md` 111절을 따른다.
+공유 진단 스크립트 `src/contact_manipulation/tests/probe_hand_contact.py`에
+`--package contact_manipulation_symmetric`를 추가하면 이 프로젝트의 실제 설정을 측정한다.
+
 ## Isaac Lab 기본 학습 흐름
 
 ```text

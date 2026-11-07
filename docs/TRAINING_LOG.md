@@ -7827,3 +7827,161 @@ OnPolicyRunner/PPO·rollout·GAE·update·checkpoint 경로를 유지한다.
 `policy`·`critic` 전체 `[4,232]` 관측이 bit-exact하게 일치했다. 해당 장면은 공유 영역12개를
 가졌고, 실제 relocation/Hold weight3·현재 거리 함수 연결과 독립 모델 parameter storage도
 검사했다. 영역 개수는 이 검증 장면의 결과이며 전체 scene에 대한 고정 개수가 아니다.
+
+## 110. 2026-11-06 — 물체 접촉 시 손가락 역꺾임 재현과 native hand 제약 수정
+
+**현재 상태:** 아래 강체 mimic 후보는111절의 사용자 요청으로 제거했다.
+이 절의 강체0/0·10rad/s·motor envelope와 측정 결과는 현재 설정의 설명이 아니다.
+
+사용자가 지정한 문제는 물체를 밀 때 손가락이 반대로 꺾이는 현상이다. 이번 수정은
+`contact_manipulation`과 `contact_manipulation_symmetric`의 손 설정에 동일하게 적용했다.
+모델·관측 계약·reward·PPO·12D action 및 공식 학습 흐름은 변경하지 않았다.
+
+**확인한 원인과 변경:**
+
+- 원본 URDF의12회전관절 하한은 모두0이다. Importer2.4.31은 일반 손가락 child 하한을
+  −17.8686°, thumb3를−5.9622°, thumb4를−12.7497°로 넓혔고 기존 후처리는 이를 유지했다.
+  종속6관절의 하한을 원본0°로 복원했다. 종속 상한·속도·drive와 mimic reference·gearing·
+  offset은 보존한다. Master 위치 범위는 기존 URDF 연동 범위의 교집합을 유지한다.
+- 하한만 복원한 대조에서는 child 대신 master가−16.89°까지 밀렸다. 실제 backend master
+  하한도0이었으므로 설정 누락이 아니라 제약 수렴 문제였다. URDF 모터 속도
+  .922254rad/s·2rad/s를 관절 전체의 solver brake로 사용하면 접촉/한계 보정까지 막는다.
+  해당 solver 상한을10rad/s로 완화하고, 기존 모터 속도는 native
+  `PhysxDrivePerformanceEnvelopeAPI:angular/maxActuatorVelocity`에 deg/s로 전달한다.
+  이 API는 모터가 속도 경계 밖으로 더 가속하는 힘을 제한한다. 외력·mimic으로 생긴
+  모든 관절 속도를 정격 속도에 강제로 묶지는 않는다. API가 없으면 명확한 오류로 중단한다.
+- Native mimic6개를0/0 강체 연동으로 설정한다. 실제 gearing 속성의 namespace를 사용해
+  일반 손가락 rotZ와 엄지 rotX에 적용한다. Importer의 엄지 `rot:*` compliance 이름 오류를
+  그대로 따르지 않는다. 설치 API에는 mimic.GetName()이 없어
+  `GetGearingAttr().GetNamespace()`를 사용한다.
+
+Implicit PD20/1·1N·m, 종속 gain0/0, 기존 self-collision filter·collision mesh,
+physics100Hz·policy50Hz·solver32/1은 유지했다. Python joint pose 덮어쓰기,
+종속 action/속도 brake, 물체/손 self-collision 비활성화는 추가하지 않았다.
+
+**비교 과정:** 강체 mimic만 적용하고 기존의 좁은 속도 brake를 유지한 대조는 불안정했다.
+Solver 속도를 사실상 무제한으로 푼 강체 구성은1/3N 접촉 시험을 통과했지만 완전 닫기에서
+불안정했다.25/1·100/1·1000/1 compliance, 시간 간격.005, solver64/4 등도 분리 비교했으며,
+이번 최종 설정으로 채택하지 않았다. 최종적으로 모터 envelope와 유한한10rad/s solver
+상한을 함께 둔 강체 구성이 접촉과 완전 여닫기를 모두 완료했다.
+
+**동일1N 자유 구체 접촉 비교:** 고정 베이스·무중력 손,0목표, 반지름12mm·질량.2kg의
+동적 구체를 검지 distal pad의 음의 flexion 방향으로 가압했다.200step 무하중 후
+10step ramp를 포함한200step 접촉 구간을 비교했다. 임시 동일 fixture/physics 조건에서
+기존 설정과 최종 설정을 각각 새 프로세스로 실행했다.
+
+| 측정 | 기존 | 수정 후 |
+|---|---:|---:|
+|12관절 중 URDF 하한 최대 이탈|−17.8686°|−.1245°|
+|구체 접촉 frame /200|12|199|
+|최대 관절 속도|5.5494rad/s|.4583rad/s|
+|최대 mimic 오차|.29317rad|.002357rad|
+
+기존 최대 하한 이탈은 index2, 수정 후 작은 잔여 이탈은 index1에서 발생했다.
+원본 결과는 `/tmp/hand_contact_baseline.json`, 최종 동일 조건 결과는
+`/tmp/hand_final_matched_1N.json`이다. 이는 한 fixture의 비교이며 실제 로봇의 강성 보정이나
+임의 하중에서 완전한 한계 준수를 입증하지 않는다.
+
+**현재 production 재현 도구:** `src/contact_manipulation/tests/probe_hand_contact.py`를 추가했다.
+실제 프로젝트의 손·simulation cfg를 import하고12관절·6연동·17pad, native 속성,
+단계별 접촉 frame 수와 궤적을 JSON에 저장한다. `--package contact_manipulation_symmetric`
+으로 대칭 프로젝트도 검사한다. 탐색 중 사용한 물리 override는 이 도구에 넣지 않았다.
+Guide는 기존 translate XformOp의 실제 precision으로 배치하고, physics 생성 전 위치 및
+settle 후 guide 직선 이탈을 검증한다. 초기 임시 guide의 XformCommonAPI 배치 경고가 있었던
+결과는 지속 접촉의 근거에서 제외한다.
+
+수정된 production guide 검사의1N 구간은199/200frame 접촉·최대 하한 이탈−.1313°였다.
+3N 구간은33/200frame만 접촉했고 최대 하한 이탈은−.6496°였다. 따라서3N을 끝까지
+지지했다고 해석하지 않는다. 결과는 `/tmp/hand_final_index_corrected.json`이다.
+강한 하중의 접촉 유지·미끄러짐/통과와 native solver의 잔여 오차는 추가 검증 대상이다.
+
+실제 symmetric cfg의 무접촉 완전 닫기300step→열기300step도 측정했다.
+하한 이탈은0이고 종료 시12관절 모두 절댓값1.2e−15rad 미만으로 열렸다. 닫기 중
+원본 상한 초과.02027rad·mimic 오차.11820rad·종속관절 최고35.21rad/s는 남아 있었다.
+결과는 `/tmp/hand_final_close_open.json`이다. 완료 상태가 모든 원본 한계의 엄격한 준수나
+장기 안정성을 뜻하지 않으며, child 순간 속도는 모터 정격 속도로 제한하지 않는다.
+
+**검증:** Original/Symmetric의 손 제약·모터 envelope·Arm actuator 회귀12개가 통과했다.
+Envelope 미지원 오류, 실제 축의 mimic 속성, reference/gearing/offset과 passive 속성 보존을
+검사했다. 최종 설정에서 Symmetric 전체 CPU 검사는546개 통과·환경 의존33개 생략,
+597개 subtest 통과(18.82초)였다. 로그는 `/tmp/hand_fix_full_cpu.log`에 저장했다.
+실제 원본4환경·1 iteration PPO 학습도 exit0과 checkpoint 저장을 완료했다.
+학습 구간은16.52초이며 전체 초기화 시간과 구분한다. 결과는
+`logs/rsl_rl/contact_manipulation/2026-11-06_19-45-39_hand_contact_fix_smoke/`이다.
+이는 실행 검증이며 장기 학습 성능이나 기존 CUDA 오류 해결의 증거는 아니다.
+
+## 111. 2026-11-06 — 강체 mimic 강제 제거와 원본 URDF 정의값 정합성 복원
+
+사용자는 강체 mimic의 기존 문제를 지적하고 URDF와 동일한 모델을 목표로 요청했다.
+110절 후보의 강체0/0·10rad/s 상한·motor performance envelope를 제거했다.
+현재 기준은 **원본 URDF의 정의값 보존**이다. 이것을 접촉 안정성이나 이상적인 URDF
+mimic 연동의 정확한 재현이 완료됐다는 뜻으로 사용하지 않는다. Original과 Symmetric에
+동일한 손 설정을 적용했으며 모델·reward·PPO·학습 loop는 바꾸지 않았다.
+
+**원본 확인:** ROAS vendor 원본과 `_relative.urdf`는 mesh 경로·공백을 정규화하면 동일하다.
+32link·31joint 중12개 revolute·6개 mimic이다. 모든 revolute 하한은0, effort는1N·m다.
+일반 손가락의 master/child 속도는1rad/s, 엄지4관절은2rad/s다. 모든 mimic offset은0이다.
+`dynamics`·PD gain·mimic 강성/감쇠·motor envelope 정의는 없다.
+[URDF mimic XSD](https://github.com/ros/urdfdom/blob/rolling/xsd/urdf.xsd)는 joint·multiplier·offset을
+정의하며 PhysX의 compliance 수치를 지정하지 않는다.
+
+| 구분 | 원본 native 위치 상한(rad) | 학습용 master 상한(rad) |
+|---|---|---|
+| 일반 손가락 master4개 |1.4381|1.36159181|
+| 일반 손가락 child4개 |1.476374|독립 action 없음|
+| thumb1 |1.658|1.658|
+| thumb2 |.62|.609220762|
+| thumb3 |.5410520681182421|독립 action 없음|
+| thumb4 |.45553093477052004|독립 action 없음|
+
+**구현:**
+
+- `_configure_hand_joints()`는12관절의 native 하한·상한·속도·drive max force를 원문에서
+  복원한다. Child의 importer 확장 상한과 무제한 속도도 원본으로 되돌린다. 종속관절의
+  PD0/0·독립 action 없음은 유지하므로 effort 값1은 추가 구동을 만들지 않는다.
+  이 값은 drive cap이며 mimic·충돌 제약의 모든 반력을1N·m로 제한하는 기능이 아니다.
+- Native mimic6개의 reference·gearing·offset과 기존 양수 compliance를 보존한다.
+  실제 namespace에 값이 없고 importer의 잘못된 `rot:*`에만 있으면 그 값을 그대로 복사한다.
+  기존 active 값은 덮어쓰지 않는다. 강성/감쇠를 새 숫자로 정하지 않았고, 유한한 양수 값이
+  없으면 강체 fallback 대신 오류를 낸다. 현재 설치 importer 값은25/약.005이며 URDF 값이 아니다.
+- Native hard bounds를 좁혀 action 범위를 만들던 처리를 분리했다.
+  `configure_hand_action_limits`를 공식 startup event에 등록해 독립6관절의
+  `robot.data.soft_joint_pos_limits`만 연동 가능 교집합으로 설정한다. 공식
+  `JointPositionToLimitsAction`이 이 배열을 읽으므로 기존 raw±2의 position mapping을
+  유지하면서 물리 hard bound는 원문 그대로 보존한다. 부분 reset에서 물리 한계를 다시 쓰지 않는다.
+- 질량·관성·joint frame/axis·원본 mesh는 바꾸지 않았다. 기존 convex decomposition과
+  mounting overlap filter도 유지한다. Importer의 재회전된 native X축에 raw URDF 벡터를
+  다시 덮어쓰지 않는다. Offline 비교에서32link 질량·COM 오차는 각각 최대3.58e−9kg·
+  3.42e−9m,12관절 축 벡터 오차는4.27e−7 이하였다. 관성 재구성 최대 절대 오차는
+  8.20e−10kg·m²였다. 이를 고친다는 명목으로 armature·질량을 추가하지 않았다.
+
+**실제 backend 정합성:** `/tmp/hand_urdf_final_audit.json`에서 위치·속도·drive effort가 각각
+12/12 일치하고 mimic reference·비율·offset도 각각6/6 일치했다(비교 허용 오차1e−6).
+양수 compliance6/6, startup action 설정 전후 physical limits 동일, child soft limits 보존,
+master soft limits 교집합 일치를 확인했다. Native gearing은 URDF multiplier의 음수인
+PhysX 표현으로 비교한다. 현재 offset6개가 모두0이므로 이 값의 일치를 확인했으며,
+향후 비영점 offset은 단위·부호를 추측하지 않고 감사 결과에서 비교 불가로 표시한다.
+
+**남은 동작 문제:** 현재 source 설정 그대로의 실제 symmetric 접촉 결과는
+`/tmp/hand_urdf_final_contact.json`이다.1N 구간에서200step 중57frame만 구체 접촉이 있었고,
+최대 하한 이탈은−.267557rad(약−15.33°), 연동 오차는.290112rad였다. 따라서 강체를
+제거하고 URDF 정의값을 맞췄다고 역꺾임이 해결된 것은 아니다.
+
+Original의 닫기300→열기300step은 `/tmp/hand_urdf_final_close_open.json`에 기록했다.
+종료 시12관절은 절댓값6.1e−9rad 미만으로 열렸지만, 닫는 동안 최대 mimic 오차는
+1.012067rad(약58°), 상한 초과는.005261rad, 관절 최고 속도는2.347rad/s였다.
+Compliant backend에서 URDF의 이상적인 동시 연동까지 정확하게 재현했다고 볼 수 없다.
+
+URDF 값을 그대로 두고 solver 반복 수/TGS·PGS만 바꾼 임시 대조도 수행했다.
+TGS128에서는1N 이탈이.000317rad까지 줄었지만3N에서−1.531028rad로 악화했다.
+TGS64·velocity0·PGS128도 전 하중 안정성을 확인하지 못해 **production에 채택하지 않았다.**
+현재 physics100Hz·policy50Hz·TGS solver32/1과 독립 PD20/1·종속0/0은 기존 값이다.
+이 중 PD·solver·importer compliance는 URDF에 없는 제어/수치 설정이며 별도 검증 대상이다.
+
+**검증:** 두 프로젝트의 관련 CPU22개와 native action mapping subtest가 통과했다.
+Symmetric 전체 CPU는551개 통과·환경 의존33개 생략·596개 subtest 통과(27.77초)했다.
+로그는 `/tmp/contact_hand_urdf_symmetric_cpu.log`다. Original 전체 검사는 기존의 누락된
+예제 cfg 파일과 relocation/Hold 과거 weight 기대값3건으로 중단됐으며 이 요청에서 수정하지 않았다.
+실제 Original4환경·PPO1 iteration은15.79초 학습 후 exit0과 checkpoint 저장을 완료했다.
+결과는 `logs/rsl_rl/contact_manipulation/2026-11-06_20-35-12_hand_urdf_alignment_smoke/`다.
+이는 startup 및 학습 실행 확인이며 역꺾임·장기 물리 안정성의 통과 판정이 아니다.

@@ -228,7 +228,7 @@ def hand_joint_limits(urdf_path: str) -> tuple[dict[str, tuple[float, float]], d
     """Resolve master position/velocity bounds from the coupled URDF constraints.
 
     Some master maxima exceed a mimic child's limit. Intersect the constraints
-    once at configuration time; PhysX enforces mimic motion during simulation.
+    for learning/action limits, without narrowing the source native hard bounds.
     """
     joints = {joint.attrib["name"]: joint for joint in ElementTree.parse(urdf_path).findall("joint")}
     original = {name: (float(joints[name].find("limit").attrib["lower"]),
@@ -437,36 +437,47 @@ def _deinstance_subtree(stage: Usd.Stage, subtree_path: str) -> None:
 
 
 def _configure_hand_joints(stage: Usd.Stage, hand_path: str, urdf_path: str) -> None:
-    """Restore master URDF limits while retaining importer-authored mimic setup.
+    """Restore declared URDF joint limits without forcing rigid mimic behavior.
 
-    Mimic reference, gearing, offset, compliance and dependent drives belong to
-    the native importer. Only validate their presence; do not override them.
-    No joint motion or dependent position targets are computed in Python.
+    Native hard position/velocity bounds and drive effort use the source URDF.
+    Mimic references, gearing, offsets and imported compliance are preserved.
+    The thumb importer namespace defect is repaired by copying existing values,
+    never by inventing stiffness/damping or overwriting joint state.
     """
     joints = {prim.GetName(): UsdPhysics.RevoluteJoint(prim)
               for prim in Usd.PrimRange(stage.GetPrimAtPath(hand_path)) if prim.IsA(UsdPhysics.RevoluteJoint)}
-    positions, velocities = hand_joint_limits(urdf_path)
     for source in ElementTree.parse(urdf_path).findall("joint"):
         if source.attrib["type"] != "revolute":
             continue
         joint = joints[source.attrib["name"]]
         prim = joint.GetPrim()
         mimic = source.find("mimic")
+        if mimic is not None:
+            apis = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
+            if len(apis) != 1:
+                raise RuntimeError(f"Native URDF importer must preserve one mimic constraint on {prim.GetPath()}.")
+        limit = source.find("limit")
+        joint.CreateLowerLimitAttr(math.degrees(float(limit.attrib["lower"])))
+        joint.CreateUpperLimitAttr(math.degrees(float(limit.attrib["upper"])))
+        PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr(math.degrees(float(limit.attrib["velocity"])))
+        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+        drive.CreateMaxForceAttr(float(limit.attrib["effort"]))
         if mimic is None:
-            drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
             drive.CreateTypeAttr("force")
-            drive.CreateMaxForceAttr(float(source.find("limit").attrib["effort"]))
-            lower, upper = positions[source.attrib["name"]]
-            joint.CreateLowerLimitAttr(math.degrees(lower))
-            joint.CreateUpperLimitAttr(math.degrees(upper))
-            PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr(math.degrees(velocities[source.attrib["name"]]))
             continue
-        # Retain the importer's expanded child range and unconstrained velocity.
-        # The master cap incorporates the dependent URDF limits. Compliance is
-        # left exactly as authored by the installed importer, without tuning.
-        apis = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
-        if len(apis) != 1:
-            raise RuntimeError(f"Native URDF importer must preserve one mimic constraint on {prim.GetPath()}.")
+        namespace = apis[0].GetGearingAttr().GetNamespace()
+        for name in ("naturalFrequency", "dampingRatio"):
+            active = prim.GetAttribute(f"{namespace}:{name}")
+            if not active or not active.HasAuthoredValueOpinion():
+                # Importer 2.4.31 writes non-cardinal thumb compliance under
+                # 'rot' although its native mimic instance is 'rotX'.
+                legacy = prim.GetAttribute(f"physxMimicJoint:rot:{name}")
+                if legacy and legacy.HasAuthoredValueOpinion():
+                    active = prim.CreateAttribute(f"{namespace}:{name}", legacy.GetTypeName())
+                    active.Set(legacy.Get())
+            value = active.Get() if active else None
+            if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise RuntimeError(f"Native importer must provide compliant mimic {name} on {prim.GetPath()}.")
 
 
 def _configure_hand_collisions(stage: Usd.Stage, hand_path: str) -> None:
@@ -694,7 +705,8 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=[".*(thumb|index|middle|ring|little).*"],
-                # Inherit URDF effort and the coupled master velocity bounds.
+                # Inherit source URDF effort/velocity limits for all 12 joints.
+                # Dependent gains stay zero; only six independent motors act.
                 effort_limit_sim=None,
                 velocity_limit_sim=None,
                 stiffness={

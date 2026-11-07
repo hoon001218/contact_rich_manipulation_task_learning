@@ -2349,6 +2349,29 @@ class HandUrdfBoundsTests(unittest.TestCase):
         sources = {joint.attrib['name']: joint for joint in ElementTree.parse(urdf).findall('joint')
                    if joint.attrib['type'] == 'revolute'}
         writes, mimic_reads = {}, []
+        float_type = object()
+
+        class ImportedAttribute:
+            def __init__(self, prim, name, writable=False):
+                self.prim, self.name, self.writable = prim, name, writable
+
+            def __bool__(self):
+                return self.name in self.prim.attributes
+
+            def Get(self):
+                return self.prim.attributes.get(self.name)
+
+            def HasAuthoredValueOpinion(self):
+                return bool(self)
+
+            def GetTypeName(self):
+                return float_type
+
+            def Set(self, value):
+                if not self.writable:
+                    raise AssertionError('Existing imported compliance must not be overwritten.')
+                self.prim.attributes[self.name] = value
+                self.prim.attribute_writes[self.name] = value
 
         class ImportedPrim:
             def __init__(self, name, source):
@@ -2356,9 +2379,16 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 # Distinct imported values make accidental replacement observable.
                 self.imported = dict(lower=-210., upper=210., velocity=math.inf,
                                      drive_type='acceleration', effort=37., stiffness=19., damping=7.)
+                axis = 'rotX' if name.startswith('right_thumb_') else 'rotZ'
+                self.mimic_namespace = f'physxMimicJoint:{axis}'
+                # Distinct importer values must survive; thumb has only the legacy namespace.
+                prefix = 'physxMimicJoint:rot' if name.startswith('right_thumb_') else self.mimic_namespace
+                self.attributes = {f'{prefix}:naturalFrequency': 123., f'{prefix}:dampingRatio': .7}
+                self.attribute_writes = {}
+                self.applied_apis = []
                 self.mimic_apis = [] if source.find('mimic') is None else [SimpleNamespace(
                     reference=object(), gearing=-1.0843, offset=.25,
-                    natural_frequency=123., damping_ratio=.7)]
+                    GetGearingAttr=lambda: SimpleNamespace(GetNamespace=lambda: self.mimic_namespace))]
 
             def IsA(self, schema):
                 return schema is RevoluteJoint
@@ -2369,8 +2399,18 @@ class HandUrdfBoundsTests(unittest.TestCase):
             def GetPath(self):
                 return '/Hand/' + self.name
 
-            def CreateAttribute(self, *args):
-                raise AssertionError('Importer mimic attributes must not be overwritten.')
+            def ApplyAPI(self, api_name, instance):
+                raise AssertionError('URDF restoration must not add a motor performance envelope.')
+
+            def GetAttribute(self, name):
+                return ImportedAttribute(self, name)
+
+            def CreateAttribute(self, name, value_type):
+                allowed = {f'{self.mimic_namespace}:naturalFrequency', f'{self.mimic_namespace}:dampingRatio'}
+                if (self.source.find('mimic') is None or name not in allowed
+                        or value_type is not float_type or name in self.attributes):
+                    raise AssertionError('Only missing active-axis compliance may copy the importer value.')
+                return ImportedAttribute(self, name, writable=True)
 
         class RevoluteJoint:
             def __init__(self, prim):
@@ -2380,24 +2420,22 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 return self.prim
 
             def CreateLowerLimitAttr(self, value):
-                writes.setdefault(self.prim.name, {})['lower'] = value
+                joint_attribute(self.prim, 'lower', value)
 
             def CreateUpperLimitAttr(self, value):
-                writes.setdefault(self.prim.name, {})['upper'] = value
+                joint_attribute(self.prim, 'upper', value)
 
-        def master_attribute(prim, kind, value):
-            if prim.source.find('mimic') is not None:
-                raise AssertionError('Dependent joint properties must retain importer defaults.')
+        def joint_attribute(prim, kind, value):
+            if prim.source.find('mimic') is not None and kind == 'drive_type':
+                raise AssertionError('Dependent drive type must retain the importer default.')
             writes.setdefault(prim.name, {})[kind] = value
 
         def drive(prim, axis):
-            if prim.source.find('mimic') is not None:
-                raise AssertionError('Dependent joint drives must retain importer defaults.')
             if axis != 'angular':
                 raise AssertionError(axis)
             return SimpleNamespace(
-                CreateTypeAttr=lambda value: master_attribute(prim, 'drive_type', value),
-                CreateMaxForceAttr=lambda value: master_attribute(prim, 'effort', value))
+                CreateTypeAttr=lambda value: joint_attribute(prim, 'drive_type', value),
+                CreateMaxForceAttr=lambda value: joint_attribute(prim, 'effort', value))
 
         def imported_mimics(prim):
             mimic_reads.append(prim.name)
@@ -2407,18 +2445,20 @@ class HandUrdfBoundsTests(unittest.TestCase):
         stage = SimpleNamespace(GetPrimAtPath=lambda path: tuple(prims.values()))
         namespace = dict(
             ElementTree=ElementTree, math=math,
+            Sdf=SimpleNamespace(ValueTypeNames=SimpleNamespace(Float=float_type)),
             Usd=SimpleNamespace(Stage=object, PrimRange=lambda values: values),
             UsdPhysics=SimpleNamespace(RevoluteJoint=RevoluteJoint, DriveAPI=SimpleNamespace(Apply=drive)),
             PhysxSchema=SimpleNamespace(
                 PhysxJointAPI=SimpleNamespace(Apply=lambda prim: SimpleNamespace(
-                    CreateMaxJointVelocityAttr=lambda value: master_attribute(prim, 'velocity', value))),
+                    CreateMaxJointVelocityAttr=lambda value: joint_attribute(prim, 'velocity', value))),
                 PhysxMimicJointAPI=SimpleNamespace(GetAll=imported_mimics)))
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
         return namespace, stage, urdf, sources, prims, writes, mimic_reads
 
-    def test_imported_compliant_mimic_and_child_drives_are_preserved(self):
+    def test_literal_urdf_limits_and_imported_compliance_preserve_native_linkage(self):
         namespace, stage, urdf, sources, prims, writes, mimic_reads = self.imported_hand_fixture()
-        imported = {name: (dict(prim.imported), [vars(api).copy() for api in prim.mimic_apis])
+        imported = {name: (dict(prim.imported), [vars(api).copy() for api in prim.mimic_apis],
+                           dict(prim.attributes))
                     for name, prim in prims.items()}
         namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
 
@@ -2427,18 +2467,51 @@ class HandUrdfBoundsTests(unittest.TestCase):
         self.assertEqual(len(children), 6)
         self.assertEqual(set(mimic_reads), children)
         self.assertEqual(len(mimic_reads), 6)
-        self.assertEqual(set(writes), set(masters))
-        positions, velocities = namespace['hand_joint_limits'](str(urdf))
-        for name in masters:
-            with self.subTest(master=name):
-                self.assertEqual(writes[name], dict(
-                    lower=math.degrees(positions[name][0]), upper=math.degrees(positions[name][1]),
-                    velocity=math.degrees(velocities[name]), drive_type='force',
-                    effort=float(sources[name].find('limit').attrib['effort'])))
+        self.assertEqual(set(writes), set(masters) | children)
+        for name, source in sources.items():
+            with self.subTest(joint=name):
+                limit = source.find('limit').attrib
+                expected = {key: math.degrees(float(limit[key])) for key in ('lower', 'upper', 'velocity')}
+                expected['effort'] = float(limit['effort'])
+                if name in masters:
+                    expected['drive_type'] = 'force'
+                self.assertEqual(writes[name], expected)
         for name, prim in prims.items():
             with self.subTest(imported_joint=name):
                 self.assertEqual(prim.imported, imported[name][0])
                 self.assertEqual([vars(api) for api in prim.mimic_apis], imported[name][1])
+                expected = {f'{prim.mimic_namespace}:{attribute}': imported[name][2][f'physxMimicJoint:rot:{attribute}']
+                            for attribute in ('naturalFrequency', 'dampingRatio')} if (
+                                name in children and name.startswith('right_thumb_')) else {}
+                self.assertEqual(prim.attribute_writes, expected)
+                self.assertEqual(prim.attributes, imported[name][2] | expected)
+                self.assertEqual(prim.applied_apis, [])
+
+    def test_existing_active_thumb_compliance_is_not_replaced_by_legacy_values(self):
+        namespace, stage, urdf, _, prims, _, _ = self.imported_hand_fixture()
+        thumbs = [prim for name, prim in prims.items() if name in ('right_thumb_3_joint', 'right_thumb_4_joint')]
+        for prim in thumbs:
+            prim.attributes[f'{prim.mimic_namespace}:naturalFrequency'] = 987.
+            prim.attributes[f'{prim.mimic_namespace}:dampingRatio'] = .42
+        before = [dict(prim.attributes) for prim in thumbs]
+        namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
+        for prim, expected in zip(thumbs, before):
+            self.assertEqual(prim.attributes, expected)
+            self.assertEqual(prim.attribute_writes, {})
+
+    def test_missing_or_nonpositive_imported_compliance_is_rejected_instead_of_forced_rigid(self):
+        for value in (None, 0., -1., math.nan, math.inf):
+            with self.subTest(natural_frequency=value):
+                namespace, stage, urdf, _, prims, _, _ = self.imported_hand_fixture()
+                prim = prims['right_index_2_joint']
+                key = f'{prim.mimic_namespace}:naturalFrequency'
+                if value is None:
+                    del prim.attributes[key]
+                else:
+                    prim.attributes[key] = value
+                with self.assertRaisesRegex(RuntimeError, 'Native importer must provide compliant mimic'):
+                    namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
+                self.assertEqual(prim.attribute_writes, {})
 
     def test_missing_or_duplicate_native_mimic_is_rejected_instead_of_reconstructed(self):
         for count in (0, 2):
@@ -2449,6 +2522,7 @@ class HandUrdfBoundsTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'importer must preserve one mimic constraint'):
                     namespace['_configure_hand_joints'](stage, '/Hand', str(urdf))
                 self.assertNotIn(child, writes)
+                self.assertEqual(prims[child].attribute_writes, {})
 
     def test_converter_keeps_native_mimic_parsing_and_default_drive_configuration(self):
         root = Path(__file__).resolve().parents[3]
@@ -2504,6 +2578,115 @@ class HandUrdfBoundsTests(unittest.TestCase):
             child = name.replace('_1_joint', '_2_joint')
             self.assertLessEqual(velocities[name] * float(joints[child].find('mimic').attrib['multiplier']),
                                  float(joints[child].find('limit').attrib['velocity']) + 1.e-10)
+
+
+class HandActionSoftLimitsTests(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        from unittest.mock import Mock
+
+        namespace, _, urdf, sources, _, _, _ = HandUrdfBoundsTests.imported_hand_fixture()
+        names = [f'arm_{index}' for index in range(6)] + list(reversed(sources))
+        hard = torch.tensor([[-3., 3.]] * len(names), dtype=torch.float64).repeat(4, 1, 1)
+        for name, source in sources.items():
+            hard[:, names.index(name)] = hard.new_tensor([
+                float(source.find('limit').attrib[key]) for key in ('lower', 'upper')])
+        robot = SimpleNamespace(
+            cfg=SimpleNamespace(spawn=SimpleNamespace(hand_urdf_path=str(urdf))),
+            data=SimpleNamespace(joint_pos_limits=hard, soft_joint_pos_limits=hard.clone()),
+            find_joints=lambda requested, preserve_order: (
+                [names.index(name) for name in requested], list(requested)) if preserve_order else None,
+            set_joint_position_target=Mock(),
+            write_joint_position_limit_to_sim=Mock(side_effect=AssertionError('Startup must not write hard limits.')),
+            write_joint_velocity_limit_to_sim=Mock(side_effect=AssertionError('Startup must not write physical velocity.')),
+            write_joint_effort_limit_to_sim=Mock(side_effect=AssertionError('Startup must not write physical effort.')),
+        )
+        scene_module_name = task.__package__.removesuffix('.mdp') + '.config.ur5e.scene'
+        scene_module = types.ModuleType(scene_module_name)
+        scene_module.hand_joint_limits = namespace['hand_joint_limits']
+        return SimpleNamespace(scene={'robot': robot}), robot, namespace, names, {scene_module_name: scene_module}
+
+    def test_startup_soft_limits_preserve_native_bounds_and_original_action_mapping(self):
+        env, robot, namespace, names, modules = self.fixture()
+        physical_before = robot.data.joint_pos_limits.clone()
+        soft_before = robot.data.soft_joint_pos_limits.clone()
+        positions, _ = namespace['hand_joint_limits'](robot.cfg.spawn.hand_urdf_path)
+        ids = [names.index(name) for name in positions]
+        expected = soft_before.new_tensor(list(positions.values())).expand(4, -1, -1)
+        with patch.dict(sys.modules, modules):
+            task.configure_hand_action_limits(env, env_ids=None)
+        torch.testing.assert_close(robot.data.soft_joint_pos_limits[:, ids], expected, rtol=0, atol=0)
+        other_ids = [index for index in range(len(names)) if index not in ids]
+        torch.testing.assert_close(robot.data.soft_joint_pos_limits[:, other_ids], soft_before[:, other_ids], rtol=0, atol=0)
+        torch.testing.assert_close(robot.data.joint_pos_limits, physical_before, rtol=0, atol=0)
+        self.assertEqual(float(robot.data.joint_pos_limits[0, names.index('right_index_1_joint'), 1]), 1.4381)
+        self.assertEqual(float(robot.data.joint_pos_limits[0, names.index('right_thumb_2_joint'), 1]), .62)
+        for method in (robot.write_joint_position_limit_to_sim, robot.write_joint_velocity_limit_to_sim,
+                       robot.write_joint_effort_limit_to_sim):
+            method.assert_not_called()
+
+        source = Path(__file__).resolve().parents[3] / (
+            'IsaacLab/source/isaaclab/isaaclab/envs/mdp/actions/joint_actions_to_limits.py')
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == 'JointPositionToLimitsAction')
+        methods = [node for node in definition.body if isinstance(node, ast.FunctionDef)
+                   and node.name in ('process_actions', 'apply_actions')]
+        native = dict(torch=torch, math_utils=sys.modules['isaaclab.utils.math'])
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), 'exec'), native)
+        raw = torch.tensor([[-2.] * 6, [0.] * 6, [2.] * 6,
+                            [-1000., 1000., -1., 1., -.25, .25]], dtype=torch.float64)
+
+        class NativeAction(SimpleNamespace):
+            @property
+            def processed_actions(self):
+                return self._processed_actions
+
+        action = NativeAction(
+            cfg=SimpleNamespace(clip=None, rescale_to_limits=True),
+            _asset=robot, _joint_ids=ids, _scale=.5,
+            _raw_actions=torch.zeros_like(raw), _processed_actions=torch.zeros_like(raw))
+        native['process_actions'](action, raw)
+        targets = torch.lerp(expected[:, :, 0], expected[:, :, 1], (raw.mul(.5).clamp(-1., 1.) + 1.) * .5)
+        torch.testing.assert_close(action._processed_actions, targets, rtol=0, atol=1.e-15)
+        native['apply_actions'](action)
+        torch.testing.assert_close(robot.set_joint_position_target.call_args.args[0], targets, rtol=0, atol=1.e-15)
+        self.assertEqual(robot.set_joint_position_target.call_args.kwargs['joint_ids'], ids)
+        native['process_actions'](action, raw.clamp(-2., 2.))
+        torch.testing.assert_close(action._processed_actions, targets, rtol=0, atol=1.e-15)
+        torch.testing.assert_close(robot.data.joint_pos_limits, physical_before, rtol=0, atol=0)
+
+    def test_explicit_rows_update_only_the_selected_learning_limits(self):
+        env, robot, namespace, names, modules = self.fixture()
+        before = robot.data.soft_joint_pos_limits.clone()
+        positions, _ = namespace['hand_joint_limits'](robot.cfg.spawn.hand_urdf_path)
+        ids = [names.index(name) for name in positions]
+        with patch.dict(sys.modules, modules):
+            task.configure_hand_action_limits(env, env_ids=torch.tensor([1, 3]))
+        expected = before.clone()
+        expected[torch.tensor([1, 3])[:, None], torch.tensor(ids)] = expected.new_tensor(list(positions.values()))
+        torch.testing.assert_close(robot.data.soft_joint_pos_limits, expected, rtol=0, atol=0)
+        torch.testing.assert_close(robot.data.joint_pos_limits, before, rtol=0, atol=0)
+
+    def test_missing_or_reordered_independent_joint_resolution_is_rejected(self):
+        env, robot, _, _, modules = self.fixture()
+        before = robot.data.soft_joint_pos_limits.clone()
+        robot.find_joints = lambda names, preserve_order: ([0] * len(names), list(reversed(names)))
+        with patch.dict(sys.modules, modules), self.assertRaisesRegex(RuntimeError, 'all independent URDF joints'):
+            task.configure_hand_action_limits(env)
+        torch.testing.assert_close(robot.data.soft_joint_pos_limits, before, rtol=0, atol=0)
+
+    def test_feasible_action_limits_are_registered_as_a_native_startup_event(self):
+        path = Path(__file__).resolve().parents[3] / (
+            'src/contact_manipulation_symmetric/contact_manipulation_symmetric/config/ur5e/ur5e_env_cfg.py')
+        registrations = [node for node in ast.walk(ast.parse(path.read_text()))
+                         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Attribute)
+                         and node.targets[0].attr == 'hand_action_limits']
+        self.assertEqual(len(registrations), 1)
+        call = registrations[0].value
+        self.assertEqual(call.func.id, 'EventTermCfg')
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        self.assertEqual(keywords['func'].id, 'configure_hand_action_limits')
+        self.assertEqual(ast.literal_eval(keywords['mode']), 'startup')
 
 
 class NativeArmEffortLimitTests(unittest.TestCase):

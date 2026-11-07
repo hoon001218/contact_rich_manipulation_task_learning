@@ -380,34 +380,48 @@ Python 위치 갱신을 넣지 않고 **native PhysX Mimic API**로 URDF의 비�
 손의 위치·속도 제한과 토크1N·m는 URDF에서 읽어 공식 API에 설정한다.
 독립관절 gain20/1·종속관절0/0을 사용한다. 설치된 importer의 flag가 `parse_mimic`에
 직접 전달되므로 `convert_mimic_joints_to_normal_joints=True`와 `joint_drive=None`을 사용한다.
-Mimic은 **설치된 importer의 기본 설정을 유지**한다. Reference·gearing·offset·natural frequency·
-damping ratio와 종속관절 drive를 덮어쓰지 않는다. 강체 mimic으로 바꾸던 후처리는 제거했다.
-Importer가 종속관절에 둔 확장 범위와 별도 속도 brake를 두지 않는 방식은 유지하고,
-URDF 전체 제약을 독립관절의 범위에 반영한다. Mimic API6개가 생성됐는지는 검사한다.
-기존 importer 원본 USD의6개 reference·gearing·offset은 URDF와 일치했다.
-일반 손가락4개에는 rotZ compliance 기본값이 작성되지만, 엄지2개는 mimic 축 rotX와
-compliance 속성의 rot 표기가 다르다. 이번에는 importer 결과 그대로 보존하며,
-6개 모두 동일한 compliant 설정이 실제 적용된다고 보장하지 않는다.
+**강체 mimic 강제 설정을 사용하지 않는다.** Native mimic6개의 reference·gearing·offset과
+importer가 작성한 양수 compliance를 보존한다. URDF에는 mimic의 강성·감쇠나 PD gain이
+정의돼 있지 않으므로, 이를 원본 URDF의 물리 값이라고 설명하지 않는다. 엄지의 실제 rotX
+namespace에 값이 없고 잘못된 `rot:*`에만 있으면 기존 importer 값을 그대로 복사한다.
+양수 compliance가 없으면 강체로 묵시적으로 실행하지 않고 오류를 낸다.
 
-URDF의 일부 master 상한은 mimic child 상한을 초과한다. 초기화 때 전체 연동 범위의
-교집합을 공식 physics limit에 전달한다. 네 손가락 master는0–1.36159rad·최대.922254rad/s,
-thumb2는0–.609221rad·최대2rad/s다. 공식 action은 이 한계를 그대로 사용한다.
-종속관절의 SDK limit 숫자는 원본보다 넓다. Master 한계는 URDF 연동식을 기준으로 원본 범위를
-반영하지만, compliant mimic은 하중에 따른 연동 오차를 허용하므로 실제 child의 원본 범위
-준수를 보장하지 않는다. 실제12관절각과 연동 오차를 원본 기준으로 함께 확인해야 한다.
-매 step coupling 계산이나 joint pose 덮어쓰기는 없다.
-속도 상한은 독립관절의 native 제한이다. 접촉 시 종속관절의 순간 속도까지 원본 상한에
-엄격히 묶는 것은 검증되지 않았다. 닫기 시험에서 index2는 순간9.25rad/s가 관측됐다.
-종속관절에도 별도 native 속도 제한을 중복 적용한 대조는 불안정해 채택하지 않았다.
+12관절의 **native 위치 하한·상한·속도·drive effort는 원본 URDF 값**으로 복원한다.
+네 손가락 master 상한은1.4381rad·child는1.476374rad이고 속도는모두1rad/s다.
+엄지는 각각1.658/.62/.5410520681/.4555309348rad이고 속도는모두2rad/s다.
+모든 하한은0, effort는1N·m다. 종속관절도 drive effort 값은 복원하지만 gain0/0·독립 action
+없음을 유지한다. 이 값이 mimic·충돌 제약의 반력까지1N·m로 제한한다는 의미는 아니다.
+이전110절 후보의 강체0/0·10rad/s 상한·motor performance envelope는 제거했다.
+
+URDF의 일부 master 최대점은 child 한계와 연동식을 함께 만족하지 못한다. 따라서 공식
+startup event에서 **학습용 `soft_joint_pos_limits`만** 교집합으로 설정한다. 네 손가락 master의
+action 범위는0–1.36159rad, thumb2는0–.609221rad로 기존과 같다. Native hard limit은
+원문 값을 유지하며 공식 `JointPositionToLimitsAction`이 soft limit을 읽는다. 환경 step·action
+class를 바꾸거나 Python으로 관절각을 덮어쓰지 않는다. 원본과 symmetric에 같은 설정을 적용했다.
+
+질량·관성·축·원본 mesh는 유지한다. Collision cooking은 기존 native convex decomposition을
+사용한다. 설정값 일치와 실제 동작의 한계 준수는 별도이며, compliant mimic의 연동 오차와
+접촉 중12관절의 위치·속도 이탈을 함께 측정한다. 역꺾임의 물리 수렴 문제는 아직 미해결이다.
 Native mimic과 접촉 제약을 위해 기존에 선택한 결합 로봇 articulation의 position solver를
 32회로 설정한다. 2026-10-23 사용자 요청으로 예제용 로컬 USD에 맞춰 velocity solver를
 1회로 변경했고, 물체도 예제 cfg와 같은 position16회·velocity1회다. 팔·손이 하나의
 articulation이므로 로봇의 수치 설정은 전체 로봇에 적용된다. UR5e의 actuator·controller·
 collision mesh는 유지한다. 아래 시험 수치는 **이전 강체 mimic·velocity2회**의 기록이며,
-현재 importer 기본 mimic 구성의 안정성을 확인한 수치가 아니다.
+현재 손 설정의 안정성을 확인한 수치가 아니다.
 100Hz 여닫기 시험에서 최대 관절 범위 이탈은.000068rad, 최대 mimic 연동 오차는.030736rad였다.
 1,024환경의 동일 시작 상태에서 native32step은 solver32회1.330초·64회1.955초였다.
 이는 NN/PPO update가 빠진 환경 실행 시간이며, 64회는 연동 오차를 줄이는 대신 비용이47% 컸다.
+
+현재 설정의 손 단독 접촉·여닫기 측정은 아래 스크립트로 재현한다. 12개 관절·6개 mimic·
+17개 pad의 결과와 단계별 실제 접촉 frame 수를 JSON에 기록한다. `status=complete`와 별개로
+접촉이 유지된 구간을 확인해야 한다. JSON의 `nominal_config_alignment`는12관절 원문 값과
+backend 값을 비교하고, 실제 궤적 오차는 별도 기록한다. 현재 기준은 `docs/TRAINING_LOG.md` 111절이다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation/tests/probe_hand_contact.py \
+  --headless --prismatic-guide --ramp-steps 20 --output /tmp/hand_contact.json
+```
+
 예제처럼 OSC 환경의 `__post_init__`에서도 arm stiffness/damping=0을 명시한다.
 팔은 `IdealPDActuatorCfg`를 사용해 OSC가 계산한 토크를 PhysX에 전달하기 전에 제한한다.
 `effort_limit`과 `effort_limit_sim`은 모두 shoulder/elbow 150·wrist 28 N·m이며,

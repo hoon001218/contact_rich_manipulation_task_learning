@@ -42,6 +42,31 @@ from .terminations import (
 _DEFAULT_MAX_OBJECTS = 10  # Policy slots; physical scene count is configured separately.
 
 
+def configure_hand_action_limits(env, env_ids: Sequence[int] | None = None) -> None:
+    """Use the coupled URDF range for actions without changing physical limits.
+
+    The native position action reads these learning-only soft limits. Apply
+    them once through the startup event; hard limits remain the literal URDF
+    bounds on all twelve joints.
+    """
+    from ..config.ur5e.scene import hand_joint_limits
+
+    robot = env.scene["robot"]
+    positions, _ = hand_joint_limits(str(robot.cfg.spawn.hand_urdf_path))
+    names = list(positions)
+    joint_ids, resolved_names = robot.find_joints(names, preserve_order=True)
+    if list(resolved_names) != names:
+        raise RuntimeError("Hand action limits require all independent URDF joints in their configured order.")
+    soft_limits = robot.data.soft_joint_pos_limits
+    bounds = soft_limits.new_tensor([positions[name] for name in names])
+    if env_ids is None:
+        soft_limits[:, joint_ids] = bounds
+    else:
+        rows = torch.as_tensor(env_ids, device=soft_limits.device, dtype=torch.long)
+        columns = torch.as_tensor(joint_ids, device=soft_limits.device, dtype=torch.long)
+        soft_limits[rows[:, None], columns] = bounds
+
+
 @dataclass
 class MdpCfg:
     max_objects: int = _DEFAULT_MAX_OBJECTS
