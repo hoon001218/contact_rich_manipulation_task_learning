@@ -98,7 +98,7 @@ class CurriculumCfg:
 class RewardsCfg:
     """Raw task scores/costs, integrated by the native RewardManager."""
 
-    clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
+    # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
