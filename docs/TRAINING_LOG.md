@@ -10518,3 +10518,62 @@ CUDA전용2생략이다. 전체609개 중586통과·23생략이며 구문·`git 
 goal-only map·부분 reset/rollback과 기존 관측/학습 계약이다. 실행한 진단 GPU 프로세스는
 모두 종료했다. 학습 시작 전 검토할320D readout 대 attention-only128D 비교 과제는 기존대로
 미결이며 이번 스폰 적용에서 모델 구조를 바꾸지 않았다.
+
+
+## 145. 2026-11-11 — 현재 Blocker 접촉 pad 수와 step 개선량을 곱하는 보상
+
+사용자 요청으로 `contact_manipulation_symmetric`의 clearance·relocation을 변경했다.
+기존 `mdp.clearance(env)`와 `mdp.blocker_relocation(env, decay)` 함수 본문은 그대로 보존했다.
+`shelf_manipulation_env_cfg.py`의 기존 두 선언을 주석으로 남기고, 활성 term 이름은
+`clearance`·`blocker_relocation`을 유지하면서 각각 `mdp.clearance_contact_progress`와
+`mdp.blocker_relocation_contact_progress`에 연결했다. 기존에 주석이던 clearance도 새 함수로
+활성화했다. Weight는 각각12·3, relocation decay는10이다.
+
+### 수식과 현재 접촉의 의미
+
+- `C(t) = 1 - 현재 Blocker 가림 면적 / episode 초기 Blocker 가림 면적`:
+  기존 signed clearance quality를 사용한다. 초기 유효 가림이 없으면 품질0이다.
+- `Q(t) = exp(-10 * d(t))`: 기존 relocation quality이며 `d`는 현재 Blocker 중심에서
+  초기 생성된 유효 목적지 polygon까지의 최소 XY 거리다. 영역 내부·경계는 품질1,
+  유효 영역이 없으면 품질0이다.
+- `n(t)`는 현재 유효한 Blocker 전용 접촉 합력 norm이0.01N을 초과하는 pad의 개수다.
+  Canonical17pad를 각각 한 번씩 세며 새 접촉과 기존 접촉을 동일하게1개로 계산한다.
+- 새 raw clearance는 `n(t) * max(C(t) - C(t-1), 0)`이다.
+- 새 raw relocation은 `n(t) * max(Q(t) - Q(t-1), 0)`이다.
+
+Native RewardManager가 raw 값에 해당 weight와 control dt를 한 번씩 곱한다. Reward 함수가
+dt로 나누거나 weight를 중복 적용하지 않는다. 두 새 term에는 이전 step 접촉 여부나
+Target 보호 gate를 추가하지 않았다. 현재 무접촉·정체·악화는0이며, 목적지 안에 정지한
+상태도 반복 보상을 주지 않는다. Invalid force·센서 validity가 false인 pad는 세지 않으며,
+유효하지 않은 현재/이전 기하 비교에서도 보상을 지급하지 않는다.
+
+### 이력·센서·reset 연결
+
+`TaskState.advance()`가 매 완료 control transition마다 직전 clearance 품질과 Blocker
+중심을 먼저 저장한다. 접촉이 없어도 갱신하므로 비접촉 개선량을 재접촉 때 소급 지급하지
+않는다. 같은 step의 reward·termination 재조회는 기준을 다시 진행시키지 않는다. 부분
+reset은 선택 행의 이전 clearance 품질을0, 이전 Blocker 중심을 실제 초기 중심으로 맞추고
+다른 행을 유지한다. 따라서 첫 접촉 transition의 실제 개선량도 계산할 수 있다.
+
+접촉은 observation의 any-object flags 대신 기존 native `blocker_force_w`의 단일 Blocker
+filter column을 사용한다. Canonical 순서로 pad force를 모으고 동일 순서의 센서 validity를
+적용한다. Shared scene의 host Blocker ID로 필터를 idempotent하게 연결하므로 기존
+`BlockerContactHold`의 weight가0이거나 term 자체가 없어도 두 새 term을 사용할 수 있다.
+Timeline stop/play로 native view가 재생성되면, 등록된 기존 hold term의 재연결·이력 초기화를
+먼저 수행한다. 기존 hold의 새 접촉0.5·유지1 수식과 나머지 reward는 유지했다.
+
+### 검증
+
+새 CPU 테스트9개로 양의 step 개선량·현재 pad 수 비례·신규 접촉 포함·비접촉 개선분
+소급 방지·최초 transition·같은 step 반복·부분 reset 격리·invalid geometry 회복·native
+weight와 dt 적용·timeline 재연결 순서를 확인했다. 접촉 집계는 tensor의 `item`·`__bool__`·
+`cpu`·`numpy` 호출을 금지한 상태에서도 검사했다. 기존 두 함수의 AST가 변경 전과 같은지도
+확인했고, 기존 함수 동작 테스트는 그대로 유지했다.
+
+- 관련 집중 검사:107통과·1생략·subtest129통과.
+- Symmetric 전체 CPU 회귀:596통과·33생략·subtest777통과,29.38초.
+- 수정 Python 구문과 `git diff --check` 통과.
+
+전체 검사 로그는 `/tmp/contact_progress_symmetric_cpu.log`다. GPU 시뮬레이션·PPO 학습은
+실행하지 않았으며 실제 정책 성능 변화는 측정하지 않았다. 모델·관측·action·PPO와 native
+학습 루프는 변경하지 않았다.

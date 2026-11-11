@@ -99,11 +99,15 @@ class RewardsCfg:
     """Raw task scores/costs, integrated by the native RewardManager."""
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
+    clearance = RewardTermCfg(func=mdp.clearance_contact_progress, weight=12.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
+    # blocker_relocation = RewardTermCfg(
+    #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
+    # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
+        func=mdp.blocker_relocation_contact_progress, weight=3.0, params={"decay": 10.0},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
     shelf_collision = RewardTermCfg(

@@ -564,6 +564,7 @@ class TaskState:
         self.blocker = zeros(n, o, kind=torch.bool)
         self.object_motion_cost = zeros(n)
         self.blocker_center = torch.full((n, 3), math.nan, device=device, dtype=dtype)
+        self.previous_blocker_center = self.blocker_center.clone()
         # Immutable scene metadata is attached at reset as broadcast views.
         # No region geometry is rebuilt or copied per environment/physics step.
         self.relocation_regions = zeros(n, 0, 3, 2)
@@ -611,6 +612,7 @@ class TaskState:
         self.invalid_reason_index = FAILURE_REASON_NAMES.index("invalid_state")
         # Named transition measurements; each native reward term owns its formula.
         self.clearance_quality = zeros(n)
+        self.previous_clearance_quality = zeros(n)
         self.force_growth = zeros(n)
         self.torque_growth = zeros(n)
         self.terminal_reward = zeros(n)
@@ -643,6 +645,7 @@ class TaskState:
         role = self.blocker[ids] & self.active[ids]
         center = batch.center[rows].gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
         self.blocker_center[ids] = torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan)
+        self.previous_blocker_center[ids] = self.blocker_center[ids]
         self.initial_target_pose[ids] = 0
         if self.bindings is not None and hasattr(self.bindings, "objects"):
             target_slots = self.target[ids].long().argmax(-1)
@@ -703,6 +706,7 @@ class TaskState:
                      "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
                      "success", "failure", "success_paid", "failure_paid", "failure_reasons", "clearance_quality",
+                     "previous_clearance_quality",
                      "force_growth", "torque_growth", "terminal_reward", "blocker_overlap"):
             getattr(self, name)[ids] = 0
         # One batched geometry query for reset rows only. The initial reference
@@ -756,6 +760,12 @@ class TaskState:
             raise RuntimeError("reset_task must run after scene/vision initialization before stepping.")
         if step != self.last_step + 1:
             raise RuntimeError("MDP must be evaluated once every completed control transition.")
+        # Snapshot every completed control sample, even without contact. Reward
+        # calls only read these baselines, so repeats cannot consume progress
+        # and later contacts cannot collect improvements from earlier steps.
+        self.previous_blocker_center.copy_(self.blocker_center)
+        self.previous_clearance_quality.copy_(torch.where(
+            torch.isfinite(self.blocker_overlap), self.clearance_quality, math.nan))
         role = self.blocker & self.active
         center = batch.center.gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
         self.blocker_center.copy_(torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan))

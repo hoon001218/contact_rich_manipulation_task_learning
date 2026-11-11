@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-11-08, Asia/Seoul**.
+최종 갱신: **2026-11-11, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-11-08
+## 최신 진입점 — 2026-11-11
 
 사용자 지정 메인 개발·학습 대상은 **`src/contact_manipulation_symmetric`**,
 task는 **`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`**다. Actor와 Critic이 같은 관측을
@@ -19,7 +19,15 @@ task는 **`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`**다. Actor와 Critic�
 현재 구현은 [Symmetric README](../src/contact_manipulation_symmetric/README.md),
 생성·동기화·손 설정 이력은 **[TRAINING_LOG.md](TRAINING_LOG.md) 108–111절**을 먼저 읽는다.
 
-**2026-11-08 최신 적용은144절이다. 순차 생성 규칙을 Symmetric 학습 reset에 연결했다.**
+**2026-11-11 최신 reward 변경은145절이다.** Symmetric의 기존 clearance·relocation
+함수는 그대로 보존하고 cfg의 기존 선언을 주석으로 남겼다. 활성 두 term은
+`현재 Blocker 접촉 pad 수 * max(현재 품질 - 직전 control step 품질, 0)`를 반환한다.
+접촉은 유효한 Blocker 전용 pad 합력 norm이0.01N을 초과하는 현재 sample이며, 새 접촉도
+즉시1개로 센다. 가림 품질은 기존 signed 초기 가림 대비 개선, 재배치 품질은 기존
+`exp(-10*d)`다. 정체·악화·무접촉은0이며 비접촉 개선량을 재접촉 때 소급 지급하지 않는다.
+기존 clearance weight12·relocation weight3/decay10과 native weight·dt 적용을 유지한다.
+
+**2026-11-08 스폰 규칙 적용은144절이다. 순차 생성 규칙을 Symmetric 학습 reset에 연결했다.**
 `mdp/events.py`의 `SequentialSceneGenerator`를 학습과 단계별 이미지 진단이 함께 사용하며,
 기본 `spawn_rules.generation_mode="sequential"`이다. 배치·ray는 새 공통 장면당1회만 계산하고
 부분 reset에서는 공통 배치/비전을 재사용하며 로봇 시작 자세만 샘플링한다. 기존 물리 pool의

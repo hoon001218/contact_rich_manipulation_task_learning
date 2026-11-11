@@ -14,10 +14,11 @@ import torch
 from isaaclab.utils.math import quat_error_magnitude
 
 __all__ = [
-    "clearance_quality", "clearance", "shelf_collision", "target_collision", "object_collision",
+    "clearance_quality", "clearance", "clearance_contact_progress",
+    "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
-    "blocker_min_distance", "relocation_distance", "blocker_relocation",
+    "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -185,6 +186,64 @@ def clearance(env):
     return state.clearance_quality.clamp_min(0.0)
 
 
+def _current_blocker_contact_count(env, threshold):
+    """Count valid pads touching the current Blocker, including new contacts.
+
+    Pair-filtered native forces exclude shelf/other-object contacts. Reuse the
+    sensor's one-column cache independently of the old contact-hold reward and
+    its history, weight or evaluation order. The shared scene supplies a host
+    Blocker ID, so binding needs no device scalar read during control steps.
+    """
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("Contact threshold must be finite and nonnegative.")
+    sensor = env.scene["tactile_contact"]
+    binding = getattr(env, "_blocker_progress_contact_binding", None)
+    if binding is None or binding[0] is not sensor:
+        from ..config.ur5e.scene import TACTILE_BODY_NAMES
+
+        ids, names = sensor.find_bodies(list(TACTILE_BODY_NAMES), preserve_order=True)
+        if tuple(names) != TACTILE_BODY_NAMES:
+            raise RuntimeError("Blocker progress rewards require all 17 canonical tactile pads.")
+        binding = (sensor, torch.tensor(ids, device=env.device, dtype=torch.long))
+        env._blocker_progress_contact_binding = binding
+    blocker_id = env._episode_reset.shared_sample.blocker_id
+    contact_hold = getattr(env, "_blocker_contact_hold", None)
+    if contact_hold is not None and sensor._blocker_id is None:
+        # A timeline restart loses native views. Let the old hold term clear
+        # its continuity before these earlier reward terms reconnect the view.
+        contact_hold.configure_blocker(blocker_id)
+    sensor.enable_blocker_filtering(
+        env.scene["object_collection"], env.scene.env_prim_paths,
+        blocker_id,
+    )
+    force = sensor.blocker_force_w.index_select(1, binding[1])
+    current = (env.task_sensor_reader().tactile_valid & torch.isfinite(force).all(-1)
+               & (torch.linalg.vector_norm(force, dim=-1) > threshold))
+    return current.sum(-1).to(force.dtype)
+
+
+def _positive_improvement(current, previous):
+    """Finite, positive one-control-step quality change; invalid pairs pay zero."""
+    valid = torch.isfinite(current) & torch.isfinite(previous)
+    return torch.where(valid, (current - previous).clamp_min(0.0), 0.0)
+
+
+def clearance_contact_progress(env, threshold=0.01):
+    """Current Blocker pad count times positive clearance-quality improvement.
+
+    Quality is the existing signed initial-overlap score. Compare consecutive
+    control samples, including noncontact samples; no historical contact gate
+    or delayed payment applies. Stationary/worsening clearance pays zero.
+    Native RewardManager applies weight and control dt once.
+    """
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    quality = torch.where(torch.isfinite(state.blocker_overlap), state.clearance_quality, math.nan)
+    progress = _positive_improvement(quality, state.previous_clearance_quality)
+    return _current_blocker_contact_count(env, threshold) * progress
+
+
 def _current_blocker_pad_distances(env):
     """Read current native poses and share the same OBB geometry for both rewards."""
     from .observations import quat_apply, quat_conjugate, quat_mul
@@ -289,6 +348,29 @@ def blocker_relocation(env, decay=math.log(2.0) / 0.10):
     distance = relocation_distance(state.blocker_center[:, :2], state.relocation_regions,
                                    state.relocation_vertex_counts, state.relocation_valid)
     return torch.exp(-decay * distance)
+
+
+def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, threshold=0.01):
+    """Current Blocker pad count times positive relocation-quality improvement.
+
+    Preserve the original exp(-decay * distance) quality and fixed reset-time
+    goal regions. Compare against the previous control sample even when it had
+    no contacts. Staying inside a goal region earns no additional progress.
+    """
+    from .events import get_task_state
+
+    if not math.isfinite(decay) or decay <= 0:
+        raise ValueError("Relocation decay must be finite and positive.")
+    state = get_task_state(env)
+    current = blocker_relocation(env, decay=decay)
+    previous_distance = relocation_distance(
+        state.previous_blocker_center[:, :2], state.relocation_regions,
+        state.relocation_vertex_counts, state.relocation_valid,
+    )
+    progress = _positive_improvement(current, torch.exp(-decay * previous_distance))
+    valid = (torch.isfinite(state.blocker_center).all(-1)
+             & torch.isfinite(state.previous_blocker_center).all(-1))
+    return _current_blocker_contact_count(env, threshold) * torch.where(valid, progress, 0.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

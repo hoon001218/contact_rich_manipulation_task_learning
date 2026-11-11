@@ -39,7 +39,8 @@ Reset·부분 reset·terminal snapshot·결측 mask도 두 입력에 동일하�
 ## 유지한 모델과 설정
 
 2026-11-06 통합 브랜치의 원본 코드를 기준으로 복사했다. 이후 차이는 위 표를 따르며,
-제어·물리·배치·reward·termination·PPO 설정은 원본과 동일하다. 원본 패키지를 import하지 않는다.
+제어·물리·배치·termination·PPO의 후속 변경은 아래 기록을 따른다. Reward는 아래의
+접촉·개선량 기준을 사용한다. 원본 패키지를 import하지 않는다.
 Asset과 Isaac Lab checkout은 저장소의 공통 경로를 사용하고, 초기 카탈로그는 독립 복사했다.
 
 | 항목 | 기본값 |
@@ -62,25 +63,38 @@ GNN node/message/update와 최적화된 edge 커널은 ReLU, attention은 Softma
 Action mean과 value의 최종 출력은 선형이다. 이전 ReLU checkpoint는 play에서 저장된
 activation을 복원하며, ELU 기본 설정으로 ReLU 학습을 그대로 resume하는 것은 계약 검사로 거부한다.
 
-### 최신 reward·action 동기화
+### 최신 reward·action 설정 (2026-11-11)
 
-원격 변경을 병합한 원본 `contact_manipulation`과 reward·reset 상태 계산을 다시 맞췄다.
+기존 clearance·relocation 함수와 cfg 선언은 보존하고, Symmetric의 활성 두 term을
+현재 Blocker 접촉 pad 수와 직전 control step 대비 양의 개선량을 곱하는 함수로 교체했다.
 
 | 항목 | 현재 설정 |
 |---|---|
-| Clearance | 초기 Blocker 가림 대비 양의 개선, weight12 |
+| Clearance | `현재 접촉 pad 수 * max(Q_clear(t)-Q_clear(t-1), 0)`, weight12 |
 | Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
-| Blocker relocation | 초기 빈 재배치 영역까지 현재 중심점 거리의 `exp(-10*d)`, weight3 |
+| Blocker relocation | `현재 접촉 pad 수 * max(Q_reloc(t)-Q_reloc(t-1), 0)`, weight3·decay10 |
 | Contact hold | 새 접촉0.5·유지 접촉1의 pad 합, weight3·Target 보호 gate |
 | Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
 | Action-rate / Joint velocity | 각각−.03, 기존 clipping·12독립관절 선택 |
 | Blocker stability / Time / Terminal | 위 원본 설정 유지 |
 
-Distance는 이전 episode 최소거리 이력 대신 현재 거리를 평가한다. 초기 재배치 영역은
-새 공유 scene을 생성할 때1회 준비하고 부분 reset에서 재사용한다. Blocker 중심이 유효 영역
-내부나 경계에 있으면 relocation raw1이며, 영역이 없으면0이다. 접근 경로의 존재나 전체
-Blocker footprint의 영역 진입을 보장하는 판정은 아니다. Native RewardManager가 weight와
-control dt를 한 번 곱한다. 현재50Hz의 relocation 최대 지급은 step당0.06이다.
+`Q_clear = 1 - 현재 Blocker 가림 면적 / 초기 가림 면적`이며 signed 값을 유지한다.
+`Q_reloc = exp(-10*d)`의 `d`는 현재 Blocker 중심에서 초기 빈 재배치 영역까지의 XY 거리다.
+영역 내부나 경계에서는 품질1이지만 정지하면 개선량0이므로 새 보상이 없다. 영역이 없거나
+기하가 유효하지 않으면 보상0이다. 초기 영역은 새 공유 scene당1회 준비하고 부분 reset에서
+재사용한다. 접근 경로나 전체 Blocker footprint의 영역 진입을 보장하는 판정은 아니다.
+
+접촉 pad는 유효한 **Blocker 전용 법선 접촉 합력 norm > 0.01N**인17채널 중 개수다.
+새로 접촉한 pad도 즉시1개로 세고, 직전 step 접촉 여부나 Target 보호 gate는 두 새 term에
+추가하지 않는다. 무접촉·정체·악화는0이다. 비접촉 동안에도 비교 기준을 매 control step
+갱신하므로 재접촉 시 과거 개선량을 소급 지급하지 않는다. 부분 reset은 해당 행의 초기
+가림 품질0과 실제 Blocker 위치로 기준을 다시 잡는다. Native RewardManager가 weight와
+control dt를 한 번 곱한다. Distance는 기존 현재 거리 평가를 유지한다.
+
+기존 `mdp.clearance`·`mdp.blocker_relocation`은 그대로 남아 있고, cfg의 기존 선언은
+주석으로 보존했다. 새 선언은 `mdp.clearance_contact_progress`와
+`mdp.blocker_relocation_contact_progress`를 사용한다. 구현·검증은
+[`TRAINING_LOG.md` 145절](../../docs/TRAINING_LOG.md)을 따른다.
 
 Action 출력은 Sensor-frame wrench6 + Hand6의12D를 유지한다.
 Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정,

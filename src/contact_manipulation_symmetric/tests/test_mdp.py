@@ -858,20 +858,274 @@ class RelocationRewardTests(unittest.TestCase):
             self.assertEqual(actual.shape, (1024,))
             self.assertEqual(actual.dtype, dtype)
 
-    def test_cfg_uses_current_original_relocation_weight_and_decay(self):
+    def test_cfg_uses_contact_progress_relocation_and_preserves_weight_and_decay(self):
         source = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
         term = next(node.value for node in definition.body if isinstance(node, ast.Assign)
                     and node.targets[0].id == 'blocker_relocation')
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
-        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation')
+        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_contact_progress')
         self.assertEqual(ast.literal_eval(fields['weight']), 3.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
         self.assertEqual(params, {'decay': 10.})
         for decay in (0., -1., math.nan, math.inf):
             with self.subTest(decay=decay), self.assertRaises(ValueError):
                 rewards.blocker_relocation(SimpleNamespace(), decay=decay)
+
+
+class ContactProgressRewardTests(unittest.TestCase):
+    @staticmethod
+    def regions(state, batch):
+        polygon = batch.center.new_tensor([[.3, -.1], [.4, -.1], [.4, .1], [.3, .1]])
+        state.relocation_regions = polygon[None, None].expand(len(batch.center), 1, -1, -1)
+        state.relocation_vertex_counts = torch.full((len(batch.center), 1), 4, dtype=torch.long)
+        state.relocation_valid = torch.ones((len(batch.center), 1), dtype=torch.bool)
+
+    def test_clearance_pays_only_current_contact_count_times_positive_step_improvement(self):
+        quality = torch.tensor([.3, .4, .1, .2, -.3, math.nan, .5], dtype=torch.float64)
+        state = SimpleNamespace(clearance_quality=quality,
+            previous_clearance_quality=quality.new_tensor([.2, .4, .2, 0., -.5, 0., math.nan]),
+            initial_blocker_overlap=quality.new_full((7,), .01),
+            blocker_overlap=quality.new_full((7,), .005),
+            target_protected=torch.zeros(7, dtype=torch.bool), failure=torch.ones(7, dtype=torch.bool))
+        contacts = quality.new_tensor([1., 2., 17., 0., 3., 1., 1.])
+        previous = state.previous_clearance_quality.clone()
+        for dt in (.01, .02, .1):
+            env = SimpleNamespace(step_dt=dt)
+            with patch.object(task, 'get_task_state', return_value=state), \
+                 patch.object(rewards, '_current_blocker_contact_count', return_value=contacts):
+                actual = rewards.clearance_contact_progress(env)
+                torch.testing.assert_close(actual, quality.new_tensor([.1, 0., 0., 0., .6, 0., 0.]))
+                torch.testing.assert_close(rewards.clearance_contact_progress(env), actual)
+        torch.testing.assert_close(state.previous_clearance_quality, previous, equal_nan=True)
+
+    def test_relocation_uses_positive_change_in_existing_exponential_quality(self):
+        current = torch.tensor([[.3, 0., 0.], [.2, 0., 0.], [.4, 0., 0.], [.3, 0., 0.],
+                                [.3, 0., 0.], [.1, 0., 0.], [math.nan, 0., 0.]], dtype=torch.float64)
+        previous = current.clone()
+        previous[:, 0] = current.new_tensor([.4, .3, .3, .4, math.nan, .15, .4])
+        rectangle = current.new_tensor([[0., -.1], [.2, -.1], [.2, .1], [0., .1]])
+        state = SimpleNamespace(blocker_center=current, previous_blocker_center=previous,
+            relocation_regions=rectangle[None, None].expand(7, 1, -1, -1),
+            relocation_vertex_counts=torch.full((7, 1), 4),
+            relocation_valid=torch.ones((7, 1), dtype=torch.bool),
+            target_protected=torch.zeros(7, dtype=torch.bool), failure=torch.ones(7, dtype=torch.bool))
+        contacts = current.new_tensor([1., 2., 17., 0., 1., 3., 1.])
+        expected = current.new_tensor([math.exp(-1.) - math.exp(-2.),
+                                       2. * (1. - math.exp(-1.)), 0., 0., 0., 0., 0.])
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=contacts):
+            torch.testing.assert_close(rewards.blocker_relocation_contact_progress(
+                SimpleNamespace(step_dt=.02), decay=10.), expected)
+            state.relocation_valid.zero_()
+            torch.testing.assert_close(rewards.blocker_relocation_contact_progress(
+                SimpleNamespace(step_dt=.02), decay=10.), torch.zeros_like(expected))
+
+    def test_contact_reader_counts_current_valid_blocker_pads_and_uses_canonical_order(self):
+        canonical_names = tuple(f'pad_{index}' for index in range(17))
+
+        class Sensor:
+            def __init__(self):
+                self.native_force = torch.zeros((3, 17, 3), dtype=torch.float64)
+                self._blocker_id = None
+                self.enables = []
+                # Any-object observation contacts must not enter this reward.
+                self.data = SimpleNamespace(net_forces_w=torch.ones((3, 17, 3)))
+
+            def find_bodies(self, names, preserve_order=False):
+                assert tuple(names) == canonical_names and preserve_order
+                return list(reversed(range(17))), list(names)
+
+            def enable_blocker_filtering(self, objects, paths, blocker_id):
+                assert objects is object_collection and len(paths) == 3
+                changed = self._blocker_id != blocker_id
+                if changed:
+                    self.enables.append(blocker_id)
+                self._blocker_id = blocker_id
+                return changed
+
+            @property
+            def blocker_force_w(self):
+                assert self._blocker_id == 2
+                return self.native_force
+
+            def contact(self, row, pad, force):
+                self.native_force[row, 16 - pad, 0] = force
+
+        class Scene(dict):
+            env_prim_paths = ['/env0', '/env1', '/env2']
+
+        sensor, object_collection = Sensor(), object()
+        values = SimpleNamespace(tactile_valid=torch.ones((3, 17), dtype=torch.bool))
+        env = SimpleNamespace(num_envs=3, device='cpu', common_step_counter=1,
+            scene=Scene(tactile_contact=sensor, object_collection=object_collection),
+            _episode_reset=SimpleNamespace(shared_sample=SimpleNamespace(blocker_id=2)),
+            task_sensor_reader=lambda: values)
+        sensor.contact(0, 0, .02)
+        sensor.contact(0, 1, -.02)
+        sensor.contact(0, 2, .01)  # Strict > threshold, not >=.
+        sensor.contact(0, 3, math.nan)
+        sensor.contact(0, 4, math.inf)
+        sensor.contact(0, 16, .02)
+        values.tactile_valid[0, 16] = False
+        sensor.native_force[1, :, 0] = .02
+        fake_scene = types.ModuleType('contact_manipulation_symmetric.config.ur5e.scene')
+        fake_scene.TACTILE_BODY_NAMES = canonical_names
+        with patch.dict(sys.modules, {fake_scene.__name__: fake_scene}):
+            with patch.object(torch.Tensor, 'item', side_effect=AssertionError('host scalar read')), \
+                 patch.object(torch.Tensor, '__bool__', side_effect=AssertionError('host condition')), \
+                 patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('host transfer')), \
+                 patch.object(torch.Tensor, 'numpy', side_effect=AssertionError('host transfer')):
+                actual = rewards._current_blocker_contact_count(env, threshold=.01)
+            torch.testing.assert_close(actual, torch.tensor([2., 17., 0.], dtype=torch.float64))
+            # No prior contact is needed and removing contacts takes effect now.
+            sensor.native_force.zero_()
+            torch.testing.assert_close(rewards._current_blocker_contact_count(env, threshold=.01),
+                                       torch.zeros(3, dtype=torch.float64))
+            self.assertEqual(sensor.enables, [2])
+        self.assertFalse(hasattr(env, '_blocker_contact_hold'))
+        # A recreated native view must let the hold term clear stale history
+        # before this earlier-running progress term reconnects the same sensor.
+        reconnects = []
+        def reconnect(blocker_id):
+            self.assertIsNone(sensor._blocker_id)
+            reconnects.append(blocker_id)
+            sensor.enable_blocker_filtering(object_collection, env.scene.env_prim_paths, blocker_id)
+        env._blocker_contact_hold = SimpleNamespace(configure_blocker=reconnect)
+        sensor._blocker_id = None
+        actual = rewards._current_blocker_contact_count(env, threshold=.01)
+        torch.testing.assert_close(actual, torch.zeros(3, dtype=torch.float64))
+        self.assertEqual(reconnects, [2])
+        self.assertEqual(sensor.enables, [2, 2])
+
+    def test_native_reward_manager_applies_weight_and_control_dt_once(self):
+        quality = torch.tensor([.2, .1, .4], dtype=torch.float64)
+        center = quality.new_tensor([[.3, 0., 0.]]).expand(3, -1)
+        rectangle = quality.new_tensor([[0., -.1], [.2, -.1], [.2, .1], [0., .1]])
+        state = SimpleNamespace(clearance_quality=quality, previous_clearance_quality=torch.zeros_like(quality),
+            blocker_overlap=quality.new_full((3,), .005), blocker_center=center,
+            previous_blocker_center=quality.new_tensor([[.4, 0., 0.]]).expand(3, -1),
+            relocation_regions=rectangle[None, None].expand(3, 1, -1, -1),
+            relocation_vertex_counts=torch.full((3, 1), 4),
+            relocation_valid=torch.ones((3, 1), dtype=torch.bool))
+        contacts = quality.new_tensor([1., 3., 0.])
+        expected = 12. * contacts * quality + 3. * contacts * (math.exp(-1.) - math.exp(-2.))
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=contacts):
+            for dt in (.01, .02, .1):
+                manager = SimpleNamespace(_env=SimpleNamespace(step_dt=dt),
+                    _term_names=['clearance', 'blocker_relocation'],
+                    _term_cfgs=[SimpleNamespace(func=rewards.clearance_contact_progress, weight=12., params={}),
+                        SimpleNamespace(func=rewards.blocker_relocation_contact_progress, weight=3., params={'decay': 10.})],
+                    _reward_buf=torch.zeros_like(quality), _step_reward=quality.new_zeros(3, 2),
+                    _episode_sums={'clearance': torch.zeros_like(quality), 'blocker_relocation': torch.zeros_like(quality)})
+                torch.testing.assert_close(native_reward_compute()(manager, dt), expected * dt)
+
+    def test_contact_threshold_and_relocation_decay_reject_invalid_values(self):
+        for threshold in (-.01, math.nan, math.inf):
+            with self.subTest(threshold=threshold), self.assertRaises(ValueError):
+                rewards._current_blocker_contact_count(SimpleNamespace(), threshold=threshold)
+        for decay in (0., -1., math.nan, math.inf):
+            with self.subTest(decay=decay), self.assertRaises(ValueError):
+                rewards.blocker_relocation_contact_progress(SimpleNamespace(), decay=decay)
+
+    def test_initial_reset_baseline_pays_first_contact_transition_and_repeat_is_stable(self):
+        state, batch, reset = fixture(1)
+        self.regions(state, batch)
+        delta = .2 - batch.center[:, 1, 0]
+        batch.center[:, 1, 0] += delta
+        batch.corners[:, 1, :, 0] += delta[:, None]
+        state.reset(torch.tensor([0]), batch, **reset, step=0)
+        torch.testing.assert_close(state.previous_clearance_quality, torch.zeros(1, dtype=batch.center.dtype))
+        torch.testing.assert_close(state.previous_blocker_center, batch.center[:, 1])
+        batch.center[:, 1, 0] += .01
+        batch.corners[:, 1, :, 0] += .01
+        state.advance(batch, 1)
+        env = SimpleNamespace(step_dt=state.dt)
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=batch.center.new_tensor([2.])):
+            for _ in range(2):
+                state.advance(batch, 1)  # Shared state is idempotent at a timestamp.
+                torch.testing.assert_close(rewards.clearance_contact_progress(env), batch.center.new_tensor([.4]))
+                torch.testing.assert_close(rewards.blocker_relocation_contact_progress(env, decay=10.),
+                    batch.center.new_tensor([2. * (math.exp(-.9) - math.exp(-1.))]))
+
+    def test_noncontact_progress_is_not_paid_on_recontact_and_stationary_contact_pays_zero(self):
+        state, batch, reset = fixture(1)
+        self.regions(state, batch)
+        delta = .2 - batch.center[:, 1, 0]
+        batch.center[:, 1, 0] += delta
+        batch.corners[:, 1, :, 0] += delta[:, None]
+        state.reset(torch.tensor([0]), batch, **reset, step=0)
+        env, count = SimpleNamespace(step_dt=state.dt), batch.center.new_zeros(1)
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=count):
+            batch.center[:, 1, 0] += .01
+            batch.corners[:, 1, :, 0] += .01
+            state.advance(batch, 1)
+            torch.testing.assert_close(rewards.clearance_contact_progress(env), torch.zeros_like(count))
+            torch.testing.assert_close(rewards.blocker_relocation_contact_progress(env, decay=10.), torch.zeros_like(count))
+            count.fill_(2.)
+            state.advance(batch, 2)
+            torch.testing.assert_close(rewards.clearance_contact_progress(env), torch.zeros_like(count))
+            torch.testing.assert_close(rewards.blocker_relocation_contact_progress(env, decay=10.), torch.zeros_like(count))
+            batch.center[:, 1, 0] += .01
+            batch.corners[:, 1, :, 0] += .01
+            state.advance(batch, 3)
+            torch.testing.assert_close(rewards.clearance_contact_progress(env), batch.center.new_tensor([.4]))
+            torch.testing.assert_close(rewards.blocker_relocation_contact_progress(env, decay=10.),
+                batch.center.new_tensor([2. * (math.exp(-.8) - math.exp(-.9))]))
+
+    def test_partial_reset_rebases_only_selected_progress_snapshots(self):
+        state, batch, reset = fixture(4)
+        delta = .2 - batch.center[:, 1, 0]
+        batch.center[:, 1, 0] += delta
+        batch.corners[:, 1, :, 0] += delta[:, None]
+        state.reset(torch.arange(4), batch, **reset, step=0)
+        batch.center[:, 1, 0] += .01
+        batch.corners[:, 1, :, 0] += .01
+        state.advance(batch, 1)
+        ids, others = torch.tensor([3, 1]), torch.tensor([0, 2])
+        names = ('previous_clearance_quality', 'previous_blocker_center', 'clearance_quality', 'blocker_center')
+        saved = {name: getattr(state, name)[others].clone() for name in names}
+        delta = batch.center.new_tensor([.19, .18]) - batch.center[ids, 1, 0]
+        batch.center[ids, 1, 0] += delta
+        batch.corners[ids, 1, :, 0] += delta[:, None]
+        selected = task.TransitionBatch(**{field.name: getattr(batch, field.name)[ids].clone()
+                                           for field in dataclasses.fields(batch)})
+        state.reset(ids, selected, **{name: value[ids] for name, value in reset.items()},
+                    step=1, batch_is_selected=True)
+        torch.testing.assert_close(state.previous_clearance_quality[ids], batch.center.new_zeros(2))
+        torch.testing.assert_close(state.previous_blocker_center[ids], batch.center[ids, 1])
+        for name in names:
+            torch.testing.assert_close(getattr(state, name)[others], saved[name])
+        state.advance(batch, 2)
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=batch.center.new_ones(4)):
+            torch.testing.assert_close(rewards.clearance_contact_progress(SimpleNamespace()), batch.center.new_zeros(4),
+                                       atol=1.e-12, rtol=0)
+
+    def test_invalid_clearance_interval_does_not_create_recovery_payment(self):
+        state, batch, reset = fixture(1)
+        delta = .2 - batch.center[:, 1, 0]
+        batch.center[:, 1, 0] += delta
+        batch.corners[:, 1, :, 0] += delta[:, None]
+        state.reset(torch.tensor([0]), batch, **reset, step=0)
+        invalid = clone_batch(batch)
+        invalid.corners[:, 1] = math.nan
+        state.advance(invalid, 1)
+        batch.center[:, 1, 0] += .01
+        batch.corners[:, 1, :, 0] += .01
+        state.advance(batch, 2)
+        self.assertTrue(torch.isnan(state.previous_clearance_quality).all())
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=batch.center.new_ones(1)):
+            torch.testing.assert_close(rewards.clearance_contact_progress(SimpleNamespace()), batch.center.new_zeros(1))
+            batch.center[:, 1, 0] += .01
+            batch.corners[:, 1, :, 0] += .01
+            state.advance(batch, 3)
+            torch.testing.assert_close(rewards.clearance_contact_progress(SimpleNamespace()), batch.center.new_tensor([.2]))
 
 
 class InitialRelocationRegionTests(unittest.TestCase):
@@ -1152,8 +1406,8 @@ class RewardTests(unittest.TestCase):
             self.assertLess(terms[name][1], 0.)
         # Research weights/decays are experiment parameters. Check the public
         # function wiring and cost signs without freezing one experiment's values.
-        for name, fn in (('clearance', 'clearance'), ('blocker_distance', 'blocker_distance'),
-                         ('blocker_relocation', 'blocker_relocation'),
+        for name, fn in (('clearance', 'clearance_contact_progress'), ('blocker_distance', 'blocker_distance'),
+                         ('blocker_relocation', 'blocker_relocation_contact_progress'),
                          ('blocker_contact_hold', 'BlockerContactHold'),
                          ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
             if name == 'motion_singularity' and name not in terms:
@@ -1164,9 +1418,9 @@ class RewardTests(unittest.TestCase):
         self.assertLess(terms['time_penalty'][1], 0.)
         self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
-        self.assertEqual(terms['clearance'], ('clearance', 12.))
+        self.assertEqual(terms['clearance'], ('clearance_contact_progress', 12.))
         self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', 3.))
-        self.assertEqual(terms['blocker_relocation'], ('blocker_relocation', 3.))
+        self.assertEqual(terms['blocker_relocation'], ('blocker_relocation_contact_progress', 3.))
         self.assertEqual(terms['target_collision'], ('target_collision', -.5))
         self.assertEqual(terms['object_stability'], ('object_stability', .5))
         self.assertNotIn('motion_singularity', terms)
