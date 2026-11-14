@@ -109,7 +109,7 @@ class RewardsCfg:
     blocker_relocation = RewardTermCfg(
         func=mdp.blocker_relocation_contact_progress, weight=3.0, params={"decay": 10.0},
     )
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
+    # blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
