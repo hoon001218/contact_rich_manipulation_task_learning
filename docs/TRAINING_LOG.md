@@ -10577,3 +10577,239 @@ weight와 dt 적용·timeline 재연결 순서를 확인했다. 접촉 집계는
 전체 검사 로그는 `/tmp/contact_progress_symmetric_cpu.log`다. GPU 시뮬레이션·PPO 학습은
 실행하지 않았으며 실제 정책 성능 변화는 측정하지 않았다. 모델·관측·action·PPO와 native
 학습 루프는 변경하지 않았다.
+
+
+## 146. 2026-11-14 — 장면별 seed 분리 방식의 추후 재검토
+
+**상태: 검토 보류, 구현 변경 없음.** 사용자가 play에서 배치 순서가 반복되는 이유를 확인한 뒤,
+현재의 장면별 파생 seed 구조를 추후 수정할 수 있는 내용으로 기록하도록 요청했다.
+전역 RNG로 전환하거나 seed 기본값을 바꾸기로 확정한 것은 아니다.
+
+### 현재 구현과 목적
+
+- Symmetric의 물체 배치는 `_episode_seed(base_seed, 0, scene_generation)`으로 장면 seed를
+  만들고, `SequentialSceneGenerator`의 `random.Random(scene_seed)`에서 종류·위치·yaw·개수
+  등을 선택한다. 저장된 배치 목록을 seed 번호로 조회하는 방식은 아니다.
+- 로봇 초기 자세는 `_episode_seed(base_seed, env_id, reset_count)`로 별도 샘플링한다.
+  부분 reset 순서·횟수와 로봇 자세 탐색의 난수 소비량이 다음 공통 물체 배치를 바꾸지 않도록
+  분리했다. 같은 장면 조건으로 reward 비교나 reset 최적화 전후 검증을 하기 위한 설계다.
+- 현재 train/play는 별도 override가 없으면 공식 runner 기본 seed42를 환경에 적용한다.
+  같은 설정·seed로 새 실행을 시작하면 같은 배치 순서가 재현되지만, 한 실행 안에서 계속
+  같은 배치만 생성한다는 뜻은 아니다. `--seed -1`은 실행 시 seed를 새로 선택하며,
+  train은 선택된 seed를 `params/env.yaml`과 `params/agent.yaml`에 저장한다.
+- 현재 새 공통 배치는 시뮬레이션8초마다 생성하고, 그 전에 종료된 환경은 기존 배치를
+  복원하며 로봇 자세만 다시 샘플링한다. 이 배치 재사용 주기와 seed 고정은 별개의 설정이다.
+- 새 환경을 만드는 현재 resume 경로는 모델·optimizer·iteration은 복원하지만 장면 번호와
+  reset 횟수는 복원하지 않는다. 동일 seed를 사용하면 물체 배치열은 처음부터 다시 시작한다.
+
+### 예제와의 차이와 검토 후보
+
+`examples/Sweeping-Policy-DRL-Sim-Train`의 `mdp/events.py`는 전역 Python `choice`·`shuffle`과
+Torch `uniform_`·`random_yaw_orientation`을 사용한다. Isaac Lab이 초기화 시 전역 seed를
+설정하므로 예제 역시 seed 영향을 받지만, 장면마다 별도 파생 seed로 RNG를 만드는 구조는
+아니다. 전역 방식에서는 reset 및 다른 연산의 난수 호출 순서·횟수가 이후 샘플에 영향을 줄 수 있다.
+
+현재 독립 RNG는 재현성을 위한 추가 구현이며, Target·Blocker 가림과 재배치 공간 등의
+기하학적 생성 규칙이 요구하는 필수 조건은 아니다. 추후에는 다음을 검토할 수 있다.
+
+- 예제처럼 초기 seed 설정 후 전역 난수열을 계속 소비하는 방식으로 단순화할지.
+- 고정 seed와 실행마다 자동 선택하는 seed를 학습·play·비교 평가에서 어떻게 사용할지.
+- resume에서 장면 진행·난수 상태를 복원할 필요가 있는지. 이는 seed 선택과 별도로 판단한다.
+- 변경 시 생성 규칙·역할 및 yaw 분포·공유 장면/부분 reset 동작과 재현성에 미치는 영향.
+
+이번에는 위 논의와 보류 상태만 문서에 남겼다. 실행 코드·학습 설정을 수정하거나
+시뮬레이션·학습을 실행하지 않았다.
+
+## 147. 2026-11-14 — E checkpoint 실제 재생으로 관절 속도 종료 확인
+
+사용자 요청에 따라 E의 `2026-11-11_11-41-47/model_76500.pt`를 실제 GPU에서
+결정론적 inference로 재생했다. Seed42, physics100Hz, policy50Hz, decimation2이며,
+보상·제어·종료 기준은 변경하지 않았다. Native play에 공식 `RecorderTerm.record_post_step`
+hook을 추가해 **termination 계산 후, 자동 reset 전**의 속도와 원인을 기록했다.
+이는 이전 TensorBoard의 rollout별 최대 속도 통계와 다른, 정확한 종료 transition 기록이다.
+
+- 1환경 ×1,600step: 4장면, 완료 episode10개. 속도 종료4건은 wrist3 단독3건,
+  wrist1 단독1건이었다. wrist3 종료 시각은0.80/1.60/1.64초, 속도는
+  −1.0922/−1.1345/−1.0095rad/s였다. 마지막 사례는 reset 후 두 번째 step이다.
+- 16환경 ×1,600step 추가 재생:25,600transition, 4공통 장면, 완료 episode165개.
+  속도 종료63건 중 wrist3가 초과한 경우41건(65.1%, 단독39), wrist1이10건,
+  wrist2가6건, shoulder pan이5건, shoulder lift와 elbow가 각각2건이다.
+  복수 관절 초과3건이 있으므로 관절별 건수는 중복 포함이다. Native 종료 flag와
+  직접 계산한 `abs(qdot)>1rad/s` mask는 모든 transition에서 일치했다.
+- 실제 영상에서 첫 두 wrist3 종료는 물체를 밀어 기울이는 중이었다. 당시 wrist3의
+  기록상 누적 관절 이동은 각각 약6.04°/6.15°였다. 큰 손목 회전을 완료한 뒤의
+  종료가 아니었다. 새 episode 두 번째 step에는 tactile 신호 없이 wrist3로 종료됐다.
+- 추가로 16환경 재생의 **모든 step·모든 손가락6채널 명령이 하한에 포화**됐다.
+  Gaussian 평균을 사용한 raw hand action 범위는 −341.262~−116.505였다.
+  Native hand action은 `raw×0.5 → clip[-1,1] → joint limits`이므로, 목표는
+  매번 각 관절 하한이다. 이는 실제 측정 관절각이 항상 하한이라는 뜻은 아니다.
+  기존의 큰 탐색 표준편차뿐 아니라, 결정론적 정책 평균도 유효 입력 구간 밖이었다.
+
+`wrist3`가 실제 종료의 주요 관절이라는 점과 손가락 명령 포화는 확인했다.
+다만 이 재생만으로 "해당 종료 조건 때문에 손목 회전을 회피하도록 학습했다"는
+인과관계를 확정하지 않는다. 종료 기준을 바꾼 비교 학습과 구분해야 한다.
+이번에는 진단만 수행했으며 학습은 실행하지 않았다. 두 재생 프로세스 모두 정상 종료했다.
+
+결과는 `logs/diagnostics/wrist_velocity_play_2026-11-14/` 아래 `E_76500`과
+`E_76500_16env`에 저장했다. 각 폴더의 `analysis.json`/`transitions.jsonl`이
+수치 근거이며, 1환경의 `annotated_play.mp4`에는 실측6관절 속도·초과 관절·종료 원인과
+손가락 명령 포화를 표시했다. 속도 종료4회의 영상 프레임은 별도로 저장한 실제
+reset 직전 이미지로 대체했다. 영상은 step1–1599이며, 마지막1600step의 timeout은
+JSONL에만 기록되어 있다.
+
+## 148. 2026-11-14 — 센서 정면축 토크와 wrist3 회전 응답 영상
+
+사용자가 손목 회전 억제 가설을 단정하지 않고, OSC 정면축 torque를 단계적으로 높였을 때
+실제 wrist3 속도를 확인하도록 요청했다. 기존 `tests/probe_ft_compensation.py`에
+`--osc-torque-staircase` 모드를 추가했다. Production UR5e·F/T·Hand와
+`SensorFrameWrenchAction`/공식 OSC/IdealPD를 그대로 사용하며 학습 policy는 사용하지 않는다.
+Jacobian의 wrist3 각운동축을 sensor frame으로 변환한 값은
+`[4.17e-7, -2.38e-7, 0.9999995]`로, 센서 +Z와 정렬·부호가 일치했다.
+
+### 시험 조건과 기록
+
+- 비접촉, 중력 ON·OSC 자중 보상 ON, 내부 F/T 오차 feedback OFF, nullspace OFF.
+  다른 관절 고정이나 진단용 자세 PD를 추가하지 않았다. 센서 Tz만 입력하고 나머지5축은0이다.
+- 같은 초기 자세·zero qdot에서0과±0.001/0.002/0.005/0.01/0.02/0.05/0.1N·m의
+  총15개 독립 시행을 실행했다. 초기 자세는 기존 조립 로봇 밀기 시험과 같은 wrist3 roll을 썼다.
+  각 시행은0.4초 무명령 →0.8초 일정 토크 →0.3초 무명령이다.
+  초기 상태는 **시행 사이에만** 복원하며, 시행 중 상태 덮어쓰기는 없다.
+- Physics100Hz, command50Hz, video25fps. 학습의1rad/s 종료는 실행하지 않고 참고선으로
+  표시했다. 별도4rad/s guard를 넘으면 해당 시행만 끝냈다. 높은 토크 시행은0.8초를
+  완주하지 않으므로 마지막 속도·각도를 같은 적용 시간의 값으로 비교하면 안 된다.
+  Report에는 실제 토크 적용 시간·hold 완주 여부·guard 사유가 함께 들어 있다.
+- 영상은 전체 로봇과 회전축 방향 확대 화면, 실제 sensor frame gizmo, Tz 명령,
+  wrist3 실제 속도·회전각, raw/submitted 관절 토크,6관절 속도 bar와 그래프를 표시한다.
+  표시용 gizmo에는 물리 schema가 없다. 카메라를 손의 회전과 함께 회전시키지 않았다.
+
+### 실제 측정
+
+0.001/0.002/0.005N·m 양의 명령을0.8초 입력한 직후 wrist3 속도는 각각
+0.4550/0.9103/2.2692rad/s, 초기 대비 각도는10.61°/21.22°/52.98°였다.
+음의 명령은 각각−0.4627/−0.9204/−2.2843rad/s로 방향 대칭성이 확인됐다.
+
+| Tz 크기(N·m) | 명령 시작 후 wrist3의1rad/s 초과 시점(양·음 동일 표본) |
+|---|---:|
+|0.001/0.002|0.8초 명령 동안 초과하지 않음|
+|0.005|0.35초|
+|0.01|0.18초|
+|0.02|0.09초|
+|0.05|0.04초|
+|0.1|0.02초|
+
+무명령 시행의 최대 wrist3 속도는0.00405rad/s였다. 본 시험에서 다른5개 arm 관절의
+최대 속도는0.1951rad/s였고 tactile force는 전부0이었다. 입력을 높였을 때 주로 wrist3가
+가속했고,0.01N·m 이상8개 시행은4rad/s guard로 조기 종료됐다. 이는 torque 입력에 대한
+응답이며 특정 각속도를 목표로 유지하는 제어가 아니다.0 torque도 즉시 정지를 명령하지 않는다.
+15개 시행의 첫 physics 표본 q/qdot는 동일했고, 모든6관절 raw OSC와 actuator 제출 토크의
+차이는0이었다. 이번 범위에서 effort clipping이 회전 응답을 제한하지는 않았다.
+센서 Tz 명령과 관절 raw/submitted torque는 기준과 자중 보상 때문에 같을 필요가 없다.
+특히 회전 후 관절 토크의 부호가 명령과 달라도 그 자체가 잘못된 동작을 뜻하지 않는다.
+
+최종15개 시행은1,624physics 표본으로 정상 수집했다. 양·음 pulse 경계와 다른 축0 입력,
+구문 검사 및 `git diff --check`를 확인했다. 영상의 실제 회전·수치·gizmo·guard 표시도
+CPU 프레임 검토로 대조했다. Guard 순간 이미지를 누락하지 않도록 추가로 저장한 프레임이
+있어 영상411프레임(16.44초)과 실제 시뮬레이션16.24초는 조금 다르며, 화면의 실제 sample
+timestamp를 기준으로 해석한다. 학습 설정·reward·termination·production controller는 변경하지 않았다.
+
+- 영상: `docs/videos/osc_torque_staircase_2026-11-14/torque_staircase.mp4`
+- 그래프: 같은 폴더의 `torque_staircase_trajectory.png`
+- 원자료: `logs/diagnostics/osc_torque_staircase_2026-11-14/final/report.json`
+  (정확한 frame→sample index 포함), 후처리 전 영상은 같은 폴더의 `scene.mp4`.
+- 예비 실행: `logs/diagnostics/osc_torque_staircase_2026-11-14/pilot/report.json`.
+
+재실행 명령:
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-torque-staircase --headless --device cuda:0 --max-arm-speed 4
+```
+
+## 149. 2026-11-14 — 센서 6축 wrench 입력과 UR5e 전체 관절 속도 검증
+
+정면축 Tz뿐 아니라 다른 torque와 force 축도 확인해 달라는 요청으로 기존 진단에
+`--osc-wrench-sweep`를 추가했다. 사용자 정정에 따라 **속도 분석·영상 표시는 UR5e 6관절만**
+대상으로 한다. Hand는 실제 조립 상태로 유지하고 열린 목표 자세를 고정한다.
+Production OSC·actuator·학습 설정·reward·termination은 변경하지 않았다.
+
+### 시험 조건
+
+- Production symmetric UR5e·F/T·Hand와 `SensorFrameWrenchAction`/공식 OSC/IdealPD를 사용한다.
+  학습 policy 없이 센서 frame 한 축만 입력한다. 중력과 OSC 자중 보상은 ON,
+  내부 wrench 오차 feedback·motion PD·nullspace는 OFF다. 다른 팔 관절을 고정하지 않았다.
+- Force Fx/Fy/Fz 각각 0 및 ±0.1/0.5/1/2/5/10N, torque Tx/Ty/Tz 각각
+  0 및 ±0.001/0.005/0.01/0.05/0.1/0.5/1N·m로 **총 84개 독립 시행**을 실행했다.
+  SI 입력을 native action scale로 나눠 전달하며 다른 5축은 정확히 0이다.
+- 시행마다 동일한 elbow-up 자세·zero qdot에서 0.4초 무명령, 0.8초 일정 명령,
+  0.3초 무명령을 준다. Physics 100Hz, command 50Hz, video 25fps다.
+  상태 복원은 시행 사이에만 한다. 외부 물체는 없으며 표준 ground와 self collision은 유지한다.
+- 학습의 1rad/s 종료는 실행하지 않고 영상 참고선으로 표시한다. 별도 진단 guard로
+  팔 관절 하나라도 4rad/s 초과 또는 센서의 초기 대비 변위 0.25m 초과 시 해당 시행만 끝낸다.
+  **35개 시행이 조기 종료**됐으므로 아래 최대값은 같은 지속시간의 정상상태 응답이나 gain이 아니다.
+  Guard는 속도 clamp가 아니므로 한 physics step에서 4rad/s를 넘을 수 있다.
+
+### 실제 측정 결과
+
+84개 시행에서 총 **10,007 physics 표본**을 수집했다. 영상은 각 축 명령·단위,
+UR5e 6관절 실측 속도와 bar/곡선, 센서 frame gizmo, 전체 로봇 및 추적 확대 화면을 함께 표시한다.
+전체 표본의 q/qdot·raw/submitted effort는 유한했고, native 속도 상한 초과는 없었다.
+
+| UR5e 관절 | 시험 전체 최대 절대 속도(rad/s) | Native 속도 상한(rad/s) |
+|---|---:|---:|
+| shoulder_pan | 0.4401 | 3.14 |
+| shoulder_lift | 0.7475 | 3.14 |
+| elbow | 2.3939 | 3.14 |
+| wrist_1 | 4.1021 | 6.28 |
+| wrist_2 | 3.5414 | 6.28 |
+| wrist_3 | 5.3921 | 6.28 |
+
+| 센서 입력축 | pan | lift | elbow | wrist_1 | wrist_2 | wrist_3 |
+|---|---:|---:|---:|---:|---:|---:|
+| Fx | 0.336 | 0.101 | 0.193 | 1.024 | 2.027 | 4.169 |
+| Fy | 0.239 | 0.251 | 2.394 | 4.031 | 1.011 | 2.267 |
+| Fz | 0.214 | 0.747 | 0.872 | 4.054 | 0.127 | 0.766 |
+| Tx | 0.107 | 0.335 | 0.789 | 4.102 | 0.493 | 1.075 |
+| Ty | 0.440 | 0.120 | 0.189 | 1.844 | 3.541 | 4.314 |
+| Tz | 0.002 | 0.005 | 0.009 | 0.121 | 0.257 | 5.392 |
+
+표의 값은 각 입력축의 모든 부호·시험 강도·release를 포함한 최대 절대 속도(rad/s)다.
+Force와 torque는 단위·시험 범위가 다르므로 축 사이의 응답 gain 비교에는 사용하지 않는다.
+
+현재 초기 자세에서는 Fx·Ty 입력으로도 wrist3가 크게 움직였다. Fx±1N은 양방향 모두
+명령 후 0.27초, Ty±0.1N·m는 0.37/0.36초에 wrist3가 1rad/s를 초과했다.
+Tz±0.01N·m는 0.18초였다. 이는 특정 자세의 응답이며, 학습 policy가 회전을 피하는
+원인이나 실기에서도 같은 속도가 발생한다는 것을 증명하지 않는다.
+
+첫 명령 step을 같은 축의 무명령 시험과도 비교했다. 명령 직전 q/qdot는 완전히 같고,
+raw/submitted effort 차이도 없다. Fx+1N과 Ty+0.1N·m에서 추가 wrist3 직접 토크는
+각각 약 −9e−8/−1e−8N·m지만, 10ms 구간의 속도 증가분 차이를 시간으로 나눈 값은
+약 +3.760/+2.756rad/s²였다. Tz+0.01N·m는 추가 wrist3 토크 +0.01N·m,
+같은 지표 +5.734rad/s²였다. **wrist3 속도 증가를 큰 Tz 명령만으로 설명할 수 없는**
+결합 응답을 실측에서도 확인했다. 이 지표는 이산 10ms 구간의 속도 차이이며 순간 가속도가 아니다.
+
+### 검증과 결과물
+
+CPU 독립 재집계와 원래 summary의 차이는 0건이었다. 84개 시행의 첫 q/qdot 일치,
+단일 축 입력, SI 명령 대응, 전체 표본의 유한성을 확인했다. Raw/submitted effort 차이는
+0이며 이번 범위에서 effort clipping은 발생하지 않았다. Tactile force도 전부 0이었지만,
+이것이 팔의 self contact나 ground 접촉까지 없다는 것을 증명하지는 않는다.
+6축·두 guard의 대표 프레임을 실제 값과 대조했고, Hand 속도가 표시에 포함되지 않음도 확인했다.
+큰 이동에서는 고정 overview에서 손끝 일부가 벗어나지만 추적 close-up은 유지된다.
+작은 torque는 공통 그래프 축에서 평평하게 보이므로 함께 표시된 수치를 참고한다.
+
+- 영상: `docs/videos/osc_wrench_sweep_2026-11-14/wrench_sweep.mp4`
+- 6축×6관절 heatmap: 같은 폴더 `axis_joint_max_speeds.png`
+- 전체 시간 파형: 같은 폴더 `wrench_sweep_ur5e_joint_velocities.png`
+- 원자료: `logs/diagnostics/osc_wrench_sweep_2026-11-14/final/report.json`
+- 전체 표본 CSV: 같은 폴더 `ur5e_velocities.csv`, 시행별 집계 `ur5e_velocity_summary.csv`
+- 독립 검증: 같은 폴더 `independent_analysis.json`, 결합 확인 `first_step_coupling.json`
+
+영상은 guard 순간의 추가 frame을 포함해 2530frame/101.20초, 실제 물리 수집은 100.07초다.
+정확한 시간은 표시된 sample timestamp를 사용한다. 예비 42개·최종 84개 시행 모두 정상 종료했다.
+구문 검사와 `git diff --check`도 수행했다. 추가 학습은 실행하지 않았다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-wrench-sweep --headless --device cuda:0 --max-arm-speed 4 \
+  --force-levels .1 .5 1 2 5 10 --torque-levels .001 .005 .01 .05 .1 .5 1
+```

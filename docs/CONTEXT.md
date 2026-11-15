@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-11-11, Asia/Seoul**.
+최종 갱신: **2026-11-14, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,7 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-11-11
+## 최신 진입점 — 2026-11-14
 
 사용자 지정 메인 개발·학습 대상은 **`src/contact_manipulation_symmetric`**,
 task는 **`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`**다. Actor와 Critic이 같은 관측을
@@ -18,6 +18,14 @@ task는 **`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`**다. Actor와 Critic�
 비교 대상으로 보존하고, `contact_manipulation_parallel`은 별도의 MLP 실험으로 구분한다.
 현재 구현은 [Symmetric README](../src/contact_manipulation_symmetric/README.md),
 생성·동기화·손 설정 이력은 **[TRAINING_LOG.md](TRAINING_LOG.md) 108–111절**을 먼저 읽는다.
+
+**2026-11-14 보류 검토: 장면별 seed 분리 방식은 추후 수정할 수 있다.** 현재 물체 배치는
+기본 seed·장면 번호에서 파생한 독립 RNG, 로봇 자세는 기본 seed·환경 번호·reset 횟수에서
+파생한 RNG를 사용한다. 이는 reset 순서와 난수 소비량이 바뀌어도 배치를 재현하려는 설계이며,
+새 생성 규칙의 필수 조건은 아니다. 예제처럼 전역 난수열을 사용하는 방식으로 단순화할지,
+고정/자동 seed 선택 및 resume 시 장면 진행 복원을 어떻게 다룰지는 미정이다. 현재 동작을
+유지하고 추후 검토할 항목으로 기록한다. 기본 seed42·반복 배치 순서·예제와의 차이는
+**[TRAINING_LOG.md](TRAINING_LOG.md) 146절**을 따른다.
 
 **2026-11-11 최신 reward 변경은145절이다.** Symmetric의 기존 clearance·relocation
 함수는 그대로 보존하고 cfg의 기존 선언을 주석으로 남겼다. 활성 두 term은

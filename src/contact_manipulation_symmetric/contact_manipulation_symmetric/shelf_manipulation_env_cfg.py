@@ -167,7 +167,7 @@ class TerminationsCfg:
 
 
 class ShelfManipulationEnvWindow(ManagerBasedRLEnvWindow):
-    """Extend the native debug panel with OBB toggles and sensor monitoring."""
+    """Extend the native debug panel with geometry toggles and sensor monitoring."""
 
     def __init__(self, env, window_name="IsaacLab"):
         import omni.ui as ui
@@ -178,6 +178,8 @@ class ShelfManipulationEnvWindow(ManagerBasedRLEnvWindow):
                 with self.ui_window_elements["debug_vstack"]:
                     self._create_debug_vis_ui_element("Target / Blocker OBB", env._role_obb_visualizer)
                     self._create_debug_vis_ui_element("Observed objects OBB", env._observation_obb_visualizer)
+                    self._create_debug_vis_ui_element("Access region (yellow)", env._access_region_visualizer)
+                    self._create_debug_vis_ui_element("Relocation regions (purple)", env._relocation_region_visualizer)
                     self._create_debug_vis_ui_element("Tactile / F/T monitor", env._sensor_monitor)
                     frame = ui.Frame(width=ui.Fraction(1), height=0, visible=env._sensor_monitor.debug_vis)
                     self.ui_window_elements["sensor_monitor_panel"] = frame
@@ -222,6 +224,8 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     blocker_asset: str | None = None
     role_obb_debug_vis: bool = True
     observation_obb_debug_vis: bool = True
+    access_region_debug_vis: bool = False
+    relocation_region_debug_vis: bool = False
     sensor_monitor_debug_vis: bool = False
     # Training-only TensorBoard diagnostics; uses the native runner's writer.
     tensorboard_sensor_monitor: bool = True

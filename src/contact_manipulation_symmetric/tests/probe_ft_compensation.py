@@ -26,6 +26,12 @@ within a case every contact and displacement comes from actual PhysX dynamics.
 Add --osc-push for a supported 300 g box pushed by the assembled robot's actual
 production wrench OSC. Only initial states are written: no hand guide, external
 body force, or pose replacement drives either the hand or the box.
+
+Add --osc-torque-staircase for independent sensor +Z torque trials. Each level
+starts from the same pose at rest; all six arm joints remain torque controlled.
+The training overspeed threshold is displayed, not used to reset the trial.
+Add --osc-wrench-sweep to repeat the same independent trials for every sensor
+force/torque axis and compare all six UR5e joint velocities.
 """
 
 from __future__ import annotations
@@ -65,6 +71,18 @@ def parse_args():
     parser.add_argument("--max-arm-speed", type=float, default=2., help="Diagnostic stop threshold in rad/s.")
     parser.add_argument("--tactile-scan", action="store_true", help="Record real contact / release on all 17 tactile pads.")
     parser.add_argument("--osc-push", action="store_true", help="Push a supported dynamic box with the assembled robot's OSC.")
+    parser.add_argument("--osc-torque-staircase", action="store_true",
+                        help="Compare signed sensor +Z torque levels from the same initial robot state.")
+    parser.add_argument("--osc-wrench-sweep", action="store_true",
+                        help="Compare signed sensor force/torque inputs and all six UR5e velocities.")
+    parser.add_argument("--wrench-axes", nargs="+", choices=("Fx", "Fy", "Fz", "Tx", "Ty", "Tz"),
+                        default=["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"])
+    parser.add_argument("--force-levels", type=float, nargs="+", default=[.1, .5, 1., 2., 5., 10.],
+                        help="Nonnegative force magnitudes in N, applied separately in both directions.")
+    parser.add_argument("--torque-levels", type=float, nargs="+", default=[0., .001, .002, .005, .01, .02, .05, .1],
+                        help="Nonnegative torque magnitudes in N m; positive and negative trials are generated.")
+    parser.add_argument("--torque-hold", "--wrench-hold", type=float, default=.8,
+                        help="Duration of each constant input pulse, in seconds.")
     parser.add_argument("--push-force", type=float, default=1.8, help="Peak scripted horizontal push wrench force, in N.")
     parser.add_argument("--push-hand-fraction", type=float, default=.15, help="Fixed hand position fraction within native limits.")
     parser.add_argument("--push-orientation-kp", type=float, default=.5, help="Diagnostic wrench-generator angular gain, N m/rad.")
@@ -79,8 +97,14 @@ def parse_args():
     args = parser.parse_args()
     if args.video_fps < 1:
         parser.error("--video-fps must be positive.")
-    if args.osc_push and args.tactile_scan:
-        parser.error("--osc-push and --tactile-scan are separate diagnostic modes.")
+    if sum((args.osc_push, args.tactile_scan, args.osc_torque_staircase, args.osc_wrench_sweep)) > 1:
+        parser.error("OSC push, torque staircase, wrench sweep and tactile scan are separate diagnostic modes.")
+    if any(not math.isfinite(value) or not 0 <= value <= 8. for value in args.torque_levels):
+        parser.error("Torque magnitudes must be finite and within [0, 8] N m.")
+    if any(not math.isfinite(value) or not 0 <= value <= 200. for value in args.force_levels):
+        parser.error("Force magnitudes must be finite and within [0, 200] N.")
+    if not math.isfinite(args.torque_hold) or args.torque_hold <= 0:
+        parser.error("--torque-hold must be finite and positive.")
     if not math.isfinite(args.push_force) or not 0 < args.push_force <= 8.:
         parser.error("--push-force must be in (0, 8] N.")
     if not math.isfinite(args.push_hand_fraction) or not 0 <= args.push_hand_fraction <= .5:
@@ -99,12 +123,16 @@ def parse_args():
         parser.error("Wrench amplitudes, frequency and speed threshold must be finite and positive.")
     if not args.no_video:
         args.enable_cameras = True
-    directory = ("osc_hand_push_2026-11-08" if args.osc_push else
+    directory = ("osc_wrench_sweep_2026-11-14" if args.osc_wrench_sweep else
+                 "osc_torque_staircase_2026-11-14" if args.osc_torque_staircase else
+                 "osc_hand_push_2026-11-08" if args.osc_push else
                  "tactile_contact_2026-11-08" if args.tactile_scan else "ft_compensation_2026-11-08")
     if args.output is None:
         args.output = REPOSITORY_ROOT / "logs/diagnostics" / directory / "report.json"
     if args.video_output is None:
-        filename = "osc_push.mp4" if args.osc_push else "all_pads.mp4" if args.tactile_scan else "ft_shake.mp4"
+        filename = ("wrench_sweep.mp4" if args.osc_wrench_sweep else
+                    "torque_staircase.mp4" if args.osc_torque_staircase else
+                    "osc_push.mp4" if args.osc_push else "all_pads.mp4" if args.tactile_scan else "ft_shake.mp4")
         args.video_output = REPOSITORY_ROOT / "docs/videos" / directory / filename
     return args
 
@@ -132,6 +160,92 @@ def motion_command(phase, time, duration, force_amplitude, torque_amplitude, fre
         envelope = smooth_step(time / .6) * smooth_step((duration - time) / .6)
         hand_fraction = .45 * envelope * .5 * (1. - math.cos(2. * math.pi * .4 * time))
     return wrench, hand_fraction
+
+
+def torque_trial_command(time, level, hold):
+    """An exact step pulse, with baseline/release and no motion feedback added."""
+    baseline = .4
+    stage = "baseline" if time < baseline - 1.e-9 else "torque" if time < baseline + hold - 1.e-9 else "release"
+    return ([0.] * 5 + [level if stage == "torque" else 0.]), stage
+
+
+def summarize_wrench_trials(samples, metadata, dt):
+    """Offline per-axis response; only the six UR5e joints are evaluated."""
+    import numpy as np
+
+    result = []
+    names = metadata["arm_joint_names"]
+    limits = np.asarray(metadata["arm_joint_velocity_limits_rad_s"])
+    reference = metadata["trained_velocity_threshold_rad_s"]
+    for index, trial in enumerate(metadata["wrench_trials"]):
+        rows = [sample for sample in samples if sample["trial_index"] == index]
+        if not rows:
+            continue
+        velocities = np.asarray([sample["arm_joint_velocity_rad_s"] for sample in rows])
+        times = np.asarray([sample["trial_time_s"] for sample in rows])
+        active = np.asarray([sample["trial_stage"] == "command" for sample in rows])
+        active_rows = np.flatnonzero(active)
+        baseline_rows = np.flatnonzero(times <= .4 + 1.e-9)
+        raw = np.asarray([sample["osc_raw_joint_effort_Nm"] for sample in rows])
+        applied = np.asarray([sample["arm_applied_joint_effort_Nm"] for sample in rows])
+        joints = {}
+        for column, name in enumerate(names):
+            values = velocities[:, column]
+            above = np.flatnonzero(np.abs(values) > reference)
+            joints[name] = {
+                "speed_min_rad_s": float(values.min()), "speed_max_rad_s": float(values.max()),
+                "speed_max_abs_rad_s": float(np.abs(values).max()),
+                "rms_rad_s": float(np.sqrt(np.mean(values**2))),
+                "native_velocity_limit_rad_s": float(limits[column]),
+                "samples_over_native_limit": int((np.abs(values) > limits[column] + 1.e-5).sum()),
+                "samples_over_training_reference": int(len(above)),
+                "first_over_training_reference_after_onset_s": float(times[above[0]] - .4) if len(above) else None,
+                "speed_on_first_command_step_rad_s": float(values[active_rows[0]]) if len(active_rows) else None,
+                "initial_acceleration_estimate_rad_s2": float((values[active_rows[0]] - values[baseline_rows[-1]]) / dt)
+                    if len(active_rows) and len(baseline_rows) else None,
+                "peak_raw_osc_effort_Nm": float(np.abs(raw[:, column]).max()),
+                "peak_applied_effort_Nm": float(np.abs(applied[:, column]).max()),
+                "max_raw_applied_difference_Nm": float(np.abs(raw[:, column] - applied[:, column]).max()),
+            }
+        peak_column = int(np.abs(velocities).max(0).argmax())
+        result.append({
+            "trial_index": index, "axis": ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")[trial["axis"]],
+            "level": trial["level"], "unit": "N" if trial["axis"] < 3 else "N m", "samples": len(rows),
+            "applied_input_duration_s": int(active.sum()) * dt,
+            "completed_full_hold": int(active.sum()) >= round(metadata["trial_timing"]["torque_hold_s"] / dt),
+            "maximum_speed_joint": names[peak_column],
+            "maximum_speed_rad_s": joints[names[peak_column]]["speed_max_abs_rad_s"],
+            "maximum_sensor_displacement_m": max(float(np.linalg.norm(s["sensor_displacement_w_m"])) for s in rows),
+            "minimum_body_origin_height_m": min(s["minimum_body_origin_height_m"] for s in rows),
+            "maximum_tactile_force_N": max(s["max_tactile_normal_force_N"] for s in rows),
+            "all_arm_states_finite": bool(np.isfinite(velocities).all() and
+                np.isfinite([s["arm_joint_position_rad"] for s in rows]).all()),
+            "joints": joints,
+        })
+    return result
+
+
+def write_wrench_velocity_csv(directory, samples, metadata, summaries):
+    """Keep every physics sample and per-trial/joint limits reviewable in CSV."""
+    import csv
+
+    names = metadata["arm_joint_names"]
+    with (directory / "ur5e_velocities.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["trial", "axis", "level", "time_s", "trial_time_s", "stage",
+                         *[f"{name}_rad_s" for name in names]])
+        for sample in samples:
+            writer.writerow([sample["trial_index"], ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")[sample["trial_axis"]],
+                             sample["trial_level"], sample["time_s"], sample["trial_time_s"], sample["trial_stage"],
+                             *sample["arm_joint_velocity_rad_s"]])
+    with (directory / "ur5e_velocity_summary.csv").open("w", newline="") as stream:
+        fields = list(summaries[0]["joints"][names[0]]) if summaries else []
+        writer = csv.writer(stream)
+        writer.writerow(["trial", "axis", "level", "unit", "joint", *fields])
+        for trial in summaries:
+            for name, values in trial["joints"].items():
+                writer.writerow([trial["trial_index"], trial["axis"], trial["level"], trial["unit"], name,
+                                 *[values[key] for key in fields]])
 
 
 def _phase_statistics(samples, phases=PHASES):
@@ -301,6 +415,436 @@ def encode_overlay(scene_video, output, samples, sample_indices, fps, metadata):
         writer.close()
 
 
+def encode_torque_overlay(scene_video, output, samples, sample_indices, fps, metadata):
+    """Render measured velocities/angles alongside the commanded sensor Tz.
+
+    ``sample_indices`` is the acquisition-time mapping of each rendered frame
+    to its exact post-physics sample. Every trial starts from its own reset;
+    plots display only the current trial and never connect different resets.
+    The training velocity threshold is a reference line, not an assertion
+    that this independent diagnostic automatically terminates there.
+    """
+    import math
+    import os
+    from pathlib import Path
+    import imageio.v2 as imageio
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if len(samples) == 0 or len(sample_indices) == 0:
+        raise ValueError('Torque overlay requires acquired samples and video/sample associations.')
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError('Video FPS must be finite and positive.')
+    names = list(metadata.get('arm_joint_names', (
+        'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+        'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint')))
+    if len(names) != 6:
+        raise ValueError('Expected exactly six ordered arm_joint_names.')
+    wrist = next((i for i, name in enumerate(names) if name == 'wrist_3_joint'), 5)
+    reference = float(metadata.get('trained_velocity_threshold_rad_s', 1.0))
+    if not math.isfinite(reference) or reference <= 0:
+        raise ValueError('Training velocity reference must be finite and positive.')
+    qd = np.asarray([s['arm_joint_velocity_rad_s'] for s in samples], dtype=float)
+    command = np.asarray([s['wrench_command'][5] for s in samples], dtype=float)
+    angle = np.rad2deg(np.asarray([s['wrist3_delta_rad'] for s in samples], dtype=float))
+    trial_time = np.asarray([s['trial_time_s'] for s in samples], dtype=float)
+    time = np.asarray([s['time_s'] for s in samples], dtype=float)
+    if qd.shape != (len(samples), 6):
+        raise ValueError('Expected six measured arm velocities at every sample.')
+    trial_ids = [s['trial_index'] for s in samples]
+    trial_order = list(dict.fromkeys(trial_ids))
+    trial_rows = {key: np.asarray([i for i, value in enumerate(trial_ids) if value == key])
+                  for key in trial_order}
+    trials_count = len(metadata.get('torque_trials_Nm', [])) or len(trial_order)
+    index_lookup = {key: n + 1 for n, key in enumerate(trial_order)}
+
+    def finite_max(values, fallback):
+        finite = np.abs(np.asarray(values))[np.isfinite(values)]
+        return max(float(finite.max()) if finite.size else 0., fallback)
+
+    command_limit = finite_max(command, .02) * 1.1
+    speed_limit = finite_max(qd[:, wrist], reference * 1.12) * 1.08
+    bar_limit = max(2 * reference, min(finite_max(qd, 2 * reference), 5 * reference))
+    trial_duration = {key: max(.1, float(np.nanmax(trial_time[rows]))) for key, rows in trial_rows.items()}
+    angle_limits = {}
+    for key, rows in trial_rows.items():
+        finite = angle[rows][np.isfinite(angle[rows])]
+        low = min(float(finite.min()) if finite.size else 0., 0.)
+        high = max(float(finite.max()) if finite.size else 0., 0.)
+        span = max(high - low, 10.)
+        angle_limits[key] = (low - .12 * span, max(high + .12 * span, low + 10.))
+
+    def load_font(size):
+        for face in ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 'DejaVuSans.ttf'):
+            try:
+                return ImageFont.truetype(face, size)
+            except OSError:
+                pass
+        return ImageFont.load_default()
+
+    title_font, font, small, tiny = (load_font(n) for n in (23, 19, 16, 13))
+    background = (18, 23, 32)
+    white, muted = (240, 245, 250), (174, 191, 211)
+    violet, teal, blue = (204, 150, 255), (83, 226, 178), (117, 183, 255)
+    red, yellow = (255, 91, 100), (255, 214, 128)
+    canvas_size = (1280, 1088)
+
+    def dashed_horizontal(draw, x0, x1, y, color, width=1):
+        for left in range(int(x0), int(x1), 10):
+            draw.line((left, y, min(left + 6, x1), y), fill=color, width=width)
+
+    def plot(draw, box, title, xvalues, yvalues, xend, yrange, color, *, thresholds=(), current=None):
+        left, top, width, height = box
+        draw.rounded_rectangle((left, top, left + width, top + height), radius=8, fill=(26, 34, 46))
+        draw.text((left + 12, top + 9), title, font=font, fill=white)
+        if current is not None:
+            draw.text((left + 12, top + 37), current, font=small, fill=color)
+        x0, x1 = left + 57, left + width - 14
+        y0, y1 = top + 78, top + height - 31
+        low, high = yrange
+        def yy(value):
+            return y1 - (float(value) - low) / (high - low) * (y1 - y0)
+        draw.line((x0, y0, x0, y1), fill=(100, 113, 132))
+        draw.line((x0, y1, x1, y1), fill=(100, 113, 132))
+        if low <= 0 <= high:
+            draw.line((x0, yy(0.), x1, yy(0.)), fill=(70, 82, 99))
+        for threshold in thresholds:
+            if low <= threshold <= high:
+                dashed_horizontal(draw, x0, x1, yy(threshold), yellow)
+                draw.text((x0 + 5, yy(threshold) - 17), f'{threshold:+.1f}', font=tiny, fill=yellow)
+        draw.text((left + 4, y0 - 6), f'{high:.2g}', font=tiny, fill=muted)
+        draw.text((left + 4, y1 - 8), f'{low:.2g}', font=tiny, fill=muted)
+        finite = np.isfinite(xvalues) & np.isfinite(yvalues)
+        points = [(float(x0 + t / xend * (x1 - x0)), float(yy(v)))
+                  for t, v in zip(xvalues[finite], yvalues[finite])]
+        if len(points) > 1:
+            draw.line(points, fill=color, width=3)
+        if points:
+            x, y = points[-1]
+            draw.ellipse((x-3, y-3, x+3, y+3), fill=color)
+        draw.text((x0, y1 + 8), '0 s', font=tiny, fill=muted)
+        draw.text((x1 - 40, y1 + 8), f'{xend:.1f}s', font=tiny, fill=muted)
+
+    reader = imageio.get_reader(str(scene_video))
+    writer = imageio.get_writer(str(output), fps=fps, codec='libx264', quality=8,
+                               macro_block_size=None,
+                               ffmpeg_params=['-movflags', '+faststart', '-threads', '2'])
+    frame_count = 0
+    try:
+        for frame_index, frame in enumerate(reader):
+            if frame_index >= len(sample_indices):
+                raise ValueError('Video has more frames than recorded sample associations.')
+            sample_index = int(sample_indices[frame_index])
+            if not 0 <= sample_index < len(samples):
+                raise IndexError(f'Frame {frame_index} has invalid sample index {sample_index}.')
+            sample = samples[sample_index]
+            trial = sample['trial_index']
+            rows = trial_rows[trial]
+            history = rows[rows <= sample_index]
+            stage = str(sample['trial_stage'])
+            speed = float(qd[sample_index, wrist])
+            measured_over = abs(speed) > reference
+            current_color = red if measured_over else teal
+            canvas = Image.new('RGB', canvas_size, background)
+            scene = Image.fromarray(frame[..., :3]).convert('RGB')
+            if scene.size != (1280, 400):
+                # Preserve camera aspect ratio if a temporary probe changes resolution.
+                scene.thumbnail((1280, 400))
+                canvas.paste(scene, ((1280 - scene.width)//2, 100 + (400 - scene.height)//2))
+            else:
+                canvas.paste(scene, (0, 100))
+            draw = ImageDraw.Draw(canvas)
+            draw.text((16, 8), 'UR5e + F/T + Hand | free-space sensor +Z torque step', font=title_font, fill=white)
+            draw.text((16, 40), f'COMMAND Tz  {command[sample_index]:+.4f} N m', font=font, fill=violet)
+            draw.text((460, 40), f'MEASURED wrist_3  {speed:+.4f} rad/s  ({math.degrees(speed):+.1f} deg/s)',
+                      font=font, fill=current_color)
+            draw.text((16, 70), f'Wrist_3 angle from case reset: {angle[sample_index]:+.2f} deg', font=small, fill=blue)
+            draw.text((650, 70), f'Sim time {time[sample_index]:.2f}s | case time {trial_time[sample_index]:.2f}s', font=small, fill=muted)
+            # These are explanatory view labels, with no physical scene geometry.
+            draw.rectangle((8, 108, 190, 131), fill=(18,23,32))
+            draw.text((15, 110), 'Overview', font=small, fill=white)
+            draw.rectangle((648, 108, 1268, 131), fill=(18,23,32))
+            draw.text((655, 110), 'Axial close-up | sensor XYZ = red / green / blue', font=small, fill=white)
+            reset_note = ' | SAME INITIAL q, qdot RESET' if trial_time[sample_index] <= .45 else ''
+            draw.text((16, 509), f"CASE {index_lookup[trial]}/{trials_count} | level {float(sample['trial_torque_Nm']):+.4f} N m | {stage.upper()}{reset_note}",
+                      font=font, fill=yellow if reset_note else white)
+            stopped = any(stop['trial_index'] == trial for stop in metadata.get('trial_stops', []))
+            if stopped and sample_index == rows[-1]:
+                guard = metadata.get('diagnostic_speed_guard_rad_s', float('nan'))
+                draw.text((835, 509), f'TRIAL GUARD STOP > {guard:g} rad/s', font=small, fill=red)
+            raw = float(sample['osc_raw_joint_effort_Nm'][wrist])
+            applied = float(sample['arm_applied_joint_effort_Nm'][wrist])
+            draw.text((16, 538), f'wrist_3 JOINT torque: OSC raw {raw:+.3f} / actuator submitted {applied:+.3f} N m', font=small, fill=muted)
+            axial = float(sample.get('sensor_axial_angular_velocity_rad_s', float('nan')))
+            draw.text((820, 538), f'sensor axial speed {axial:+.3f} rad/s', font=small, fill=muted)
+            x = trial_time[history]
+            duration = trial_duration[trial]
+            plot(draw, (12, 568, 412, 303), 'Sensor Tz COMMAND [N m]', x, command[history], duration,
+                 (-command_limit, command_limit), violet, current=f'{command[sample_index]:+.4f} N m')
+            plot(draw, (434, 568, 412, 303), 'wrist_3 MEASURED [rad/s]', x, qd[history, wrist], duration,
+                 (-speed_limit, speed_limit), teal, thresholds=(-reference, reference),
+                 current=f'{speed:+.4f} rad/s | ref +/-{reference:g}')
+            plot(draw, (856, 568, 412, 303), 'wrist_3 relative angle [deg]', x, angle[history], duration,
+                 angle_limits[trial], blue, current=f'{angle[sample_index]:+.2f} deg from case start')
+            for j, name in enumerate(names):
+                col, row = j % 3, j // 3
+                left, top = 16 + col*423, 889 + row*68
+                value = float(qd[sample_index, j])
+                color = red if abs(value) > reference else teal
+                label = name.removesuffix('_joint')
+                draw.text((left, top), f'{label:<14} {value:+.4f} rad/s', font=small, fill=color)
+                bx, by, width = left, top+29, 394
+                draw.rectangle((bx, by, bx+width, by+9), fill=(47,55,69))
+                amount = min(abs(value)/bar_limit, 1.)
+                draw.rectangle((bx, by, bx+width*amount, by+9), fill=color)
+                line = bx+width*reference/bar_limit
+                draw.line((line,by-3,line,by+12), fill=yellow, width=2)
+            alignment=float(sample.get('axial_alignment',float('nan')))
+            contact=float(sample.get('max_tactile_normal_force_N',float('nan')))
+            draw.text((16, 1029), f'Axial alignment dot {alignment:+.4f} | tactile peak {contact:.3f} N | yellow: training speed reference',font=tiny,fill=muted)
+            draw.text((16, 1051), 'Only case boundaries reset state. Within a case: native wrench OSC / IdealPD; no pose replacement.',font=tiny,fill=muted)
+            draw.text((16, 1070), 'Tz is a command; velocities/angles are measured. Raw/submitted joint torques include gravity compensation.',font=tiny,fill=muted)
+            writer.append_data(np.asarray(canvas))
+            frame_count += 1
+    finally:
+        reader.close()
+        writer.close()
+
+    os.environ.setdefault('MPLCONFIGDIR', '/tmp/contact_osc_torque_matplotlib')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+    colors = ('#318d80', '#5e60ce', '#d17b0f', '#b04177', '#698f3f', '#e63946')
+    for key in trial_order:
+        rows = trial_rows[key]
+        level=float(samples[int(rows[0])]['trial_torque_Nm'])
+        axes[0].plot(time[rows],command[rows],color='#9359c5',lw=1.4)
+        for j,name in enumerate(names):
+            axes[1].plot(time[rows],qd[rows,j],color=colors[j],lw=1.4 if j==wrist else .7,
+                         alpha=1 if j==wrist else .55,label=name.removesuffix('_joint') if key==trial_order[0] else None)
+        axes[2].plot(time[rows],angle[rows],color='#3286bf',lw=1.2)
+        for ax in axes:ax.axvline(time[rows[0]],color='gray',ls=':',lw=.8,alpha=.6)
+        axes[0].annotate(f'case {index_lookup[key]}\n{level:+g} N m',(time[rows[0]],level),
+                         xytext=(3,7),textcoords='offset points',fontsize=8)
+    axes[0].set_ylabel('Command sensor Tz [N m]')
+    axes[1].set_ylabel('Measured joint velocity [rad/s]')
+    axes[1].axhline(reference,color='#c34d27',ls='--',lw=1.,label=f'training reference +/-{reference:g}')
+    axes[1].axhline(-reference,color='#c34d27',ls='--',lw=1.)
+    axes[1].legend(loc='upper left',ncol=4,fontsize=8)
+    axes[2].set_ylabel('wrist_3 angle from case reset [deg]')
+    axes[2].set_xlabel('Simulation time [s]')
+    for ax in axes:ax.grid(alpha=.2)
+    fig.suptitle('Sensor-axis torque steps: independent same-state trials; no interpolation across resets')
+    fig.tight_layout()
+    plot_path=output.with_name(output.stem+'_trajectory.png')
+    fig.savefig(plot_path,dpi=160);plt.close(fig)
+    return {'video':str(output),'trajectory_plot':str(plot_path),'video_frames':frame_count,
+            'output_size':[1280,1088],'fps':fps,'trial_count':len(trial_order)}
+
+
+def encode_wrench_sweep_overlay(scene_video, output, samples, sample_indices, fps, metadata):
+    """Overlay physical joint velocities; preserve the supplied frame/sample map.
+
+    Sensor wrench commands and measured joint velocities are explicitly distinct.
+    Only the six UR5e joints are analyzed; the assembled hand remains physical.
+    Diagnostic guard information comes from metadata.trial_stops; it is not
+    inferred as a training termination. Each plot resets at a new trial.
+    """
+    import math
+    import os
+    from pathlib import Path
+    import imageio.v2 as imageio
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if len(samples) == 0 or len(sample_indices) == 0:
+        raise ValueError('Wrench overlay requires acquired samples and frame/sample associations.')
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError('FPS must be finite and positive.')
+    default_arm = ('shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+                   'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint')
+    arm_names = list(metadata.get('arm_joint_names', default_arm))
+    if len(arm_names) != 6:
+        raise ValueError('Expected six named UR5e joints.')
+    names = arm_names
+    display_order = list(range(6))
+    qd = np.asarray([s['arm_joint_velocity_rad_s'] for s in samples], dtype=float)
+    arm_qd = qd
+    if qd.shape != (len(samples),6):
+        raise ValueError('Every sample must contain six measured UR5e joint velocities.')
+    commands = np.asarray([s['wrench_command'] for s in samples], dtype=float)
+    times = np.asarray([s['time_s'] for s in samples], dtype=float)
+    case_time = np.asarray([s['trial_time_s'] for s in samples], dtype=float)
+    axes = np.asarray([s['trial_axis'] for s in samples], dtype=int)
+    axis_names = ('Fx','Fy','Fz','Tx','Ty','Tz')
+    if commands.shape != (len(samples),6) or np.any((axes<0)|(axes>5)):
+        raise ValueError('Expected six-axis wrench commands and trial_axis in 0..5.')
+    arm_reference = float(metadata.get('trained_velocity_threshold_rad_s',1.))
+    guard = float(metadata.get('diagnostic_speed_guard_rad_s',4.))
+    if not (math.isfinite(arm_reference) and arm_reference>0 and math.isfinite(guard) and guard>0):
+        raise ValueError('Velocity reference and guard must be finite and positive.')
+    keys = [s['trial_index'] for s in samples]
+    order = list(dict.fromkeys(keys))
+    groups = {key:np.asarray([i for i,k in enumerate(keys) if k==key]) for key in order}
+    numbers = {key:i+1 for i,key in enumerate(order)}
+    ntrials = len(metadata.get('wrench_trials',[])) or len(order)
+    stops = {s['trial_index']:s for s in metadata.get('trial_stops',[])}
+
+    def maximum(values,fallback):
+        values=np.abs(np.asarray(values,dtype=float));values=values[np.isfinite(values)]
+        return max(float(values.max()) if values.size else 0.,fallback)
+
+    command_limits = {axis:maximum(commands[axes==axis,axis],.01 if axis<3 else .001)*1.12
+                      for axis in range(6)}
+    arm_plot_limit = maximum(arm_qd,arm_reference*1.15)*1.06
+    bar_limit = maximum(qd,guard)*1.06
+    durations = {key:max(.1,float(case_time[rows].max())) for key,rows in groups.items()}
+    sensor_positions = np.asarray([s['sensor_pose_w'][:3] for s in samples],dtype=float)
+    displacement = sensor_positions.copy()
+    for rows in groups.values():
+        displacement[rows] = (sensor_positions[rows] - sensor_positions[int(rows[0])]) * 1000.
+    displacement_limit = maximum(displacement,.5)*1.12
+    arm_colors = ((80,217,177),(100,179,255),(255,184,92),(228,123,191),(180,211,111),(255,112,108))
+    purple,teal,white,muted,red,yellow=(204,150,255),(83,226,178),(240,245,250),(173,191,210),(255,91,100),(255,214,128)
+
+    def font(size):
+        for filename in ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf','DejaVuSans.ttf'):
+            try:return ImageFont.truetype(filename,size)
+            except OSError:pass
+        return ImageFont.load_default()
+
+    f24,f19,f16,f14,f12=(font(n) for n in (24,19,16,14,12))
+    def short(name):
+        return name.removeprefix('right_').removesuffix('_joint')
+
+    def plot(draw,box,title,xx,series,xend,limit,colors,*,reference=None,subtitle=''):
+        left,top,width,height=box
+        draw.rounded_rectangle((left,top,left+width,top+height),radius=8,fill=(26,34,46))
+        draw.text((left+11,top+10),title,font=f19,fill=white)
+        draw.text((left+11,top+39),subtitle,font=f14,fill=muted)
+        x0,x1,y0,y1=left+58,left+width-13,top+81,top+height-31
+        middle=(y0+y1)/2.
+        draw.line((x0,y0,x0,y1),fill=(100,113,132));draw.line((x0,y1,x1,y1),fill=(100,113,132))
+        draw.line((x0,middle,x1,middle),fill=(70,82,99))
+        if reference is not None:
+            for value in (-reference,reference):
+                y=middle-value/limit*(y1-y0)/2
+                if y0<=y<=y1:
+                    for x in range(int(x0),int(x1),10):draw.line((x,y,min(x+6,x1),y),fill=yellow)
+                    draw.text((x0+3,y-16),f'{value:+g}',font=f12,fill=yellow)
+        draw.text((left+3,y0-5),f'{limit:.2g}',font=f12,fill=muted)
+        draw.text((left+3,y1-8),f'{-limit:.2g}',font=f12,fill=muted)
+        yy=np.asarray(series,dtype=float)
+        if yy.ndim==1:yy=yy[:,None]
+        for j in range(yy.shape[1]):
+            good=np.isfinite(xx)&np.isfinite(yy[:,j])
+            points=[(float(x0+x/xend*(x1-x0)),float(middle-np.clip(v/limit,-1.,1.)*(y1-y0)/2))
+                    for x,v in zip(xx[good],yy[good,j])]
+            color=colors[j%len(colors)]
+            if len(points)>1:draw.line(points,fill=color,width=2)
+            if len(points):
+                x,y=points[-1];draw.ellipse((x-2,y-2,x+2,y+2),fill=color)
+        draw.text((x0,y1+9),'0 s',font=f12,fill=muted)
+        draw.text((x1-42,y1+9),f'{xend:.2f}s',font=f12,fill=muted)
+
+    reader=imageio.get_reader(str(scene_video))
+    writer=imageio.get_writer(str(output),fps=fps,codec='libx264',quality=8,macro_block_size=None,
+                              ffmpeg_params=['-movflags','+faststart','-threads','2'])
+    frame_count=0
+    try:
+        for frame_index,frame in enumerate(reader):
+            if frame_index>=len(sample_indices):raise ValueError('More video frames than sample associations.')
+            index=int(sample_indices[frame_index])
+            if not 0<=index<len(samples):raise IndexError(f'Invalid video sample index {index}.')
+            sample=samples[index];key=sample['trial_index'];axis=int(sample['trial_axis'])
+            unit='N' if axis<3 else 'N m';name=axis_names[axis]
+            rows=groups[key];past=rows[rows<=index];duration=durations[key]
+            now_qd=qd[index];peak_index=int(np.nanargmax(np.abs(now_qd)))
+            peak=float(now_qd[peak_index]);peak_joint=short(names[peak_index])
+            warning=abs(peak)>arm_reference
+            image=Image.new('RGB',(1280,1088),(18,23,32));scene=Image.fromarray(frame[...,:3]).convert('RGB')
+            if scene.size!=(1280,400):
+                scene.thumbnail((1280,400));image.paste(scene,((1280-scene.width)//2,100+(400-scene.height)//2))
+            else:image.paste(scene,(0,100))
+            d=ImageDraw.Draw(image)
+            d.text((16,8),'UR5e + F/T + Hand | independent six-axis wrench trials',font=f24,fill=white)
+            d.text((16,43),f'COMMAND {name} {commands[index,axis]:+.4f} {unit}',font=f19,fill=purple)
+            d.text((505,43),f'MAX MEASURED |qdot|: {peak_joint} {peak:+.4f} rad/s',font=f19,fill=red if warning else teal)
+            d.text((16,73),f'Sim t={times[index]:.2f}s | case t={case_time[index]:.2f}s | 6 measured UR5e joints',font=f16,fill=muted)
+            d.text((795,73),f'ARM train reference +/-{arm_reference:g}; ARM guard {guard:g}',font=f16,fill=yellow)
+            for x,label in ((8,'Overview'),(648,'Sensor/hand close-up | XYZ = red / green / blue')):
+                d.rectangle((x,108,x+(180 if x==8 else 620),132),fill=(18,23,32));d.text((x+7,110),label,font=f16,fill=white)
+            stage=str(sample['trial_stage']).upper()
+            label=f"CASE {numbers[key]}/{ntrials} | {name} level {float(sample['trial_level']):+.4f} {unit} | {stage}"
+            d.text((16,509),label,font=f19,fill=white)
+            is_guard=key in stops and index==int(rows[-1])
+            if is_guard:
+                cause = f'SPEED GUARD > {guard:g} rad/s' if 'speed' in stops[key]['reason'].lower() else 'DISPLACEMENT GUARD > 0.25 m'
+                d.text((795,509),cause,font=f16,fill=red)
+            elif case_time[index]<=.38:d.text((830,509),'RESET: same initial q / qdot',font=f16,fill=yellow)
+            raw=maximum(sample['osc_raw_joint_effort_Nm'],0.)
+            submitted=maximum(sample['arm_applied_joint_effort_Nm'],0.)
+            contact=float(sample.get('max_tactile_normal_force_N',float('nan')))
+            d.text((16,539),f'Arm joint effort |max|: OSC raw {raw:.3f} / submitted {submitted:.3f} N m',font=f16,fill=muted)
+            d.text((886,539),f'Tactile peak {contact:.4f} N',font=f16,fill=muted)
+            xx=case_time[past]
+            plot(d,(12,568,412,303),f'{name} COMMAND [{unit}]',xx,commands[past,axis],duration,command_limits[axis],(purple,),
+                 subtitle=f'Current {commands[index,axis]:+.4f} {unit}; sensor axes')
+            plot(d,(434,568,412,303),'ARM 6 measured [rad/s]',xx,arm_qd[past],duration,arm_plot_limit,arm_colors,reference=arm_reference,
+                 subtitle=f'Yellow +/-{arm_reference:g}: training reference')
+            current_delta=displacement[index]
+            plot(d,(856,568,412,303),'Sensor displacement [mm]',xx,displacement[past],duration,displacement_limit,
+                 ((255,112,108),(110,221,144),(117,183,255)),
+                 subtitle=f'X {current_delta[0]:+.1f} | Y {current_delta[1]:+.1f} | Z {current_delta[2]:+.1f}')
+            d.text((16,886),f'Measured UR5e joints | red: >{arm_reference:g} rad/s training reference | diagnostic guard: {guard:g} rad/s',font=f16,fill=yellow)
+            for position,j in enumerate(display_order):
+                col,row=position%3,position//3;left,top=16+col*423,918+row*51
+                value=float(now_qd[j]);threshold=arm_reference
+                color=red if abs(value)>threshold else arm_colors[position]
+                d.text((left,top),f'{short(names[j]):<15} {value:+.4f} rad/s',font=f16,fill=color)
+                bx,by,width=left,top+29,394
+                d.rectangle((bx,by,bx+width,by+9),fill=(47,55,69))
+                d.rectangle((bx,by,bx+width*min(abs(value)/bar_limit,1.),by+9),fill=color)
+                line=bx+width*threshold/bar_limit;d.line((line,by-3,line,by+12),fill=yellow,width=2)
+            d.text((16,1033),'Sensor displacement is relative to the first measured sample of this case. XYZ curves are world-frame translations.',font=f12,fill=muted)
+            d.text((16,1053),'Same initial state is restored only BETWEEN cases. Within a case: native wrench OSC, assembled physical hand, no pose replacement.',font=f12,fill=muted)
+            d.text((16,1073),'Wrench COMMAND, OSC joint effort and measured joint velocity are different quantities. Hand velocities are outside this diagnostic.',font=f12,fill=muted)
+            writer.append_data(np.asarray(image));frame_count+=1
+    finally:
+        reader.close();writer.close()
+
+    os.environ.setdefault('MPLCONFIGDIR','/tmp/contact_osc_wrench_matplotlib')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig,axs=plt.subplots(3,2,figsize=(15,10),sharex=True)
+    for position,j in enumerate(display_order):
+        ax=axs.flat[position]
+        for key,rows in groups.items():
+            ax.plot(times[rows],qd[rows,j],lw=.85,color='#16826e')
+        limit=maximum(qd[:,j],arm_reference*1.1)*1.12
+        ax.set_ylim(-limit,limit)
+        ax.axhline(arm_reference,color='#c77b26',ls='--',lw=.75)
+        ax.axhline(-arm_reference,color='#c77b26',ls='--',lw=.75)
+        if guard<=limit:
+            ax.axhline(guard,color='#c44747',ls=':',lw=.75)
+            ax.axhline(-guard,color='#c44747',ls=':',lw=.75)
+        ax.set_title('UR5e '+names[j],fontsize=9)
+        ax.set_ylabel('rad/s');ax.grid(alpha=.2)
+        if position>=4:ax.set_xlabel('Simulation time [s]')
+    fig.suptitle('Six measured UR5e joint velocities | independent Y scales | lines break at case resets\nDashed: training +/-1 rad/s; red dotted: separate diagnostic guard where visible',fontsize=12)
+    fig.tight_layout(rect=(0,0,1,.96));plot_path=output.with_name(output.stem+'_ur5e_joint_velocities.png')
+    fig.savefig(plot_path,dpi=160);plt.close(fig)
+    return {'video':str(output),'ur5e_joint_velocity_plot':str(plot_path),'video_frames':frame_count,
+            'output_size':[1280,1088],'fps':fps,'trial_count':len(order),'measured_joint_count':len(names),
+            'arm_joint_names':arm_names}
+
+
 def run_probe(args):
     import imageio.v2 as imageio
     import numpy as np
@@ -320,6 +864,7 @@ def run_probe(args):
     observations = importlib.import_module("contact_manipulation_symmetric.mdp.observations")
     rewards = importlib.import_module("contact_manipulation_symmetric.mdp.rewards")
     production_cfg = env_module.UR5eContactManipulationEnvCfg()
+    independent_trials = args.osc_torque_staircase or args.osc_wrench_sweep
     robot_cfg = production_cfg.scene.robot.copy()
     # The official OSC Action uses this native cloned-environment namespace
     # when resolving its task FrameTransformer; keep it unchanged in this probe.
@@ -351,7 +896,8 @@ def run_probe(args):
                 physics_material=sim_utils.RigidBodyMaterialCfg(),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(.95, .52, .15), roughness=.6)),
             init_state=RigidObjectCfg.InitialStateCfg(pos=(0., 0., 8.))))
-    # A visual ground establishes world orientation without touching the robot.
+    # The standard ground has a collider; do not confuse it with the visual-only
+    # sensor gizmo below. Diagnostic motion bounds keep the hand near its start.
     ground = sim_utils.GroundPlaneCfg()
     ground.func("/World/Ground", ground)
     light = sim_utils.DomeLightCfg(intensity=1800., color=(.9, .94, 1.))
@@ -376,7 +922,7 @@ def run_probe(args):
     # configured elbow-up pose once, as the official standalone OSC tutorial
     # does at reset; every subsequent motion is generated by torque dynamics.
     initial_q = robot.data.default_joint_pos.clone()
-    if args.osc_push:
+    if args.osc_push or independent_trials:
         # Default palm faces down. Roll the wrist once so the pad face is
         # horizontal, retaining the elbow-up shoulder/elbow configuration.
         initial_q[:, robot.joint_names.index("wrist_3_joint")] += math.pi / 2.
@@ -558,6 +1104,37 @@ def run_probe(args):
         "phases": [{"name": phase, "duration_s": duration} for phase, duration in PHASES],
     }
     phases = PHASES
+    torque_trials = []
+    wrench_trials = []
+    if independent_trials:
+        for axis in (range(6) if args.osc_wrench_sweep else [5]):
+            label = ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")[axis]
+            if args.osc_wrench_sweep and label not in args.wrench_axes:
+                continue
+            magnitudes = sorted(set(args.force_levels if axis < 3 else args.torque_levels) - {0.})
+            levels = [0., *magnitudes, *(-value for value in magnitudes)]
+            wrench_trials.extend({"axis": axis, "level": value} for value in levels)
+        torque_trials = [trial["level"] for trial in wrench_trials]
+        phases = tuple((f"trial_{index:02d}", .4 + args.torque_hold + .3)
+                       for index in range(len(torque_trials)))
+        metadata.update({
+            "experiment": "osc_wrench_sweep" if args.osc_wrench_sweep else "osc_torque_staircase",
+            "torque_trials_Nm": torque_trials if args.osc_torque_staircase else [],
+            "wrench_trials": wrench_trials,
+            "arm_joint_names": list(scene.ARM_JOINT_NAMES),
+            "arm_joint_velocity_limits_rad_s": robot.data.joint_vel_limits[0, arm_ids].cpu().tolist(),
+            "trained_velocity_threshold_rad_s": 1., "diagnostic_speed_guard_rad_s": args.max_arm_speed,
+            "trial_timing": {"baseline_s": .4, "torque_hold_s": args.torque_hold, "release_s": .3},
+            "state_writes": "Same initial q and zero qdot only between independent torque levels; none during a trial.",
+            "command": "One sensor wrench axis at a time; all other axes zero; no orientation PD or joint locking.",
+            "initial_wrist_3_roll_added_rad": math.pi / 2.,
+            "training_termination": "Not active in this standalone probe; 1 rad/s is a visual reference only.",
+            "phases": [{"name": phase, "duration_s": duration} for phase, duration in phases],
+            "trial_stops": [],
+        })
+        if args.osc_wrench_sweep:
+            metadata["sensor_displacement_guard_m"] = .25
+            metadata["external_contact"] = "No scene objects; physical ground and robot self-collision remain enabled."
     if args.osc_push:
         phases = (("baseline", 1.2), ("approach", 1.6), ("push", 1.6), ("brake", .8), ("settle", 2.4))
         metadata.update({"external_contact": "Dynamic 300 g box on a fixed horizontal support.",
@@ -588,6 +1165,19 @@ def run_probe(args):
         center = sensor_position[0]
         midpoint = (robot.data.root_pos_w[0] + center) * .5
         detail_aim = center + observations.quat_apply(sensor_rotation, center.new_tensor([[0., 0., .06]]))[0]
+        if independent_trials:
+            # Static world camera: do not rotate the viewer along with the hand.
+            reference_q = initial_sensor_camera_rotation
+            axial = observations.quat_apply(reference_q, center.new_tensor([[0., 0., 1.]]))[0]
+            lateral = observations.quat_apply(reference_q, center.new_tensor([[1., 0., 0.]]))[0]
+            vertical = observations.quat_apply(reference_q, center.new_tensor([[0., 1., 0.]]))[0]
+            reference_aim = initial_sensor_camera_position[0] + axial * .08
+            detail_aim = (center if args.osc_wrench_sweep else initial_sensor_camera_position[0]) + axial * .08
+            midpoint = (robot.data.root_pos_w[0] + reference_aim) * .5
+            eyes = torch.stack((midpoint + center.new_tensor([1.4, -1.6, .7]),
+                                detail_aim + .70 * axial + .12 * lateral + .10 * vertical))
+            camera.set_world_poses_from_view(eyes, torch.stack((midpoint, detail_aim)))
+            return
         if args.osc_push:
             detail_aim = (rewards.tactile_pad_points(env)[0, 5:].mean(0) + box.data.root_pos_w[0]) * .5
             midpoint = (robot.data.root_pos_w[0] + detail_aim) * .5
@@ -599,6 +1189,8 @@ def run_probe(args):
                             center + center.new_tensor([-.45, -.50, .20])))
         camera.set_world_poses_from_view(eyes, torch.stack((midpoint, detail_aim)))
 
+    initial_sensor_camera_position = robot.data.body_link_pos_w[:, sensor_id].clone()
+    initial_sensor_camera_rotation = robot.data.body_link_quat_w[:, sensor_id].clone()
     if camera is not None:
         sensor_position = robot.data.body_link_pos_w[:, sensor_id]
         sensor_rotation = robot.data.body_link_quat_w[:, sensor_id]
@@ -610,12 +1202,34 @@ def run_probe(args):
     try:
         stop_reason = None
         push_braking_step = None
-        for phase, duration in phases:
+        for trial_index, (phase, duration) in enumerate(phases):
+            if independent_trials:
+                robot.write_joint_state_to_sim(initial_q, robot.data.default_joint_vel)
+                robot.reset()
+                sim.forward()
+                tactile.reset()
+                reader.reset(torch.tensor([0], device=sim.device))
+                arm_action.reset()
+                hand_action.reset()
+                wrench_command.zero_()
+                arm_action.process_actions(wrench_command)
+                hand_action.process_actions(mass.new_full((1, 6), -1. / production_cfg.actions.hand_action.scale))
+                wrist3_initial = float(initial_q[0, arm_ids[-1]])
+                trial_sensor_origin = robot.data.body_link_pos_w[0, sensor_id].clone()
             print(f"[F/T probe] {phase}: {duration:g} simulated seconds", flush=True)
             count = round(duration / dt)
             for step in range(count):
-                if len(samples) % policy_decimation == 0:
-                    if args.osc_push:
+                if (step if independent_trials else len(samples)) % policy_decimation == 0:
+                    if independent_trials:
+                        command, trial_stage = torque_trial_command(step * dt, torque_trials[trial_index], args.torque_hold)
+                        if args.osc_wrench_sweep:
+                            value = command[5]
+                            command = [0.] * 6
+                            command[wrench_trials[trial_index]["axis"]] = value
+                            trial_stage = "command" if trial_stage == "torque" else trial_stage
+                        wrench_command[:] = wrench_command.new_tensor(command)
+                        fraction = 0.
+                    elif args.osc_push:
                         progress = smooth_step((step + 1) * dt / min(.4, duration))
                         travel = float((box.data.root_pos_w[0] - box_initial_position) @ push_direction)
                         if push_braking_step is None and travel >= .08:
@@ -673,7 +1287,7 @@ def run_probe(args):
                 compensated = measured - self_load
                 arm_max_speed = float(robot.data.joint_vel[:, arm_ids].abs().max())
                 finite = bool(sensor.wrench_valid.all() & torch.isfinite(self_load).all()
-                              & torch.isfinite(robot.data.joint_pos).all())
+                              & torch.isfinite(robot.data.joint_pos).all() & torch.isfinite(robot.data.joint_vel).all())
                 if not finite:
                     raise RuntimeError(f"Invalid F/T sample at physics step {len(samples)}.")
                 samples.append({
@@ -692,6 +1306,30 @@ def run_probe(args):
                     "arm_max_speed_rad_s": arm_max_speed,
                     "max_tactile_normal_force_N": float(torch.linalg.vector_norm(sensor.tactile_force, dim=-1).max()),
                 })
+                if independent_trials:
+                    angular_axis = observations.quat_apply(observations.quat_conjugate(arm_action._ee_pose_b[:, 3:7]),
+                                                          arm_action._jacobian_b[:, 3:6, -1])
+                    alignment = float(angular_axis[0, 2])
+                    if abs(abs(alignment) - 1.) > 1.e-4 or float(angular_axis[0, :2].norm()) > 1.e-4:
+                        raise RuntimeError(f"Sensor +Z is not the wrist3 angular Jacobian axis: {angular_axis.tolist()}")
+                    metadata.setdefault("wrist3_axis_in_sensor", angular_axis[0].cpu().tolist())
+                    angular_velocity = observations.quat_apply(observations.quat_conjugate(sensor_rotation),
+                                                             robot.data.body_com_ang_vel_w[:, sensor_id])
+                    samples[-1].update({"trial_index": trial_index,
+                        **({"trial_torque_Nm": torque_trials[trial_index]} if args.osc_torque_staircase else {}),
+                        "trial_axis": wrench_trials[trial_index]["axis"], "trial_level": torque_trials[trial_index],
+                        "trial_time_s": (step + 1) * dt, "trial_stage": trial_stage,
+                        "arm_joint_position_rad": robot.data.joint_pos[0, arm_ids].cpu().tolist(),
+                        "arm_joint_velocity_rad_s": robot.data.joint_vel[0, arm_ids].cpu().tolist(),
+                        "wrist3_delta_rad": float(robot.data.joint_pos[0, arm_ids[-1]]) - wrist3_initial,
+                        "sensor_axial_angular_velocity_rad_s": float(angular_velocity[0, 2]),
+                        "axial_alignment": alignment})
+                    if args.osc_wrench_sweep:
+                        displacement = sensor_position[0] - trial_sensor_origin
+                        samples[-1]["sensor_displacement_w_m"] = displacement.cpu().tolist()
+                        samples[-1]["minimum_body_origin_height_m"] = float(positions[0, :, 2].min())
+                        if float(displacement.norm()) > metadata["sensor_displacement_guard_m"]:
+                            stop_reason = "Sensor displacement exceeded the 0.25 m diagnostic region."
                 if args.osc_push:
                     binary, valid, _, _ = sensors.sensor_monitor_snapshot(sensor.tactile_force, sensor.tactile_valid,
                         raw, sensor.wrench_valid, production_cfg.mdp.tactile_threshold)
@@ -722,7 +1360,8 @@ def run_probe(args):
                         "hand_max_limit_violation_rad": float(violation.max())})
                     if float(offset[:2].norm()) > .35 or abs(float(offset[2])) > .08:
                         stop_reason = "Box left the bounded diagnostic pushing region."
-                if writer is not None and len(samples) % stride == 0:
+                if writer is not None and (len(samples) % stride == 0 or
+                        (independent_trials and (arm_max_speed > args.max_arm_speed or stop_reason is not None))):
                     marker.visualize(translations=sensor_position, orientations=sensor_rotation)
                     # Track close-up translation; world-fixed eye-to-target direction
                     # avoids concealing rotation by rotating the camera with the hand.
@@ -739,7 +1378,14 @@ def run_probe(args):
                 if stop_reason is not None:
                     break
             if stop_reason is not None:
-                break
+                if independent_trials and (args.max_steps is None or len(samples) < args.max_steps):
+                    metadata["trial_stops"].append({"trial_index": trial_index,
+                        **wrench_trials[trial_index],
+                        **({"torque_Nm": torque_trials[trial_index]} if args.osc_torque_staircase else {}),
+                        "trial_time_s": (step + 1) * dt, "reason": stop_reason})
+                    stop_reason = None
+                else:
+                    break
         metadata["joint_names"] = list(robot.joint_names)
         metadata["status"] = "complete" if stop_reason is None else "stopped"
         metadata["stop_reason"] = stop_reason
@@ -751,6 +1397,32 @@ def run_probe(args):
             metadata["stop_reason"] = "Exception during acquisition; see the console traceback."
         args.output.parent.mkdir(parents=True, exist_ok=True)
         report = {"metadata": metadata, "phase_statistics": _phase_statistics(samples, phases), "samples": samples}
+        if args.osc_torque_staircase:
+            report["video_sample_indices"] = sample_indices
+            summaries = []
+            for index, level in enumerate(torque_trials):
+                selected = [s for s in samples if s["trial_index"] == index]
+                if not selected:
+                    continue
+                active = [s for s in selected if s["trial_stage"] == "torque"]
+                crossing = next((s["trial_time_s"] for s in selected if abs(s["arm_joint_velocity_rad_s"][-1]) > 1.), None)
+                summaries.append({"trial_index": index, "torque_Nm": level, "samples": len(selected),
+                    "first_wrist3_over_1_rad_s_at_trial_time_s": crossing,
+                    "wrist3_speed_max_rad_s": max(abs(s["arm_joint_velocity_rad_s"][-1]) for s in selected),
+                    "applied_torque_duration_s": len(active) * dt,
+                    "completed_full_hold": len(active) >= round(args.torque_hold / dt),
+                    "wrist3_speed_at_last_active_sample_rad_s": active[-1]["arm_joint_velocity_rad_s"][-1] if active else None,
+                    "wrist3_angle_at_last_active_sample_deg": math.degrees(active[-1]["wrist3_delta_rad"]) if active else None,
+                    "first_wrist3_over_1_rad_s_after_torque_onset_s": None if crossing is None else crossing - .4,
+                    "max_other_arm_speed_rad_s": max(max(abs(v) for v in s["arm_joint_velocity_rad_s"][:-1]) for s in selected),
+                    "max_tactile_force_N": max(s["max_tactile_normal_force_N"] for s in selected),
+                    "peak_wrist3_osc_effort_Nm": max(abs(s["osc_raw_joint_effort_Nm"][-1]) for s in selected),
+                    "peak_wrist3_applied_effort_Nm": max(abs(s["arm_applied_joint_effort_Nm"][-1]) for s in selected)})
+            report["torque_summary"] = summaries
+        if args.osc_wrench_sweep:
+            report["video_sample_indices"] = sample_indices
+            report["wrench_summary"] = summarize_wrench_trials(samples, metadata, dt)
+            write_wrench_velocity_csv(args.output.parent, samples, metadata, report["wrench_summary"])
         if args.osc_push and samples:
             report["push_summary"] = {
                 "max_box_push_displacement_m": max(s["box_push_displacement_m"] for s in samples),
@@ -768,7 +1440,12 @@ def run_probe(args):
         args.output.write_text(json.dumps(report, indent=2) + "\n")
     if camera is not None:
         print(f"[F/T probe] Encoding six-axis overlay: {args.video_output}", flush=True)
-        encode_overlay(scene_path, args.video_output, samples, sample_indices, args.video_fps, metadata)
+        if independent_trials:
+            import shutil
+            shutil.copyfile(scene_path, args.output.parent / "scene.mp4")
+        (encode_wrench_sweep_overlay if args.osc_wrench_sweep else
+         encode_torque_overlay if args.osc_torque_staircase else encode_overlay)(
+            scene_path, args.video_output, samples, sample_indices, args.video_fps, metadata)
     temporary.cleanup()
     print(f"[F/T probe] Report: {args.output}", flush=True)
 

@@ -101,6 +101,13 @@ Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정
 Hand scale.5·native joint-limit mapping, 적용 action 이력·action-rate를 그대로 사용한다.
 Transition/support/robot-start의 진단용 CUDA graph 스위치도 원본과 동일하게 제공한다.
 
+GUI play의 **Debug Visualization**에서 `Access region (yellow)`와
+`Relocation regions (purple)`를 각각 켜고 끌 수 있다(기본 OFF).
+보상에 사용하는 실제 영역의 윤곽을 초기 선반 지지면보다3mm 위에 표시하며,
+새 장면마다 갱신한다. Relocation은 예약된 목적지만 표시하고 앞쪽 접근 통로는 포함하지 않는다.
+OBB·센서와 같은 DebugDraw callback을 사용하며 USD prim이나 물리 형상을 만들지 않는다.
+Headless에서는 표시 자원을 생성하지 않는다.
+
 F/T 형상은 Axia80-M20의 외경82mm·높이25.4mm·질량0.30kg(표준 인터페이스 plate 포함)을
 사용한다. 미정인 추가 연결 플랜지는 양쪽12.3mm·외경50mm·합계0.04kg의 임시값이다.
 전체 tool–hand 간격은50mm로 유지하며 `scene.py`의 `sensor_mount_length`로 조절한다.
@@ -123,6 +130,35 @@ OSC와 Hand action으로21초·2100physics step을 실행했고, 초기 자세 �
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
   --headless --device cuda:0 --force-amplitude .6 --torque-amplitude .012
+```
+
+같은 진단의 `--osc-torque-staircase`는 센서 정면 +Z torque를0과양·음 방향
+0.001/0.002/0.005/0.01/0.02/0.05/0.1N·m로 바꿔 비교한다.
+[회전 시험 영상](../../docs/videos/osc_torque_staircase_2026-11-14/torque_staircase.mp4)에
+전체 로봇·회전축 방향 확대 화면·sensor frame gizmo, 명령 토크와 실제6관절 속도,
+wrist3 회전각·OSC 및 actuator 제출 토크를 표시한다. 각 단계는 동일 초기 자세·정지 상태에서
+시작하며, 단계 중에는 실제 native wrench OSC만 구동한다. 다른 관절 고정이나 자세 PD는 없다.
+학습의1rad/s 기준은 표시만 하고, 아래 명령의4rad/s 진단 guard를 넘으면 해당 단계만 끝낸다.
+원자료와 단계별 요약은 `logs/diagnostics/osc_torque_staircase_2026-11-14/final/report.json`이다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-torque-staircase --headless --device cuda:0 --max-arm-speed 4
+```
+
+`--osc-wrench-sweep`는 같은 조건에서 Fx/Fy/Fz/Tx/Ty/Tz를 각각 양·음 방향으로 입력한다.
+[6축 입력 영상](../../docs/videos/osc_wrench_sweep_2026-11-14/wrench_sweep.mp4)은
+명령·로봇 동작·UR5e6관절 속도·sensor 변위를 동시에 보여준다. Hand는 결합된 채로 유지하고
+속도 검증 대상에서는 제외한다. 각 축·입력 크기마다 초기 q·zero qdot를 복원한다.
+4rad/s 속도 guard 또는 초기 sensor 위치에서0.25m 변위 guard는 해당 단계만 중단한다.
+학습의1rad/s 기준은 참고선이며 native joint velocity limit과 별도로 비교한다.
+원자료·매 physics step의6관절 속도 CSV·단계별 관절 요약 CSV는
+`logs/diagnostics/osc_wrench_sweep_2026-11-14/final/`에 저장한다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-wrench-sweep --headless --device cuda:0 --max-arm-speed 4 \
+  --force-levels .1 .5 1 2 5 10 --torque-levels .001 .005 .01 .05 .1 .5 1
 ```
 
 같은 진단의 `--tactile-scan`은 Palm1·Thumb4·나머지 손가락 각3개, 총17개 pad를

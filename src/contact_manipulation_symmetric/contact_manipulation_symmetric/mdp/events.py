@@ -962,10 +962,10 @@ class SensorBatch:
 
 
 class RoleObbVisualizer:
-    """Shared viewport drawing for OBBs and the optional sensor monitor.
+    """Shared viewport drawing for OBBs, task regions and the sensor monitor.
 
     Physical role bounds follow current body-link poses. Observation bounds
-    remain the initial visible-surface snapshot used by the policy. Both layers
+    remain the initial visible-surface snapshot used by the policy. All layers
     share one draw callback because DebugDraw's buffers are global. No USD
     prims, rigid bodies, collision shapes or markers are made.
     """
@@ -980,6 +980,8 @@ class RoleObbVisualizer:
         self.cfg = env.cfg
         self.debug_vis = False
         self.observation_debug_vis = bool(env.cfg.observation_obb_debug_vis)
+        self.access_region_debug_vis = bool(getattr(env.cfg, "access_region_debug_vis", False))
+        self.relocation_region_debug_vis = bool(getattr(env.cfg, "relocation_region_debug_vis", False))
         self._draw = None
         self.set_debug_vis(env.cfg.role_obb_debug_vis)
         # Native env.close() deletes the manager before clearing callbacks.
@@ -1002,6 +1004,7 @@ class RoleObbVisualizer:
         env = self._env
         sensor_monitor = getattr(env, "_sensor_monitor", None)
         if not (self.debug_vis or self.observation_debug_vis
+                or self.access_region_debug_vis or self.relocation_region_debug_vis
                 or (sensor_monitor is not None and sensor_monitor.debug_vis)):
             if env.sim.render_callback_exists(self.callback_name):
                 env.sim.remove_render_callback(self.callback_name)
@@ -1043,6 +1046,37 @@ class RoleObbVisualizer:
         orientation = robot.data.root_quat_w[:, None].expand(-1, capacity, -1)[valid]
         return position[:, None] + quat_apply(orientation[:, None], corners_b)
 
+    def _region_lines(self, scene, *, relocation):
+        """Outline the exact reward polygons, 3 mm above the initial shelf panel.
+
+        Regions use fixed environment-local XY, not the moving shelf frame.
+        Read the current scene on every render: scene replacement can change
+        the number of polygons/vertices. No physics or MDP update is requested.
+        """
+        if relocation:
+            vertices = scene.relocation_regions
+            if vertices is None:
+                return scene.access_region.new_empty((0, 2, 3))
+            counts, valid = scene.relocation_vertex_counts, scene.relocation_valid
+        else:
+            bounds = scene.access_region
+            vertices = torch.stack((bounds[:, [0, 1, 1, 0]], bounds[:, [2, 2, 3, 3]]), -1)[:, None]
+            counts = torch.full(vertices.shape[:2], 4, device=vertices.device, dtype=torch.long)
+            valid = ((bounds[:, 1] > bounds[:, 0]) & (bounds[:, 3] > bounds[:, 2]))[:, None]
+        capacity = vertices.shape[-2]
+        slots = torch.arange(capacity, device=vertices.device)
+        used = slots < counts[..., None]
+        valid = (valid & (counts >= 3) & (counts <= capacity)
+                 & (torch.isfinite(vertices).all(-1) | ~used).all(-1))
+        heights = scene.shelf_top + .003
+        origins = self._env.scene.env_origins
+        valid = valid & (torch.isfinite(heights) & torch.isfinite(origins).all(-1))[:, None]
+        points = torch.cat((vertices, heights[:, None, None, None].expand(*vertices.shape[:-1], 1)), -1)
+        points = points + origins[:, None, None]
+        following = (slots + 1) % counts.clamp(1, capacity)[..., None]
+        ends = points.gather(-2, following[..., None].expand(*following.shape, 3))
+        return torch.stack((points, ends), -2)[valid[..., None] & used]
+
     @torch.no_grad()
     def update(self, _event=None):
         env = self._env
@@ -1054,7 +1088,8 @@ class RoleObbVisualizer:
         sensor_monitor = getattr(env, "_sensor_monitor", None)
         sensors_enabled = sensor_monitor is not None and sensor_monitor.debug_vis
         # Startup rendering can precede the first committed scene/MDP reset.
-        if (not (self.debug_vis or self.observation_debug_vis or sensors_enabled) or scene is None
+        if (not (self.debug_vis or self.observation_debug_vis or self.access_region_debug_vis
+                 or self.relocation_region_debug_vis or sensors_enabled) or scene is None
                 or state is None or state.bindings is None or env._is_closed):
             return
         line_batches, colors, widths = [], [], []
@@ -1074,6 +1109,16 @@ class RoleObbVisualizer:
             line_batches.append(corners[:, :, self._edges].reshape(-1, 2, 3))
             colors.extend(self._colors)
             widths.extend(self._widths)
+        if self.access_region_debug_vis:
+            region_lines = self._region_lines(scene, relocation=False)
+            line_batches.append(region_lines)
+            colors.extend([(1., .8, 0., 1.)] * region_lines.shape[0])
+            widths.extend([4.] * region_lines.shape[0])
+        if self.relocation_region_debug_vis:
+            region_lines = self._region_lines(scene, relocation=True)
+            line_batches.append(region_lines)
+            colors.extend([(.85, .2, 1., 1.)] * region_lines.shape[0])
+            widths.extend([4.] * region_lines.shape[0])
         if sensors_enabled:
             primitives = sensor_monitor.render_geometry()
             if primitives is not None:
@@ -1092,6 +1137,7 @@ class RoleObbVisualizer:
 
     def close(self):
         self.debug_vis = self.observation_debug_vis = False
+        self.access_region_debug_vis = self.relocation_region_debug_vis = False
         sensor_monitor = getattr(self._env, "_sensor_monitor", None)
         if sensor_monitor is not None:
             sensor_monitor.close()
@@ -1115,12 +1161,35 @@ class ObservationObbVisualizer:
         return self._visualizer.set_observation_debug_vis(debug_vis)
 
 
+class RegionVisualizer:
+    """One native checkbox per region layer, backed by the shared renderer."""
+
+    has_debug_vis_implementation = True
+
+    def __init__(self, visualizer, region):
+        self._visualizer = visualizer
+        self.cfg = visualizer.cfg
+        self._flag = f"{region}_region_debug_vis"
+
+    @property
+    def debug_vis(self):
+        return getattr(self._visualizer, self._flag)
+
+    def set_debug_vis(self, debug_vis):
+        setattr(self._visualizer, self._flag, bool(debug_vis))
+        setattr(self.cfg, self._flag, bool(debug_vis))
+        self._visualizer._refresh_debug_vis()
+        return True
+
+
 def initialize_role_obb_visualization(env, env_ids=None):
     """Prepare GUI toggles; headless training creates no visualizer resources."""
     if env.sim.has_gui():
         if not hasattr(env, "_role_obb_visualizer"):
             env._role_obb_visualizer = RoleObbVisualizer(env)
             env._observation_obb_visualizer = ObservationObbVisualizer(env._role_obb_visualizer)
+            env._access_region_visualizer = RegionVisualizer(env._role_obb_visualizer, "access")
+            env._relocation_region_visualizer = RegionVisualizer(env._role_obb_visualizer, "relocation")
         if not hasattr(env, "_sensor_monitor"):
             from .sensors import SensorMonitor
 
