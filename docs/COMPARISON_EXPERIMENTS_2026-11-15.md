@@ -111,7 +111,7 @@ wrench_scale = (0.1, 0.1, 0.1, 0.001, 0.001, 0.001)
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/scripts/train.py \
   --task Isaac-Contact-Manipulation-Symmetric-UR5e-RelocationDistance-v0 \
-  --num_envs 1024 --headless --seed 42 --max_iterations 90000
+  --num_envs 1024 --headless --max_iterations 90000
 ```
 
 ### jh_computer — 학습2
@@ -119,7 +119,7 @@ wrench_scale = (0.1, 0.1, 0.1, 0.001, 0.001, 0.001)
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/scripts/train.py \
   --task Isaac-Contact-Manipulation-Symmetric-UR5e-AccessBackWall-v0 \
-  --num_envs 1024 --headless --seed 42 --max_iterations 90000
+  --num_envs 1024 --headless --max_iterations 90000
 ```
 
 ### base_computer — 학습3
@@ -127,7 +127,7 @@ wrench_scale = (0.1, 0.1, 0.1, 0.001, 0.001, 0.001)
 ```bash
 ./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/scripts/train.py \
   --task Isaac-Contact-Manipulation-Symmetric-UR5e-SmallWrench-v0 \
-  --num_envs 1024 --headless --seed 42 --max_iterations 90000
+  --num_envs 1024 --headless --max_iterations 90000
 ```
 
 ## 6. 실험별 play 명령
