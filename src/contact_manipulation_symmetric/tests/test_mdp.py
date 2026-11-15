@@ -1410,7 +1410,7 @@ class RewardTests(unittest.TestCase):
                          ('blocker_relocation', 'blocker_relocation_contact_progress'),
                          ('blocker_contact_hold', 'BlockerContactHold'),
                          ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
-            if name == 'motion_singularity' and name not in terms:
+            if name in {'motion_singularity', 'blocker_contact_hold'} and name not in terms:
                 continue
             self.assertEqual(terms[name][0], fn)
             self.assertGreaterEqual(terms[name][1], 0.)
@@ -1419,7 +1419,8 @@ class RewardTests(unittest.TestCase):
         self.assertNotIn('time_reward', terms)
         self.assertEqual(terms['terminal'], ('terminal', 1.))
         self.assertEqual(terms['clearance'], ('clearance_contact_progress', 12.))
-        self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', 3.))
+        if 'blocker_contact_hold' in terms:
+            self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', 3.))
         self.assertEqual(terms['blocker_relocation'], ('blocker_relocation_contact_progress', 3.))
         self.assertEqual(terms['target_collision'], ('target_collision', -.5))
         self.assertEqual(terms['object_stability'], ('object_stability', .5))
@@ -4439,6 +4440,8 @@ class CudaGraphSwitchTests(unittest.TestCase):
                      str(source), 'exec'), namespace)
         def config(**updates):
             return SimpleNamespace(**(dict(defaults, actor_vision_update_interval=0, decimation=2,
+                relocation_include_front_corridors=False, access_region_to_back_wall=False,
+                spawn_rules=SimpleNamespace(generation_mode='sequential'),
                 sim=SimpleNamespace(physx=SimpleNamespace()), viewer=SimpleNamespace()) | updates))
         for enabled in (False, True):
             namespace['__post_init__'](config(**dict.fromkeys(names, enabled)))

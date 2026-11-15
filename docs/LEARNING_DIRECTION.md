@@ -32,18 +32,26 @@
 
 ## Reward
 
+Relocation은 학습 1의 거리 감소량 정규화 방식을 사용한다.
+실험 설정과 실행 명령은 [비교 실험 문서](COMPARISON_EXPERIMENTS_2026-11-15.md)에 정리한다.
+
 ### 기존 버전 — 접촉·변화량 기반
 
-![Clearance·Relocation·Distance의 보상 구조와 Blocker 접촉 pad 수](figures/reward_baseline_overview.png)
+![Clearance·거리 감소량으로 정규화한 Relocation·Distance와 Blocker 접촉 pad 수](figures/reward_learning_direction_overview.png)
 
 #### Task-related terms
 
 | 항 | 항별 값 $g_t$ | 기준 |
 |---|---|---|
 | Clearance | $n_t(C_t-C_{t-1})$ | Blocker 접촉 pad 수로 가중. 겹침 감소는 양수, 증가는 음수. |
-| Blocker relocation | $n_t(Q_t-Q_{t-1})$ | 접촉 중 재배치 영역에 가까워지면 양수, 멀어지면 음수. 앞쪽 통로 포함. |
+| Blocker relocation | $n_t\operatorname{clip}\!\left(\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},0,1\right)$ | 재배치 목적지와 전방 통로까지의 거리 감소량을 정규화하고 현재 접촉 pad 수를 곱한다. 정체·악화·무접촉 시 0. |
 | Blocker distance | $\frac{1}{17}\sum_{i=0}^{16}e^{-a_Dd_{i,t}}$ | 17개 pad에서 OBB 면까지의 현재 거리 점수 평균. |
 | Time | $-\mathbf{1}_{\mathrm{alive}\,\land\,\neg\mathrm{success}}$ | 성공 상태가 아닌 생존 step에 시간 비용. |
+
+$d_t$는 Blocker 중심에서 재배치 목적지와 전방 통로의 합집합까지의 최소 XY 거리이며, 영역 내부에서는 0이다.
+기준 거리는 [제조사 공식 TCP 최대속도](UR5E_RELOCATION_REFERENCE_DISTANCE.md)에 따라
+$d_{\mathrm{ref}}=4\,\mathrm{m/s}\times\Delta t$로 정한다. 정책 50Hz에서는 **80mm**다.
+거리 감소량의 정규화 값은 0–1이며, 접촉 pad 수 $n_t$를 곱한 항별 값은 1을 초과할 수 있다.
 
 #### Motion and constraint terms
 

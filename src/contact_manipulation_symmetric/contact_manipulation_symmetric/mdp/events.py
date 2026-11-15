@@ -4006,11 +4006,13 @@ def _free_relocation_rectangles(obstacles, bounds, footprint_sizes):
     return rectangles[keep]
 
 
-def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype):
+def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype,
+                                    include_front_corridors=False):
     """Initial free patches on either Y side of A0, in fixed environment XY.
 
     Sequential scenes use their reserved empty destination rectangles, which
-    already enclose a rotated full goal OBB. Front corridors are not goals.
+    already enclose a rotated full goal OBB. The optional experiment also uses
+    their reserved front corridors, as separate polygons in the region union.
     The legacy extraction below reconstructs and checks its pocket polygons.
 
     Regions are physical empty patches large enough for the Blocker at one of
@@ -4025,13 +4027,30 @@ def build_initial_relocation_regions(sample, geometries, rules, *, device, dtype
     from certified pocket metadata and independently checked before inclusion.
     Return padded convex vertices [K,V,2], vertex counts [K], validity [K].
     """
+    if include_front_corridors and rules.generation_mode != 'sequential':
+        raise ValueError('Relocation front corridors require a sequential scene.')
     if rules.generation_mode == 'sequential':
         # The generator already reserved empty patches for independently
-        # rotated goal OBBs. Approach strips are not relocation destinations.
-        regions = sample.reserved_regions
+        # rotated goal OBBs. Keep each side/corridor separate: taking one convex
+        # hull would incorrectly fill the access region between destinations.
+        regions = tuple(sample.reserved_regions)
         if not regions or any(len(r) != 4 or not all(math.isfinite(v) for v in r)
                               or r[1] <= r[0] or r[3] <= r[2] for r in regions):
             raise ValueError('Sequential scenes require nonempty valid relocation patches.')
+        if include_front_corridors:
+            certificate = sample.parameter_certificate
+            state = certificate.get('sequential_state') if isinstance(certificate, Mapping) else None
+            corridors = state.get('pocket_front_corridors') if isinstance(state, Mapping) else None
+            if not isinstance(corridors, (tuple, list)) or len(corridors) != len(regions):
+                raise ValueError('Sequential relocation requires its reserved front-corridor metadata.')
+            for pocket, corridor in zip(regions, corridors):
+                if (len(corridor) != 4 or not all(math.isfinite(v) for v in corridor)
+                        or corridor[1] <= corridor[0] or corridor[3] <= corridor[2]
+                        or not all(math.isclose(actual, expected, rel_tol=0., abs_tol=1.e-9)
+                            for actual, expected in zip(corridor,
+                                (pocket[1], rules.x_range[1], pocket[2], pocket[3])))):
+                    raise ValueError('Relocation corridors must match the actual reserved pocket-to-front strips.')
+            regions += tuple(tuple(corridor) for corridor in corridors)
         polygon = torch.tensor([rectangle_polygon(region) for region in regions], device=device, dtype=dtype)
         return (polygon, torch.full((len(regions),), 4, device=device, dtype=torch.long),
                 torch.ones(len(regions), device=device, dtype=torch.bool))
@@ -8957,6 +8976,23 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
             env.sim.forward()
 
 
+def evaluation_access_region(access_region, workspace_bounds, *, to_back_wall=False):
+    """Return reward/success geometry without modifying spawn/vision/IK inputs.
+
+    +X points toward the shelf front. The measured support panel's minimum X
+    is its rear extent; keep the original front and lateral limits unchanged.
+    Inputs contain selected reset rows, in the same order as the native commit.
+    """
+    if not to_back_wall:
+        return access_region
+    if (access_region.ndim != 2 or access_region.shape[-1] != 4
+            or workspace_bounds.shape != access_region.shape):
+        raise ValueError('Access and workspace bounds must have matching [N,4] shapes.')
+    result = access_region.clone()
+    result[:, 0] = workspace_bounds[:, 0]
+    return result
+
+
 def apply_episode_batch(env, ids, batch):
     """Commit selected rows after applying any shared pool-flag transition."""
     runtime, scene = env._episode_reset, env.task_scene_data
@@ -8968,8 +9004,15 @@ def apply_episode_batch(env, ids, batch):
     _write_physical_reset(env, ids, batch.object_state, batch.joint_positions, batch.active)
     shelf.write_root_state_to_sim(shelf_state, env_ids=ids)
     runtime.mdp_reset_scene = None
-    for name in ("object_ids", "target_id", "blocker_id", "access_region", "geometry_b", "geometry_valid", "observed_ids"):
+    for name in ("object_ids", "target_id", "blocker_id", "geometry_b", "geometry_valid", "observed_ids"):
         getattr(scene, name)[ids] = getattr(batch, name)
+    # Evaluation-only extension: preserve the sampled scene, frozen vision,
+    # collision-checked starts, and shared template across all partial resets.
+    access_region = batch.access_region
+    if getattr(getattr(env, "cfg", None), "access_region_to_back_wall", False):
+        access_region = evaluation_access_region(
+            access_region, scene.workspace_bounds[ids], to_back_wall=True)
+    scene.access_region[ids] = access_region
     for name in ("robot_regions", "visibility", "camera_pose", "camera_intrinsics"):
         getattr(runtime, name)[ids] = getattr(batch, name)
     runtime.robot_tcp[ids] = batch.robot_tcp + env.scene.env_origins[ids]
@@ -9090,7 +9133,8 @@ def reset_scene(env, env_ids=None):
             env, runtime, torch.zeros(1, device=env.device, dtype=torch.long), scene_generation=generation)
         relocation = build_initial_relocation_regions(
             sample, env.spawn_geometries, env.spawn_rules,
-            device=env.device, dtype=template.object_state.dtype)
+            device=env.device, dtype=template.object_state.dtype,
+            include_front_corridors=getattr(env.cfg, "relocation_include_front_corridors", False))
     else:
         template, sample = runtime.shared_template, runtime.shared_sample
     batch = _shared_reset_batch(env, runtime, ids, template, sample)

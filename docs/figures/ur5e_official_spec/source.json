@@ -1,0 +1,33 @@
+{
+  "source_url": "https://www.universal-robots.com/media/1807465/ur5e_e-series_datasheets_web.pdf",
+  "document_title": "UR5e Technical Specification",
+  "publisher": "Universal Robots A/S",
+  "document_update": "December 2024",
+  "access_date_Asia_Seoul": "2026-11-15",
+  "page_number": 1,
+  "pdf_sha256": "9f8fe19535441ca13fb7c34cdb3bd14fa2a7430b6c117e0d40ab3ce6413f00cd",
+  "render_dpi": 150,
+  "render_tool": "pdftoppm",
+  "images": {
+    "ur5e_datasheet_full_page.png": {
+      "region": "full page"
+    },
+    "ur5e_datasheet_identity_tcp.png": {
+      "pixel_crop_xywh": [
+        0,
+        0,
+        1235,
+        1754
+      ]
+    },
+    "ur5e_tcp_speed_excerpt.png": {
+      "pixel_crop_xywh": [
+        38,
+        1360,
+        1170,
+        335
+      ]
+    }
+  },
+  "content_modification": "None; direct PDF rendering and rectangular clipping only."
+}

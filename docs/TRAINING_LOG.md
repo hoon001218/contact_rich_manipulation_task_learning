@@ -10813,3 +10813,428 @@ CPU 독립 재집계와 원래 summary의 차이는 0건이었다. 84개 시행�
   --osc-wrench-sweep --headless --device cuda:0 --max-arm-speed 4 \
   --force-levels .1 .5 1 2 5 10 --torque-levels .001 .005 .01 .05 .1 .5 1
 ```
+
+## 150. 2026-11-15 — 관계 기반 재배치 보상 논의 보류
+
+현재 구현을 변경하지 않은 논의 기록이다. 확정된 Task goal·Observation·기존 보상 설계는
+[학습 방향 정리](LEARNING_DIRECTION.md)에 두고, 다음 후보는 추후 논의를 이어가기 위해 보존한다.
+
+- 목표는 지정된 Blocker를 Target 접근영역 밖으로 옮기는 것이며, 목표 pose나 이동 방향을
+  정책에 명시적으로 제공하지 않는다. 주변 물체·Target·선반의 관계로 재배치의 방향과 품질을
+  평가하는 대안을 검토했다.
+- 최초 후보는 접근영역의 가까운 좌우 경계까지의 분리 거리 `D`, 이웃 OBB 간격의 부족 비용,
+  선반 경계 여유 부족 비용을 합친 `U`의 감소량에 접촉 pad 수 `n_t`를 곱하는 방식이었다.
+- 사용자 지적: 겹침 직전의 작은 여유만 벌점으로 주면 반응이 늦고, 가까운 쪽이 막혀 있어도
+  반대편으로 향하는 준비 이동은 `D`가 커져 불리하다. 반발 범위·weight 조절만으로는 이
+  공간 연결성 문제를 해결하지 못한다. 이웃을 멀리 밀어낸 변화가 보상으로 들어갈 수도 있다.
+- 다음 논의 후보는 `q=(x,y,yaw)`에서 다른 물체와 선반을 침범하지 않는 경로를 따라,
+  접근영역을 비우는 모든 유효 자세 집합까지의 최소 이동·회전 비용 `L(q)`를 평가하는 방식이다.
+  기하학적 진행값은 `L(q_prev)-L(q)`다. 예를 들어 왼쪽 탈출은30mm지만20mm에서 막히고
+  오른쪽150mm는 열려 있을 때, 오른쪽20mm 이동을 기존 `D:30→50mm`의 악화 대신
+  `L:150→130mm`의 개선으로 평가한다(오른쪽이 유효 경로인 단순 예시).
+- 경량 근사는 방향별 탈출 필요거리와 첫 간섭까지 이동 가능한 거리를 비교하는 것이다.
+  직선 방향 비교에는 유용하지만, 회전·pivot·꺾이는 경로는 빠질 수 있다. 이를 포함하려면
+  `(x,y,yaw)` 연결성 지도나 그래프가 필요하며, 격자·회전 비용·swept 형상·메모리·생성 시간을
+  측정해야 한다. 기하학적 경로는 Hand 접촉·마찰·팔 가동성까지 보장하는 물리적 해가 아니다.
+- 같은 초기 배치의 지도 재사용 가능성, 이웃이 움직였을 때의 지도 갱신/무효화, 지도 자체가
+  바뀐 데 따른 보상 방지, OBB와 실제 메시의 차이는 미정이다. 거리 변화 전체에 `n_t`를
+  곱하면 접촉 수를 달리하는 왕복 수익이 생기는 문제도 별도로 해결해야 한다.
+
+논의 그림·기하 보고서는 `logs/diagnostics/relational_reward_2026-11-15/`에 있다.
+`relational_reward_draft.png`는 최초 관계 합산안, `neighbor_relation_refinement.png`는
+작은 여유 부족 비용의 설명이다. 후자는 위 방향 선택 문제를 해결한 최종 설계가 아니다.
+모든 합성 이동은 기존 native 이미지의 CPU 가공이며, 실제 물리 궤적이나 성공 검증이 아니다.
+
+참고: [Paternain 등, Navigation Functions](https://arxiv.org/abs/1605.00638),
+[Sethian, 경로 계획과 Fast Marching](https://math.berkeley.edu/~sethian/2006/History/hold.chart.applications.robotics.html).
+현재 학습 적용·수치 실험 없이 논의를 보류했다.
+
+## 151. 2026-11-15 — 독립 학습 3개 범위 확정과 Reward 그림 거리선 개선
+
+사용자는 한 번에 적용하지 않고 확인 후 단계적으로 진행하도록 요청했다. 메인 프로젝트는
+`contact_manipulation_symmetric`이며, 관계 기반 보상 후보(150절)를 이번 실험에 넣지 않는다.
+현재 단계는 아래 범위 기록과 그림의 거리선 개선이다. 후속 측정·실험 구현·학습은 미실행이다.
+
+### 공통 기준 및 구조
+
+- 기준은 현재 학습 코드다. 문서의 signed 변화량 계획과 달리, 실제 Clearance·Relocation은
+  `n_t*max(현재 품질-직전 품질,0)`이고 `Q=exp(-10*d)`는0~1의 연속값이다.
+- 정책50Hz(`step_dt=.02`), physics/OSC100Hz(`sim.dt=.01`, decimation2), 기존 관측·모델·PPO를
+  유지한다. UR5e 6관절 중 하나라도 `abs(qdot)>1rad/s`이면 종료하며 Hand는 이 종료에서 제외한다.
+- 전체 비교 학습의 Terminal 보상을 주석 처리할 예정이다. 성공·실패·Timeout의 종료 조건은
+  유지한다. **현재 production cfg의 Terminal(+10 성공 지급)은 아직 활성**이며 이 단계에서는
+  변경하지 않았다.
+- 세 실험은 같은 baseline을 직접 상속하고 서로의 변경을 상속하지 않는다. 각각 `env_cfg.py`와
+  `play.py`를 두고 기존 공통 train/play 흐름을 재사용하며 독립 Gym task·로그로 실행할 계획이다.
+- 실행 배정 초안은 server_computer=학습1, jh_computer=학습2, base_computer=학습3이다.
+  실제 실행 가능한 명령어는 각 파일·task를 구현한 뒤 기록한다. 기존 로그 폴더의
+  `sever_computer`는 사용자가 지칭하는 server_computer다.
+
+### 학습1 — 실거리 증분 정규화와 Relocation 전방 통로
+
+사용자가 아래 식을 확인했다.
+
+$$
+g_t^R=n_t\operatorname{clip}\left(\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},0,1\right).
+$$
+
+- `d_t`는 현재 Blocker 중심에서 목적지와 그 전방 통로의 합집합까지의 최소 XY 거리다.
+  영역 내부·경계에서는0이며, 좌우 영역을 하나의 convex hull로 합쳐 접근영역을 채우지 않는다.
+- 양의 거리 감소분만0~1로 제한하고 접촉 pad 수는 기존대로 곱한다. 따라서 최종 raw 항은
+  최대17이며, native RewardManager가 weight·dt를 적용한 뒤의 지급값과는 구분한다.
+- `d_ref`는 물체 없는 **비접촉 이동 시험**에서 측정하도록 사용자가 선택했다. 현재 센서 원점
+  EEF의 선반 평면 XY 변위를20ms 간격으로 읽고, UR5e 6관절 속도가1rad/s 이하인 유효 구간의
+  실측 기준 거리를 정한다. 정지 직후 첫20ms만으로 최대값을 정하지 않는다. 값은 아직 미정이며,
+  측정한 자세·명령·지속시간에서의 기준값이지 모든 상태의 물리적 최대 이동 보장은 아니다.
+  **후속 변경:** 사용자가 초기화 자세 표본이 아닌 가장 빠른 자세를 기준으로 요구했고,
+  이후 제조사 실제 spec에 따른 운동학적 상한 계산을 선택했다. 최신 방법과 결과는152절이다.
+- 기존 `blocker_relocation`·`blocker_relocation_contact_progress` 함수는 보존하고 새 함수를 만든다.
+  현재 `build_initial_relocation_regions`는 예약 목적지만 포함하므로, 새 경로에서 앞쪽 통로도
+  평가하도록 구성해야 한다. 기존 배치 생성과 다른 두 실험의 영역은 유지한다.
+
+### 학습2 — Access region의 뒤쪽 확장
+
+- 사용자는 끝점을 **선반 뒷벽**으로 선택했다. 원래 장면 배치 생성 규칙은 유지하고,
+  Clearance·성공 판정에 쓰는 접근영역만 앞뒤로 선반 뒷벽까지 확장한다. 기존 가로폭을 유지한다.
+- 학습1의 정규화 수식·Relocation 통로 확장은 섞지 않는다. 공통 Terminal 제외 외에는
+  현재 baseline 보상·제어 설정을 따른다.
+
+### 학습3 — 작은 OSC action scale
+
+- 공통 Terminal 제외 외에는 기존 보상·영역을 유지하고 OSC wrench scale만 별도로 축소한다.
+  현재 baseline은 힘10N/raw·토크1N·m/raw다. 변경값은 기존 149절 시험을 참고하여 결정한다.
+- 과거 sweep은 한 자유공간 자세·단일축0.8초 유지 시험이므로, 여러 자세·다축 입력의
+  `1rad/s` 종료 미발생을 보장하지 않는다. 여러 입력·초기 자세의 실제 속도를 확인해야 한다.
+- Gaussian raw 출력은 무상한이고 센서 SI 범위 clipping은 유지된다. scale을 줄이는 것과 최종
+  힘·토크 상한을 낮추는 것은 다르다. scale 축소만으로 과속이 절대 없다고 판단하지 않는다.
+
+### 현재 그림 수정 범위
+
+- [기존 Reward 그림](figures/reward_baseline_overview.png)의 Relocation `d_{1,t}`는 진한 분홍색,
+  `d_{2,t}`는 청색 실선으로 구분하고 두 선의 두께·대비를 높였다. 라벨과 연결선을 이동하여
+  Blocker 중심에서 각 영역의 최근접점까지 잇는 거리임을 식별하기 쉽게 한다.
+- 목적지+전방 통로의 보라색 영역과 기존 수식은 유지한다. 새 수식은 `d_ref` 측정과 학습1
+  셋업 이후 반영한다. 그림의 통로 포함 설계는 아직 production 계산과 다르다.
+- 생성 코드: `logs/diagnostics/reward_figure_2026-11-15/build_reward_overview.py`.
+  기하 검증 정보는 같은 폴더 `reward_overview_geometry.json`에 기록한다.
+
+## 152. 2026-11-15 — 제조사 관절속도와 공칭 DH에 따른 EEF 이동 상한 계산
+
+### 사용자 수정 기준
+
+초기화 자세16개 등의 관측 최대는 물리적으로 가장 빠른 자세의 기준이 아니므로,
+사용자는 가장 빠른 자세를 고려해 계산 가능한 운동학적 상한을 사용하도록 요청했다.
+제조사 UR5e 실제 spec을 기준으로 계산하며,151절의 비접촉 초기 자세 시험 계획을 대체한다.
+이번 단계는 CPU 기구학 계산과 기록만 수행했다. 학습·물리 시험·설정 변경은 하지 않았다.
+
+### 입력 자료와 계산점
+
+- [UR 공식 명세 PDF](https://www.universal-robots.com/media/1807465/ur5e_e-series_datasheets_web.pdf):
+  Base·Shoulder·Elbow·Wrist1·2·3 모두 최대180°/s, 즉πrad/s.
+- [UR 공식 공칭 DH](https://www.universal-robots.com/articles/ur/application-installation/dh-parameters-for-calculations-of-kinematics-and-dynamics/):
+  `a=[0,-.425,-.3922,0,0,0]`, `d=[.1625,0,0,.1333,.0997,.0996]`m,
+  `alpha=[pi/2,0,0,pi/2,-pi/2,0]`. 실제 개별 장비의 보정 파라미터는 포함하지 않는다.
+- 기준점은 현재 제어·관측의 `ToolForceTorqueLink` 원점이다. 생성 코드의 flange→sensor
+  축방향 오프셋은 `(.05+.0254)/2=.0377m`다. Hand anchor까지의 전체50mm와 구분한다.
+  기존 native USD 좌표 기록의37.699972mm와 일치한다. 이 점은 wrist3축과 동축이므로
+  wrist3 자체의 회전은 센서 원점의 병진을 만들지 않는다.
+- 현재 프로젝트의 wrist1·2·3 `velocity_limit_sim=6.28rad/s`는 제조사π와 다르다.
+  이번 주 계산에는 제조사π를 쓰고 production 설정은 변경하지 않았다.
+- 공식 TCP 표기는 문서별로 다르다. SW5.26 및 위 PDF에는 최대 약4m/s,
+  일부 SW10.10 자료에는 약1m/s로 표기되어 있다. 이번 계산은 이 대표값을 엄밀한 상계로
+  간주하지 않고 **관절속도와 DH만** 사용한다. 별도 TCP 제어 속도 제한은 계산에 넣지 않았다.
+
+### 계산 방법과 상한의 의미
+
+고정된 수직 base에서 센서 원점 선속도 Jacobian의 XY 행을 `J_xy(q)`라 두고,
+`max_q max_abs(qdot)<=omega ||J_xy(q)*qdot||`의 상한을 구했다. 위치 관절범위·자체충돌·
+선반 충돌·토크·가속도·초기 속도·controller 도달성 제약은 완화했다. 이 완화된 문제의 상계는
+그 제약을 추가한 문제에도 보수적 상계지만, 실제 실행 가능한 최대와 같다는 뜻은 아니다.
+
+고정 자세에서 관절속도 box의 최대는 부호 조합의 꼭짓점에서 구할 수 있다. UR축 구조에서는
+XY 회전 대칭으로 q1을 없애고, 센서가 동축인 q6의 병진 기여를 제외할 수 있다. 전체 속도
+부호 반전 대칭으로 부호16조합을 남겼다. q2, q2+q3, q2+q3+q4의 사인·코사인 항을
+진폭으로 정확히 최대화하여 남은 두 각도에 대한 주기 함수로 줄였다.
+
+두 각도를 각각2048개 격자로 평가하고 전역 Lipschitz 여유를 더했다. 관절별 최대 기여를
+단순히 더하는 상계보다 타이트하며, 격자의 최대 표본을 그대로 전역 최대라고 부르지 않는다.
+double precision 계산으로 interval arithmetic까지 포함한 수치 인증은 아니다.
+
+| 기준 | 최대 순간속도 후보(m/s) | 균일 XY 속도 상계(m/s) | 20ms XY 변위 상계(mm) |
+|---|---:|---:|---:|
+| 제조사6축πrad/s | 6.084972 | 6.101473 | **122.029459** |
+| 현재 종료 기준6축1rad/s | 1.936907 | 1.942159 | **38.843183** |
+
+구간 전체에서 속도 제약이 유지되면 `||Delta p_xy|| <= integral ||v_xy||dt`이므로,
+이 상계는 순간속도에20ms를 단순 근사한 값이 아니라 유한20ms 변위에도 적용된다.
+최대 순간속도 후보 자세 중심의 일정 관절속도20ms FK 변위는 각각121.538403mm,
+38.732938mm로 상계보다 작았다. 이 궤적의 Hand/팔 충돌·토크 도달성은 검증하지 않았다.
+
+당시 제조사 관절속도 계산을 상향 반올림한 `d_ref=.123m`를 정규화 후보로 기록했다. 현재1rad/s 종료 기준을
+유지하면 EEF의20ms 변위 상계는 그 약0.316배이므로, 이 분모를 쓰는 것만으로 일반 조작의
+진행 점수가1에 가까워지는 것은 아니다. EEF 병진과 Blocker의 회전·관성 이동도 구분한다.
+새 보상 함수·실험 cfg 및 그림 수식에는 아직 적용하지 않았다.
+**후속 결정:**153절에서 공식 TCP 최대속도4m/s를 기준으로 `d_ref=.08m`를 확정했다.
+위123mm는 참고 상한으로 보존하며 정규화 기준으로 채택하지 않는다.
+
+### 재현 자료와 검산
+
+- CPU 계산: `logs/diagnostics/ur5e_kinematic_bound_2026-11-15/calculate_bound.py`.
+- 원자료·가정·상계·후보 자세·출처: 같은 폴더 `report.json`.
+- 전체 격자와 최적 후보 계산 wall time은 CPU 약1.12초였다. GPU·Isaac Sim은 사용하지 않았다.
+- 별도64표본 CPU 검산에서 DH Jacobian 대 FK 중앙차분 최대 오차1.35e-10,
+  support 함수 대 최대화 자세 투영속도 차4.44e-16, 임의 자세의 support 초과0건이었다.
+- 이 결과를 실물 TCP 최대 속도나 현재 OSC로 달성한 물리 변위로 보고하지 않는다.
+
+## 153. 2026-11-15 — 공식 TCP 명세에 따른 기준 거리 확정과 계산 문서·원문 캡처
+
+사용자가 계산 과정의 Markdown 문서화와 제조사 공식 spec 기준의 거리 설정을 요청했다.
+추가로 공식 TCP 최대속도 표기를 제조사 문서임이 확인되는 캡처로 저장하고 문서에 포함하도록 했다.
+
+- 확정 기준: UR5e 공식 명세의 **`Max TCP speed 4 m/s`**. 정책50Hz의20ms를 곱해
+  **`d_ref=0.08m`(80mm)**로 정한다. 정책 주기 변경 시 `4.0*env.step_dt`를 사용한다.
+- 이는 공식 TCP 성능값을 채택한 보상 정규화 척도다. 현재 OSC의 실측 성능이나
+  Blocker의 실제 이동 상한, 임의 tool point의 엄밀한 전역 속도 보장으로 해석하지 않는다.
+-152절의 관절속도·DH 계산123mm는 별도 TCP 제약을 생략한 참고 상한으로 보존하고 채택하지 않는다.
+- 새 문서: [UR5E_RELOCATION_REFERENCE_DISTANCE.md](UR5E_RELOCATION_REFERENCE_DISTANCE.md).
+  공식 입력·Jacobian·속도 부호 조합·자세 최대화·격자 여유·20ms 적분과 적용 상태를 설명한다.
+- 공식 출처: [UR5e Technical Specification](https://www.universal-robots.com/media/1807465/ur5e_e-series_datasheets_web.pdf),
+  본문 `Updated December 2024`, Universal Robots A/S 저작권, PDF1페이지 `Movement` 표.
+- 저장 자료: `docs/figures/ur5e_official_spec/`의 원본 PDF, 전체 페이지 PNG,
+  문서명·저작권·속도 표기가 함께 보이는 PNG, 속도표·제조사 연락처 발췌 PNG 및 `source.json`.
+  캡처는150dpi 직접 렌더링·직사각형 clipping만 수행했고 내용은 수정하지 않았다.
+- 원본 SHA-256: `9f8fe19535441ca13fb7c34cdb3bd14fa2a7430b6c117e0d40ab3ce6413f00cd`.
+- 기존 baseline에는 아직 실거리 정규화 함수·`d_ref` 인자가 없다. 학습1의 설계값으로 확정했으며,
+  기존 함수를 보존한 새 함수·실험 cfg 연결은 다음 구현 단계에서 진행한다.
+  이번 작업은 문서·이미지·원본 보존이며 학습 코드·그림 수식은 변경하지 않고 시뮬레이션을 실행하지 않았다.
+
+## 154. 2026-11-15 — 학습3의 축별 OSC scale 선정과 추가 단축 진단
+
+사용자는 학습3의 scale을 먼저 결정하고 세 실험의 학습 코드는 이후 한 번에 수정하도록 했다.
+149절의84회 wrench 시험과148절의 Tz 시험을 재집계하고 미측정 입력 두 개만 추가 확인했다.
+기존 `wrench_scale=(10,10,10,1,1,1)`은 이번 단계에서 변경하지 않았다.
+**후속 변경:**155절에서 사용자가 힘3축·토크3축의 공통 scale을 요청했다.
+이 절의 축별 값은 중간 선정 이력이며, 최신 학습3 비교값은 `(.1,.1,.1,.001,.001,.001)`이다.
+
+### 비교 설정 선정 기준
+
+- 현재 물리/OSC100Hz·정책50Hz·팔6관절1rad/s 과속 종료를 유지한다. Hand는 속도 분석에서 제외한다.
+- Raw±1에 대응하는 SI 명령에서 첫20ms의 급격한 속도 증가와,0.8초 일정 입력 이후 해제0.3초까지의
+  최대 속도를 확인한다. 한 자세의 단축 입력에서 최대 속도가 대략0.5rad/s 이하인 값을 선택한다.
+- 이는 초기 std1의 탐색을 작은 물리 명령으로 바꾸기 위한 **학습3 비교값**이다. 일정 wrench는
+  속도 명령이 아니므로 지속시간과 무관한 과속 미발생 상한을 정한 것이 아니다.
+- 현재 baseline의 Tz±1N·m는 첫10ms에 wrist3가+3.581/−3.794rad/s였고 첫20ms의 최대는
+  5.392rad/s였다. 다음 정책 명령 전에1rad/s를 넘는 탐색 입력을 줄이는 것이 목적이다.
+- 축별 관성·기구학 결합 응답이 달라 같은 축소 비율을 쓰지 않는다.
+
+| 센서 축 | 기존 scale/raw | 학습3 scale/raw | 축소 비율 | ±raw1 대응 SI 명령에서 측정한 팔 최대 속도(rad/s) | 최대 관절 |
+|---|---:|---:|---:|---:|---|
+| Fx | 10N | **0.1N** | 100배 | 0.306111 | wrist3 |
+| Fy | 10N | **0.5N** | 20배 | 0.438462 | wrist1 |
+| Fz | 10N | **0.25N** | 40배 | 0.286559 | wrist1 |
+| Tx | 1N·m | **0.025N·m** | 40배 | 0.307887 | wrist1 |
+| Ty | 1N·m | **0.01N·m** | 100배 | 0.226615 | wrist3 |
+| Tz | 1N·m | **0.001N·m** | 1000배 | 0.462709 | wrist3 |
+
+표는 모든6관절·양/음 입력·명령 해제 구간을 포함한 최대 절대 속도다.
+초기 자세는149절과 동일한 elbow-up이며 wrist3 roll을 더한 상태다. 외부 물체는 없다.
+
+```python
+# 학습3의 비교 설정. Production cfg에는 아직 적용하지 않음.
+wrench_scale = (0.1, 0.5, 0.25, 0.025, 0.01, 0.001)
+```
+
+### 추가 실행과 기존 자료의 결합
+
+Fz0.25N·Tx0.025N·m는 기존 격자에 없으므로 기존 진단 스크립트로 0/양/음 각3회씩 실행했다.
+실제 조립 UR5e·F/T·Hand·공식 OSC·현재 IdealPD·자중 보상·self collision을 사용했다.
+기존 scale을 유지한 채 SI 명령을 그 scale로 나눠 입력했다. 이는 새 scale에서 raw±1이
+만드는 SI 명령의 동역학 시험이며 새 학습 cfg를 적용한 실행은 아니다.
+다른 축 명령은0이고 Hand 목표는 열린 자세로 유지한다. 각 시행 사이에서만 상태를 복원했다.
+
+추가6회는900physics sample·9초 simulated time으로 정상 완료됐다. Guard 조기 종료와
+1rad/s 초과는0건이었다. q/qdot·raw/submitted torque는 모두 유한하며 두 torque의 차이는0이다.
+시행별 첫 physics q/qdot도 동일했다. Tactile force 최대값은0이었다. 영상은 생성하지 않았다.
+GPU가 비어 있음을 먼저 읽기 전용으로 확인했으며 학습은 실행하지 않았다.
+
+```bash
+/home/hoon/miniconda3/envs/env_isaaclab/bin/python \
+  src/contact_manipulation_symmetric/tests/probe_ft_compensation.py \
+  --osc-wrench-sweep --wrench-axes Fz Tx \
+  --force-levels .25 --torque-levels .025 --wrench-hold .8 \
+  --headless --device cuda:0 --no-video --max-arm-speed 4 \
+  --output logs/diagnostics/osc_scale_selection_2026-11-15/report.json
+```
+
+### 첫 정책 스텝의 응답과 적용 범위
+
+| 센서 축 | 첫20ms 실제 최대 속도(rad/s) | 같은 시점 무명령 궤적 대비 최대 변화(rad/s) |
+|---|---:|---:|
+| Fx | 0.011560 | 0.007518 |
+| Fy | 0.009977 | 0.009813 |
+| Fz | 0.007159 | 0.006995 |
+| Tx | 0.007551 | 0.007387 |
+| Ty | 0.009552 | 0.005509 |
+| Tz | 0.015512 | 0.011470 |
+
+무명령에서도 작은 drift가 있으므로 실제 속도와 명령으로 유발된 변화량을 구분한다.
+각 후보의 양/음 첫20ms 응답을 대칭 차분해 국소 선형 응답 행렬을 만들었다.
+6채널 raw가 동시에±3 이내라는 상자에서의 속도 변화 추정은 관절 순서
+`pan/lift/elbow/wrist1/wrist2/wrist3`로 약
+`[.00521,.00571,.02125,.07296,.03111,.09614]rad/s`다.
+이것은 같은 자세의 **국소 선형 추정**이며 다축 실제 시험이나 다른 자세의 보장이 아니다.
+
+다른 초기 자세·접촉·기존 속도·장기간 일정 입력에서는1rad/s를 넘을 수 있다.
+Gaussian raw는 무상한이며 scale을 줄여도 SI sensor-range clipping
+`±(200,200,360,8,8,8)`은 유지된다. 따라서 이 비교 설정을 절대 속도 제한으로 설명하지 않는다.
+
+### Action-rate와의 동반 효과
+
+현재 `motion_action_rate`는 SI wrench가 아니라 **clipping한 raw action 차분의 제곱합**이다.
+같은 물리 변화량 Δw에 대해 비용은 `(Δw/scale)^2`이므로 아래 변화가 동반된다.
+
+| 축 | 같은 SI 명령 변화에 대한 기존 대비 action-rate 비용 배율 |
+|---|---:|
+| Fx | 10,000배 |
+| Fy | 400배 |
+| Fz | 1,600배 |
+| Tx | 1,600배 |
+| Ty | 10,000배 |
+| Tz | 1,000,000배 |
+
+같은 raw 출력에서 초기 비용이 이 배수로 늘어난다는 의미는 아니다. Raw가 같으면 비용은 같고
+물리 명령만 작아진다. 같은 물리 명령을 내도록 모델이 raw를 늘렸을 때의 효과다.
+따라서 과속 감소와 동시에 조작 위축·필요 raw 증가·action-rate 지급량을 확인해야 한다.
+사용자가 정한 학습3의 독립 비교 범위에 따라 이번 선정에서 보상식·weight는 바꾸지 않는다.
+
+### 결과물과 다음 단계
+
+- 기존 자료: `logs/diagnostics/osc_wrench_sweep_2026-11-14/final/`.
+- 추가 원자료·콘솔·시행별 집계: `logs/diagnostics/osc_scale_selection_2026-11-15/`.
+- 최종6축 선정값·실측·비용 배율·국소 선형 추정: 같은 폴더 `selection_summary.json`, `selected_scales.csv`.
+- 다음 단계는 선정값을 사용하는 독립 학습3 cfg와 나머지 두 실험을 함께 구현하는 것이다.
+  공통 Terminal 보상 제외와 실험별 cfg/play/task/명령은 아직 미적용이다.
+  이번 단계에서 학습 코드·기존 controller·PPO·reward·termination은 변경하지 않았다.
+
+## 155. 2026-11-15 — 학습3의 힘3축·토크3축 공통 scale로 선정안 변경
+
+사용자는 힘3축과 토크3축에 각각 같은 scale을 사용하도록 요청했다.
+154절의 관절속도 여유 기준은 유지하고, 각 그룹에서 가장 민감했던 Fx·Tz에 맞춰 통일했다.
+
+```python
+# 센서 frame: Fx, Fy, Fz, Tx, Ty, Tz
+# 학습3의 최신 비교 설정. Production cfg에는 아직 적용하지 않음.
+wrench_scale = (0.1, 0.1, 0.1, 0.001, 0.001, 0.001)
+```
+
+힘은 기존10N/raw에서 **0.1N/raw로100배**, 토크는 기존1N·m/raw에서
+**0.001N·m/raw로1000배** 축소한다. 공통 scale은 같은 raw에 같은 SI 명령 크기를 부여한다.
+관성·기구학 결합이 다르므로 동작 속도까지 균일해지는 것은 아니다.
+
+149절의 기존84회 시험에 여섯 값의 양/음 입력이 모두 포함되어 있어 추가 시뮬레이션은 하지 않았다.
+동일 비접촉 자세에서 단축 raw±1에 대응하는 명령을0.8초 유지하고0.3초 해제한 실측 결과다.
+
+| 센서 축 | scale/raw | 양·음 및 모든 팔 관절의 최대 절대 속도(rad/s) |
+|---|---:|---:|
+| Fx | 0.1N | 0.306111 |
+| Fy | 0.1N | 0.080047 |
+| Fz | 0.1N | 0.112718 |
+| Tx | 0.001N·m | 0.011948 |
+| Ty | 0.001N·m | 0.025857 |
+| Tz | 0.001N·m | 0.462709 |
+
+전체 해당 표본의1rad/s 초과는0건이다. 다른 자세·복합 입력·접촉·장기간 명령·큰 Gaussian raw의
+과속 미발생을 보장하지 않는다. 특히 Tx·Ty는154절의 축별 안보다 작은 명령을 주게 된다.
+현재 sensor SI hard clipping과 Gaussian 분포를 유지하며 Hand scale은 바꾸지 않는다.
+
+154절의 action-rate 동반 효과는 계속 적용된다. 같은 SI 명령 변화에 대한 기존 대비 비용은
+힘3축 모두10,000배, 토크3축 모두1,000,000배다. 같은 raw 변화의 비용은 그대로다.
+학습3은 다른 보상식·weight를 유지하고 과속 감소와 조작 위축을 함께 확인하는 비교로 둔다.
+
+- CPU 재집계·독립 검산 결과가 일치했다. 학습과 추가 GPU 진단은 실행하지 않았다.
+- 최신 선정값·축별 실측: `logs/diagnostics/osc_scale_selection_2026-11-15/common_scale_selection.json`,
+  `common_scales.csv`.154절의 축별 선정 원자료는 그대로 보존한다.
+- 사용자 지시대로 학습 코드 수정은 세 실험을 함께 구현하는 후속 단계에서 수행한다.
+  이번에는 선정 기록만 갱신했고 production cfg는 기존10/1 그대로다.
+
+## 156. 2026-11-15 — 독립 비교 학습3개 구현과 native reset/step 검증
+
+사용자의 구현 시작 지시에 따라151–155절에서 확정한 세 실험을 동일 baseline에서 독립적으로
+분기했다. 새 reward는 기존 함수를 보존하여 추가했고 실제 장기 PPO 학습은 실행하지 않았다.
+
+### 구성과 적용 범위
+
+| 실험 | 변경 | 배정 | 로그 이름 |
+|---|---|---|---|
+| 학습1 `relocation_distance` | pad수×clip((직전거리−현재거리)/(4×step_dt),0,1), 예약 목적지+전방 통로 | server_computer | `contact_manipulation_symmetric_relocation_distance` |
+| 학습2 `access_back_wall` | 평가용Access rear X만 실제 선반 후방까지 확장 | jh_computer | `contact_manipulation_symmetric_access_back_wall` |
+| 학습3 `small_wrench` | 힘3축.1N/raw·토크3축.001N·m/raw | base_computer | `contact_manipulation_symmetric_small_wrench` |
+
+세 실험은 `experiments/common.py`의 baseline subclass를 공유하며 `self.rewards.terminal=None`만
+공통 적용한다. 기존 baseline task의 Terminal 보상은 보존한다. Success·실패·timeout 종료는
+유지하고 PPO·Actor/Critic·관측·다른 보상식/weight·Hand·물리/정책 주기·배치 규칙은 상속한다.
+이전 checkpoint를 resume하는 비교가 아니라 각각 새 학습을 시작하는 구성이다.
+
+- 각 실험에 `env_cfg.py`·`play.py`를 제공하고 runner cfg는 `experiment_name`만 별도로 지정한다.
+- Gym ID는 기존 prefix에 각각 `RelocationDistance-v0`, `AccessBackWall-v0`, `SmallWrench-v0`를
+  붙인다. 기존 `Isaac-Contact-Manipulation-Symmetric-UR5e-v0` 등록도 보존한다.
+- Play는 AppLauncher 이전 EnvCfg import 없이 기존 `scripts/play.py`를 위임한다.
+  각 진입점이 해당 task를 선택하며 다른 `--task`를 지정하면 오류 처리한다.
+- 공식 `ManagerBasedRLEnv`, manager·RSL-RL runner/학습 흐름을 재사용한다.
+
+### 보상과 기하 구현
+
+- `blocker_relocation_distance_progress(env,reference_speed=4.0,threshold=.01)`는 기존
+  `relocation_distance`의 GPU tensor 경로와 현재 Blocker 전용 pad 합계를 사용한다.
+  기준 거리는50Hz에서80mm이며 정책dt가 바뀌면 함께 바뀐다. 추가 CPU row loop나
+  GPU→CPU scalar 조회를 하지 않는다. Native RewardManager의 weight·dt는 한 번 적용된다.
+- 기존 `blocker_relocation`·`blocker_relocation_contact_progress`는 본문을 보존했다.
+  직전 위치·부분reset 이력은 기존 TaskState를 사용하여 비접촉 진행을 소급 지급하지 않는다.
+- `relocation_include_front_corridors=False`, `access_region_to_back_wall=False`를 기본 cfg에
+  추가했다. 기존 task의 동작은 유지하고 각각 학습1·학습2에서만True다.
+- 학습1은 `sequential_state.pocket_front_corridors`에 기록된 **실제 예약 통로**를 가져온다.
+  목적지와 통로를 별도 convex polygon으로 저장해 각 영역 거리의최소값을 사용하며,
+  좌우 convex hull로Access를 잘못 목표로 채우지 않는다. 새 공유 장면에서만 구축한다.
+- 학습2는 물체·ray·IK 준비 후 `apply_episode_batch`에서만 `scene.access_region`을 확장한다.
+  Sample·공유template·생성기·난수 흐름은 보존한다. 초기 가림 면적·현재Clearance·성공 판정이
+  모두 같은 평가 영역을 읽고, 부분reset에서도 선택한 행만 반영한다.
+- 기존 GUI의 Access·Relocation 시각화는 최종SceneBatch를 읽으므로 실험별 실제 평가 영역과
+  일치한다. 추가 물리 prim이나 collision 형상은 만들지 않는다.
+- 학습3의 action-rate는 기존 clipped raw 평가를 유지한다. 같은 SI 명령 변화 비용의
+  힘10,000배·토크1,000,000배 동반 효과와 조작 위축 가능성을 실험 문서에 명시했다.
+
+### 검증
+
+신규 CPU 검증은 reward10개, 영역8개, cfg/CLI7개다. 전체 회귀는 **643개 중620통과·
+CUDA/Kit전용23생략**이다. 최초 전체 실행에서 새 cfg flag가 없는 오래된 fixture와
+이미 비활성인 Contact-hold를 활성으로 가정한 검사 두 곳을 발견해 테스트만 수정했다.
+실제 보상 설정을 이에 맞춰 변경하지 않았다. 최종 전체 실행은33.77초에정상 종료했다.
+
+GPU에 다른 학습이 없음을 읽기 전용으로 확인한 뒤, 각 task를 별도 프로세스에서
+**4환경·공유 장면2개·부분reset2회·각장면6control step**으로 실행했다. 세 task 모두
+정상 종료했고 총36control step 동안 유한한 보상과 Actor/Critic 동일232D 관측을 확인했다.
+부분reset은 다른 행의 robot state·직전 Blocker 위치·시간을 보존했다. 종료 episode는0이었다.
+
+| 실험 | 장면별 목표 polygon 수 | 첫 장면 Access X 범위(m) | 결과 |
+|---|---|---|---|
+| 학습1 | 4 / 4 | [−0.681171, −0.515] | 통과 |
+| 학습2 | 2 / 2 | [−0.9, −0.515] | 통과 |
+| 학습3 | 2 / 2 | [−0.681171, −0.515] | 통과 |
+
+같은seed42의 각 장면에서 세 실험의 Target/Blocker·활성ID·물체 위치·yaw·생성 Access·예약
+목적지가 완전히 같았다. 즉 평가 기하 변경이 실제 물리 배치 생성으로 역전파되지 않았다.
+Terminal reward는 비활성이며 success termination은 활성인 것도 실제 manager에서 확인했다.
+세 전용 `play.py --help`와 CLI 전달 검증도 통과했다. 실제 학습 checkpoint 재생이나
+장기 학습·1,024환경 성능 benchmark는 이번 검증에 포함하지 않는다.
+
+### 문서·그림·원자료
+
+- 컴퓨터별 train/play/video 명령과 재검증:
+  [COMPARISON_EXPERIMENTS_2026-11-15.md](COMPARISON_EXPERIMENTS_2026-11-15.md).
+- 학습1 새1×3 그림: [PNG](figures/reward_relocation_distance_overview.png),
+  [SVG](figures/reward_relocation_distance_overview.svg). Relocation은거리 감소량·80mm기준,
+  Clearance는 실제양의개선식으로표시했다. 기존설계그림·generator는보존했다.
+- 실제 native 진단 코드: `src/contact_manipulation_symmetric/tests/probe_experiments.py`.
+- 원자료: `logs/diagnostics/three_experiments_2026-11-15/`의 각task JSON/콘솔,
+  `native_summary.json`, `cpu_tests_final.log`, 세play help로그.
+- 기록과실행명령은정리했으며, 사용자가 실행할1024환경 학습 프로세스는 시작하지 않았다.

@@ -19,6 +19,7 @@ __all__ = [
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
+    "blocker_relocation_distance_progress",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -371,6 +372,44 @@ def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, thresho
     valid = (torch.isfinite(state.blocker_center).all(-1)
              & torch.isfinite(state.previous_blocker_center).all(-1))
     return _current_blocker_contact_count(env, threshold) * torch.where(valid, progress, 0.0)
+
+
+def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.01):
+    """Pay current Blocker pad count times normalized positive distance progress.
+
+    Distance is from the Blocker center to the union of this scene's relocation
+    polygons, including the front corridors when configured by the experiment.
+    The reference distance is ``reference_speed * env.step_dt``: the official
+    UR5e TCP speed specification of 4 m/s gives 80 mm at a 50 Hz policy rate.
+    This is a normalization reference, not a bound on actual object motion.
+
+    Consecutive centers come from the shared TaskState snapshots, including
+    noncontact steps. A partial reset rebases only its rows; repeated reward
+    reads never consume history or pay earlier noncontact progress. Invalid
+    geometry/centers and missing goals pay zero. Native RewardManager applies
+    weight and control dt once; no additional rate conversion is applied here.
+    """
+    from .events import get_task_state
+
+    if not math.isfinite(reference_speed) or reference_speed <= 0:
+        raise ValueError("Relocation reference speed must be finite and positive.")
+    dt = env.step_dt
+    if not math.isfinite(dt) or dt <= 0:
+        raise ValueError("Relocation control step_dt must be finite and positive.")
+    reference_distance = reference_speed * dt
+    if not math.isfinite(reference_distance) or reference_distance <= 0:
+        raise ValueError("Relocation reference distance must be finite and positive.")
+
+    state = get_task_state(env)
+    current = relocation_distance(state.blocker_center[:, :2], state.relocation_regions,
+                                  state.relocation_vertex_counts, state.relocation_valid)
+    previous = relocation_distance(state.previous_blocker_center[:, :2], state.relocation_regions,
+                                   state.relocation_vertex_counts, state.relocation_valid)
+    valid = (torch.isfinite(current) & torch.isfinite(previous)
+             & torch.isfinite(state.blocker_center).all(-1)
+             & torch.isfinite(state.previous_blocker_center).all(-1))
+    progress = torch.where(valid, previous - current, 0.0) / reference_distance
+    return _current_blocker_contact_count(env, threshold) * progress.clamp(0.0, 1.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

@@ -1,5 +1,10 @@
 # Contact Manipulation Symmetric
 
+**2026-11-15 독립 비교 학습 3개:** 학습1(Relocation 실거리 정규화+전방 통로),
+학습2(Access 후방 확장), 학습3(작은 공통 wrench scale)을 별도 task/config/play로 실행한다.
+세 실험의 Terminal 보상만 제외하고 기존 task는 보존한다. 컴퓨터별 학습·play·영상 명령과
+수식은 [비교 실험 실행 문서](../../docs/COMPARISON_EXPERIMENTS_2026-11-15.md)를 따른다.
+
 **2026-11-07부터 사용자 지정 메인 개발·학습 프로젝트다.** 기존 `contact_manipulation`은
 비교 구현과 과거 실행 이력으로 보존한다. 공통 PhysX 경로의 오류 조사 기록은
 [`docs/TRAINING_LOG.md` 112절](../../docs/TRAINING_LOG.md)을 따른다.
@@ -73,7 +78,7 @@ activation을 복원하며, ELU 기본 설정으로 ReLU 학습을 그대로 res
 | Clearance | `현재 접촉 pad 수 * max(Q_clear(t)-Q_clear(t-1), 0)`, weight12 |
 | Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
 | Blocker relocation | `현재 접촉 pad 수 * max(Q_reloc(t)-Q_reloc(t-1), 0)`, weight3·decay10 |
-| Contact hold | 새 접촉0.5·유지 접촉1의 pad 합, weight3·Target 보호 gate |
+| Contact hold | 주석 처리되어 비활성. Clearance·Relocation은 별도로 현재 접촉 pad 수를 사용 |
 | Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
 | Action-rate / Joint velocity | 각각−.03, 기존 clipping·12독립관절 선택 |
 | Blocker stability / Time / Terminal | 위 원본 설정 유지 |

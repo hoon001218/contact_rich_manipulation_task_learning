@@ -213,6 +213,9 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
     actor_vision_update_interval: int = 0
+    # Independent experiment geometry; defaults preserve the baseline layout/MDP.
+    relocation_include_front_corridors: bool = False
+    access_region_to_back_wall: bool = False
     # Independent diagnostic switches retain GPU tensor/Warp arithmetic while
     # bypassing only cached CUDA graph capture/replay in the selected stage.
     transition_cuda_graph: bool = True
@@ -234,9 +237,12 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     episode_length_s: float = 8.0
 
     def __post_init__(self):
-        for name in ("transition_cuda_graph", "support_cuda_graph", "robot_start_cuda_graph"):
+        for name in ("transition_cuda_graph", "support_cuda_graph", "robot_start_cuda_graph",
+                     "relocation_include_front_corridors", "access_region_to_back_wall"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean.")
+        if self.relocation_include_front_corridors and self.spawn_rules.generation_mode != "sequential":
+            raise ValueError("Relocation front corridors require the sequential scene generator.")
         if (isinstance(self.actor_vision_update_interval, bool)
                 or not isinstance(self.actor_vision_update_interval, int)
                 or self.actor_vision_update_interval < 0):
