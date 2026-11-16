@@ -3,7 +3,19 @@
 기준일: **2026-11-15, Asia/Seoul**. 프로젝트: `contact_manipulation_symmetric`.
 
 세 실험은 같은 기존 UR5e 설정에서 독립적으로 분기한다. 이전 checkpoint를 이어 학습하지 않고
-각각 새 학습을 시작한다. 원래 task와 기존 Relocation 함수는 비교 기준으로 보존한다.
+각각 새 학습을 시작한다. 기존 Relocation 함수는 비교 기준으로 보존한다.
+
+**2026-11-16 변경:** 기본 Symmetric task에도 학습1의 거리 감소량 정규화와 목적지·전방 통로를
+적용했다. 아래 표의11월15일 비교 조건은 유지한다. 학습1은 그대로이며, 학습2·학습3에는
+기존 `blocker_relocation_contact_progress(decay=10.0)`와
+`relocation_include_front_corridors=False`를 명시하여 기본값 변경을 상속하지 않도록 했다.
+기본 task의 Terminal 보상과 다른 설정은 이번 변경에서 유지한다.
+
+**2026-11-16 후속 변경:** 기본 task는 `access_region_to_back_wall=True`도 적용한다.
+평가용 후방 X만 실제 선반 지지면 후방(`workspace_bounds[:, 0]`)까지 늘리고 정면 X·좌우 Y는
+유지한다. 초기 가림·현재 Clearance·성공·GUI가 같은 확장 영역을 사용하며 배치·ray·IK는
+바꾸지 않는다. 아래 비교 표는 그대로다. 학습1·학습3은 해당 옵션을 명시적으로 끄고 학습2는
+켜서 세 독립 실험에 기본값 변경이 섞이지 않도록 했다. 기본 Relocation의 앞선 변경도 유지한다.
 
 ## 1. 실험 구성
 

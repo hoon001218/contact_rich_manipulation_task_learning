@@ -99,7 +99,7 @@ class RewardsCfg:
     """Raw task scores/costs, integrated by the native RewardManager."""
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
-    clearance = RewardTermCfg(func=mdp.clearance_contact_progress, weight=12.0)
+    clearance = RewardTermCfg(func=mdp.clearance_contact_progress, weight=30.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
@@ -107,9 +107,10 @@ class RewardsCfg:
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation_contact_progress, weight=3.0, params={"decay": 10.0},
+        func=mdp.blocker_relocation_distance_progress, weight=30.0,
+        params={"reference_speed": 4.0, "threshold": 0.01},
     )
-    # blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
@@ -212,10 +213,11 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
-    actor_vision_update_interval: int = 0
-    # Independent experiment geometry; defaults preserve the baseline layout/MDP.
-    relocation_include_front_corridors: bool = False
-    access_region_to_back_wall: bool = False
+    actor_vision_update_interval: int = 5
+    # Score the generated destination patches and their reserved front corridors.
+    relocation_include_front_corridors: bool = True
+    # Evaluate access across the full shelf depth, including behind the Target.
+    access_region_to_back_wall: bool = True
     # Independent diagnostic switches retain GPU tensor/Warp arithmetic while
     # bypassing only cached CUDA graph capture/replay in the selected stage.
     transition_cuda_graph: bool = True

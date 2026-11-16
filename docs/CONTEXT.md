@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-11-15, Asia/Seoul**.
+최종 갱신: **2026-11-16, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,14 +10,36 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-11-15
+## 최신 진입점 — 2026-11-16
+
+**2026-11-16 — 기본 Access region도 선반 후방까지 확장.**
+기본 `access_region_to_back_wall=True`로 설정했다. 평가용 영역의 후방 X만 실제 선반 지지면
+경계 `workspace_bounds[:, 0]`까지 늘리고 정면 X·좌우 Y는 유지한다. 초기 가림 면적·현재
+Clearance·성공 판정·GUI Access 표시가 같은 확장 영역을 사용한다. 생성된 물체 배치·예약
+재배치 영역·카메라·초기 ray·IK는 유지한다. 기본 Relocation은157절의 거리 감소량·전방 통로를
+그대로 사용한다.11월15일 독립 비교를 보존하도록 학습1·학습3은 후방 확장을 명시적으로 끄고,
+학습2만 켠다. 시뮬레이션·play·학습은 실행하지 않았으며 세부 변경은
+**[TRAINING_LOG.md](TRAINING_LOG.md)158절**을 따른다.
+사용자가 별도로 조정한 현재 Clearance·Relocation weight30과 Contact hold 활성·weight3은
+보존했다. 아래157절의 weight3 서술은 변경 당시 이력이다.
+
+**2026-11-16 — 기본 Symmetric task에 학습1의 Relocation 적용.**
+기본 `blocker_relocation`은 `mdp.blocker_relocation_distance_progress`를 사용한다.
+수식은 `n_t*clip((d_prev-d)/(4.0*env.step_dt),0,1)`이며 weight3·접촉 기준0.01N을 유지한다.
+거리의 목표 영역은 예약 목적지와 실제 전방 통로의 합집합이다.
+`relocation_include_front_corridors=True`를 기본값으로 하고, 기존 exponential 함수는 보존한다.
+학습1은 유지한다. 학습2·학습3은11월15일 비교 조건을 유지하도록 기존 exponential 진행 보상과
+전방 통로 미포함을 명시한다. 기본 task의 Terminal·다른 보상·종료·제어·배치 생성 규칙은
+변경하지 않는다. 세부 이력은 **[TRAINING_LOG.md](TRAINING_LOG.md)157절**이다.
+CPU 전체 회귀는644개 중621통과·CUDA/Kit 전용23생략이다.
+이번 변경에서 시뮬레이션과 학습은 실행하지 않았다.
 
 **2026-11-15 — 독립 비교 학습 3개 구현·검증 완료, 학습 미시작.**
 현재 실행 기준은 **[비교 실험 문서](COMPARISON_EXPERIMENTS_2026-11-15.md)**와
 **[TRAINING_LOG.md](TRAINING_LOG.md)156절**이다. 각 실험에 별도 `env_cfg.py`·`play.py`·
 Gym task·로그 이름을 제공한다. server_computer=학습1, jh_computer=학습2, base_computer=학습3의
 실행 명령을 정리했다. 세 실험의 Terminal 보상만 제외하고 실제 종료 조건은 유지한다.
-기존 baseline task는 비교 대상으로 보존한다.
+당시 baseline task는 비교 대상으로 보존했다.11월16일 이후 기본 Relocation·Access는 위 변경을 따른다.
 CPU643개 중620통과·CUDA/Kit전용23생략이며 실제 각4환경·2장면·부분reset·12control step을
 통과했다. 같은seed의 생성 배치는3실험에서일치했고 Actor/Critic 관측도동일232D·유한값이었다.
 장기학습이나1024환경성능 측정은 수행하지 않았다.
@@ -72,8 +94,8 @@ task는 **`Isaac-Contact-Manipulation-Symmetric-UR5e-v0`**다. Actor와 Critic�
 유지하고 추후 검토할 항목으로 기록한다. 기본 seed42·반복 배치 순서·예제와의 차이는
 **[TRAINING_LOG.md](TRAINING_LOG.md) 146절**을 따른다.
 
-**2026-11-11 최신 reward 변경은145절이다.** Symmetric의 기존 clearance·relocation
-함수는 그대로 보존하고 cfg의 기존 선언을 주석으로 남겼다. 활성 두 term은
+**2026-11-11 접촉·개선량 reward 변경 이력은145절이다.** Symmetric의 기존 clearance·relocation
+함수는 그대로 보존하고 cfg의 기존 선언을 주석으로 남겼다. 당시 활성 두 term은
 `현재 Blocker 접촉 pad 수 * max(현재 품질 - 직전 control step 품질, 0)`를 반환한다.
 접촉은 유효한 Blocker 전용 pad 합력 norm이0.01N을 초과하는 현재 sample이며, 새 접촉도
 즉시1개로 센다. 가림 품질은 기존 signed 초기 가림 대비 개선, 재배치 품질은 기존

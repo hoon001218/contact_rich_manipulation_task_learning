@@ -1,8 +1,17 @@
 # Contact Manipulation Symmetric
 
+**2026-11-16 기본 Access 변경:** 기본 task는 평가용 Access region을 선반 후방까지 확장한다.
+초기 가림 면적·Clearance·성공 판정·GUI 표시가 같은 확장 영역을 사용하며 실제 배치·ray·IK는
+유지한다. 학습1·학습3은 후방 확장을 끄고 학습2만 켜서11월15일 비교 조건을 보존한다.
+
+**2026-11-16 기본 Relocation 변경:** 기본 task도 학습1과 같은 거리 감소량 정규화와
+예약 목적지·전방 통로의 합집합을 사용한다. 기존 exponential 함수는 보존한다.
+학습2·학습3은 비교 조건을 유지하도록 기존 exponential 보상·목적지만 명시적으로 설정한다.
+Terminal 보상과 다른 설정은 이번 변경에 포함하지 않는다.
+
 **2026-11-15 독립 비교 학습 3개:** 학습1(Relocation 실거리 정규화+전방 통로),
 학습2(Access 후방 확장), 학습3(작은 공통 wrench scale)을 별도 task/config/play로 실행한다.
-세 실험의 Terminal 보상만 제외하고 기존 task는 보존한다. 컴퓨터별 학습·play·영상 명령과
+세 실험의 Terminal 보상만 제외한다. 컴퓨터별 학습·play·영상 명령과
 수식은 [비교 실험 실행 문서](../../docs/COMPARISON_EXPERIMENTS_2026-11-15.md)를 따른다.
 
 **2026-11-07부터 사용자 지정 메인 개발·학습 프로젝트다.** 기존 `contact_manipulation`은
@@ -68,24 +77,33 @@ GNN node/message/update와 최적화된 edge 커널은 ReLU, attention은 Softma
 Action mean과 value의 최종 출력은 선형이다. 이전 ReLU checkpoint는 play에서 저장된
 activation을 복원하며, ELU 기본 설정으로 ReLU 학습을 그대로 resume하는 것은 계약 검사로 거부한다.
 
-### 최신 reward·action 설정 (2026-11-11)
+### 최신 reward·action 설정 (2026-11-16)
 
 기존 clearance·relocation 함수와 cfg 선언은 보존하고, Symmetric의 활성 두 term을
-현재 Blocker 접촉 pad 수와 직전 control step 대비 양의 개선량을 곱하는 함수로 교체했다.
+현재 Blocker 접촉 pad 수와 직전 control step 대비 양의 개선량을 곱하는 함수로 사용한다.
+Relocation은 학습1에서 사용한 실거리 정규화 방식을 기본값으로 적용한다.
 
 | 항목 | 현재 설정 |
 |---|---|
-| Clearance | `현재 접촉 pad 수 * max(Q_clear(t)-Q_clear(t-1), 0)`, weight12 |
+| Clearance | `현재 접촉 pad 수 * max(Q_clear(t)-Q_clear(t-1), 0)`, weight30 |
+| Access region | 후방 X를 선반 지지면 후방까지 확장, 기존 정면 X·좌우 Y 유지 |
 | Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
-| Blocker relocation | `현재 접촉 pad 수 * max(Q_reloc(t)-Q_reloc(t-1), 0)`, weight3·decay10 |
-| Contact hold | 주석 처리되어 비활성. Clearance·Relocation은 별도로 현재 접촉 pad 수를 사용 |
+| Blocker relocation | `현재 접촉 pad 수 * clip((d(t-1)-d(t))/(4*step_dt), 0, 1)`, weight30 |
+| Contact hold | `BlockerContactHold` 활성, weight3. Clearance·Relocation도 별도로 현재 접촉 pad 수를 사용 |
 | Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
 | Action-rate / Joint velocity | 각각−.03, 기존 clipping·12독립관절 선택 |
 | Blocker stability / Time / Terminal | 위 원본 설정 유지 |
 
+Clearance·Relocation weight30과 Contact hold 활성화는 사용자가 수정한 현재 설정이다.
+이번 Access 후방 확장에서는 이 값을 그대로 보존했다.
+
 `Q_clear = 1 - 현재 Blocker 가림 면적 / 초기 가림 면적`이며 signed 값을 유지한다.
-`Q_reloc = exp(-10*d)`의 `d`는 현재 Blocker 중심에서 초기 빈 재배치 영역까지의 XY 거리다.
-영역 내부나 경계에서는 품질1이지만 정지하면 개선량0이므로 새 보상이 없다. 영역이 없거나
+기본 `access_region_to_back_wall=True`이며 평가용 최소 X를 `workspace_bounds[:, 0]`로 설정한다.
+초기와 현재 가림 면적 모두 이 확장 영역에서 계산하고 성공 판정에도 같은 영역을 쓴다.
+생성 sample과 공유 template은 바꾸지 않아 물체 배치·예약 영역·카메라·초기 ray·IK는 유지한다.
+Relocation의 `d`는 현재 Blocker OBB 중심에서 예약 목적지와 **전방 통로의 합집합**까지의
+최단 XY 거리다. 기준 거리 `4*step_dt`는 제조사 TCP 최대속도4m/s를 사용하며50Hz에서80mm다.
+영역 내부나 경계에서는 거리0이고 정지하면 개선량0이므로 새 보상이 없다. 영역이 없거나
 기하가 유효하지 않으면 보상0이다. 초기 영역은 새 공유 scene당1회 준비하고 부분 reset에서
 재사용한다. 접근 경로나 전체 Blocker footprint의 영역 진입을 보장하는 판정은 아니다.
 
@@ -98,8 +116,9 @@ control dt를 한 번 곱한다. Distance는 기존 현재 거리 평가를 유�
 
 기존 `mdp.clearance`·`mdp.blocker_relocation`은 그대로 남아 있고, cfg의 기존 선언은
 주석으로 보존했다. 새 선언은 `mdp.clearance_contact_progress`와
-`mdp.blocker_relocation_contact_progress`를 사용한다. 구현·검증은
-[`TRAINING_LOG.md` 145절](../../docs/TRAINING_LOG.md)을 따른다.
+`mdp.blocker_relocation_distance_progress`를 사용한다. 이전 exponential 진행 함수인
+`mdp.blocker_relocation_contact_progress`도 보존한다. 변경 이력은
+[`TRAINING_LOG.md` 145·156–158절](../../docs/TRAINING_LOG.md)을 따른다.
 
 Action 출력은 Sensor-frame wrench6 + Hand6의12D를 유지한다.
 Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정,
@@ -109,7 +128,9 @@ Transition/support/robot-start의 진단용 CUDA graph 스위치도 원본과 �
 GUI play의 **Debug Visualization**에서 `Access region (yellow)`와
 `Relocation regions (purple)`를 각각 켜고 끌 수 있다(기본 OFF).
 보상에 사용하는 실제 영역의 윤곽을 초기 선반 지지면보다3mm 위에 표시하며,
-새 장면마다 갱신한다. Relocation은 예약된 목적지만 표시하고 앞쪽 접근 통로는 포함하지 않는다.
+새 장면마다 갱신한다. 기본 task와 학습1의 Relocation은 예약 목적지와 전방 통로를 함께
+표시하고, 학습2·학습3은 비교 조건대로 예약 목적지만 표시한다.
+Access 표시는 기본 task·학습2에서 선반 후방까지 확장하고 학습1·학습3에서는 기존 영역을 쓴다.
 OBB·센서와 같은 DebugDraw callback을 사용하며 USD prim이나 물리 형상을 만들지 않는다.
 Headless에서는 표시 자원을 생성하지 않는다.
 

@@ -89,7 +89,7 @@ def load_configs():
 
     mdp_names = {node.attr for path in (
         PACKAGE / "shelf_manipulation_env_cfg.py",
-        PACKAGE / "experiments/relocation_distance/env_cfg.py",
+        *(PACKAGE / f"experiments/{variant}/env_cfg.py" for variant in EXPERIMENTS),
     ) for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
         and node.value.id == "mdp"}
@@ -99,7 +99,7 @@ def load_configs():
         ManagerBasedRLEnvCfg=ManagerBasedRLEnvCfg, ShelfManipulationEnvWindow=object,
         RewardTermCfg=TermCfg, TerminationTermCfg=TermCfg, SceneEntityCfg=record,
         EventTermCfg=record, ActionTermCfg=object, joint_vel_out_of_manual_limit=object,
-        mdp=mdp, math=math, os=os,
+        mdp=mdp, math=math, os=os, BlockerContactHold=type("BlockerContactHold", (), {}),
         ShelfManipulationSceneCfg=record,
         ObservationsCfg=lambda: record(policy=record(marker="actor"), critic=record(marker="critic")),
         EventCfg=record, CurriculumCfg=lambda: record(time_penalty=None),
@@ -141,22 +141,28 @@ class ExperimentConfigurationTests(unittest.TestCase):
     def test_variants_change_only_their_declared_baseline_fields(self):
         baseline = freeze(self.baseline_env())
         self.assertIsNotNone(baseline["rewards"]["terminal"])
-        self.assertFalse(baseline["access_region_to_back_wall"])
-        self.assertFalse(baseline["relocation_include_front_corridors"])
+        self.assertTrue(baseline["access_region_to_back_wall"])
+        self.assertTrue(baseline["relocation_include_front_corridors"])
+        relocation = baseline["rewards"]["blocker_relocation"]
+        self.assertIs(relocation["func"], self.mdp.blocker_relocation_distance_progress)
+        self.assertEqual(relocation["params"], {"reference_speed": 4.0, "threshold": 0.01})
+        # Research weights may be tuned independently; variants below must
+        # inherit them without modifying the user's current baseline values.
         for variant, (cfg_class, _) in self.variants.items():
             with self.subTest(variant=variant):
                 expected = freeze(self.baseline_env())
                 expected["rewards"]["terminal"] = None
-                if variant == "relocation_distance":
-                    expected["relocation_include_front_corridors"] = True
+                # Existing Learning 2/3 comparisons retain their historical
+                # relocation definition even after the default becomes Learning 1.
+                if variant != "relocation_distance":
+                    expected["relocation_include_front_corridors"] = False
                     expected["rewards"]["blocker_relocation"]["func"] = (
-                        self.mdp.blocker_relocation_distance_progress)
-                    expected["rewards"]["blocker_relocation"]["params"] = {
-                        "reference_speed": 4.0, "threshold": 0.01,
-                    }
-                elif variant == "access_back_wall":
-                    expected["access_region_to_back_wall"] = True
-                else:
+                        self.mdp.blocker_relocation_contact_progress)
+                    expected["rewards"]["blocker_relocation"]["params"] = {"decay": 10.0}
+                # Learning 1/3 keep the original access depth; only the main
+                # task combines metric relocation with rear-wall access now.
+                expected["access_region_to_back_wall"] = variant == "access_back_wall"
+                if variant == "small_wrench":
                     expected["actions"]["arm_action"]["wrench_scale"] = (
                         0.1, 0.1, 0.1, 0.001, 0.001, 0.001,
                     )
@@ -165,18 +171,21 @@ class ExperimentConfigurationTests(unittest.TestCase):
 
     def test_instance_mutation_does_not_leak_to_baseline_or_other_variants(self):
         before = freeze(self.baseline_env())
+        variants_before = {
+            name: freeze(cfg_class()) for name, (cfg_class, _) in self.variants.items()
+        }
         modified = self.variants["relocation_distance"][0]()
         modified.rewards.clearance.weight = 999.0
+        modified.rewards.blocker_relocation.params["reference_speed"] = 999.0
+        modified.relocation_include_front_corridors = False
+        modified.access_region_to_back_wall = True
         modified.actions.hand_action.scale = 0.99
         modified.terminations.hand_velocity.params["max_velocity"] = 999.0
         modified.spawn_rules.max_objects = 999
         self.assertEqual(freeze(self.baseline_env()), before)
-        for cfg_class, _ in self.variants.values():
-            cfg = cfg_class()
-            self.assertEqual(cfg.rewards.clearance.weight, before["rewards"]["clearance"]["weight"])
-            self.assertEqual(cfg.actions.hand_action.scale, before["actions"]["hand_action"]["scale"])
-            self.assertEqual(freeze(cfg.terminations), before["terminations"])
-            self.assertEqual(freeze(cfg.spawn_rules), before["spawn_rules"])
+        for name, (cfg_class, _) in self.variants.items():
+            with self.subTest(variant=name):
+                self.assertEqual(freeze(cfg_class()), variants_before[name])
 
     def test_runner_ppo_models_and_observation_settings_are_identical_except_log_name(self):
         baseline = freeze(self.baseline_runner())

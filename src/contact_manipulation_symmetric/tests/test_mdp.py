@@ -858,17 +858,19 @@ class RelocationRewardTests(unittest.TestCase):
             self.assertEqual(actual.shape, (1024,))
             self.assertEqual(actual.dtype, dtype)
 
-    def test_cfg_uses_contact_progress_relocation_and_preserves_weight_and_decay(self):
+    def test_cfg_uses_metric_distance_progress_relocation_and_preserves_weight(self):
         source = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
         term = next(node.value for node in definition.body if isinstance(node, ast.Assign)
                     and node.targets[0].id == 'blocker_relocation')
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
-        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_contact_progress')
+        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_progress')
         self.assertEqual(ast.literal_eval(fields['weight']), 3.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
-        self.assertEqual(params, {'decay': 10.})
+        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01})
+
+    def test_legacy_relocation_rejects_invalid_decay(self):
         for decay in (0., -1., math.nan, math.inf):
             with self.subTest(decay=decay), self.assertRaises(ValueError):
                 rewards.blocker_relocation(SimpleNamespace(), decay=decay)
@@ -1407,7 +1409,7 @@ class RewardTests(unittest.TestCase):
         # Research weights/decays are experiment parameters. Check the public
         # function wiring and cost signs without freezing one experiment's values.
         for name, fn in (('clearance', 'clearance_contact_progress'), ('blocker_distance', 'blocker_distance'),
-                         ('blocker_relocation', 'blocker_relocation_contact_progress'),
+                         ('blocker_relocation', 'blocker_relocation_distance_progress'),
                          ('blocker_contact_hold', 'BlockerContactHold'),
                          ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
             if name in {'motion_singularity', 'blocker_contact_hold'} and name not in terms:
@@ -1421,7 +1423,7 @@ class RewardTests(unittest.TestCase):
         self.assertEqual(terms['clearance'], ('clearance_contact_progress', 12.))
         if 'blocker_contact_hold' in terms:
             self.assertEqual(terms['blocker_contact_hold'], ('BlockerContactHold', 3.))
-        self.assertEqual(terms['blocker_relocation'], ('blocker_relocation_contact_progress', 3.))
+        self.assertEqual(terms['blocker_relocation'], ('blocker_relocation_distance_progress', 3.))
         self.assertEqual(terms['target_collision'], ('target_collision', -.5))
         self.assertEqual(terms['object_stability'], ('object_stability', .5))
         self.assertNotIn('motion_singularity', terms)

@@ -11238,3 +11238,69 @@ Terminal reward는 비활성이며 success termination은 활성인 것도 실�
 - 원자료: `logs/diagnostics/three_experiments_2026-11-15/`의 각task JSON/콘솔,
   `native_summary.json`, `cpu_tests_final.log`, 세play help로그.
 - 기록과실행명령은정리했으며, 사용자가 실행할1024환경 학습 프로세스는 시작하지 않았다.
+
+## 157. 2026-11-16 — 기본 Relocation에 실거리 정규화와 전방 통로 적용
+
+사용자 요청에 따라 기본 `contact_manipulation_symmetric`의 Relocation을 학습1과 동일하게
+설정했다. 기존 exponential 보상 함수는 삭제하지 않는다.
+
+$$
+d_t=\min_k\operatorname{dist}(p_{B,t}^{xy},\mathcal R_k),\qquad
+g_t^R=n_t\operatorname{clip}\left(
+\frac{d_{t-1}-d_t}{4\,\mathrm{m/s}\times\Delta t},0,1\right).
+$$
+
+- 활성 함수는 `mdp.blocker_relocation_distance_progress`, weight3,
+  `reference_speed=4.0`, `threshold=0.01`이다.50Hz에서 기준 거리는80mm다.
+- `relocation_include_front_corridors=True`를 기본값으로 하여 $\mathcal R_k$는 배치 생성 시
+  예약한 목적지와 **실제 전방 통로의 합집합**이다. 목적지와 통로는 별도 polygon으로 유지하고
+  각 영역까지 거리의 최소값을 사용한다. 영역 사이의 빈 공간을 convex hull로 채우지 않는다.
+- Blocker OBB 중심의 XY 거리를 사용한다. 내부·경계는0이며 정체·악화·무접촉은 보상0이다.
+  접촉 pad 수와 reset 이력, native RewardManager의 weight·dt 적용은 기존 함수를 재사용한다.
+- 학습1은 그대로 유지한다. 학습2·학습3은11월15일의 독립 비교 조건을 보존하도록
+  `blocker_relocation_contact_progress(decay=10.0)`와 전방 통로 미포함을 명시한다.
+- 기본 task의 Terminal 보상·다른 보상과 종료 조건·Actor/Critic·관측·제어·배치 생성 규칙은
+  이번 변경에서 수정하지 않는다. 이미 실행 중인 프로세스에는 변경된 설정이 소급 적용되지 않는다.
+
+현재 설정과 비교 조건은 [Symmetric README](../src/contact_manipulation_symmetric/README.md)와
+[비교 실험 문서](COMPARISON_EXPERIMENTS_2026-11-15.md)에 반영했다.
+이번 변경에서 시뮬레이션·play·학습을 실행하지 않았다.11월15일의 native 검증 결과는156절의
+당시 설정에 대한 기록이며, 이번 변경의 새 실행 결과로 간주하지 않는다.
+
+CPU 전체 회귀검사는 **644개 중 621개 통과·CUDA/Kit 전용 23개 생략**으로 완료했다
+(32.26초). 기본 설정의 새 함수·파라미터·weight와 전방 통로 활성화, 학습2·3의 기존 설정
+보존 및 설정 인스턴스 분리를 확인했다. 기존 영역 검사에서 전방 통로 내부 거리0과
+좌우 영역 사이의 Access 공간이 목표 영역으로 합쳐지지 않는 것도 확인했다.
+원자료: `logs/diagnostics/default_relocation_2026-11-16/cpu_tests.log`.
+
+## 158. 2026-11-16 — 기본 Access region을 선반 후방까지 확장
+
+사용자 요청으로 기본 `contact_manipulation_symmetric`에도 학습2의 평가용 후방 확장을
+적용했다.157절의 Relocation 거리 감소량 정규화·전방 통로 포함 설정은 유지한다.
+
+- `ShelfManipulationEnvCfg.access_region_to_back_wall=True`를 기본값으로 한다.
+- 기존 `evaluation_access_region` 경로에서 평가용 `SceneBatch.access_region`의 최소 X만
+  실제 선반 지지면 후방인 `workspace_bounds[:, 0]`로 바꾼다. 이 환경의 정면은+X다.
+  기존 정면 X·좌우 Y 경계는 유지한다.
+- 초기 가림 면적과 현재 Clearance, 성공 판정, GUI Access 표시는 이 확장 영역을 공유한다.
+  Blocker를 Target 뒤로 밀어도 같은 폭 안에 남아 있으면 접근 영역 점유로 평가한다.
+- 생성 sample·공유 template·물체 배치·예약 재배치 영역·카메라·초기 ray·IK는 바꾸지 않는다.
+  후방 공간을 추가로 비우거나 새 배치 검사를 수행하지 않는다.
+- 11월15일 독립 비교 조건을 보존한다. 학습1 `RelocationDistance`와 학습3 `SmallWrench`는
+  `access_region_to_back_wall=False`를 명시하고 학습2 `AccessBackWall`은True를 유지한다.
+- Terminal 보상·나머지 보상식과 weight·종료 조건 자체·관측·모델·PPO·제어·물리 주기는
+  변경하지 않는다. 기본 task는 새 실행부터 두 영역 변경을 함께 적용한다.
+- 작업 중 확인한 사용자 수정(Clearance weight30·Relocation weight30·Contact hold 활성화와
+  weight3)은 그대로 보존했다. 이는 이번 Access 변경으로 조정한 값이 아니다.
+
+현재 설정은 [Symmetric README](../src/contact_manipulation_symmetric/README.md)와
+[비교 실험 문서](COMPARISON_EXPERIMENTS_2026-11-15.md)에 반영했다.
+이번 변경에서 시뮬레이션·play·학습은 실행하지 않았다.156절의 실제 GPU 검증은 당시
+독립 실험 설정에 대한 이력이며 이번 기본값 변경의 재실행 결과로 기록하지 않는다.
+
+CPU 실험 검사 **25개가 모두 통과**했다. 기본값의 후방 확장과 독립 비교 설정,
+뒤로 이동한 Blocker의 가림·성공 판정, 선택한 행만 바꾸는 부분 reset을 확인했다.
+Relocation 전방 통로와 Access 후방 확장을 동시에 켠 상태에서도 공유 배치와 두 평가 영역이
+부분 reset에서 유지되는지 검증했다. 사용자 조정 weight를 고정하지 않도록 설정 검사를
+정리하고 활성 Contact hold를 지원하도록 CPU fixture를 보완했다.
+원자료: `logs/diagnostics/baseline_access_2026-11-16/cpu_tests.log`.

@@ -10,6 +10,8 @@ from ..common import ExperimentEnvCfg
 @configclass
 class RelocationDistanceEnvCfg(ExperimentEnvCfg):
     relocation_include_front_corridors: bool = True
+    # Preserve the 2026-11-15 comparison's original access depth.
+    access_region_to_back_wall: bool = False
 
     def __post_init__(self):
         super().__post_init__()

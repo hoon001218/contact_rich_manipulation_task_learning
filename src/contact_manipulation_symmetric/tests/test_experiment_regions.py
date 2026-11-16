@@ -36,7 +36,7 @@ class ExperimentRelocationRegionTests(unittest.TestCase):
         distance = rewards.relocation_distance(points, vertices[None].expand(3, -1, -1, -1),
             counts[None].expand(3, -1), valid[None].expand(3, -1))
         torch.testing.assert_close(distance, points.new_tensor([0., 0., .2]))
-        # Baseline retains its destination-only distance even with corridor metadata.
+        # Historical comparisons can retain destination-only distance with corridor metadata.
         baseline = task.build_initial_relocation_regions(sample, (), rules, device='cpu', dtype=torch.float64)
         self.assertEqual(baseline[0].shape, (2, 4, 2))
         baseline_distance = rewards.relocation_distance(points[:1], baseline[0][None],
@@ -163,21 +163,27 @@ class ExperimentBackWallTests(unittest.TestCase):
     def test_shared_partial_resets_reuse_original_template_and_expanded_evaluation(self):
         env, template, sample = fixtures.EpisodeResetTests.shared_fixture()
         env.cfg.access_region_to_back_wall = True
+        env.cfg.relocation_include_front_corridors = True
         env.task_scene_data.workspace_bounds = torch.tensor([-.95, -.5, -.4, .4]).expand(5, -1)
         saved = template.access_region.clone()
-        relocation = (torch.empty((0, 4, 2)), torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.bool))
+        relocation = (torch.tensor([task.rectangle_polygon(region) for region in
+                                   ((-.8, -.6, -.4, -.2), (-.6, -.5, -.4, -.2))]),
+                      torch.full((2,), 4), torch.ones(2, dtype=torch.bool))
         with patch.object(task, '_build_episode_batch', return_value=(template, sample)) as builder, \
              patch.object(task, '_sample_robot_starts', side_effect=fixtures.EpisodeResetTests.shared_starts), \
              patch.object(task, 'build_initial_relocation_regions', return_value=relocation) as regions:
             task.reset_scene(env)
             before = env.task_scene_data.access_region.clone()
+            relocation_before = env.task_scene_data.relocation_regions
             env.common_step_counter = 17
             task.reset_scene(env, torch.tensor([4, 1]))
         self.assertEqual(builder.call_count, 1)
         self.assertEqual(regions.call_count, 1)
-        self.assertFalse(regions.call_args.kwargs['include_front_corridors'])
+        self.assertTrue(regions.call_args.kwargs['include_front_corridors'])
         self.assertIs(env._episode_reset.shared_template, template)
         self.assertIs(env._episode_reset.shared_sample, sample)
+        self.assertIs(env.task_scene_data.relocation_regions, relocation_before)
+        torch.testing.assert_close(relocation_before, relocation[0][None].expand(5, -1, -1, -1))
         torch.testing.assert_close(env.task_scene_data.access_region, before)
         torch.testing.assert_close(template.access_region, saved)
         self.assertEqual(sample.access_region, (-.8, -.5, -.1, .1))
