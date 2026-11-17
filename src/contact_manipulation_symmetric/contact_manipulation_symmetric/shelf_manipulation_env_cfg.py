@@ -173,12 +173,12 @@ class TerminationsCfg:
     """Native cause-specific termination logs over the cached task predicates."""
 
     time_out = TerminationTermCfg(func=mdp.scene_time_out, time_out=True)
-    success = TerminationTermCfg(func=mdp.success)
-    object_support_lost = TerminationTermCfg(func=mdp.failure, params={"reason": "object_support_lost"})
-    object_tilt = TerminationTermCfg(func=mdp.failure, params={"reason": "object_tilt"})
+    # success = TerminationTermCfg(func=mdp.success)
+    # Immediate height/roll-pitch predicate; thresholds live in MdpCfg.
+    object_drop = TerminationTermCfg(func=mdp.failure, params={"reason": "object_drop"})
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     target_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "target_displacement"})
-    invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
+    # invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
     singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
     # Actual arm overspeed; the UR5e config selects only the six arm joints.
     hand_velocity = TerminationTermCfg(

@@ -12025,3 +12025,38 @@ Weight·현재 접촉 pad 수·기준 거리·clipping·목표 영역·현재/�
 다른 reward·termination·물체 수 curriculum·제어 설정은 이번 변경에 포함하지 않는다.
 학습 중이므로 테스트·Python import·시뮬레이션·학습은 실행하지 않았다.
 소스 읽기·텍스트 diff만 점검했으며 실행 검증은 남아 있다.
+
+## 175. 2026-11-17 — 물체 종료를 높이·roll/pitch의 object_drop으로 통합
+
+사용자가 기존 `object_support_lost`·`object_tilt` 대신 예제의 `object_drop`을
+사용하도록 요청했다. 앞선 초기 높이 확인은 종료 범위를 높이에만 제한한다는 뜻이
+아니었으며, 추가 지시로 roll/pitch 조건도 함께 적용하기로 확정했다.
+
+| 판정 대상 | 즉시 종료 조건 |
+|---|---|
+| 모든 활성 물체(Target·Blocker·주변 물체) | link 원점 world Z<1.04m 또는 abs(roll)>0.9rad 또는 abs(pitch)>0.9rad |
+
+기준값은 로컬 예제 `joint_pos_random_sweep_env_cfg.py`의 height1.04와 rotation0.9를
+따른다.0.9rad는 약51.6°이며, 기존 80°·0.2초 전도 조건보다 엄격하고 지속시간을
+기다리지 않는다. 높이는 OBB 중심이나 충돌형상 최저점이 아닌 실제 link 원점이다.
+앞선 저장 geometry와 현재 spawn 식으로 확인한10종의 초기 link 높이는 모두1.04m보다
+높다. 이는 저장 자료와 수식 점검이며 현재 실행 중인 물체의 live 높이 검증은 아니다.
+
+예제의 raw quaternion을 그대로 쓰면 YCB의 정상 직립 −90° 회전도 실패로 분류할 수 있다.
+따라서 현재 기하 계산의 `q_link * conjugate(q_upright)`를 정규화하고 공식
+`isaaclab.utils.math.euler_xyz_from_quat(..., wrap_to_2pi=False)`로 roll/pitch를 구한다.
+Yaw만 바뀐 직립 물체는 종료시키지 않는다. 실제 link 높이는 transition reader가 이미
+취득한 `object_link_pose_w` cache에서 활성 슬롯 순서로 가져온다. 추가 PhysX fetch,
+CPU 전송, Python 물체별 반복이나 physics step은 없다.
+
+`TerminationsCfg`의 두 기존 선언을 `object_drop` 하나로 대체하고 공유 실패 원인·
+native mask·성공 동시 검출 우선순위에 연결했다. TensorBoard 종료 원인은
+`Episode_Termination/object_drop`이다. 기존 support/tilt raw 진단은 이전 코드 비교를 위해
+남기지만 현재 cfg에서는 실패 집계에 사용하지 않는다. 기존 성공용 지지·선반 잔류 검사,
+Object stability 비용과 보상은 유지한다. 사용자가 미리 주석 처리한 success 종료도 유지한다.
+관측10slot 이외의 활성 물체도 검사하고, 미사용 pool 슬롯은 검사에서 제외한다.
+비유한 pose는 기존 `invalid_state`가 담당한다.
+
+수치 경계·기준 frame·활성 마스크·현재 world pose·반복 조회·부분 reset·실패 집계를
+확인하는 테스트 소스를 추가/조정했다. **학습 중이므로 테스트·Python import·시뮬레이션·
+학습은 실행하지 않았다.** 검증은 소스 읽기와 텍스트 diff 점검이며 실행 검증은 남아 있다.

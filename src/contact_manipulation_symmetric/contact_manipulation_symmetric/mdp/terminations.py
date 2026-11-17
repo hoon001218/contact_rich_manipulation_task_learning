@@ -6,17 +6,45 @@ import math
 from typing import NamedTuple
 
 import torch
+from isaaclab.utils.math import euler_xyz_from_quat
 
-__all__ = ["FAILURE_REASON_NAMES", "ObjectSupportValidity", "object_support_validity", "task_conditions",
+__all__ = ["FAILURE_REASON_NAMES", "ObjectSupportValidity", "object_support_validity", "object_drop_condition", "task_conditions",
            "terminal_transition", "scene_time_out", "success", "failure"]
 
 
 # Ordered columns of TaskState.failure_reasons, shared by predicates and logging.
+# Legacy support/tilt diagnostics remain available; the native configuration
+# selects object_drop in their place through configured_terminations().
 FAILURE_REASON_NAMES = (
     "object_support_lost", "object_tilt", "shelf_displacement", "invalid_state", "singularity",
-    "target_displacement",
+    "object_drop", "target_displacement",
 )
 _FAILURE_REASON_INDEX = {name: index for index, name in enumerate(FAILURE_REASON_NAMES)}
+
+
+def object_drop_condition(height_world, rotation, active, *, height_condition=1.04, rotation_condition=0.9):
+    """Example-style height OR roll/pitch failure for active physical objects.
+
+    Heights are actual link-origin world Z, not OBB-center or collider-bottom Z.
+    Rotations are wxyz relative to each asset's canonical upright pose, as in
+    ``object_geometry``. This removes the importer's YCB upright rotation while
+    preserving yaw and the example's XYZ Euler roll/pitch convention. A failed
+    condition terminates immediately; no persistence timer is applied.
+    Invalid poses remain the responsibility of the separate invalid-state term.
+    """
+    if (height_world.ndim != 2 or rotation.shape != (*height_world.shape, 4)
+            or active.shape != height_world.shape or active.dtype != torch.bool):
+        raise ValueError("Object-drop inputs require [environments, objects] heights/mask and wxyz rotations.")
+    if (not math.isfinite(height_condition) or not math.isfinite(rotation_condition)
+            or not 0 < rotation_condition <= math.pi):
+        raise ValueError("Object-drop height must be finite and rotation threshold must be in (0, pi].")
+    norm = torch.linalg.vector_norm(rotation, dim=-1, keepdim=True)
+    finite = (torch.isfinite(height_world) & torch.isfinite(rotation).all(-1)
+              & (norm.squeeze(-1) > 1.e-8))
+    normalized = rotation / norm.clamp_min(1.e-12)
+    roll, pitch, _ = euler_xyz_from_quat(normalized.reshape(-1, 4), wrap_to_2pi=False)
+    flipped = ((roll.abs() > rotation_condition) | (pitch.abs() > rotation_condition)).reshape_as(active)
+    return (active & finite & ((height_world < height_condition) | flipped)).any(-1)
 
 
 def scene_time_out(env):
@@ -178,7 +206,7 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
                     stable_count, tilt_count, step_dt, workspace_bounds, shelf_top, ceiling,
                     shelf_pose=None, initial_shelf_pose=None, state_valid=None,
                     failure_mask=None, singularity=None, support_validity=None, raw_goal_out=None,
-                    target_protected_out=None):
+                    target_protected_out=None, object_drop=None):
     """Evaluate a full parallel batch without reading tensors back to Python.
 
     Object tensors have shapes (N, O, 3), (N, O, 8, 3), (N, O, 4), and
@@ -204,6 +232,9 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
     ``raw_goal_out`` optionally receives the protected-target/cleared-blocker
     predicate before completion validity, so diagnostics do not recompute poses.
     ``target_protected_out`` exposes the same pose predicate to reward gates.
+    ``object_drop`` optionally supplies the example-style world-height/roll-pitch
+    failure from native link poses. Missing inputs leave this cause false; an
+    OBB center cannot substitute for the actual link-origin height.
     Target displacement, like shelf displacement, compares the current pose to
     the episode's initial pose with separate position/rotation tolerances.
     Inactive slots never trigger a failure, even
@@ -283,8 +314,12 @@ def task_conditions(cfg, *, center, corners, rotation, velocity, active, target,
             support_loss_count=torch.zeros_like(tilt_count),
             step_dt=step_dt,
         )
+    if object_drop is None:
+        object_drop = torch.zeros_like(invalid)
+    elif object_drop.shape != invalid.shape or object_drop.dtype != torch.bool:
+        raise ValueError("Object drop must contain one boolean per environment.")
     reasons = torch.stack((support_validity.lost, (next_tilt_count >= tilt_steps).any(-1),
-                           displaced, invalid, singular, target_displaced), -1)
+                           displaced, invalid, singular, object_drop, target_displaced), -1)
     failed = (reasons if failure_mask is None else reasons & failure_mask).any(-1)
     raw_goal = (blocker_overlap >= 0.) & (blocker_overlap <= cfg.success_overlap_area) & protected
     if raw_goal_out is not None:

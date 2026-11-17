@@ -1,5 +1,13 @@
 # Contact Manipulation Symmetric
 
+**2026-11-17 물체 종료 조건 통합:** 활성 물체 중 하나라도 link 원점의 world 높이가
+`1.04m` 미만이거나 upright 기준 `|roll|` 또는 `|pitch|`가 `0.9rad`(약51.6°)를 넘으면
+`object_drop`으로 즉시 종료한다. 기존 `object_support_lost`·`object_tilt` 종료 term을
+대체하며, YCB 원본 frame의 −90° 회전은 upright 보정 후 평가한다. 관측10slot 외의
+활성 물체도 검사하고 미사용 pool은 제외한다. 기준값은 `MdpCfg.object_drop_height`와
+`MdpCfg.object_drop_rotation`이다. 기존 성공의 지지·잔류 검사와 Object stability 비용은
+유지한다. 사용자가 주석 처리한 `success` 종료는 그대로이며 실행 검증은 하지 않았다.
+
 **2026-11-17 Clearance·Relocation은 양의 개선량만 지급:** 양·음 분리 대신
 각각의 `max(진행량,0)` 항만 사용한다. 현재 Blocker 접촉 pad 수를 곱하며 weight는 각각30이다.
 

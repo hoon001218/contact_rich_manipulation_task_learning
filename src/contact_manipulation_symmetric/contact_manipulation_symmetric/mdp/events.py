@@ -38,7 +38,8 @@ from .observations import (
 from .rewards import clearance_quality, object_motion_cost, singularity_margin
 from .curriculums import curriculum_spawn_rules
 from .terminations import (
-    FAILURE_REASON_NAMES, configured_terminations, object_support_validity, task_conditions, terminal_transition,
+    FAILURE_REASON_NAMES, configured_terminations, object_drop_condition, object_support_validity,
+    task_conditions, terminal_transition,
 )
 
 _DEFAULT_MAX_OBJECTS = 10  # Policy slots; physical scene count is configured separately.
@@ -102,6 +103,9 @@ class MdpCfg:
     support_loss_duration: float = 0.100
     max_tilt: float = math.radians(80.0)
     tilt_duration: float = 0.20
+    # Example-style immediate termination; rotations use asset-canonical upright.
+    object_drop_height: float = 1.04
+    object_drop_rotation: float = 0.9
     joint_position_scale: float = math.pi
     joint_velocity_scale: float = 2.0
     tactile_threshold: float = 0.01
@@ -119,6 +123,8 @@ class MdpCfg:
             raise ValueError("Support warning/completion ranges must precede the loss threshold.")
         if not 0 < self.max_tilt <= math.pi or self.tilt_duration <= 0:
             raise ValueError("Fall angle must be in (0, pi] and tilt_duration must be positive.")
+        if not 0 < self.object_drop_rotation <= math.pi:
+            raise ValueError("Object-drop rotation threshold must be in (0, pi].")
         if not (self.singularity_characteristic_length > 0
                 and 0 < self.singularity_termination_threshold < self.motion_singularity_threshold):
             raise ValueError("Singularity requires a positive length and hard margin below the warning margin.")
@@ -754,7 +760,7 @@ class TaskState:
         self.critic_observation = None
 
     @torch.no_grad()
-    def advance(self, batch, step, *, singularity=None, hand_velocity=None):
+    def advance(self, batch, step, *, singularity=None, hand_velocity=None, object_drop=None):
         if step == self.last_step:
             return
         if not self.ready:
@@ -818,6 +824,7 @@ class TaskState:
             support_validity=support,
             raw_goal_out=self.raw_goal,
             target_protected_out=self.target_protected,
+            object_drop=object_drop,
         )
         # The official velocity term is logged by the native manager. Include
         # its result here too, so success/payment never wins an overspeed step.
@@ -1683,8 +1690,19 @@ def get_task_state(env):
             if not term.time_out:
                 velocity_failure = term.func(env, **term.params)
         batch = _read_transition(env, state)
+        # The transition reader already acquired this timestamp's native pose
+        # buffer. Reuse its cache: no extra PhysX fetch or CPU synchronization.
+        # Bindings map every active physical slot, including unobserved objects;
+        # inactive pool slots are excluded by state.active in the predicate.
+        heights = state.bindings.objects.data.object_link_pose_w[..., 2].gather(
+            1, state.bindings.object_ids)
+        dropped = object_drop_condition(
+            heights, batch.rotation, state.active,
+            height_condition=state.cfg.object_drop_height,
+            rotation_condition=state.cfg.object_drop_rotation,
+        )
         state.advance(batch, env.common_step_counter,
-                      singularity=margin, hand_velocity=velocity_failure)
+                      singularity=margin, hand_velocity=velocity_failure, object_drop=dropped)
         monitor = getattr(env, "_tensorboard_sensor_monitor", None)
         if monitor is not None:
             monitor.record(batch)

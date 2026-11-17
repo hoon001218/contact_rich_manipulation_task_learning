@@ -2217,7 +2217,8 @@ class TerminationTests(unittest.TestCase):
 
         # Disabling native termination preserves the diagnostic cause, while
         # removing its effect on aggregate failure and timeout bootstrapping.
-        data['failure_mask'] = torch.tensor([True, True, True, True, False, True])
+        data['failure_mask'] = torch.ones(len(terminations.FAILURE_REASON_NAMES), dtype=torch.bool)
+        data['failure_mask'][terminations.FAILURE_REASON_NAMES.index('singularity')] = False
         masked_candidate, _, _, masked_reasons, masked_failure = terminations.task_conditions(cfg, **data)
         torch.testing.assert_close(masked_reasons, reasons)
         self.assertFalse(masked_failure.any())
@@ -2317,7 +2318,9 @@ class TerminationTests(unittest.TestCase):
                                            params={'reason': 'hard_load_or_overrange'}, time_out=True),
         )
         mask, enabled = terminations.configured_terminations(config, device='cpu')
-        self.assertEqual(mask.tolist(), [False, False, True, False, False, False])
+        expected = torch.zeros(len(terminations.FAILURE_REASON_NAMES), dtype=torch.bool)
+        expected[terminations.FAILURE_REASON_NAMES.index('shelf_displacement')] = True
+        torch.testing.assert_close(mask, expected)
         self.assertTrue(enabled)
         mask, enabled = terminations.configured_terminations({'all_failures': term(terminations.failure)}, device='cpu')
         self.assertTrue(mask.all())
@@ -3997,7 +4000,9 @@ def native_fixture(n=3):
             return action.previous_actions
 
     env = types.SimpleNamespace(
-        num_envs=n, device="cpu", cfg=types.SimpleNamespace(mdp=task.MdpCfg(), actions=SimpleNamespace(
+        # This synthetic shelf is at world Z=0; the real task uses Z=1.05 m.
+        # Keep the same 5 cm object-origin clearance over this fixture's floor.
+        num_envs=n, device="cpu", cfg=types.SimpleNamespace(mdp=task.MdpCfg(object_drop_height=0.), actions=SimpleNamespace(
             arm_action=SimpleNamespace(joint_names=arm_names, body_name="tcp", wrench_scale=(10., 10., 10., 1., 1., 1.)),
             hand_action=SimpleNamespace(joint_names=hand_names, scale=.5, rescale_to_limits=True))), step_dt=.1,
         common_step_counter=0, scene=scene, sim=types.SimpleNamespace(cfg=types.SimpleNamespace(gravity=(0., 0., -10.))),
@@ -5327,6 +5332,7 @@ class NativeAdapterTests(unittest.TestCase):
         expected = torch.zeros(9, len(names), dtype=torch.bool)
         expected[[0, 2, 3, 8], names.index('object_support_lost')] = True
         expected[1, names.index('object_tilt')] = True
+        expected[[0, 1], names.index('object_drop')] = True
         expected[[5, 8], names.index('shelf_displacement')] = True
         expected[6, names.index('invalid_state')] = True
         with patch.object(task, '_read_transition', wraps=task._read_transition) as read, \
@@ -5461,7 +5467,7 @@ class NativeAdapterTests(unittest.TestCase):
             exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
         cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
                if isinstance(value, TermCfg)}
-        expected_names = {'time_out', 'success', 'object_support_lost', 'object_tilt',
+        expected_names = {'time_out', 'object_drop',
                           'shelf_displacement', 'invalid_state', 'singularity', 'target_displacement', 'hand_velocity'}
         self.assertEqual(set(cfg), expected_names)
         velocity_cfg = cfg['hand_velocity']
@@ -5486,9 +5492,9 @@ class NativeAdapterTests(unittest.TestCase):
         torch.testing.assert_close(dones, env._contact_mdp.failure)
         self.assertFalse(manager.time_outs.any())
         expected = torch.zeros(9, len(names), dtype=torch.bool)
-        for row, name in ((0, 'object_support_lost'), (1, 'object_tilt'), (2, 'object_support_lost'),
-                          (3, 'object_support_lost'), (5, 'shelf_displacement'), (6, 'invalid_state'),
-                          (8, 'shelf_displacement'), (8, 'object_support_lost'), (4, 'hand_velocity')):
+        for row, name in ((0, 'object_drop'), (1, 'object_drop'),
+                          (5, 'shelf_displacement'), (6, 'invalid_state'),
+                          (8, 'shelf_displacement'), (4, 'hand_velocity')):
             expected[row, names.index(name)] = True
         for column, name in enumerate(names):
             torch.testing.assert_close(manager.get_term(name), expected[:, column])

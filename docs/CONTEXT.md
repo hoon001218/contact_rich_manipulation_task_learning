@@ -12,6 +12,18 @@
 
 ## 최신 진입점 — 2026-11-17
 
+**2026-11-17 — Symmetric의 물체 종료를 예제식 object_drop으로 교체.**
+활성 물체 link 원점의 world Z<1.04m 또는 upright 기준 |roll|/|pitch|>0.9rad이면
+즉시 종료한다. 사용자가 roll/pitch도 함께 적용하도록 확인했다. 기존 support loss
+30mm·0.1초와 tilt80°·0.2초는 native 종료 term에서 제거한다. 기존 raw 진단 열은
+보존하되 활성 실패 집계에서는 제외하고 새 `object_drop` 원인을 기록한다.
+YCB의 원본 −90° 회전은 canonical upright 보정 후 공식 Euler 함수로 평가한다.
+관측 여부와 무관하게 모든 활성 물체를 검사하며 미사용 pool은 제외한다.
+기존 native world pose cache와 현재 rotation을 사용하고 PhysX 추가 조회·CPU 전송은 없다.
+성공용 지지·잔류 검사와 Object stability 비용, 사용자가 주석 처리한 success 종료는 유지한다.
+진행 중인 학습에는 소급 적용되지 않는다. 실행 없이 소스·텍스트 diff만 검토했으며
+상세는 TRAINING_LOG175절이다.
+
 **2026-11-17 — Clearance·Relocation은 양의 max 항만 유지.**
 사용자 요청으로172–173절의 양·음 분리 설정을 대체했다.
 `clearance=30*n_t*max(C_t-C_prev,0)`,
