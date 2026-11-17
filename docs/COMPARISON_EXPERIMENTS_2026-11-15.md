@@ -5,6 +5,11 @@
 세 실험은 같은 기존 UR5e 설정에서 독립적으로 분기한다. 이전 checkpoint를 이어 학습하지 않고
 각각 새 학습을 시작한다. 기존 Relocation 함수는 비교 기준으로 보존한다.
 
+**2026-11-16 방향 보상 추가:** 현재 Symmetric 기본 `RewardsCfg`에
+`blocker_normal_alignment`가 weight1로 추가됐다. 이 문서의 세 파생 task도 해당 항을
+같이 상속한다.45°에서0.5인17pad 방향 점수 평균이며 접촉 gate는 없다.
+11월15일 실제 검증 당시에는 없었던 항이므로 과거 결과와 현재 설정을 구분한다.
+
 **2026-11-16 변경:** 기본 Symmetric task에도 학습1의 거리 감소량 정규화와 목적지·전방 통로를
 적용했다. 아래 표의11월15일 비교 조건은 유지한다. 학습1은 그대로이며, 학습2·학습3에는
 기존 `blocker_relocation_contact_progress(decay=10.0)`와
@@ -18,6 +23,12 @@
 켜서 세 독립 실험에 기본값 변경이 섞이지 않도록 했다. 기본 Relocation의 앞선 변경도 유지한다.
 
 ## 1. 실험 구성
+
+**2026-11-16 signed 진행량 변경:** 공유 `clearance_contact_progress`는 모든 task에서
+`n_t*(C_t-C_prev)`를 사용한다. 기본 task와 학습1의 실거리 Relocation은 아래의 −1~1
+정규화식을 사용한다. 학습2·3의 기존 exponential Relocation 함수는 양의 개선량만 지급하는
+방식을 유지한다.11월15일 원래 구현·검증에서는 Clearance와 학습1 Relocation 모두 양의
+개선량만 지급했으며, 당시 실행 결과는 현재 signed 설정의 검증으로 간주하지 않는다.
 
 | 구분 | 학습1 | 학습2 | 학습3 |
 |---|---|---|---|
@@ -58,7 +69,7 @@ $$
 
 $$
 g_t^R=n_t\operatorname{clip}\left(
-\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},\,0,\,1
+\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},\,-1,\,1
 \right).
 $$
 
@@ -70,15 +81,16 @@ $$
 | 접촉 수 $n_t$ | 현재 Blocker 전용 유효 tactile pad 수, 기준 0.01N |
 | 영역 $\mathcal R_k$ | 생성 시 실제로 예약한 목적지 사각형과 그 전방 통로의 합집합 |
 | 내부·경계 | 거리 0. 안에 머무르기만 하면 진행 보상 0 |
-| 정체·악화·무접촉·유효 영역 없음 | 보상 0 |
-| Weight | 기존 3.0 유지. Native RewardManager가 weight·정책 dt를 적용 |
+| 개선·악화 | 각각 양수·음수. 정규화 변화량을 −1~1로 제한한 뒤 현재 접촉 pad 수를 곱함 |
+| 정체·무접촉·유효 영역 없음 | 보상 0 |
+| Weight | 기본 task의 값을 상속(현재 30.0, 11월15일 원래 설정은 3.0). Native RewardManager가 weight·정책 dt를 적용 |
 
 영역별 최소 거리를 평가하므로 좌우 영역을 하나의 convex hull로 합쳐 통로 사이를 채우지 않는다.
 Blocker 중심이 영역에 들어오면 거리 0이며, 전체 footprint가 들어왔다는 판정은 아니다.
 직전 위치는 매 정책 스텝의 기존 상태 이력을 사용하므로 비접촉 중 개선을 재접촉 때 소급 지급하지 않는다.
 부분 reset은 해당 환경의 비교 기준만 초기화한다. 초기 영역은 새 공유 장면당 한 번 생성한다.
 
-기존 `blocker_relocation`과 `blocker_relocation_contact_progress`는 보존했다.
+기존 `blocker_relocation`과 양의 개선량 방식인 `blocker_relocation_contact_progress`는 보존했다.
 새 그림은 학습1의 거리 진행식을 나타내는 별도 파일이며 이전 설계 그림도 보존한다.
 그림의 Distance 식은 기하 품질을 나타낸다. 실제 지급 조건은 기존 Target 보호 gate를 유지한다.
 

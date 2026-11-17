@@ -17,7 +17,8 @@ __all__ = [
     "clearance_quality", "clearance", "clearance_contact_progress",
     "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
-    "tactile_pad_points", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
+    "tactile_pad_points", "tactile_pad_frames", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
+    "blocker_normal_alignment_quality", "blocker_normal_alignment",
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "blocker_relocation_distance_progress",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
@@ -27,18 +28,16 @@ __all__ = [
 ]
 
 
-def tactile_pad_points(env):
-    """Return 17 current tactile contact-surface points in world coordinates.
+def _tactile_pad_geometry_binding(env):
+    """Cache canonical pad IDs and contact-surface offsets once.
 
     The first call inspects env_0's enabled collision meshes, not the link
     origins. All supplied hand pads expose their local +Z side; their parent
     bodies sit on the -Z side. Select a triangle near the area centroid of that
     exposed surface and retain its centroid as an actual surface point. Geometry,
-    scale and fixed channel ordering are cached once. Later calls only transform
-    those 17 offsets using native batched rigid-body poses on the scene device.
+    scale and fixed channel ordering are cached once. Callers transform those
+    offsets using native batched rigid-body poses on the scene device.
     """
-    from .observations import quat_apply
-
     binding = getattr(env, "_tactile_reward_geometry", None)
     if binding is None:
         import numpy as np
@@ -96,11 +95,83 @@ def tactile_pad_points(env):
         binding = (robot, torch.tensor(indices, device=env.device, dtype=torch.long),
                    torch.as_tensor(np.asarray(offsets), device=env.device, dtype=position.dtype))
         env._tactile_reward_geometry = binding
+    return binding
 
-    robot, indices, offsets = binding
+
+def tactile_pad_points(env):
+    """Return the 17 current contact-surface points in world coordinates."""
+    from .observations import quat_apply
+
+    robot, indices, offsets = _tactile_pad_geometry_binding(env)
     position = robot.data.body_link_pos_w.index_select(1, indices)
     rotation = robot.data.body_link_quat_w.index_select(1, indices)
     return position + quat_apply(rotation, offsets)
+
+
+def tactile_pad_frames(env):
+    """Current surface points and nominal outward pad normals, both world-frame.
+
+    The exposed side is local +Z for every supplied tactile pad. This is the
+    nominal pad face direction, not a force-derived or per-contact normal.
+    Geometry parsing and the 17 local normal vectors are cached once; current
+    native body poses are transformed on the scene device without host reads.
+    """
+    from .observations import quat_apply
+
+    robot, indices, offsets = _tactile_pad_geometry_binding(env)
+    local_normals = getattr(env, "_tactile_reward_normal_axis", None)
+    if (local_normals is None or local_normals.device != offsets.device
+            or local_normals.dtype != offsets.dtype):
+        local_normals = torch.zeros_like(offsets)
+        local_normals[:, 2] = 1.0
+        env._tactile_reward_normal_axis = local_normals
+    position = robot.data.body_link_pos_w.index_select(1, indices)
+    rotation = robot.data.body_link_quat_w.index_select(1, indices)
+    points = position + quat_apply(rotation, offsets)
+    normals = quat_apply(rotation, local_normals)
+    valid_rotation = torch.isfinite(rotation).all(-1) & (rotation.square().sum(-1) > 1.e-16)
+    return points, torch.where(valid_rotation[..., None], normals, math.nan)
+
+
+def blocker_normal_alignment_quality(pad_points, pad_normals, blocker_center,
+                                     *, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))):
+    """Mean of 17 exp(-decay * (1-cosine)) scores toward the Blocker center.
+
+    Points/normals are [N,17,3] and centers [N,3], all in the same frame. Each
+    normal points out of its contact surface. Aligned/opposed normals have
+    cosine +1/-1. Average per-pad scores, not normals or cosines before exp.
+    Invalid or zero-length vectors contribute zero with the denominator fixed
+    at 17. No distance weighting, contact gate, history or device scalar reads.
+    """
+    if (pad_points.ndim != 3 or pad_points.shape[1:] != (17, 3)
+            or pad_normals.shape != pad_points.shape
+            or blocker_center.shape != (pad_points.shape[0], 3)):
+        raise ValueError("Expected pad points/normals [N,17,3] and Blocker centers [N,3].")
+    if not math.isfinite(decay) or decay <= 0:
+        raise ValueError("Alignment decay must be finite and positive.")
+    direction = blocker_center[:, None] - pad_points
+    distance = torch.linalg.vector_norm(direction, dim=-1)
+    normal_length = torch.linalg.vector_norm(pad_normals, dim=-1)
+    valid = (torch.isfinite(direction).all(-1) & torch.isfinite(pad_normals).all(-1)
+             & torch.isfinite(distance) & torch.isfinite(normal_length)
+             & (distance > 1.e-8) & (normal_length > 1.e-8))
+    unit_direction = direction / distance.clamp_min(1.e-8)[..., None]
+    unit_normal = pad_normals / normal_length.clamp_min(1.e-8)[..., None]
+    cosine = (unit_direction * unit_normal).sum(-1).clamp(-1.0, 1.0)
+    quality = torch.exp(-decay * (1.0 - cosine))
+    return torch.where(valid, quality, 0.0).mean(-1)
+
+
+def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))):
+    """Pay current pad-facing quality before/during contact; native dt applies once."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    points, normals = tactile_pad_frames(env)
+    # Transition geometry removes cloned environment origins, whereas native
+    # pad body poses are world-frame. Restore the origin before subtracting.
+    center_w = state.blocker_center + env.scene.env_origins
+    return blocker_normal_alignment_quality(points, normals, center_w, decay=decay)
 
 
 def _blocker_pad_distances(pad_points, blocker_center, blocker_rotation, blocker_half_extent):
@@ -230,18 +301,21 @@ def _positive_improvement(current, previous):
 
 
 def clearance_contact_progress(env, threshold=0.01):
-    """Current Blocker pad count times positive clearance-quality improvement.
+    """Current Blocker pad count times signed clearance-quality change.
 
     Quality is the existing signed initial-overlap score. Compare consecutive
     control samples, including noncontact samples; no historical contact gate
-    or delayed payment applies. Stationary/worsening clearance pays zero.
+    or delayed payment applies. Improving clearance pays positively; worsening
+    clearance pays negatively. Stationary or noncontact samples pay zero.
     Native RewardManager applies weight and control dt once.
     """
     from .events import get_task_state
 
     state = get_task_state(env)
     quality = torch.where(torch.isfinite(state.blocker_overlap), state.clearance_quality, math.nan)
-    progress = _positive_improvement(quality, state.previous_clearance_quality)
+    previous = state.previous_clearance_quality
+    valid = torch.isfinite(quality) & torch.isfinite(previous)
+    progress = torch.where(valid, quality - previous, 0.0)
     return _current_blocker_contact_count(env, threshold) * progress
 
 
@@ -375,13 +449,15 @@ def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, thresho
 
 
 def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.01):
-    """Pay current Blocker pad count times normalized positive distance progress.
+    """Pay current Blocker pad count times normalized signed distance progress.
 
     Distance is from the Blocker center to the union of this scene's relocation
     polygons, including the front corridors when configured by the experiment.
     The reference distance is ``reference_speed * env.step_dt``: the official
     UR5e TCP speed specification of 4 m/s gives 80 mm at a 50 Hz policy rate.
     This is a normalization reference, not a bound on actual object motion.
+    Approaching a goal pays positively; moving away pays negatively. Normalize
+    and clip the signed fraction to [-1, 1] before multiplying the pad count.
 
     Consecutive centers come from the shared TaskState snapshots, including
     noncontact steps. A partial reset rebases only its rows; repeated reward
@@ -409,7 +485,7 @@ def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.0
              & torch.isfinite(state.blocker_center).all(-1)
              & torch.isfinite(state.previous_blocker_center).all(-1))
     progress = torch.where(valid, previous - current, 0.0) / reference_distance
-    return _current_blocker_contact_count(env, threshold) * progress.clamp(0.0, 1.0)
+    return _current_blocker_contact_count(env, threshold) * progress.clamp(-1.0, 1.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

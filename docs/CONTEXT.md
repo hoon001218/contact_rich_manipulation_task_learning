@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-11-16, Asia/Seoul**.
+최종 갱신: **2026-11-17, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,59 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-11-16
+## 최신 진입점 — 2026-11-17
+
+**2026-11-17 — 스폰 높이에0.1mm 여유 적용.**
+사용자가 지정한 `spawn_rules.spawn_height_offset=0.0001m`를 현재 Symmetric task에 적용했다.
+공통 `object_spawn_height()`가 생성과 runtime support-height cache에 한 번씩 같은 결과를
+제공하므로 vision·IK·실제 reset의 위치가 일치한다. 물리 선반 상면·지지 기준은 바꾸지 않는다.
+일반 `SpawnRules`의 기본값0은 기존 독립 fixture와 과거 경로의 호환성을 유지하며 실제 학습
+cfg는0.0001을 명시한다. 상세·검증 결과는 TRAINING_LOG163절을 따른다.
+
+**2026-11-17 — 비접촉 reset 직후 선반 통과 재발 보고.**
+일부 물체가 로봇 접촉 전에도 선반 아래로 떨어져 조기 종료된다는 사용자 보고다.
+현재는 simulation OFF/ON이 아닌 미사용 pool의 kinematic 전환이며, native flush 후
+pose·속도0을 기록한다. 코드 점검에서 확정된 reset 순서 오류는 없고 실제 원인은 미확정이다.
+현재 전역 Ground 설정은54절의 우회 구성을 유지한 상태가 아니다. 과거 GPU 충돌 누락
+재현과 유사하지만 같은 원인으로 단정하지 않는다. 후속 재현에서 mask 변경/부분 reset,
+요청/native pose, 현재 선반 기준 지지 간격·수직 속도·환경/물체 ID를 구분해 기록해야 한다.
+이번에는 실행·production 변경 없이 조사만 했으며 상세는 TRAINING_LOG162절이다.
+
+**2026-11-16 — 17pad 방향 보상 weight1.**
+`blocker_normal_alignment`를 추가했다. 현재 pad 접촉면의 명목 외향 normal(local+Z)을
+현재 자세로 회전하고, pad→현재 Blocker OBB 중심 방향과의 signed cosine을 평가한다.
+수식은 `mean17(exp(-a*(1-cosine)))`, `a=ln2/(1-cos45°)≈2.36655`, weight1이다.
+접촉·거리·Target 보호 gate 없이 준비 자세도 보상한다. Blocker 중심의 env-local 좌표에
+env origin을 더해 world-frame pad 좌표와 맞춘다. 기존 표면점 geometry binding과 상태
+버퍼를 재사용하며 step별 CPU 동기화·추가 contact sensor 조회는 없다. 기본 및 세 파생
+Symmetric task에 상속되며 다른 프로젝트에는 추가하지 않았다. 상세는 TRAINING_LOG161절이다.
+
+**2026-11-16 — 동일 Hand 설정 움켜쥐기 접촉 영상.**
+별도 진단에서 현재 전체 UR5e·F/T·Hand 및 실제 OSC/Hand action을 재사용했다.
+PD20/1·armature0.0001·URDF 상한·물리100Hz/정책50Hz·solver32/1은 유지한다.
+60/80/100mm 구에 대한 동적 물체의 동시 object-pad 최대는1/1/9개지만 이후 빠져나가
+hold 평균은0이다. 고정 대조는 최대2/4/3개,80mm hold2초 내내4개다.
+전체 net 접촉과 구 전용 접촉을 분리해 영상에 표시했다. 이는 특정 명령/배치에서의
+coverage이며 임의 물체의 보편적 최대나 파지 성공이 아니다. 학습 설정은 변경하지 않았다.
+고정100mm 접촉 중 실제 상한1rad/s인 검지1의 순간 반환값2.3947rad/s도 기록했으나,
+위치 차분과 다르므로 지속 회전 속도로 해석하지 않는다. 상세는 TRAINING_LOG160절과
+`logs/diagnostics/grasp_contact_2026-11-16/analysis.md`, 영상은
+`docs/videos/grasp_contact_2026-11-16/`를 따른다.
+
+**2026-11-16 — 접촉 진행 보상에 악화 방향도 반영.**
+`clearance_contact_progress`는 `n_t*(C_t-C_prev)`,
+`blocker_relocation_distance_progress`는
+`n_t*clip((d_prev-d)/(4.0*env.step_dt),-1,1)`을 반환한다.
+현재 Blocker 접촉 pad 수를 곱하므로 무접촉·정체는0, 접촉 중 개선은 양수·악화는 음수다.
+유효하지 않은 상태나 영역은0이며 이력 갱신·부분 reset 처리는 유지한다.
+기준 거리(50Hz에서80mm), 목적지+전방 통로, 기본 Access 후방 확장, 사용자 조정
+weight30·30과 Contact hold3은 유지한다. 공유 함수 변경으로 학습1의 실거리 Relocation과
+세 비교 task의 Clearance에도 적용된다. 학습2·3의 기존 exponential
+`blocker_relocation_contact_progress`는 양의 개선량 방식 그대로 보존한다.
+11월15일의 실제 실행 결과는 당시 양의 개선량 설정의 이력이다.
+시뮬레이션·play·학습은 실행하지 않으며 세부 변경은
+**[TRAINING_LOG.md](TRAINING_LOG.md)159절**을 따른다.
+CPU 전체 회귀는648개 중625통과·CUDA/Kit 전용23생략이다. 문서와 Reward 그림도 갱신했다.
 
 **2026-11-16 — 기본 Access region도 선반 후방까지 확장.**
 기본 `access_region_to_back_wall=True`로 설정했다. 평가용 영역의 후방 X만 실제 선반 지지면

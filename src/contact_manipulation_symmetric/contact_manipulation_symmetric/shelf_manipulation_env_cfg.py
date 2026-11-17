@@ -103,6 +103,10 @@ class RewardsCfg:
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
+    blocker_normal_alignment = RewardTermCfg(
+        func=mdp.blocker_normal_alignment, weight=1.0,
+        params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))},
+    )
     # blocker_relocation = RewardTermCfg(
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
@@ -145,7 +149,7 @@ class RewardsCfg:
     object_stability = RewardTermCfg(func=mdp.object_stability, weight=0.5)
     # Training schedules this target weight; valid success keeps the native waiver.
     time_penalty = RewardTermCfg(func=mdp.time_penalty, weight=-0.3)
-    terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
+    # terminal = RewardTermCfg(func=mdp.terminal, weight=1.0)
 
 
 @configclass
@@ -207,13 +211,13 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     mdp: MdpCfg = MdpCfg()
     # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(
-        generation_mode="sequential", min_objects=15,
+        generation_mode="sequential", min_objects=15, spawn_height_offset=0.0001,
         max_objects=int(os.environ.get("CONTACT_MANIPULATION_NUM_OBJECTS", "25")),
     )
     robot_start: RobotStartRules = RobotStartRules()
     initial_vision: InitialVisionCfg = InitialVisionCfg()
     # Staggered fixed-view surface queries; 0 restores reset-only Actor vision.
-    actor_vision_update_interval: int = 5
+    actor_vision_update_interval: int = 0
     # Score the generated destination patches and their reserved front corridors.
     relocation_include_front_corridors: bool = True
     # Evaluate access across the full shelf depth, including behind the Target.

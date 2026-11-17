@@ -140,7 +140,11 @@ class ExperimentConfigurationTests(unittest.TestCase):
 
     def test_variants_change_only_their_declared_baseline_fields(self):
         baseline = freeze(self.baseline_env())
-        self.assertIsNotNone(baseline["rewards"]["terminal"])
+        # The baseline terminal payment is user-selectable; the three
+        # experiments below must still explicitly disable it in either case.
+        terminal = baseline["rewards"].get("terminal")
+        if terminal is not None:
+            self.assertIs(terminal["func"], self.mdp.terminal)
         self.assertTrue(baseline["access_region_to_back_wall"])
         self.assertTrue(baseline["relocation_include_front_corridors"])
         relocation = baseline["rewards"]["blocker_relocation"]

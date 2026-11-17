@@ -44,14 +44,20 @@ Relocation은 학습 1의 거리 감소량 정규화 방식을 사용한다.
 | 항 | 항별 값 $g_t$ | 기준 |
 |---|---|---|
 | Clearance | $n_t(C_t-C_{t-1})$ | Blocker 접촉 pad 수로 가중. 겹침 감소는 양수, 증가는 음수. |
-| Blocker relocation | $n_t\operatorname{clip}\!\left(\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},0,1\right)$ | 재배치 목적지와 전방 통로까지의 거리 감소량을 정규화하고 현재 접촉 pad 수를 곱한다. 정체·악화·무접촉 시 0. |
+| Blocker relocation | $n_t\operatorname{clip}\!\left(\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},-1,1\right)$ | 재배치 목적지와 전방 통로에 가까워지면 양수, 멀어지면 음수. 현재 접촉 pad 수를 곱하며 정체·무접촉 시 0. |
 | Blocker distance | $\frac{1}{17}\sum_{i=0}^{16}e^{-a_Dd_{i,t}}$ | 17개 pad에서 OBB 면까지의 현재 거리 점수 평균. |
+| Pad alignment | $\frac{1}{17}\sum_{i=0}^{16}e^{-a_A(1-s_{i,t})}$ | Pad 외향 normal과 pad→Blocker 중심 방향의 cosine $s_{i,t}$. 정면1,45°에서0.5. Weight1·접촉 전에도 지급. |
 | Time | $-\mathbf{1}_{\mathrm{alive}\,\land\,\neg\mathrm{success}}$ | 성공 상태가 아닌 생존 step에 시간 비용. |
 
 $d_t$는 Blocker 중심에서 재배치 목적지와 전방 통로의 합집합까지의 최소 XY 거리이며, 영역 내부에서는 0이다.
 기준 거리는 [제조사 공식 TCP 최대속도](UR5E_RELOCATION_REFERENCE_DISTANCE.md)에 따라
 $d_{\mathrm{ref}}=4\,\mathrm{m/s}\times\Delta t$로 정한다. 정책 50Hz에서는 **80mm**다.
-거리 감소량의 정규화 값은 0–1이며, 접촉 pad 수 $n_t$를 곱한 항별 값은 1을 초과할 수 있다.
+거리 변화량의 정규화 값은 −1–1이며, 접촉 pad 수 $n_t$를 곱한 항별 값의 절댓값은 1을 초과할 수 있다.
+
+Pad alignment는 $s_{i,t}=\mathbf n_{i,t}^{\mathsf T}(\mathbf c_{B,t}-\mathbf p_{i,t})/\|\mathbf c_{B,t}-\mathbf p_{i,t}\|$,
+$a_A=\ln2/(1-\cos45^\circ)\approx2.36655$를 사용한다. 두 방향은 같은 좌표계의 단위벡터이며,
+17개 점수를 각각 계산한 뒤 평균한다. 접촉면 명목 normal은 각 pad의 local+Z를 현재 자세로
+회전한 방향이다. 거리·접촉 gate는 없고, 방향을 계산할 수 없는 pad는 고정 분모17에서0으로 처리한다.
 
 #### Motion and constraint terms
 

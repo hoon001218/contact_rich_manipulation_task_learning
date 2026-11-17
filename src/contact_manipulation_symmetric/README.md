@@ -1,5 +1,18 @@
 # Contact Manipulation Symmetric
 
+**2026-11-17 초기 높이 여유:** `spawn_rules.spawn_height_offset=0.0001`로
+활성 물체의 upright bounding box 하단을 선반 윗면보다0.1mm 높게 배치한다.
+생성·vision/IK 입력·reset이 같은 높이를 사용한다. 실제 collision 최저점의 간격을
+직접 지정하는 설정은 아니며 선반 통과 현상의 해결 여부는 아직 검증하지 않았다.
+
+**2026-11-16 pad 방향 보상 추가:** `blocker_normal_alignment`는 현재 Blocker 중심을 향하는
+17개 pad의 `mean(exp(-a*(1-cosine)))`을 지급한다. Weight1, `a≈2.36655`로45° 오차에서
+점수0.5다. 접촉·거리·Target 보호 gate 없이 접촉 전 자세 준비도 평가한다.
+Pad 접촉면의 명목 외향 local+Z와 현재 native pose를 사용하고 전부 tensor로 계산한다.
+
+**2026-11-16 signed 진행량 변경:** Clearance와 실거리 Relocation은 개선 시 양수,
+악화 시 음수를 반환한다. 현재 Blocker 접촉 pad 수를 곱하는 조건과 영역 설정은 유지한다.
+
 **2026-11-16 기본 Access 변경:** 기본 task는 평가용 Access region을 선반 후방까지 확장한다.
 초기 가림 면적·Clearance·성공 판정·GUI 표시가 같은 확장 영역을 사용하며 실제 배치·ray·IK는
 유지한다. 학습1·학습3은 후방 확장을 끄고 학습2만 켜서11월15일 비교 조건을 보존한다.
@@ -80,22 +93,23 @@ activation을 복원하며, ELU 기본 설정으로 ReLU 학습을 그대로 res
 ### 최신 reward·action 설정 (2026-11-16)
 
 기존 clearance·relocation 함수와 cfg 선언은 보존하고, Symmetric의 활성 두 term을
-현재 Blocker 접촉 pad 수와 직전 control step 대비 양의 개선량을 곱하는 함수로 사용한다.
+현재 Blocker 접촉 pad 수와 직전 control step 대비 signed 변화량을 곱하는 함수로 사용한다.
 Relocation은 학습1에서 사용한 실거리 정규화 방식을 기본값으로 적용한다.
 
 | 항목 | 현재 설정 |
 |---|---|
-| Clearance | `현재 접촉 pad 수 * max(Q_clear(t)-Q_clear(t-1), 0)`, weight30 |
+| Clearance | `현재 접촉 pad 수 * (Q_clear(t)-Q_clear(t-1))`, weight30 |
 | Access region | 후방 X를 선반 지지면 후방까지 확장, 기존 정면 X·좌우 Y 유지 |
 | Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
-| Blocker relocation | `현재 접촉 pad 수 * clip((d(t-1)-d(t))/(4*step_dt), 0, 1)`, weight30 |
+| Pad–Blocker 방향 | `mean(exp(-2.36655*(1-cosine)))`, 17pad 평균·weight1·정면1/45°에서0.5 |
+| Blocker relocation | `현재 접촉 pad 수 * clip((d(t-1)-d(t))/(4*step_dt), -1, 1)`, weight30 |
 | Contact hold | `BlockerContactHold` 활성, weight3. Clearance·Relocation도 별도로 현재 접촉 pad 수를 사용 |
 | Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
 | Action-rate / Joint velocity | 각각−.03, 기존 clipping·12독립관절 선택 |
 | Blocker stability / Time / Terminal | 위 원본 설정 유지 |
 
 Clearance·Relocation weight30과 Contact hold 활성화는 사용자가 수정한 현재 설정이다.
-이번 Access 후방 확장에서는 이 값을 그대로 보존했다.
+Access 후방 확장과 signed 진행량 변경에서 이 값을 그대로 보존했다.
 
 `Q_clear = 1 - 현재 Blocker 가림 면적 / 초기 가림 면적`이며 signed 값을 유지한다.
 기본 `access_region_to_back_wall=True`이며 평가용 최소 X를 `workspace_bounds[:, 0]`로 설정한다.
@@ -109,7 +123,9 @@ Relocation의 `d`는 현재 Blocker OBB 중심에서 예약 목적지와 **전�
 
 접촉 pad는 유효한 **Blocker 전용 법선 접촉 합력 norm > 0.01N**인17채널 중 개수다.
 새로 접촉한 pad도 즉시1개로 세고, 직전 step 접촉 여부나 Target 보호 gate는 두 새 term에
-추가하지 않는다. 무접촉·정체·악화는0이다. 비접촉 동안에도 비교 기준을 매 control step
+추가하지 않는다. 개선은 양수, 악화는 음수이며 무접촉·정체는0이다. Relocation의 정규화
+변화량은−1~1로 제한하고 접촉 pad 수를 곱하므로 최종 항별 값은 이 범위를 넘을 수 있다.
+비접촉 동안에도 비교 기준을 매 control step
 갱신하므로 재접촉 시 과거 개선량을 소급 지급하지 않는다. 부분 reset은 해당 행의 초기
 가림 품질0과 실제 Blocker 위치로 기준을 다시 잡는다. Native RewardManager가 weight와
 control dt를 한 번 곱한다. Distance는 기존 현재 거리 평가를 유지한다.
@@ -117,8 +133,8 @@ control dt를 한 번 곱한다. Distance는 기존 현재 거리 평가를 유�
 기존 `mdp.clearance`·`mdp.blocker_relocation`은 그대로 남아 있고, cfg의 기존 선언은
 주석으로 보존했다. 새 선언은 `mdp.clearance_contact_progress`와
 `mdp.blocker_relocation_distance_progress`를 사용한다. 이전 exponential 진행 함수인
-`mdp.blocker_relocation_contact_progress`도 보존한다. 변경 이력은
-[`TRAINING_LOG.md` 145·156–158절](../../docs/TRAINING_LOG.md)을 따른다.
+`mdp.blocker_relocation_contact_progress`는 양의 개선량 방식 그대로 보존한다. 변경 이력은
+[`TRAINING_LOG.md` 145·156–159절](../../docs/TRAINING_LOG.md)을 따른다.
 
 Action 출력은 Sensor-frame wrench6 + Hand6의12D를 유지한다.
 Force10N/Torque1N·m scale, 센서 범위 clipping과 sensor→COM 원점 보정,

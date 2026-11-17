@@ -11304,3 +11304,189 @@ Relocation 전방 통로와 Access 후방 확장을 동시에 켠 상태에서�
 부분 reset에서 유지되는지 검증했다. 사용자 조정 weight를 고정하지 않도록 설정 검사를
 정리하고 활성 Contact hold를 지원하도록 CPU fixture를 보완했다.
 원자료: `logs/diagnostics/baseline_access_2026-11-16/cpu_tests.log`.
+
+## 159. 2026-11-16 — Clearance·실거리 Relocation의 signed 진행량 적용
+
+사용자 요청으로 두 접촉 진행 함수에서 악화를0으로 버리던 제한을 변경했다.
+
+$$
+g_t^C=n_t(C_t-C_{t-1}),\qquad
+g_t^R=n_t\operatorname{clip}\left(
+\frac{d_{t-1}-d_t}{4\,\mathrm{m/s}\times\Delta t},-1,1\right).
+$$
+
+- `clearance_contact_progress`는 품질 변화량의 양수 제한을 제거한다.
+- `blocker_relocation_distance_progress`는 정규화 거리 변화량의 clipping 범위를
+  `[0,1]`에서 `[-1,1]`로 바꾼다. 기준 거리는50Hz에서80mm다.
+- 현재 유효한 Blocker 전용 접촉 pad 수 `n_t`를 그대로 곱한다. 접촉 중 개선은 양수,
+  악화는 음수이며 무접촉·정체는0이다. 비접촉 악화에 별도 비용을 주거나 재접촉 때
+  과거 변화를 소급 반영하지 않는다.
+- 유효하지 않은 상태·영역의0 처리와 현재/직전 상태 이력·부분 reset 처리는 유지한다.
+  목표 영역은 목적지와 실제 전방 통로의 합집합, 기본 Access는 선반 후방 확장을 유지한다.
+- 사용자 조정 Clearance·Relocation weight30·30과 Contact hold 활성·weight3은 변경하지 않는다.
+- 공유 함수를 사용하는 학습1 Relocation과 모든 비교 task의 Clearance에도 적용된다.
+  학습2·3의 기존 `blocker_relocation_contact_progress`는 양의 exponential 품질 개선량
+  방식 그대로 보존한다. 원본 `clearance`·`blocker_relocation`도 수정하지 않는다.
+- 현재 문서 수식과 설명을 signed 방식으로 맞춘다.157·158절 및11월15일 원래 검증은
+  변경 당시의 이력으로 보존한다. 이번 작업에서 시뮬레이션·play·학습은 실행하지 않는다.
+
+검증은 CPU에서만 수행했다. 집중 검사42개와 전체 회귀 **648개 중625개 통과·
+CUDA/Kit 전용23개 생략**을 확인했다. 미세한 음의 변화, ±80mm 대칭 포화, 목표 영역
+진입·이탈, 무접촉·비유한 상태, 부분 reset과 반복 조회, native weight·dt 적용 시 음수 보존을
+검사했다. 처음 전체 검사에서 과거 Relocation weight3을 고정한 검사가 남아 있어,
+사용자 조정값을 유지하면서 양의 weight와 함수 연결을 검증하도록 수정했다.
+
+Learning Direction·실험 문서·기준 거리 문서와 두 Reward 그림의 수식도 signed 방식으로
+갱신했다. 그림은 기존 캡처와 기하에서 CPU로 다시 생성했으며 새 시뮬레이션은 실행하지 않았다.
+문서 링크·SVG 수식·`git diff --check`를 확인했다.
+원자료: `logs/diagnostics/signed_progress_2026-11-16/`의 `cpu_tests_initial.log`와
+`cpu_tests_final.log`.
+
+
+## 160. 2026-11-16 — 동일 Hand 설정의 움켜쥐기 접촉 수와 영상
+
+사용자 요청으로 현재 Symmetric의 전체 UR5e·F/T·Hand를 재사용한 별도 진단
+`tests/probe_grasp_contact.py`와 CPU 영상 overlay `tests/grasp_contact_video.py`를 추가했다.
+학습 코드·보상·종료·물체 배치 규칙·actuator 설정은 변경하지 않았다. 실행 전 GPU에
+학습 프로세스가 없음을 확인했다. Hand PD20/1·armature0.0001·12개 독립 drive와
+6→12 URDF 목표각 매핑, 물리100Hz/정책50Hz·robot solver32/1을 유지했다.
+실제 backend 속도 상한은 엄지4관절2rad/s·나머지8관절1rad/s, effort는 전부1N·m다.
+
+지름60/80/100mm·300g 구를 사용했다. 초기 중심은 palm 접선 방향60mm,
+pad 표면에서 구 반지름+3mm 떨어진 곳이다. 동적 구는 지지대 위에 두고, 별도의 고정 구
+대조는 같은 위치·동작을 사용했다. Material은 현재 sim 기본인 정/동 마찰0.5/0.5다.
+Arm은 기존 gravity compensation을 포함한 native OSC에 zero sensor wrench를 보내고,
+Hand는 실제 `UrdfCoupledHandAction`으로 open→thumb opposition→close→hold→release한다.
+초기 상태는 각 독립 시험 사이에만 기록하며 접촉 중 state 덮어쓰기는 없다.
+
+| 구 지름 | 동적 물체 동시 접촉 최대 | 동적 hold 평균 | 고정 물체 동시 접촉 최대 | 고정 hold 최소/평균/최대 |
+|---|---:|---:|---:|---:|
+|60mm|1|0|2|0 / 0.980 / 1|
+|80mm|1|0|4|4 / 4.000 / 4|
+|100mm|9|0|3|0 / 0.875 / 2|
+
+판정은 현재 학습과 같은 canonical17pad·법선 합력 norm>0.01N이다. Observation의 전체
+net binary와 해당 구에만 필터링한 binary를 구분했다. 동적100mm의9개 접촉은40ms 연속의
+순간 최대이며 이후 물체가 빠져나가 hold에서는0이다. 고정80mm는 hold2초·200표본 전부
+Thumb3·Middle2·Ring1·Ring2의4개가 반응했다. 손 전체의 접촉이 pad가 없는 부모 링크에서
+발생하기도 한다. 따라서 전체 net binary나 육안 접촉을 Blocker pad 수로 대체하면 안 된다.
+이 결과는 주어진 크기·초기 위치·명령의 coverage이며 보편적 최대나 파지 성공 판정이 아니다.
+
+물체 전용17pad force와 별도 whole-Hand contact view의 해당 pad force가 전 표본에서
+정확히 일치했다(최대차0N). 유한 상태·threshold·표본 수·영상 index mapping을 확인했다.
+각 최종 영상은2시점·1280×900·25fps·630frame·25.2초이며 실제 활성 pad/힘·동시 개수 추이·
+12관절 속도를 표시한다. 시각 marker/frame에는 RigidBody·Collision schema가 없다.
+학습/PPO는 실행하지 않았다. 학습용 simulation/controller를 수정하지 않았다.
+
+추가로 고정100mm close 중 실제 backend 상한1rad/s인 검지1에서 순간 반환 속도
+2.394708rad/s가 재현됐다. 해당 t=3.17초의 목표각 변화는20ms당0.019340rad(0.967rad/s)이며
+reset·NaN·큰 목표 도약은 없었다. 다만 전후 실제각의 중심 차분은약−0.286rad/s여서,
+이를 손가락이2.395rad/s로 계속 회전한 증거로 해석하지 않는다. 접촉·위치 보정과 solver의
+속도 반환 상태 사이 관계는 미확정이며 `overspeed_event.json`에 인접 표본을 보존했다.
+
+- 영상: `docs/videos/grasp_contact_2026-11-16/grasp_dynamic_aligned.mp4`, `grasp_fixed.mp4`.
+- 원자료·CSV·검증·명령·해석: `logs/diagnostics/grasp_contact_2026-11-16/`.
+- `dynamic/`은 초기35mm 배치 pilot, `smoke/`는40step 확인이며 최종 비교는
+  `dynamic_aligned/`와 `fixed/`다. 둘은 각각2520physics 표본을 기록했다.
+- 원자료의 `whole_hand_object_force_peak_N`은 링크별 법선 합력 크기의 합이며
+  전체 힘 벡터의 norm이나 개별 접촉점 힘으로 해석하지 않는다.
+
+## 161. 2026-11-16 — 17개 tactile pad의 Blocker 방향 보상 추가
+
+사용자 승인에 따라 Symmetric에 `blocker_normal_alignment`를 weight1.0으로 추가했다.
+각 pad 표면 대표점에서 현재 Blocker OBB 중심으로 향하는 단위 벡터와 pad 바깥쪽
+법선의 signed cosine을 계산하고, pad별 exponential 점수를 구한 뒤17개를 평균한다.
+
+$$
+s_{i,t}=\mathbf n_{i,t}^{\mathsf T}
+\frac{\mathbf c_{B,t}-\mathbf p_{i,t}}
+{\|\mathbf c_{B,t}-\mathbf p_{i,t}\|},\qquad
+r_t^{\mathrm{align}}=\frac1{17}\sum_{i=1}^{17}
+\exp\!\left[-a(1-s_{i,t})\right],\qquad
+a=\frac{\ln2}{1-\cos(\pi/4)}\simeq2.36655.
+$$
+
+- 정면0°에서1,45°에서0.5,90°에서약0.0938,반대180°에서약0.00880이다.
+  절댓값 cosine을 사용하지 않아 앞면과 뒷면을 구별한다.
+- 접촉 전 방향 정렬을 유도하도록 접촉·거리·Target 보호 gate 없이 현재 상태 점수를
+  지급한다. 유효하지 않거나 길이가0인 벡터는 해당 pad 점수만0으로 처리하고 분모17을
+  유지한다. Native RewardManager가 weight와 dt를 한 번 적용한다.
+- 기존 pad 표면점·body index 캐시를 재사용하고, 각 pad의 nominal local+Z를 현재
+  native body quaternion으로 회전한다. 실제 접촉력으로 추정한 법선이나 곡면의 개별
+  접촉점 법선은 아니다. Mesh 조회와 local 법선 생성은 최초 한 번만 수행한다.
+- Pad 위치는 world 기준, task state의 Blocker 중심은 환경 원점 기준이므로,
+  Blocker 중심에 `scene.env_origins`를 더해 같은 frame에서 계산한다.
+  매 step은 GPU tensor 연산이며 추가 contact sensor·CPU 값 조회를 사용하지 않는다.
+- TensorBoard 기록은 `Episode_Reward/blocker_normal_alignment`다. 기존 사용자
+  weight·비활성 Terminal·vision 설정은 유지했다. 세 독립 비교 설정도 base cfg에서
+  새 항을 상속한다.11월15일 기존 실험에는 이 항이 없었다.
+
+새 방향 보상16개 CPU 검사와 전체 회귀를 완료했다. 전체 **664개 중641개 통과,
+CUDA/Kit 전용23개 생략**이다. 각도·signed cosine·pad별 exp 후 평균·거리 불변성·
+frame 변환·환경 원점 복원·현재 pose 갱신·비유한 상태·native dt 적용을 확인했다.
+기존 검사2개가 Terminal 활성화를 가정하여, 사용자 비활성 설정을 허용하도록 검사만
+보완했다. `py_compile`과 `git diff --check`를 확인했다.
+이번 보상 추가 작업에서는 시뮬레이션·play·학습을 실행하지 않았다.
+
+원자료: `logs/diagnostics/normal_alignment_2026-11-16/`의 `targeted_tests.log`,
+`config_tests.log`, `cpu_suite_final.log`. 실제 GPU 소요 시간은 아직 측정하지 않았다.
+
+## 162. 2026-11-17 — 비접촉 reset 직후 물체의 선반 통과 재발 보고
+
+사용자가 일부 물체가 간헐적으로 선반을 통과해 시작 직후 종료되는 현상을 보고했다.
+추가 확인에서 **로봇이 닿기 전에도 발생**한다고 답했다. 현재 재발의 native 상태나 영상은
+수집하지 않았으므로, 특정 물체·환경 ID·장면 교체 여부와 직접 원인은 아직 미확정이다.
+
+Symmetric의 현재 reset·pool·spawn·선반 설정을 읽기 전용으로 점검했다.
+
+- `TaskObjectPool`은 미사용 body만 kinematic으로 전환한다. 과거 문제가 있었던
+  `set_disable_simulations()`는 현재 사용하지 않는다. 전체 장면의 활성 mask가 바뀔 때만
+  USD 속성을 변경·flush하고, 같은 mask의 부분 reset은 이 변경을 생략한다.
+- 물체 상태 packing에서 선속도·각속도를 전부0으로 설정한다. 물리 commit은 활성 flag
+  반영 후 native pose·velocity를 기록하며, 선반도 기본 pose·속도0으로 복원한다.
+  읽기 전용 점검에서 새로 확정할 수 있는 좌표 기록 순서 오류는 찾지 못했다.
+- Spawn 높이는 측정한 `shelf_top - geometry.lower[2]`다. 초기 OBB bounds와 collision
+  support vertices는 별도로 측정한다. 실제 cooked shape의 지지 상태까지 확인한 결과는 아니다.
+- 마지막 `sim.forward()`는 물리 적분이나 지지 검증이 아니다. 현재 첫 physics step에서
+  실제 충돌 지지가 정상인지 확인하는 검사·native 상태 기록은 없다.
+- 현재 전역 Ground·native 환경 ID bounds 설정은54절의 우회 구성을 적용한 상태가 아니다.
+  56절에서 kinematic 방식으로 전환하며 기존 전역 Ground 설정으로 복원했다.54절의
+  실제 충돌 누락과 증상이 유사하지만, 이번 현상의 원인이 같다는 증거는 아직 없다.
+
+후속 재현 시 필요한 구분은 (1) full scene 교체와 같은 mask의 부분 reset, (2) 새로
+dynamic이 된 slot과 계속 active였던 slot이다. 첫 수 physics step의 요청/native pose,
+현재 shelf frame의 collision 최저점·지지면 간격, 물체Z속도·선반pose, env ID·object ID·
+scene generation·seed·활성 전환 여부를 함께 기록한다. 정지 명령에서도 pose가 맞는데
+아래로 가속하면 collision 지지 경로를, 첫 native pose부터 다르면 reset 기록 경로를 조사한다.
+
+이번에는 학습·시뮬레이션·play·테스트를 실행하지 않았고 production 코드를 변경하지 않았다.
+Termination 유예·spawn 높이 변경·추가 settling step을 해결책으로 적용하지 않았다.
+기존 CPU packing·부분 reset·USD 상속 검사는 실제 접촉의 장기 안정성을 증명하지 않는다.
+
+## 163. 2026-11-17 — 활성 물체 스폰 높이에0.1mm 여유 적용
+
+사용자가 높이 offset을 지정하여 현재 Symmetric task의
+`spawn_rules.spawn_height_offset=0.0001m`를 적용했다. 초기 root 높이는 다음과 같다.
+
+$$
+z_{\mathrm{spawn}}=z_{\mathrm{shelf\ top}}-z_{\mathrm{upright\ bbox\ lower}}+0.0001\;\mathrm m.
+$$
+
+공통 `object_spawn_height()`를 배치 생성과 runtime support-height cache에 사용한다.
+따라서 vision·IK가 검사하는 초기 물체 pose와 native reset pose가 일치하고 offset을
+commit에서 다시 더하지 않는다. 공유 배치의 부분 reset도 같은 높이를 사용한다.
+기존 생성 경로의 높이 검사와 ceiling 여유 검사도 같은 계산을 따른다.
+일반 `SpawnRules`의 기본값은0으로 두고 실제 task cfg에0.0001을 명시했다.
+
+이번 변경은 upright bounding box 하단에 대한 초기 여유다. 실제 cooked collider 최저점의
+간격을 직접 지정하거나 물리 선반 상면·지지 판정 기준을 올리는 설정이 아니다.
+미사용 물체 주차 위치·kinematic 전환·초기 속도0·보상·종료 조건·물리 주기는 유지한다.
+시뮬레이션·play·학습은 실행하지 않았으므로 선반 통과 재발의 해결 여부는 미검증이다.
+
+집중 CPU 검사6개에서 동일 seed의 XY·yaw·물체 선택·난수열 보존, Z만0.1mm 증가,
+device proposal용 높이 cache와 packing의 중복 가산 없음, 환경 원점·선택 행 reset·
+주차 위치·속도0 보존 및 실제 cfg 값을 확인했다. 잘못된 offset도 거부한다.
+
+전체 CPU 회귀는 **670개 중647개 통과·CUDA/Kit 전용23개 생략**이며35.214초가 걸렸다.
+`py_compile`과 `git diff --check`도 통과했다. 원자료는
+`logs/diagnostics/spawn_height_offset_2026-11-17/cpu_suite.log`다.

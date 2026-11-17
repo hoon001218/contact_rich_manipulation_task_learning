@@ -41,10 +41,23 @@ class RelocationDistanceProgressTests(unittest.TestCase):
         actual = self.evaluate(state, contacts)
         torch.testing.assert_close(actual, contacts.new_tensor([.0625, 1., 3., 17.]))
 
-    def test_stationary_regression_no_contact_and_motion_inside_goal_pay_zero(self):
-        state = self.state([.4, .3, .4, .05], [.4, .4, .3, .15])
-        actual = self.evaluate(state, state.blocker_center.new_tensor([17., 17., 0., 17.]))
-        torch.testing.assert_close(actual, actual.new_zeros(4))
+    def test_signed_steps_are_symmetric_including_tiny_regressions(self):
+        state = self.state([.4, .395, .4, .36, .4, .4 - 1.e-8],
+                           [.395, .4, .36, .4, .4 - 1.e-8, .4])
+        contacts = state.blocker_center.new_tensor([2., 2., 3., 3., 1., 1.])
+        actual = self.evaluate(state, contacts)
+        expected = contacts.new_tensor([.125, -.125, 1.5, -1.5, 1.25e-7, -1.25e-7])
+        torch.testing.assert_close(actual, expected, atol=1.e-12, rtol=1.e-8)
+
+    def test_signed_80mm_saturation_applies_before_contact_count(self):
+        state = self.state([.4, .32, .5, .3], [.32, .4, .3, .5])
+        contacts = state.blocker_center.new_tensor([2., 2., 17., 17.])
+        torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([2., -2., 17., -17.]))
+
+    def test_goal_entry_is_positive_exit_negative_and_stationary_or_noncontact_zero(self):
+        state = self.state([.25, .15, .05, .4, .3, .4], [.15, .25, .15, .4, .4, .3])
+        contacts = state.blocker_center.new_tensor([2., 2., 17., 17., 0., 0.])
+        torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([1.25, -1.25, 0., 0., 0., 0.]))
 
     def test_minimum_distance_uses_union_including_front_corridor_and_reaches_zero_inside(self):
         state = self.state([.6, .6, .8], [.55, .45, .75])
@@ -58,7 +71,7 @@ class RelocationDistanceProgressTests(unittest.TestCase):
         state.relocation_valid = torch.ones((3, 3), dtype=torch.bool)
         # 50 mm improvement, entry into corridor, then motion away from nearest goal.
         actual = self.evaluate(state, state.blocker_center.new_ones(3))
-        torch.testing.assert_close(actual, actual.new_tensor([.625, 1., 0.]))
+        torch.testing.assert_close(actual, actual.new_tensor([.625, 1., -.625]))
 
     def test_invalid_positions_regions_and_missing_goals_pay_finite_zero(self):
         state = self.state([math.nan, .4, .4, .4, .4, .4], [.3, math.inf, .3, .3, .3, .3])
@@ -84,18 +97,19 @@ class RelocationDistanceProgressTests(unittest.TestCase):
                                    contacts.new_tensor([1.]))
 
     def test_native_reward_manager_applies_weight_and_control_dt_once(self):
-        state = self.state([.4, .4], [.36, .32])
-        contacts = state.blocker_center.new_tensor([2., 3.])
+        state = self.state([.4, .4, .36, .32], [.36, .32, .4, .4])
+        contacts = state.blocker_center.new_tensor([2., 3., 2., 3.])
         env = SimpleNamespace(step_dt=.02)
         manager = SimpleNamespace(_env=env, _term_names=['blocker_relocation'],
             _term_cfgs=[SimpleNamespace(func=rewards.blocker_relocation_distance_progress,
                                        weight=3., params={'reference_speed': 4.})],
-            _reward_buf=torch.zeros_like(contacts), _step_reward=contacts.new_zeros(2, 1),
+            _reward_buf=torch.zeros_like(contacts), _step_reward=contacts.new_zeros(4, 1),
             _episode_sums={'blocker_relocation': torch.zeros_like(contacts)})
         with patch.object(task, 'get_task_state', return_value=state), \
              patch.object(rewards, '_current_blocker_contact_count', return_value=contacts):
             actual = native_reward_compute()(manager, env.step_dt)
-        torch.testing.assert_close(actual, contacts.new_tensor([.06, .18]))
+        torch.testing.assert_close(actual, contacts.new_tensor([.06, .18, -.06, -.18]))
+        torch.testing.assert_close(manager._episode_sums['blocker_relocation'], actual)
 
     def test_bad_scalar_reference_parameters_are_rejected_before_reading_scene(self):
         for value in (0., -1., math.nan, math.inf, -math.inf):
@@ -116,7 +130,7 @@ class RelocationDistanceProgressTests(unittest.TestCase):
              patch.object(torch.Tensor, 'numpy', side_effect=AssertionError('host transfer')):
             first = self.evaluate(state, contacts)
             second = self.evaluate(state, contacts)
-        torch.testing.assert_close(first, contacts.new_tensor([1.5, 0.]))
+        torch.testing.assert_close(first, contacts.new_tensor([1.5, -17.]))
         torch.testing.assert_close(second, first)
         for name, value in original.items():
             torch.testing.assert_close(getattr(state, name), value)
@@ -142,6 +156,12 @@ class RelocationDistanceProgressTests(unittest.TestCase):
         torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([1.]))
         state.advance(batch, 3)  # Multiple readers share the same completed step.
         torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([1.]))
+        batch.center[:, 1, 0] -= .04
+        batch.corners[:, 1, :, 0] -= .04
+        state.advance(batch, 4)
+        torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([-1.]))
+        state.advance(batch, 4)
+        torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([-1.]))
 
     def test_partial_reset_rebases_only_reset_rows_without_consuming_other_progress(self):
         state, batch, reset = fixture(3)
@@ -164,6 +184,10 @@ class RelocationDistanceProgressTests(unittest.TestCase):
         torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([1., 0., 1.]))
         state.advance(batch, 2)
         torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_zeros(3))
+        batch.center[0, 1, 0] -= .04
+        batch.corners[0, 1, :, 0] -= .04
+        state.advance(batch, 3)
+        torch.testing.assert_close(self.evaluate(state, contacts), contacts.new_tensor([-1., 0., 0.]))
 
 
 if __name__ == '__main__':

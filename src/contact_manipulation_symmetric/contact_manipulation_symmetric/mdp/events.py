@@ -1739,6 +1739,8 @@ class SpawnRules:
     x_range: tuple[float, float] = (-0.89, -0.51)
     y_range: tuple[float, float] = (-0.455, 0.455)
     shelf_top: float = 1.05
+    # Initial vertical clearance only; the physical support plane stays shelf_top.
+    spawn_height_offset: float = 0.0
     ceiling: float = 1.35
     min_objects: int = _DEFAULT_MAX_OBJECTS
     max_objects: int = _DEFAULT_MAX_OBJECTS
@@ -1762,6 +1764,15 @@ class SpawnRules:
     min_region_occupancy: float = 0.0
     reserve_blocker_front: bool = True
     max_attempts: int = 300
+
+
+def object_spawn_height(rules, geometry):
+    """Root height with one initial clearance, shared by sampling and GPU packing."""
+    offset = float(_sequential_attr(rules, "spawn_height_offset", 0.0))
+    if not math.isfinite(offset) or offset < 0.0:
+        raise ValueError("spawn_height_offset must be finite and nonnegative.")
+    return (float(_sequential_attr(rules, "shelf_top")) + offset
+            - float(_sequential_attr(geometry, "lower")[2]))
 
 
 @dataclass
@@ -3014,9 +3025,9 @@ def validate_sample(sample: SceneSample, geometries: Sequence[ObjectGeometry], r
         position, yaw, geometry = sample.positions[index], sample.yaws[index], geometries[index]
         if not all(math.isfinite(value) for value in (*position, yaw)):
             raise ValueError("Sampled poses must be finite.")
-        expected_z = rules.shelf_top - geometry.lower[2]
+        expected_z = object_spawn_height(rules, geometry)
         if abs(position[2] - expected_z) > _EPS:
-            raise ValueError("Root Z must put the canonical lower bound on the shelf.")
+            raise ValueError("Root Z must put the canonical lower bound at the configured shelf clearance.")
         if position[2] + geometry.upper[2] > rules.ceiling - rules.gap + _EPS:
             raise ValueError("An active object lacks ceiling clearance.")
         polygons[index] = footprint_polygon(geometry, position[:2], yaw)
@@ -4344,7 +4355,7 @@ def _certified_background_capacity(geometries, background_ids, rules):
         if (not all(math.isfinite(value) for value in (*geometry.lower, *geometry.upper))
                 or any(high <= low for low, high in zip(geometry.lower, geometry.upper))):
             raise ValueError("Certified background geometry needs finite, positive 3D bounds.")
-        if geometry.upper[2] - geometry.lower[2] > rules.ceiling - rules.shelf_top - rules.gap + 1.e-12:
+        if object_spawn_height(rules, geometry) + geometry.upper[2] > rules.ceiling - rules.gap + 1.e-12:
             raise ValueError(f"Background body {index} lacks the configured ceiling clearance.")
         profiles[index] = _certified_footprint_profile(tuple(geometry.lower), tuple(geometry.upper),
                                                       tuple(geometry.collision_footprint_vertices))
@@ -4511,7 +4522,7 @@ def _sample_certified_background(geometries, background_ids, rules, module_bound
             centers[index][1] += shift
         plane += depth+row_gap
     positions = {index: (float(centers[index][0]), float(side*centers[index][1]),
-                         rules.shelf_top-geometries[index].lower[2]) for index in ids}
+                         object_spawn_height(rules, geometries[index])) for index in ids}
     certificate.update(free_ids=tuple(free_ids), full_yaw_ids=tuple(full_yaw_ids),
                        angle_half_widths=half_widths, outside_gap=float(outside_gap),
                        available_slab_width=float(slab_width), neighbor_gaps=tuple(neighbor_gaps),
@@ -4869,8 +4880,8 @@ def _precompute_guarded_role_family(base_family, geometries, rules, guard_id, *,
     camera = np.asarray(base_family['camera_pose'], dtype=np.float64)
     certified = _certify_role_translation_cells(geometries, target, blocker, ty, by, bx,
         (s_bounds,), rules, yaw_half_width=half, camera_eye=camera[:3], cell_width=2*s_half+1.e-12)
-    if not certified or any(geometries[i].upper[2]-geometries[i].lower[2] >
-                            rules.ceiling-rules.shelf_top-rules.gap for i in (target, blocker, guard_id)):
+    if not certified or any(object_spawn_height(rules, geometries[i]) + geometries[i].upper[2] >
+                            rules.ceiling-rules.gap for i in (target, blocker, guard_id)):
         return None
     initial = _collision_polygon(geometries[blocker], by)+(bx, s0)
     t_shape = _collision_polygon(geometries[target], ty)
@@ -5245,7 +5256,7 @@ def construct_scene(geometries, rules, rng, target_id=None, blocker_id=None, act
         locations, _ = _compact_constructive_positions(polygons, swapped[:, ::-1], y0, gaps)
         centers.update(zip(indices, locations))
     positions = {index: (float(centers[index][0]), float(centers[index][1]),
-                         rules.shelf_top - geometries[index].lower[2]) for index in ids}
+                         object_spawn_height(rules, geometries[index])) for index in ids}
     start = PlanarPose(float(centers[blocker][0]), float(centers[blocker][1]), yaws[blocker])
     turn = PlanarPose(float(rotation_center[0] + offset[0]), float(rotation_center[1] + offset[1]), yaws[blocker] + angle)
     finish = PlanarPose(float(goal_center[0] + offset[0]), float(goal_center[1] + offset[1]), turn.yaw)
@@ -5407,7 +5418,7 @@ class SequentialSceneGenerator:
         # Conservatively enclose both collision and visual geometry for support/packing.
         outer=_sequential_rect(np.concatenate((collision,visual)))
         return dict(collision=collision,visual=visual,bounds=outer,collision_bounds=_sequential_rect(collision),
-                    visual_bounds=_sequential_rect(visual),z=float(_sequential_attr(self.rules,'shelf_top')-lo[2]))
+                    visual_bounds=_sequential_rect(visual),z=object_spawn_height(self.rules,geo))
 
     def _goal_shape(self,index,yaw):
         # Reward/success use the complete local OBB, including its empty
@@ -6014,7 +6025,7 @@ def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rn
         raise ValueError("Selected asset type count exceeds the active instance cap.")
     # Larger footprints are placed first, preserving the two designated roles.
     ids = (target, blocker, *sorted(selected_ids[2:], key=area, reverse=True))
-    if any(rules.shelf_top + geometries[index].upper[2] - geometries[index].lower[2]
+    if any(object_spawn_height(rules, geometries[index]) + geometries[index].upper[2]
            > rules.ceiling - rules.gap for index in ids):
         raise RuntimeError("Selected composition exceeds shelf ceiling clearance.")
     for _ in range(rules.max_attempts):
@@ -6046,8 +6057,8 @@ def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rn
         if blocker_ymin > blocker_ymax:
             continue
         blocker_y = rng.uniform(blocker_ymin, blocker_ymax)
-        positions = {target: (target_x, target_y, rules.shelf_top - geometries[target].lower[2]),
-                     blocker: (blocker_x, blocker_y, rules.shelf_top - geometries[blocker].lower[2])}
+        positions = {target: (target_x, target_y, object_spawn_height(rules, geometries[target])),
+                     blocker: (blocker_x, blocker_y, object_spawn_height(rules, geometries[blocker]))}
         polygons = {index: footprint_polygon(geometries[index], positions[index][:2], yaws[index])
                     for index in (target, blocker)}
         initial = PlanarPose(blocker_x, blocker_y, yaws[blocker])
@@ -6073,13 +6084,13 @@ def _scene_proposals(geometries: Sequence[ObjectGeometry], rules: SpawnRules, rn
         if isinstance(packed,tuple):
             packed, device_poses = packed
         if device_poses is not None:
-            heights = {index: rules.shelf_top - geometries[index].lower[2] for index in ids}
+            heights = {index: object_spawn_height(rules, geometries[index]) for index in ids}
             positions = _PoseMapping(positions, ids, device_poses, heights)
             yaws = _PoseMapping(yaws, ids, device_poses, heights, yaw=True)
         else:
             for slot, index in enumerate(ids):
                 positions[index] = (float(packed[slot, 0]), float(packed[slot, 1]),
-                                    rules.shelf_top - geometries[index].lower[2])
+                                    object_spawn_height(rules, geometries[index]))
                 yaws[index] = float(packed[slot, 2])
         kind = "pivot" if any(motion.pivot is not None for motion in path) else (
             "rotate_translate" if any(abs(motion.end.yaw - motion.start.yaw) > _EPS for motion in path)
@@ -7858,7 +7869,7 @@ def _sample_clutter_roles(catalog, geometries, rules, rng, target, blocker, fron
     c, s = math.cos(angle), math.sin(angle)
     rotation = np.array(((c, -s), (s, c)))
     centers = {target: shift, blocker: rotation @ np.array((family['blocker_x'], parameter))+shift}
-    positions = {index: (*map(float, center), rules.shelf_top-geometries[index].lower[2])
+    positions = {index: (*map(float, center), object_spawn_height(rules, geometries[index]))
                  for index, center in centers.items()}
     yaws = {target: family['target_yaw']+angle, blocker: family['blocker_yaw']+angle}
     camera = np.asarray(family['camera_pose'], dtype=np.float64).copy()
@@ -7962,7 +7973,7 @@ def sample_clutter_episode(catalog, geometries, rules, rng, target, blocker, *, 
         (*fixed, pocket_polygon), rules.gap, rng, center_bounds=center_limits)
     positions, yaws = dict(roles.positions), dict(roles.yaws)
     for slot, index in enumerate(active_bg):
-        positions[index] = (*map(float, centers[slot]), rules.shelf_top-geometries[index].lower[2])
+        positions[index] = (*map(float, centers[slot]), object_spawn_height(rules, geometries[index]))
         yaws[index] = base_yaws[slot]+turns[slot][int(variants[slot])]*math.pi*.5
     lo, hi = pocket_polygon.min(0), pocket_polygon.max(0)
     provenance = dict(roles.parameter_certificate, method='joint_clutter', type_composition=types,
@@ -8613,12 +8624,12 @@ def sample_certified_scene(domain, rng):
     rotation = np.array(((c, -s), (s, c)))
     target, blocker = domain.target_id, domain.blocker_id
     centers = {target: shift, blocker: rotation @ np.array((domain.blocker_x, parameter))+shift}
-    positions = {index: (float(center[0]), float(center[1]), domain.rules.shelf_top-domain.geometries[index].lower[2])
+    positions = {index: (float(center[0]), float(center[1]), object_spawn_height(domain.rules, domain.geometries[index]))
                  for index, center in centers.items()}
     yaws = {target: domain.target_yaw+angle, blocker: domain.blocker_yaw+angle}
     for index, (x, y, yaw) in domain.fixed_objects.items():
         center = rotation @ np.array((x, y))+shift
-        positions[index] = (float(center[0]), float(center[1]), domain.rules.shelf_top-domain.geometries[index].lower[2])
+        positions[index] = (float(center[0]), float(center[1]), object_spawn_height(domain.rules, domain.geometries[index]))
         yaws[index] = yaw+angle
     bounds = np.asarray(cell['module_bounds']) + shift[[0, 0, 1, 1]]
     background_positions, background_yaws, neighbors, background_certificate = _sample_certified_background(
@@ -8771,7 +8782,7 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
     origins = env.scene.env_origins[ids]
     default = objects.data.default_object_state[0]
     if not hasattr(runtime, "support_heights"):
-        runtime.support_heights = default.new_tensor([env.spawn_rules.shelf_top - g.lower[2]
+        runtime.support_heights = default.new_tensor([object_spawn_height(env.spawn_rules, g)
                                                      for g in env.spawn_geometries])
     batch = EpisodeBatch(
         object_state=default.new_zeros((m, len(specs), 13)),
