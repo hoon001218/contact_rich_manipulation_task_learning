@@ -36,6 +36,7 @@ from .observations import (
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench, action_input_limits,
 )
 from .rewards import clearance_quality, object_motion_cost, singularity_margin
+from .curriculums import curriculum_spawn_rules
 from .terminations import (
     FAILURE_REASON_NAMES, configured_terminations, object_support_validity, task_conditions, terminal_transition,
 )
@@ -5687,10 +5688,14 @@ class SequentialSceneGenerator:
             free=_sequential_maxrects_cut_all(free,_sequential_inflate(rectangle,gap))
         requested=self.rng.randint(int(_sequential_attr(self.rules,'min_objects',15)),int(_sequential_attr(self.rules,'max_objects',25)))
         copies=min(len(v) for name,v in self.by_type.items() if name!=self.target_type)
-        minimum_types=max(int(_sequential_attr(self.rules,'min_asset_types',4)),math.ceil((requested-1)/copies)+1)
-        k=(min(int(_sequential_attr(self.rules,'max_asset_types',10)),len(self.types))
+        # Early curriculum scenes contain only the role objects, so a type
+        # count cannot exceed the requested body count. Full scenes keep the
+        # original bounds and random draw sequence.
+        maximum_types=min(int(_sequential_attr(self.rules,'max_asset_types',10)),len(self.types),requested)
+        minimum_types=min(maximum_types,max(int(_sequential_attr(self.rules,'min_asset_types',4)),math.ceil((requested-1)/copies)+1))
+        k=(maximum_types
            if _sequential_attr(self.rules,'all_asset_types',False)
-           else self.rng.randint(minimum_types,min(int(_sequential_attr(self.rules,'max_asset_types',10)),len(self.types))))
+           else self.rng.randint(minimum_types,maximum_types))
         extras=[t for t in self.types if t not in (self.target_type,self.blocker_type)]
         selected=[self.blocker_type]+self.rng.sample(extras,k-2)
         self.background_base_yaws={name:self.rng.uniform(-math.pi,math.pi) for name in selected}
@@ -8740,6 +8745,7 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
     scene, specs, m = env.task_scene_data, runtime.specs, ids.numel()
     capacity, observation_capacity = _active_object_capacity(env), env.cfg.mdp.max_objects
     sequential = env.spawn_rules.generation_mode == 'sequential'
+    sampling_rules = curriculum_spawn_rules(env) if sequential else env.spawn_rules
     clutter = env.spawn_rules.generation_mode == 'clutter'
     parameterized = env.spawn_rules.generation_mode in ('parameterized', 'clutter')
     constructive = sequential or parameterized or env.spawn_rules.generation_mode == "constructive"
@@ -8808,7 +8814,7 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                 candidates, samples = [], []
                 # print(f"[Episode reset] sampling {len(pending)} independent episodes, proposal {attempt + 1}", flush=True)
                 if sequential:
-                    proposals = [sample_sequential_scene(env.spawn_geometries, env.spawn_rules,
+                    proposals = [sample_sequential_scene(env.spawn_geometries, sampling_rules,
                         seed=seeds[row], target_id=roles[row][0], blocker_id=roles[row][1]) for row in pending]
                 elif clutter:
                     proposals = [sample_clutter_episode(runtime.parameter_catalog, env.spawn_geometries,
@@ -9150,6 +9156,8 @@ def reset_scene(env, env_ids=None):
         template, sample = runtime.shared_template, runtime.shared_sample
     batch = _shared_reset_batch(env, runtime, ids, template, sample)
     apply_episode_batch(env, ids, batch)
+    # Host metadata already belongs to this shared layout; no tensor readback.
+    runtime.pending_reset_metrics["Reset/scene_object_count"] = float(len(sample.active_ids))
     if refresh:
         vertices, counts, valid = relocation
         scene = env.task_scene_data

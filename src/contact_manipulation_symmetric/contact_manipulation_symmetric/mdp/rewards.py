@@ -15,12 +15,14 @@ from isaaclab.utils.math import quat_error_magnitude
 
 __all__ = [
     "clearance_quality", "clearance", "clearance_contact_progress",
+    "clearance_contact_improvement", "clearance_regression",
     "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "tactile_pad_frames", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
     "blocker_normal_alignment_quality", "blocker_normal_alignment",
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "blocker_relocation_distance_progress",
+    "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -135,18 +137,18 @@ def tactile_pad_frames(env):
 
 def blocker_normal_alignment_quality(pad_points, pad_normals, blocker_center,
                                      *, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))):
-    """Mean of 17 exp(-decay * (1-cosine)) scores toward the Blocker center.
+    """Mean per-pad exp(-decay * (1-cosine)) toward the Blocker center.
 
-    Points/normals are [N,17,3] and centers [N,3], all in the same frame. Each
+    Points/normals are [N,P,3] and centers [N,3], all in the same frame. Each
     normal points out of its contact surface. Aligned/opposed normals have
     cosine +1/-1. Average per-pad scores, not normals or cosines before exp.
     Invalid or zero-length vectors contribute zero with the denominator fixed
-    at 17. No distance weighting, contact gate, history or device scalar reads.
+    at P. No distance weighting, contact gate, history or device scalar reads.
     """
-    if (pad_points.ndim != 3 or pad_points.shape[1:] != (17, 3)
+    if (pad_points.ndim != 3 or pad_points.shape[-1] != 3 or pad_points.shape[1] < 1
             or pad_normals.shape != pad_points.shape
             or blocker_center.shape != (pad_points.shape[0], 3)):
-        raise ValueError("Expected pad points/normals [N,17,3] and Blocker centers [N,3].")
+        raise ValueError("Expected pad points/normals [N,P,3], P > 0, and Blocker centers [N,3].")
     if not math.isfinite(decay) or decay <= 0:
         raise ValueError("Alignment decay must be finite and positive.")
     direction = blocker_center[:, None] - pad_points
@@ -162,12 +164,35 @@ def blocker_normal_alignment_quality(pad_points, pad_normals, blocker_center,
     return torch.where(valid, quality, 0.0).mean(-1)
 
 
-def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))):
-    """Pay current pad-facing quality before/during contact; native dt applies once."""
+def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0)),
+                             exclude_fingertips=True):
+    """Pay facing quality for the 12 palmar pads, excluding five fingertip caps.
+
+    Canonical points/normals still contain all 17 sensors. Only this reward
+    selects a subset; contact observations and other rewards keep their own
+    pad definitions. Native weight and dt apply once after the selected mean.
+    """
     from .events import get_task_state
 
+    if not isinstance(exclude_fingertips, bool):
+        raise ValueError("exclude_fingertips must be boolean.")
     state = get_task_state(env)
     points, normals = tactile_pad_frames(env)
+    if exclude_fingertips:
+        indices = getattr(env, "_tactile_alignment_pad_indices", None)
+        if indices is None or indices.device != points.device:
+            from ..config.ur5e.scene import TACTILE_BODY_NAMES, FINGERTIP_BODY_NAMES
+
+            if not set(FINGERTIP_BODY_NAMES).issubset(TACTILE_BODY_NAMES):
+                raise RuntimeError("Fingertip exclusions must belong to the canonical tactile pads.")
+            selected = [index for index, name in enumerate(TACTILE_BODY_NAMES)
+                        if name not in FINGERTIP_BODY_NAMES]
+            if not selected:
+                raise RuntimeError("Normal alignment requires at least one non-fingertip pad.")
+            indices = torch.tensor(selected, device=points.device, dtype=torch.long)
+            env._tactile_alignment_pad_indices = indices
+        points = points.index_select(1, indices)
+        normals = normals.index_select(1, indices)
     # Transition geometry removes cloned environment origins, whereas native
     # pad body poses are world-frame. Restore the origin before subtracting.
     center_w = state.blocker_center + env.scene.env_origins
@@ -300,6 +325,17 @@ def _positive_improvement(current, previous):
     return torch.where(valid, (current - previous).clamp_min(0.0), 0.0)
 
 
+def _clearance_quality_change(env):
+    """Read finite consecutive quality samples without consuming their history."""
+    from .events import get_task_state
+
+    state = get_task_state(env)
+    quality = torch.where(torch.isfinite(state.blocker_overlap), state.clearance_quality, math.nan)
+    previous = state.previous_clearance_quality
+    valid = torch.isfinite(quality) & torch.isfinite(previous)
+    return torch.where(valid, quality - previous, 0.0)
+
+
 def clearance_contact_progress(env, threshold=0.01):
     """Current Blocker pad count times signed clearance-quality change.
 
@@ -309,14 +345,27 @@ def clearance_contact_progress(env, threshold=0.01):
     clearance pays negatively. Stationary or noncontact samples pay zero.
     Native RewardManager applies weight and control dt once.
     """
-    from .events import get_task_state
-
-    state = get_task_state(env)
-    quality = torch.where(torch.isfinite(state.blocker_overlap), state.clearance_quality, math.nan)
-    previous = state.previous_clearance_quality
-    valid = torch.isfinite(quality) & torch.isfinite(previous)
-    progress = torch.where(valid, quality - previous, 0.0)
+    progress = _clearance_quality_change(env)
     return _current_blocker_contact_count(env, threshold) * progress
+
+
+def clearance_contact_improvement(env, threshold=0.01):
+    """Positive part of the existing contact-weighted one-step progress.
+
+    The native RewardManager applies a positive weight and dt. The original
+    signed function stays available for older reward configurations.
+    """
+    return clearance_contact_progress(env, threshold=threshold).clamp_min(0.0)
+
+
+def clearance_regression(env):
+    """Nonnegative worsening cost independent of contact or its pad count.
+
+    A fixed negative native term weight scales the quality regression, including
+    changes after contact is lost. Finite consecutive geometry samples are still
+    required; no change or improvement returns zero. History is read-only.
+    """
+    return (-_clearance_quality_change(env)).clamp_min(0.0)
 
 
 def _current_blocker_pad_distances(env):
@@ -448,22 +497,12 @@ def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, thresho
     return _current_blocker_contact_count(env, threshold) * torch.where(valid, progress, 0.0)
 
 
-def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.01):
-    """Pay current Blocker pad count times normalized signed distance progress.
+def _relocation_distance_change(env, reference_speed):
+    """Contact-independent normalized signed distance change, clipped to [-1,1].
 
-    Distance is from the Blocker center to the union of this scene's relocation
-    polygons, including the front corridors when configured by the experiment.
-    The reference distance is ``reference_speed * env.step_dt``: the official
-    UR5e TCP speed specification of 4 m/s gives 80 mm at a 50 Hz policy rate.
-    This is a normalization reference, not a bound on actual object motion.
-    Approaching a goal pays positively; moving away pays negatively. Normalize
-    and clip the signed fraction to [-1, 1] before multiplying the pad count.
-
-    Consecutive centers come from the shared TaskState snapshots, including
-    noncontact steps. A partial reset rebases only its rows; repeated reward
-    reads never consume history or pay earlier noncontact progress. Invalid
-    geometry/centers and missing goals pay zero. Native RewardManager applies
-    weight and control dt once; no additional rate conversion is applied here.
+    Read the shared consecutive centers and fixed goal polygons, including
+    their front corridors when configured. Invalid samples and missing regions
+    return zero. No history update, sensor query or additional dt division.
     """
     from .events import get_task_state
 
@@ -485,7 +524,37 @@ def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.0
              & torch.isfinite(state.blocker_center).all(-1)
              & torch.isfinite(state.previous_blocker_center).all(-1))
     progress = torch.where(valid, previous - current, 0.0) / reference_distance
-    return _current_blocker_contact_count(env, threshold) * progress.clamp(-1.0, 1.0)
+    return progress.clamp(-1.0, 1.0)
+
+
+def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.01):
+    """Legacy signed progress: current Blocker pad count times distance change.
+
+    Reference distance is ``reference_speed * env.step_dt``: 4 m/s gives 80 mm
+    at 50 Hz. Clip the signed fraction before multiplying the pad count. The
+    reference is a normalization, not a limit on actual object motion.
+    Consecutive centers include noncontact steps, so recontact never pays old
+    progress. Partial reset rebases only its rows; reward reads are read-only.
+    Native RewardManager applies the configured weight and control dt once.
+    """
+    progress = _relocation_distance_change(env, reference_speed)
+    return _current_blocker_contact_count(env, threshold) * progress
+
+
+def blocker_relocation_distance_improvement(env, reference_speed=4.0, threshold=0.01):
+    """Positive normalized approach progress weighted by current contact pads."""
+    return blocker_relocation_distance_progress(
+        env, reference_speed=reference_speed, threshold=threshold,
+    ).clamp_min(0.0)
+
+
+def blocker_relocation_distance_regression(env, reference_speed=4.0):
+    """Nonnegative retreat cost independent of contact; use a negative weight.
+
+    Retain the same reference distance and unit saturation as improvement.
+    Losing contact does not waive worsening; pad count never scales this cost.
+    """
+    return (-_relocation_distance_change(env, reference_speed)).clamp_min(0.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

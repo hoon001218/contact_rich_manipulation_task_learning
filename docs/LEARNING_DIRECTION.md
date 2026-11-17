@@ -46,7 +46,7 @@ Relocation은 학습 1의 거리 감소량 정규화 방식을 사용한다.
 | Clearance | $n_t(C_t-C_{t-1})$ | Blocker 접촉 pad 수로 가중. 겹침 감소는 양수, 증가는 음수. |
 | Blocker relocation | $n_t\operatorname{clip}\!\left(\frac{d_{t-1}-d_t}{d_{\mathrm{ref}}},-1,1\right)$ | 재배치 목적지와 전방 통로에 가까워지면 양수, 멀어지면 음수. 현재 접촉 pad 수를 곱하며 정체·무접촉 시 0. |
 | Blocker distance | $\frac{1}{17}\sum_{i=0}^{16}e^{-a_Dd_{i,t}}$ | 17개 pad에서 OBB 면까지의 현재 거리 점수 평균. |
-| Pad alignment | $\frac{1}{17}\sum_{i=0}^{16}e^{-a_A(1-s_{i,t})}$ | Pad 외향 normal과 pad→Blocker 중심 방향의 cosine $s_{i,t}$. 정면1,45°에서0.5. Weight1·접촉 전에도 지급. |
+| Pad alignment | $\frac{1}{12}\sum_{i\in\mathcal P}e^{-a_A(1-s_{i,t})}$ | 손끝5개를 제외한12pad($\mathcal P$)의 외향 normal과 pad→Blocker 중심 방향의 cosine $s_{i,t}$. 정면1,45°에서0.5. Weight1·접촉 전에도 지급. |
 | Time | $-\mathbf{1}_{\mathrm{alive}\,\land\,\neg\mathrm{success}}$ | 성공 상태가 아닌 생존 step에 시간 비용. |
 
 $d_t$는 Blocker 중심에서 재배치 목적지와 전방 통로의 합집합까지의 최소 XY 거리이며, 영역 내부에서는 0이다.
@@ -56,8 +56,9 @@ $d_{\mathrm{ref}}=4\,\mathrm{m/s}\times\Delta t$로 정한다. 정책 50Hz에서
 
 Pad alignment는 $s_{i,t}=\mathbf n_{i,t}^{\mathsf T}(\mathbf c_{B,t}-\mathbf p_{i,t})/\|\mathbf c_{B,t}-\mathbf p_{i,t}\|$,
 $a_A=\ln2/(1-\cos45^\circ)\approx2.36655$를 사용한다. 두 방향은 같은 좌표계의 단위벡터이며,
-17개 점수를 각각 계산한 뒤 평균한다. 접촉면 명목 normal은 각 pad의 local+Z를 현재 자세로
-회전한 방향이다. 거리·접촉 gate는 없고, 방향을 계산할 수 없는 pad는 고정 분모17에서0으로 처리한다.
+손끝 cap(엄지4번·다른 손가락3번)을 제외한12개 점수를 각각 계산한 뒤 평균한다.
+관측·Distance·Contact hold의17pad 구성은 유지한다. 접촉면 명목 normal은 각 pad의 local+Z를 현재 자세로
+회전한 방향이다. 거리·접촉 gate는 없고, 방향을 계산할 수 없는 pad는 고정 분모12에서0으로 처리한다.
 
 #### Motion and constraint terms
 

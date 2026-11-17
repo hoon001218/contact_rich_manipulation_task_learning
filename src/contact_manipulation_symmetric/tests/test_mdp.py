@@ -858,17 +858,19 @@ class RelocationRewardTests(unittest.TestCase):
             self.assertEqual(actual.shape, (1024,))
             self.assertEqual(actual.dtype, dtype)
 
-    def test_cfg_uses_metric_distance_progress_relocation_with_positive_weight(self):
+    def test_cfg_uses_contact_metric_improvement_without_regression_term(self):
         source = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'RewardsCfg')
         term = next(node.value for node in definition.body if isinstance(node, ast.Assign)
                     and node.targets[0].id == 'blocker_relocation')
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
-        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_progress')
+        self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_improvement')
         self.assertGreater(ast.literal_eval(fields['weight']), 0.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
         self.assertEqual(params, {'reference_speed': 4., 'threshold': .01})
+        names = {node.targets[0].id for node in definition.body if isinstance(node, ast.Assign)}
+        self.assertNotIn('blocker_relocation_regression', names)
 
     def test_legacy_relocation_rejects_invalid_decay(self):
         for decay in (0., -1., math.nan, math.inf):
@@ -1442,6 +1444,8 @@ class RewardTests(unittest.TestCase):
                 terms[node.targets[0].id] = (function.attr if isinstance(function, ast.Attribute) else function.id,
                                            ast.literal_eval(fields['weight']))
         self.assertNotIn('rearrangement', terms)
+        self.assertNotIn('clearance_regression', terms)
+        self.assertNotIn('blocker_relocation_regression', terms)
         for name, fn in (('motion_action_rate', 'motion_action_rate'), ('motion_joint_velocity', 'motion_joint_velocity'),
                          ('motion_force_growth', 'motion_force_growth'), ('motion_torque_growth', 'motion_torque_growth'),
                          ('object_collision', 'object_collision'), ('shelf_collision', 'shelf_collision')):
@@ -1451,8 +1455,8 @@ class RewardTests(unittest.TestCase):
             self.assertLess(terms[name][1], 0.)
         # Research weights/decays are experiment parameters. Check the public
         # function wiring and cost signs without freezing one experiment's values.
-        for name, fn in (('clearance', 'clearance_contact_progress'), ('blocker_distance', 'blocker_distance'),
-                         ('blocker_relocation', 'blocker_relocation_distance_progress'),
+        for name, fn in (('clearance', 'clearance_contact_improvement'), ('blocker_distance', 'blocker_distance'),
+                         ('blocker_relocation', 'blocker_relocation_distance_improvement'),
                          ('blocker_contact_hold', 'BlockerContactHold'),
                          ('motion_singularity', 'motion_singularity'), ('object_stability', 'object_stability')):
             if name in {'motion_singularity', 'blocker_contact_hold'} and name not in terms:

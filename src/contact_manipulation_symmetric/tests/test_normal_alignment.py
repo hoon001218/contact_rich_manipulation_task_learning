@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import inspect
 import math
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,8 @@ from test_mdp import Rotation, native_reward_compute, rewards, task
 
 
 DECAY_45 = math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))
+FINGERTIP_INDICES = (4, 7, 10, 13, 16)
+PALMAR_INDICES = (0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15)
 
 
 def facing_inputs(batch=1, dtype=torch.float64):
@@ -93,16 +96,17 @@ class NormalAlignmentQualityTests(unittest.TestCase):
         actual = rewards.blocker_normal_alignment_quality(points, normals, center)
         torch.testing.assert_close(actual, torch.zeros(2, dtype=points.dtype))
 
-    def test_empty_and_1024_batches_preserve_shape_dtype_and_device(self):
+    def test_any_positive_pad_count_preserves_fixed_mean_and_batch_contract(self):
         for batch in (0, 1024):
             for dtype in (torch.float32, torch.float64):
-                with self.subTest(batch=batch, dtype=dtype):
-                    points, normals, center = facing_inputs(batch, dtype)
-                    actual = rewards.blocker_normal_alignment_quality(points, normals, center)
-                    self.assertEqual(actual.shape, (batch,))
-                    self.assertEqual(actual.dtype, dtype)
-                    self.assertEqual(actual.device, points.device)
-                    torch.testing.assert_close(actual, torch.ones(batch, dtype=dtype))
+                for pads in (1, 12, 16, 17):
+                    with self.subTest(batch=batch, dtype=dtype, pads=pads):
+                        points, normals, center = facing_inputs(batch, dtype)
+                        actual = rewards.blocker_normal_alignment_quality(points[:, :pads], normals[:, :pads], center)
+                        self.assertEqual(actual.shape, (batch,))
+                        self.assertEqual(actual.dtype, dtype)
+                        self.assertEqual(actual.device, points.device)
+                        torch.testing.assert_close(actual, torch.ones(batch, dtype=dtype))
 
     def test_hot_path_uses_no_host_transfer_or_tensor_scalar_condition(self):
         points, normals, center = facing_inputs(batch=1024, dtype=torch.float32)
@@ -115,7 +119,7 @@ class NormalAlignmentQualityTests(unittest.TestCase):
 
     def test_malformed_shapes_are_rejected_instead_of_broadcasting_environments(self):
         points, normals, center = facing_inputs(batch=2)
-        cases = ((points[:, :16], normals[:, :16], center),
+        cases = ((points[:, :0], normals[:, :0], center),
                  (points, normals[:1], center),
                  (points, normals, center[:1]),
                  (points[..., :2], normals, center),
@@ -206,12 +210,25 @@ class TactilePadFramesTests(unittest.TestCase):
 
 
 class NormalAlignmentIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def reward_scene(batch=1):
+        class Scene(dict):
+            pass
+
+        scene = Scene()
+        scene.env_origins = torch.zeros((batch, 3), dtype=torch.float64)
+        env = SimpleNamespace(scene=scene, step_dt=.02,
+                              _tactile_alignment_pad_indices=torch.tensor(PALMAR_INDICES))
+        points, normals, center = facing_inputs(batch=batch)
+        return env, points, normals, SimpleNamespace(blocker_center=center)
+
     def test_wrapper_uses_current_blocker_center_and_environment_origin_without_extra_gates(self):
         class Scene(dict):
             env_origins = torch.tensor([[10.0, -4.0, 2.0], [-7.0, 12.0, -3.0]], dtype=torch.float64)
 
         local_points, normals, local_center = facing_inputs(batch=2)
-        env = SimpleNamespace(scene=Scene(), step_dt=.02)
+        env = SimpleNamespace(scene=Scene(), step_dt=.02,
+                              _tactile_alignment_pad_indices=torch.tensor(PALMAR_INDICES))
         world_points = local_points + env.scene.env_origins[:, None]
         state = SimpleNamespace(blocker_center=local_center.clone(),
                                 target_protected=torch.zeros(2, dtype=torch.bool),
@@ -223,6 +240,87 @@ class NormalAlignmentIntegrationTests(unittest.TestCase):
             behind = rewards.blocker_normal_alignment(env)
         torch.testing.assert_close(facing, torch.ones(2, dtype=world_points.dtype))
         torch.testing.assert_close(behind, facing.new_full((2,), math.exp(-2 * DECAY_45)))
+
+    def test_five_fingertip_positions_and_normals_do_not_affect_default_reward(self):
+        env, points, normals, state = self.reward_scene(batch=2)
+        originals = (points.clone(), normals.clone())
+        with patch.object(task, "get_task_state", return_value=state), \
+                patch.object(rewards, "tactile_pad_frames", return_value=(points, normals)):
+            expected = rewards.blocker_normal_alignment(env)
+            points[:, FINGERTIP_INDICES] = math.nan
+            normals[:, FINGERTIP_INDICES] = math.inf
+            unchanged = rewards.blocker_normal_alignment(env)
+        torch.testing.assert_close(expected, torch.ones(2, dtype=points.dtype))
+        torch.testing.assert_close(unchanged, expected)
+        # Selection is local to this reward; all 17 pad inputs still exist and
+        # the retained pad geometry is untouched for other rewards/sensors.
+        self.assertEqual(points.shape, (2, 17, 3))
+        self.assertEqual(normals.shape, (2, 17, 3))
+        torch.testing.assert_close(points[:, PALMAR_INDICES], originals[0][:, PALMAR_INDICES])
+        torch.testing.assert_close(normals[:, PALMAR_INDICES], originals[1][:, PALMAR_INDICES])
+
+    def test_invalid_retained_pad_is_zero_with_fixed_twelve_pad_denominator(self):
+        env, points, normals, state = self.reward_scene()
+        normals[:, PALMAR_INDICES[3]] = 0.0
+        points[:, PALMAR_INDICES[5]] = state.blocker_center
+        with patch.object(task, "get_task_state", return_value=state), \
+                patch.object(rewards, "tactile_pad_frames", return_value=(points, normals)):
+            actual = rewards.blocker_normal_alignment(env)
+        torch.testing.assert_close(actual, actual.new_tensor([10.0 / 12.0]))
+
+    def test_facing_only_fingertips_cannot_replace_palmar_alignment_and_legacy_is_explicit(self):
+        env, points, normals, state = self.reward_scene()
+        normals[:, PALMAR_INDICES, 0] = -1.0
+        with patch.object(task, "get_task_state", return_value=state), \
+                patch.object(rewards, "tactile_pad_frames", return_value=(points, normals)):
+            selected = rewards.blocker_normal_alignment(env)
+            legacy = rewards.blocker_normal_alignment(env, exclude_fingertips=False)
+        opposed = math.exp(-2 * DECAY_45)
+        torch.testing.assert_close(selected, selected.new_tensor([opposed]))
+        torch.testing.assert_close(legacy, legacy.new_tensor([(12 * opposed + 5) / 17]))
+        self.assertLess(float(selected[0]), float(legacy[0]))
+
+    def test_cached_selection_reuses_indices_without_host_reads_on_current_frames(self):
+        env, points, normals, state = self.reward_scene(batch=1024)
+        indices = env._tactile_alignment_pad_indices
+        with patch.object(task, "get_task_state", return_value=state), \
+                patch.object(rewards, "tactile_pad_frames", return_value=(points, normals)):
+            with ExitStack() as stack:
+                for method in ("cpu", "item", "tolist", "numpy", "__bool__"):
+                    stack.enter_context(patch.object(torch.Tensor, method,
+                        side_effect=AssertionError(f"Unexpected host/scalar operation: {method}")))
+                actual = rewards.blocker_normal_alignment(env)
+        self.assertIs(env._tactile_alignment_pad_indices, indices)
+        torch.testing.assert_close(actual, torch.ones(1024, dtype=points.dtype))
+
+    def test_canonical_fingertip_names_build_and_cache_only_the_twelve_retained_indices(self):
+        source = Path(__file__).resolve().parents[1] / "contact_manipulation_symmetric/config/ur5e/scene.py"
+        syntax = ast.parse(source.read_text())
+        namespace = {}
+        for assignment in syntax.body:
+            if (isinstance(assignment, ast.Assign) and len(assignment.targets) == 1
+                    and isinstance(assignment.targets[0], ast.Name)
+                    and assignment.targets[0].id in {"TCP_BODY_NAME", "TACTILE_BODY_NAMES", "FINGERTIP_BODY_NAMES"}):
+                exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(source), "exec"), namespace)
+        self.assertEqual(namespace["FINGERTIP_BODY_NAMES"], (
+            "right_thumb_force_sensor_4", "right_index_force_sensor_3", "right_middle_force_sensor_3",
+            "right_ring_force_sensor_3", "right_little_force_sensor_3"))
+        self.assertEqual(tuple(namespace["TACTILE_BODY_NAMES"].index(name)
+                               for name in namespace["FINGERTIP_BODY_NAMES"]), FINGERTIP_INDICES)
+        env, points, normals, state = self.reward_scene()
+        del env._tactile_alignment_pad_indices
+        scene_name = rewards.__package__.rsplit(".", 1)[0] + ".config.ur5e.scene"
+        fake_scene = SimpleNamespace(TACTILE_BODY_NAMES=namespace["TACTILE_BODY_NAMES"],
+                                     FINGERTIP_BODY_NAMES=namespace["FINGERTIP_BODY_NAMES"])
+        with patch.dict(sys.modules, {scene_name: fake_scene}), \
+                patch.object(task, "get_task_state", return_value=state), \
+                patch.object(rewards, "tactile_pad_frames", return_value=(points, normals)):
+            actual = rewards.blocker_normal_alignment(env)
+            cached = env._tactile_alignment_pad_indices
+            rewards.blocker_normal_alignment(env)
+        torch.testing.assert_close(actual, torch.ones(1, dtype=points.dtype))
+        torch.testing.assert_close(cached, torch.tensor(PALMAR_INDICES))
+        self.assertIs(env._tactile_alignment_pad_indices, cached)
 
     def test_native_reward_manager_applies_dt_once_to_the_unscaled_quality(self):
         points, normals, center = facing_inputs(batch=2)
@@ -260,6 +358,7 @@ class NormalAlignmentIntegrationTests(unittest.TestCase):
         self.assertEqual(ast.literal_eval(terms[0]["weight"]), 1.0)
         parameters = eval(compile(ast.Expression(terms[0]["params"]), str(source), "eval"), {"math": math})
         self.assertAlmostEqual(parameters["decay"], DECAY_45)
+        self.assertIs(parameters["exclude_fingertips"], True)
         self.assertAlmostEqual(math.exp(-parameters["decay"] * (1 - math.cos(math.pi / 4))), .5)
         default = inspect.signature(rewards.blocker_normal_alignment_quality).parameters["decay"].default
         self.assertAlmostEqual(default, DECAY_45)

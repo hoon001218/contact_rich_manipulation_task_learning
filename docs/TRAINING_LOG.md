@@ -11490,3 +11490,538 @@ device proposal용 높이 cache와 packing의 중복 가산 없음, 환경 원�
 전체 CPU 회귀는 **670개 중647개 통과·CUDA/Kit 전용23개 생략**이며35.214초가 걸렸다.
 `py_compile`과 `git diff --check`도 통과했다. 원자료는
 `logs/diagnostics/spawn_height_offset_2026-11-17/cpu_suite.log`다.
+
+## 164. 2026-11-17 — 물체–선반 마찰 randomization·Hand 전체 고마찰 재질
+
+후속165절에서 사용자 요청으로 선반별 샘플을 물체별 샘플로 변경했다.
+아래는 최초 구현과 검증 당시의 이력이며 현재 설정은165절을 따른다.
+
+사용자 요청으로 현재 Symmetric의 물리 재질을 변경했다. 추가 확인에서 randomization은
+**새 공통 scene으로 바뀔 때만**, 높은 마찰은 **17pad뿐 아니라 Hand 전체**에 적용하도록
+확정했다. 일반 제어 step과 같은 scene의 부분 episode reset에서는 재질을 다시 쓰지 않는다.
+
+| 실제 접촉 쌍 | 정적 마찰 | 동적 마찰 |
+|---|---:|---:|
+| 물체–선반 | 0.25–0.4 범위의 native bucket 샘플 | 해당 정적 값의0.8배:0.20–0.32 |
+| 물체–Hand 전체 | 0.8 | 0.64 |
+| 물체–물체 | 0.5 | 0.5 |
+
+`SharedGeometryCfg`의 재질은 선반0.25/0.20·`min`, 물체0.5/0.5·`average`,
+Hand0.8/0.64·`max`다. PhysX는 결합 모드 우선순위 `max > multiply > min > average`를
+사용한다. 따라서 물체–선반은 작은 선반 값이, 물체–Hand는 큰 Hand 값이 실제 쌍에
+적용된다. 두 재질의 평균으로 요청 범위가 변하는 일을 피한다.
+[PhysX 공식 결합 규칙](https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/_api_build/structPxCombineMode.html).
+Hand–선반에도 높은 Hand 값이, 선반–Ground에는 선반의min 규칙이 적용되는 부수 효과가 있다.
+
+재질 생성·바인딩은 공식 `RigidBodyMaterialCfg.func`와 `bind_physics_material`을 사용한다.
+기존 env0 deinstance 후 바인딩하고 geometry sharing 전에 완료한다. 공유 prototype의
+material 복사·경로 재지정은 기존 경로를 유지한다. 활성 collision prim에만 physics material을
+바인딩하며 geometry·질량·collision flag·contact reporter·render material은 바꾸지 않는다.
+Hand 경로는 `Robot/ROASRightHand` 전체이고 UR5e·F/T assembly의 재질은 변경하지 않는다.
+Hand–Hand self contact도 높은 Hand 재질의 영향을 받는다.
+
+새 `mdp/materials.py`의 `SceneFrictionRandomization`은 공식
+`randomize_rigid_body_material`을 상속한다. 공식 클래스가128개 균등 random bucket을
+한 번 생성하고, 해당 palette에서 환경별·선반 collider별 값을 배정한다. 동적 bucket만
+정적 bucket의0.8배로 연동하고, scene generation이 바뀔 때만 native 전체-view 호출을
+위임한다. 같은 선반 collider에 닿는 물체들은 같은 계수를 사용하며 물체별 독립 샘플은 아니다.
+`RigidObjectCollection`을 지원하지 않는 공식 event를 억지로 물체 pool에 적용하지 않는다.
+실행 순서는 `reset_scene → scene_friction → reset_mdp`다.
+공식 event의 CPU 재질 조회·쓰기는 새 scene당 한 번이며 매 step 추가 작업은 없다.
+실제 reset 시간 증가는 아직 측정하지 않았다.
+
+### 동적/정적 비율 근거와 해석
+
+0.7 또는0.8이라는 비율은 모든 재질에 적용되는 물성 법칙이 아니다.
+
+- [ASIM2024 이동형 그리퍼 로봇 연구](https://www.asim-gi.org/fileadmin/user_upload_asim/ASIM_Publikationen_OA/AM190/a4722.arep.47_OA.pdf)의
+  Table2는 바퀴–지면 접촉 모델에 정적0.9·동적0.7을 사용한다. 비율은약0.778이며,
+  약80%라는 초기 근사의 사용 사례다. 우리 Hand나 선반의 실측 근거로 간주하지 않는다.
+- [DTransleg 연구](https://ms.copernicus.org/articles/17/1/2026/index.html)의5.1절은
+  고무 foot–세라믹 접촉의 시뮬레이션에0.8/0.6을 사용한다. 비율은0.75로,
+  연구마다 고정 비율이 다름을 보여준다.
+- [Kitamura 외, Sensors2024](https://www.mdpi.com/1424-8220/24/15/4896)의3.1절은
+  Elastic50A gripper–알루미늄 접촉을 측정하여 정적약0.88·동적약0.79를 보고한다.
+  우리 고무와 동일한 재질 쌍이 아니며 비율도약0.90다. 높은 Hand 마찰이 가능한
+  규모라는 참고 사례이고0.8/0.64의 직접 실측 검증은 아니다.
+
+이번0.8배와 Hand0.8/0.64는 사용자 승인 초기 근사값으로 기록한다.
+실제 고무·물체 재질 쌍으로 밀기 시작 힘과 일정 속도 슬립 힘을 측정하여 추후 보정해야 한다.
+앞서 논의한 접촉 안정성·signed Clearance/Relocation formulation은 이번 작업에서 변경하지 않는다.
+
+집중 CPU 검사12개가 통과했다. 설치된 공식 event 구현을 tensor-backed view에 위임해
+bucket 범위·0.8 연동·scene 경계·부분 reset 생략·실패 재시도를 확인했다.
+재질 바인딩 범위·결합 모드·deinstance/bind/share 순서와 reset event 순서도 검사했다.
+이 검사는 native GPU 재질 적용이나 실제 마찰력·미끄러짐을 측정한 결과가 아니다.
+
+전체 CPU 회귀는 **682개 중659개 통과·CUDA/Kit 전용23개 생략**이며33.350초가 걸렸다.
+`py_compile`과 `git diff --check`도 통과했다. 원자료는
+`logs/diagnostics/friction_materials_2026-11-17/cpu_suite.log`다.
+이번 작업에서는 시뮬레이션·play·학습을 실행하지 않았다. 새 실행부터 적용되며 이미
+실행 중인 프로세스의 물리 재질을 변경한 것은 아니다.
+
+## 165. 2026-11-17 — 마찰 randomization을 환경·물체별로 변경
+
+사용자가 선반을 공유하는 물체들도 서로 다른 마찰계수를 갖기를 원한다고 명확히 했다.
+164절의 선반별 randomization을 제거하고, 새 공통 scene마다 각 환경·물체 조합에
+독립적인 material bucket을 배정한다. 같은 scene의 부분 reset은 계수를 유지한다.
+
+| 재질 | 정적 마찰 | 동적 마찰 | 결합 모드 |
+|---|---:|---:|---|
+| 선반 | 0.4 고정 | 0.32 고정 | min |
+| 각 물체 | 0.25–0.4에서 독립 샘플 | 해당 정적 값의0.8배 | average |
+| Hand 전체 | 0.8 고정 | 0.64 고정 | max |
+
+물체–선반은 `min`으로 물체의 샘플값, 물체–Hand는 `max`로0.8/0.64를 사용한다.
+물체–물체 접촉은 각 물체의 정적·동적 계수 평균이므로 더 이상0.5/0.5 고정이 아니다.
+각 물체의 모든 collision shape와 decomposition hull은 같은 계수를 갖는다.
+128개 palette에서 독립적으로 ID를 추출하므로 같은 값을 뽑는 물체가 있을 수 있으며,
+모든 물체가 반드시 서로 다른 숫자를 갖도록 강제하는 방식은 아니다.
+
+공식 `randomize_rigid_body_material`은 `RigidObjectCollection`을 지원하지 않는다.
+따라서 `SceneFrictionRandomization`을 공식 `ManagerTermBase` 기반 collection adapter로
+변경했다. 공식 `sample_uniform`과 유한 palette 방식을 사용하고, 실제 재질 수정은
+collection의 공식 `root_physx_view.get/set_material_properties`에 위임한다.
+Collection의 public `reshape_data_to_view`로 `[env, object]` 샘플을 실제 object-major
+순서(`object_id * num_envs + env_id`)에 맞춘다. 전체 body material buffer를 한 번 쓰며
+물체별 Python API 호출이나 별도 마찰력 모델은 추가하지 않는다.
+
+기존 actor를 유지하는 kinematic 주차 물체에도 같은 배정 규칙을 적용하여 active mask를
+CPU로 내리거나 부분 shape setter를 사용할 필요가 없다. 새 scene당 한 번만 native
+getter/setter를 호출하고, 같은 scene의 reset은 난수 소비·CPU 전송 없이 반환한다.
+`last_bucket_ids[env, object]`에 마지막 성공한 배정 ID를 보존한다.
+재질 결합 모드의 USD 바인딩과 `reset_scene → scene_friction → reset_mdp` 순서는 유지한다.
+
+집중 CPU 검사15개가 통과했다.2환경×3물체의 서로 다른 bucket 배정을 지정하여
+native view 순서가 `[0,3,1,4,2,5]`가 되는지와 물체당5개 shape의 계수가 동일한지
+확인했다. Scene 경계·부분 reset의 무작업 경로·잘못된 buffer·중복 ID·잘못된 asset·
+backend 실패 후 재시도·계수 범위 및 결합 모드도 검사했다.
+이번 작업에서는 시뮬레이션·play·학습을 실행하지 않았다.
+
+전체 CPU 회귀는 **685개 중662개 통과·CUDA/Kit 전용23개 생략**이며33.030초가 걸렸다.
+`py_compile`과 `git diff --check`도 통과했다. 원자료는
+`logs/diagnostics/per_object_friction_2026-11-17/cpu_suite.log`다.
+실제 GPU 재질 적용과 물체별 마찰력·추가 scene reset 시간은 아직 측정하지 않았다.
+
+## 166. 2026-11-17 — Normal alignment 보상에서 끝단 cap 센서5개 제외
+
+사용자는 Hand 구조상 감싸는 조작에서 반응하는 pad가 많지 않고 손끝을 대는 행동이
+쉬워, Normal alignment에 손끝 센서를 포함하면 원하는 손바닥 접촉 준비와 달라질 수
+있다고 지적했다. 이를 반영해 **방향 보상에 한해** 끝단 cap5개를 제외했다.
+
+| 제외 센서 | 기존 canonical index(0-based) |
+|---|---:|
+| `right_thumb_force_sensor_4` | 4 |
+| `right_index_force_sensor_3` | 7 |
+| `right_middle_force_sensor_3` | 10 |
+| `right_ring_force_sensor_3` | 13 |
+| `right_little_force_sensor_3` | 16 |
+
+기존 `scene.FINGERTIP_BODY_NAMES`를 재사용했다. 실제 기본 URDF의 고정 joint 위치와
+방향에서도 끝단 배치임을 확인했다. 다른 네 손가락의2번과3번 pad는 같은 distal link에
+붙지만3번이 더 끝에 있으므로 distal link의 pad 전체를 제거하지 않는다.
+남는 pad는 손바닥1개·엄지1–3번·다른 네 손가락1–2번, 총12개다.
+
+$$
+r_t^{\mathrm{align}}=\frac1{12}\sum_{i\in\mathcal P}
+\exp\!\left[-a(1-s_{i,t})\right],\qquad
+a=\frac{\ln2}{1-\cos(\pi/4)},\quad |\mathcal P|=12.
+$$
+
+`blocker_normal_alignment(..., exclude_fingertips=True)`를 기본 및 cfg에 명시했다.
+Weight1·signed cosine·45°에서0.5·현재 Blocker 중심·접촉 전 지급은 유지한다.
+선택 index를 최초 한 번 device tensor로 캐시하고, 매 step current17pad frame에서
+12개만 index-select해 계산한다. 유효하지 않은 선택 pad는0이며 분모는12로 고정한다.
+`exclude_fingertips=False`는 해당 항을 기존17개 평균으로 복원하는 비교 옵션이다.
+
+17개 contact sensor와 물리 collision은 그대로다. Observation·Distance·Contact hold 및
+Clearance/Relocation의 접촉 수는 기존17pad 기준이며 이번 제외를 공유하지 않는다.
+방향 helper는 `[N,P,3]`의 양수 개수P를 평가하도록 일반화하되 입력 frame은17개를 유지한다.
+
+집중 CPU 검사21개가 통과했다. 끝단 위치·normal의NaN/Inf가 점수에 영향을 주지 않는지,
+나머지12개 평균과 invalid 분모, 끝단만 정렬한 경우의 낮은 점수, 기존17개 옵션,
+실제 canonical 이름에 따른 index cache와 이후 hot path의 host 조회 없음 등을 확인했다.
+학습·시뮬레이션·play는 실행하지 않았다.
+
+전체 CPU 회귀는 **690개 중667개 통과·CUDA/Kit 전용23개 생략**이며32.778초가 걸렸다.
+`py_compile`과 `git diff --check`도 통과했다. 원자료는
+`logs/diagnostics/palmar_normal_alignment_2026-11-17/cpu_suite.log`다.
+
+## 167. 2026-11-17 — PhysX 64K material 한도 초과: 복제되는 기본 재질 제거
+
+**아래 전역3개 공유 방식은 이후 native abort로168절의 환경당3개 공유로 대체했다.**
+
+사용자가 초기화 중 다음 오류를 보고했다.
+
+```text
+[37,457ms] PhysX error: PxPhysics::createMaterial: limit of 64K materials reached.
+```
+
+이는 물리 재질 객체의 개수 제한이다. GPU 메모리 부족이나 마찰계수 값이 너무 크다는
+오류가 아니다. [공식 Isaac Lab material randomization 문서](https://isaac-sim.github.io/IsaacLab/v2.3.2/source/api/lab/isaaclab.envs.mdp.html)
+역시 유한 bucket 사용과64K unique material 제한을 명시한다.
+
+실패한 실행의 Kit 로그는
+`/home/hoon/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/logs/Kit/Isaac-Sim/5.1/kit_20261117_144438.log`다.
+그 실행이29.386–30.530초에 기록한 `/tmp/contact_geometry_771i2bq_/geometry.usdc`를
+독립 USD로 열어 **Physics MaterialAPI 정의112개**를 확인했다.
+이 중64개는 `_ContactMaterial`,48개는 geometry 공유 시 복사한 `_SharedMaterials`다.
+환경 내부의 정의를1,024번 복제하면112×1,024=114,688개의 경로가 생길 수 있다.
+이는 실제 PhysX live material 수를 계측한 값이 아니라 실패 당시 USD의 복제 규모다.
+
+164–165절 구현에서 root마다 만든 물리 재질이 geometry prototype 안으로 복사되는
+부분을 놓쳤다. Randomization 계수는128개로 제한했지만, **기본 USD material 객체의
+복제**를 제한하지 못했다. 앞선 CPU tensor fixture 검사는 이 USD 구성 문제를 검증하지
+못했으므로 당시 통과 결과를 초기화 안전성의 근거로 사용할 수 없다.
+
+수정 내용은 다음과 같다.
+
+| 항목 | 수정 후 |
+|---|---|
+| 기본 재질 정의 | `/World/ContactMaterials/{shelf,object,hand}`의3개 공유 정의 |
+| 바인딩 | 공식 `UsdShade.MaterialBindingAPI`의 strong physics-purpose root binding |
+| Geometry library | 공유 physics binding·schema를 내부에 복사하지 않고 live body root에 재바인딩 |
+| 기존 시각/물리 겸용 재질 | Shader는 보존하고 managed asset 내부의 물리 schema만 제거 |
+| 초기화 검증 | 공유 body 내부의 MaterialAPI 잔류 및 collider binding 누락을 cloning 전에 검사 |
+| 물체별 마찰 | 기존128개 고정 palette·환경/물체별 독립 배정·공통 scene 교체 시 재샘플링 유지 |
+
+기존 scalar 계수·combine mode와 Arm/F/T 재질은 유지한다. 모든 물체를 같은 마찰로
+되돌리거나 환경 수·pool 크기를 줄이는 조치는 하지 않았다. 부분 reset의 재질 무작업
+경로도 유지한다. Native tensor setter의 내부 material cache 구현은 직접 계측하지 않았고,
+공식 event와 같은 유한 palette를 계속 사용한다.
+
+마찰 집중 CPU 검사16개가 통과했다. 전체 CPU 회귀는 **692개 중668개 통과·24개 생략**,
+33.485초다. 원자료는 `logs/diagnostics/material_limit_2026-11-17/cpu_suite.log`다.
+추가로 Kit를 시작하지 않는 실제 USD 검사에서80개 물체×1,024개 reference clone,
+instance proxy의3개 공유 재질 해석·시각 재질 보존을 확인했다. 일반 환경에서는 이
+검사가 pxr 부재로 생략되지만 설치된 standalone USD 바인딩으로 별도 실행해 통과했다.
+당시 기본 prim predicate로 얻은 fixture 재질 수4개는 undefined `over` 아래를 누락한
+불완전한 집계였다. 후속 AllPrims 검증으로 보완했으며 정확한 현재 집계와 native 검증은
+168절을 따른다. 실행 기록과 재현 명령은
+`logs/diagnostics/material_limit_2026-11-17/usd_composition.log` 및
+같은 디렉터리의 `reproduce_usd_composition.sh`에 남겼다.
+이는 USD 구성 검증이며 PhysX GPU 초기화·마찰력 측정·학습 재실행 결과는 아니다.
+학습·play·시뮬레이션은 이번 작업에서 실행하지 않았다.
+
+## 168. 2026-11-17 — 초기화 double-free 재현: 환경별 재질 공유로 변경
+
+167절의 수정 후 사용자가1,024환경의 `Starting the simulation` 직후 다음 오류를 보고했다.
+
+```text
+double free or corruption (out)
+Aborted (core dumped)
+```
+
+최신 Kit 로그 `kit_20261117_145821.log`에는 직전 native 스택이 없었다.
+`/var/log/apport.log`에는 PID3120137/3120716의 SIGABRT(6)가 기록돼 있지만,
+Conda Python이 배포판 패키지가 아니라는 이유로 core 저장이 생략됐다.
+이 실행들의 geometry library는 AllPrims 순회에서도 물리 재질 정의가0개였으므로
+앞선64K 초과가 그대로 남았다고 판단할 수 없었다.
+
+GPU를 사용하는 학습이 없음을 확인하고, 학습 runner 없이 실제 task를 초기화하는
+제한된 GDB 진단을 실행했다. 재현 로그는
+`logs/diagnostics/native_material_startup_2026-11-17/current_gdb.log`다.
+
+| 항목 | 확인 결과 |
+|---|---|
+| Native reset 직전 USD MaterialAPI 정의 | 5개: 전역 접촉 재질3개+기존2개 |
+| Abort worker | `carb.tasking11`, SIGABRT |
+| libc 메시지 | `malloc(): unaligned tcache chunk detected`, `double free or corruption (out)` |
+| 복제 코드 | `PhysXReplicator.cpp:883`, `vector<pair<PxShape*,const char*>>::push_back` |
+| 호출 경로 | `PhysXReplicator.cpp:1015`, 복제 인덱스641 |
+| 시점 | `sim.reset()` 내부, episode reset·friction setter·정책 실행 이전 |
+
+따라서 이번 실패는 PhysX 병렬 환경 복제에서 검출된 **CPU native heap 손상**이다.
+재질 한도 초과, reward, NaN action 또는 reset friction setter가 이 시점의 원인은 아니다.
+전역 재질의 shape-user 목록을 여러 worker가 동시에 갱신하는 문제가 유력하지만,
+라이브러리 내부의 최초 잘못된 메모리 쓰기까지 직접 계측한 것은 아니다.
+
+동일한1,024환경 초기화에서 **재질의 소유 범위만** 바꿔 비교했다.
+
+| 재질 소유 범위 | 초기화 결과 |
+|---|---|
+| `/World/ContactMaterials`의3개 전역 공유 | GDB에서 native heap 오류 재현 |
+| `env_i/ContactMaterials`의환경당3개 공유 | Native reset·환경 생성·정상 종료 성공 |
+
+이를 실제 `configure_contact_materials`와 geometry 공유 helper에 반영했다.
+환경 안에서는 모든 물체가 같은 기본 object material을 사용하고, 다른 환경과는 기본
+material 객체를 공유하지 않는다. Native cloner가 바인딩을 각 환경의 경로로 remap한다.
+Body prototype 안으로 물리 재질을 복사하지 않으므로 물체 pool 크기는 기본 material
+정의 수에 영향을 주지 않는다.1,024환경에서 접촉 재질3,072개이며64K보다 작다.
+`replicate_physics=True`·Carb 병렬 처리·물체 수·geometry·마찰계수/결합 모드는 유지했다.
+초기화 로그도 `3 definitions per environment, shared across bodies`로 바로잡았다.
+
+추가 검사에서167절 USD 검증의 기본 predicate가 undefined `over` 아래의 복사된
+시각/물리 겸용 재질을 누락할 수 있음을 확인했다. `PrimAllPrimsPredicate`로 cleanup과
+검증을 보완했다. 테스트 fixture는 보완 전84,996개의 재질을 찾아 실패했고, 현재
+환경별 공유에서는 접촉 재질3,072개·보존한 arm/source 재질을 포함한 총4,097개로 통과한다.
+이 누락은 실제 최신 double-free library에서 발견된 잔류 재질을 의미하지 않는다.
+Mesh points/faces·collision flag 보존 및 각 환경의 고유 재질 참조도 실제 USD로 검사했다.
+
+최종 실제 코드로 두 번째1,024환경 GDB 검증을 수행했다. 초기화뿐 아니라 episode reset과
+물리1step까지 실행했으며 학습·정책 action은 실행하지 않았다.
+
+| 검증 항목 | 결과 |
+|---|---|
+| Native reset 직전 USD material 정의 | 3,074개(접촉3,072+기존2) |
+| Scene 생성 | 23.089초 |
+| Simulation 시작 | 12.319초 |
+| 초기화·episode reset | 성공 |
+| Native 마찰 readback | 물체 body81,920행이 배정된128개 palette와일치 |
+| 읽힌 정적 마찰 범위 | 0.2502–0.3996 |
+| 읽힌 동적 마찰 범위 | 0.2001–0.3196, 정적 값의0.8배 |
+| 물리1step | 성공, 물체 위치 전부 finite |
+| 환경/앱 종료 | 정상 종료 |
+
+원자료는 `per_env_gdb.log`와 `fixed_reset_gdb.log`, 재현 스크립트는 같은 디렉터리의
+`probe.py`다. 기본 mode는 현재 코드이며 `--reset`으로 마찰 readback·물리1step을 추가한다.
+`--mode global`은 이전 abort 조건의 진단용 재현이며 학습 설정으로 사용하지 않는다.
+위 검증은 장기 학습의 안정성이나 실제 접촉 마찰력 측정 결과를 의미하지 않는다.
+
+집중 마찰 CPU 검사17개와 실제 USD 구성 검사가 통과했다. 전체 CPU 회귀는
+**693개 중669개 통과·24개 생략**,33.179초이며
+`logs/diagnostics/native_material_startup_2026-11-17/cpu_suite.log`에 기록했다.
+`py_compile`과 `git diff --check`도 통과했다.
+
+## 169. 2026-11-17 — Clearance·Relocation 논의 보류: 목적과 거리 근사의 구분
+
+사용자 요청으로 아래 논의를 보류하고 Hand action 검토로 전환했다.
+이 절은 논의 재개용 기록이며 새로운 보상 수식·weight·구현을 채택한 기록이 아니다.
+
+- 최종 목적은 상위 판단기가 지정한 Blocker를 조작해 Target의 Access region을 확보하는 것이다.
+  여러 재배치 해 중 특정 목적지나 손동작을 명시적으로 강제하지 않는 연구 의도를 유지한다.
+- Clearance는 최종 기하학적 목표를 직접 나타낸다. 다만 Blocker가 영역 안에 완전히 포함된
+  구간에서는 작은 평면 이동에 겹침 면적이 변하지 않아 조작 방향의 힌트가 부족할 수 있다.
+  Relocation은 이 구간에 넓은 방향성을 제공하려고 도입했다.
+- Relocation의 목적이 타당하다는 것과 현재의 중심점–목표 영역 최단 직선거리가 실제 조작을
+  잘 유도한다는 것은 별개의 주장이다. 가까운 영역은 기하학적 이동량 관점에서 효율적인
+  후보이지만, 손목 회전·접촉 재형성·주변 장애물을 고려하면 더 먼 영역이 더 쉬울 수 있다.
+- 여러 영역까지 거리의 최솟값을 사용하면, 실제로 쉬운 다른 영역을 향한 초기 이동이
+  가장 가까운 영역에서 멀어진다는 이유로 음의 진행 보상을 받을 수 있다.
+- 거리 감소량은 실제 누적 이동 경로를 직접 최소화하는 비용이 아니다. 접촉 배율이 일정하고
+  clipping·할인이 없는 특수한 경우에는 증분의 합이 시작 거리와 최종 거리의 차이로 상쇄된다.
+  실제 구현의 접촉 pad 수·clipping·할인은 이 특수한 경우와 구분한다.
+- 각 가능한 해에 대해 유리한 Hand 자세·준비 동작을 미리 정의하는 안은, 복수 해와 다양한
+  조작 방식을 설계자가 제한할 수 있으므로 채택하지 않았다. 후보 점수의 max를 취하는 것만으로
+  설계자가 정의한 후보·거리 척도의 편향이 없어지는 것도 아니다.
+- 접촉 안정성과 음의 Clearance·Relocation 증분 사이의 충돌은 미결 사항이다. 이후에는
+  특정 해를 강제하지 않으면서 유효한 조작 방향을 알려주는 방법인지 검토한다.
+
+현재 방식이 좋다는 결론이나 새 보상 추가 결정은 내리지 않았다.
+학습 중인 사용자 요청에 따라 이 논의에서는 실행·학습 코드 변경을 하지 않았다.
+
+## 170. 2026-11-17 — Hand action 포화 검토: UR5e·공식 Shadow Hand와 소스 비교
+
+로컬 `IsaacLab/VERSION=2.3.2`와 `examples/` 소스를 정적으로 확인했다.
+학습·play·시뮬레이션·테스트는 실행하지 않았고 학습·제어 설정도 변경하지 않았다.
+
+| 대상 | Action에서 관절 목표로의 변환 | 목표 평활화 |
+|---|---|---|
+| `examples/Sweeping-Policy-DRL-Sim-Train` UR5e | `JointPositionActionCfg(scale=0.5, use_default_offset=True)`: 기본 자세+0.5×raw rad | 없음 |
+| 현재 Symmetric Hand | `JointPositionToLimitsActionCfg(scale=0.5)`: 0.5×raw를[-1,1]로 제한하고 유효 관절 범위에 매핑 | 없음 |
+| 공식 Shadow Repose Cube·Vision | 별도 ActionCfg scale 없이 raw[-1,1]을 전체 관절 범위에 매핑 | `act_moving_average=1.0` |
+| 공식 Shadow OpenAI FF·LSTM | 같은 관절 범위 매핑 | `act_moving_average=0.3` |
+| 공식 Shadow Hand Over | 각 손에 같은 관절 범위 매핑 | `act_moving_average=1.0` |
+
+UR5e의0.5는 raw1당 기본 자세에서0.5rad를 지정하는 값이며, 매 step 누적 변위가 아니다.
+Hand의0.5는 정규화 좌표의 배율이므로 동일한 물리 scale로 비교할 수 없다.
+현재 Hand는 raw0에서 유효 범위 중앙, raw±1에서 범위의25%·75%, raw±2 이상에서
+하한·상한을 지정한다. URDF multiplier를 반영한 follower 목표 확장은 그 뒤에 수행된다.
+
+공식 Shadow의 공유 `_apply_action()`은 범위 변환 후
+`q_target=alpha*q_requested+(1-alpha)*q_previous_target`를 계산하고 관절 범위로 제한한다.
+이 평활화는 매 physics substep에서 수행된다. OpenAI의 decimation3에서는 동일 명령에
+대한 정책1step의 유효 갱신 비율이 `1-(1-0.3)^3=0.657`이다. 입력이 충분히 크면
+평활화 후에도 포화될 수 있으므로 EMA를 raw 출력 크기의 제한과 동일시하지 않는다.
+일반·Vision은 physics120Hz/정책60Hz, OpenAI는60Hz/20Hz다.
+
+공식 Shadow Repose/OpenAI reward에는 `-0.0002*sum(actions**2, dim=-1)`가 있다.
+이는 action-rate가 아닌 환경에 전달된 action 크기의 비용이다. 현재 `motion_action_rate`는
+현재·이전12D action을 native 입력 상한으로 각각 clipping한 뒤 차이의 제곱합을 계산한다.
+따라서 같은 포화 방향으로 큰 raw 값을 유지해도 변화량 비용이 계속 커지지는 않는다.
+현재 설정에 별도의 raw action 크기 비용은 없다. 단, 공식 계수는 Direct reward 기준이고
+현재 ManagerBased reward는 dt가 곱해지므로 계수를 그대로 복사하는 것은 적절하지 않다.
+raw 크기 비용은 관절 범위 중앙을 선호하는 효과도 있으므로 목적과 함께 검토해야 한다.
+
+RSL-RL 설정의 초기 std는 공식 Shadow와 현재 모두1.0이다. Entropy 계수는 공식0.005,
+현재0.01이다. 공식 RSL-RL 경로에도 별도 action clipping은 기본적으로 없다.
+다른 backend인 RL-Games의 Shadow 설정은 wrapper `clip_actions=1.0`과
+`bounds_loss_coef=0.0001`을 사용하므로 실행 backend까지 구분해야 한다.
+이번 점검에서 현재 학습의 실제 mean·std·포화 비율을 측정하지는 않았다.
+
+Actuator 기본값은 다음과 같다. 다른 Hand의 관성·전달 구조이므로 직접 대입하지 않는다.
+
+| 대상 | Actuator | Stiffness / damping | Effort·velocity |
+|---|---|---|---|
+| 현재 Hand 전체12관절 | Implicit | 20 / 1, armature0.0001 | URDF 값 상속 |
+| 공식 Shadow 손가락 | Implicit | 1 / 0.1 | effort0.7245–2.3722Nm, velocity는 USD 상속 |
+| 공식 Shadow 손목 | Implicit | 5 / 0.5 | effort2.175·4.785Nm, velocity는 USD 상속 |
+
+OpenAI 변형에는 actuator gain randomization도 있으므로 위 값은 기본 asset 설정이다.
+공식 예제도 전체 관절 범위의 절대 위치 목표를 사용한다. 따라서 범위 매핑 자체를 오류로
+판단하지 않으며, 다음 검토에서는 raw mean·std, clipping으로 생기는 출력 무감응 구간,
+목표 평활화, action 크기 비용을 서로 구분해야 한다. 이번에는 변경안을 적용하지 않았다.
+
+확인한 주요 소스:
+
+- `examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/config/ur5e/joint_pos_env_cfg.py`
+- `examples/Sweeping-Policy-DRL-Sim-Train/sweeping_policy/config/ur5e/joint_pos_random_sweep_env_cfg.py`
+- `IsaacLab/source/isaaclab/isaaclab/envs/mdp/actions/joint_actions_to_limits.py`
+- `IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/inhand_manipulation/inhand_manipulation_env.py`
+- `IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/shadow_hand/shadow_hand_env_cfg.py`
+- `IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/shadow_hand/agents/rsl_rl_ppo_cfg.py`
+- `IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/shadow_hand.py`
+- `src/contact_manipulation_symmetric/contact_manipulation_symmetric/config/ur5e/ur5e_env_cfg.py`
+- `src/contact_manipulation_symmetric/contact_manipulation_symmetric/mdp/rewards.py`
+
+## 171. 2026-11-17 — 학습 전용 물체 수 curriculum: 두 역할 물체부터 주변 clutter까지
+
+사용자는 Contact hold·Distance·Normal alignment만으로 감싸는 동작을 학습하는 실험을
+후속 후보로 남기고, 우선 주변 물체 수 curriculum을 요청했다.
+첫 장면은 Target·Blocker만 존재하며, Play는 현재의 전체 배치 수준을 유지해야 한다.
+추가 확인에서 다음 iteration 구간을 선택했다.
+
+| 완료 iteration | 요청하는 총 물체 수(Target·Blocker 포함) |
+|---|---:|
+| 0–10,000 | 2 |
+| 20,000 | 5–8 |
+| 30,000 | 9–15 |
+| 40,000 | 13–21 |
+| 45,000 이후 | 15–25 |
+
+10,000–45,000 구간에서 진행률p를0–1로 제한하고, 요청 범위의 양 끝을 각각
+`2+floor((최종 개수-2)*p)`로 계산한다. 경계는 `--max_iterations`의 비율이 아닌
+절대 완료 iteration이다. 실제 native term은 rollout 길이를 곱한 policy step으로
+계산하므로 환경 수·physics decimation·episode 조기 종료 횟수와 독립적이다.
+
+구현은 다음과 같다.
+
+- `shelf_manipulation_env_cfg.py`: 시작10,000·종료45,000 설정과 선택적 runtime 개수 범위를 추가했다.
+  start=None이면 학습에서도 기존 전체 배치를 사용한다.
+- `mdp/curriculums.py`: 공식 CurriculumManager에서 호출하는 작은 수치 callback을 추가했다.
+  현재 최소·최대 개수·진행률을 native curriculum 로그로 반환한다.
+- `events.py`: `_build_episode_batch`가 순차 생성기에 전달할 때만 SpawnRules 복사본의 개수
+  범위를 바꾼다. 영구 `env.spawn_rules.max_objects`는 packing과 CUDA graph capacity에도
+  사용되므로 변경하지 않는다. Target·Blocker 배치·가림·예약 영역·카메라·IK 규칙은 유지한다.
+- 2·3개 장면은 선택 종류 수를 요청 물체 수 이하로 제한한다. 기존15–25개에서 유효한 종류
+  선택 범위·난수 호출 순서는 유지한다. 새 공통 scene을 만들 때만 물체 수가 바뀌며,
+  같은 scene의 부분 reset에서는 기존 물체와 비전을 재사용한다.
+- `train.py`: 최초 환경 생성 전에 schedule을 준비한다. Resume checkpoint의 native0-based
+  iter에1을 더한 완료 iteration도 CPU에서 먼저 읽으므로, 재개 직후 첫 장면이2개로 되돌아가지
+  않는다. 환경 clock 자체는 덮어쓰지 않는다.
+- `play.py`: 물체 수 curriculum·runtime 제한을 명시적으로 비활성화한다. 초기 checkpoint도
+  `spawn_rules`의 기존 최종 범위로 재생하며, 실험별 play 위임 경로에도 같이 적용된다.
+
+물체 pool·policy 관측10slot·Actor/Critic 구조와 보상·종료·제어 설정은 이 변경 대상이 아니다.
+사용자가 별도로 조정한 reward 활성 여부와 weight를 덮어쓰지 않았다.
+최종 범위는 기본15–25개이지만 기존 packer가 공간 부족 시 더 적게 배치하는 처리는 유지한다.
+실제 배치 개수는 host metadata만 이용해 `Reset/scene_object_count`에 남긴다.
+요청 범위·진행률은 `Curriculum/scene_object_count/{min_objects,max_objects,progress}`다.
+실행 명령과 비활성화 옵션은 Symmetric README에 정리했다.
+
+`tests/test_scene_object_curriculum.py`에 경계·보간·재개 offset·기존 scene 불변·고정 capacity,
+2/3개 실제 순차 생성·관측 padding·Play 경로를 검사하는 CPU 회귀 소스를 추가했다.
+**학습 중이므로 테스트·모듈 import·시뮬레이션·학습은 실행하지 않았다.**
+소스 읽기로 연결 순서와 수식을 검토했으며, 실제 reset·ray·IK·학습 경로의 실행 검증은 남아 있다.
+현재 실행 중인 프로세스의 학습 설정을 소급 변경하거나 학습을 재시작하지 않았다.
+
+## 172. 2026-11-17 — Clearance 양·음 분리: 양수만 접촉 수 반영, 음수는 고정 배율
+
+사용자가 Clearance의 개선·악화를 별도 항으로 분리하도록 요청했다.
+추가 지시에서 **음수 항은 접촉 유지 여부·접촉 pad 수와 무관하게 고정 배수로 평가**하도록
+명확히 했다. 양수의 기존 접촉 조건은 유지한다.
+
+| 항 | Weight 적용 전 값 | 기본 weight |
+|---|---|---:|
+| `clearance` | `n_t * max(C_t-C_prev,0)` | +30 |
+| `clearance_regression` | `max(C_prev-C_t,0)` | −30 |
+
+품질은 기존 `C=1-O/O0`이며 n_t는 현재 Blocker와 접촉한 pad 수다.
+악화량은 pad 수와 무관하게 동일하게 평가한다. 예를 들어 품질이0.1 낮아지면
+접촉0개·1개·17개 모두−3에 Manager의 control dt를 한 번 곱한다.
+양쪽 weight가 같은 크기여도 이전 `30*n_t*(C_t-C_prev)`와 일반적으로 같지는 않다.
+접촉이 없을 때의 악화도 비용이 되며, 여러 pad 접촉 중 악화의 배율은 n_t 대신1이다.
+직전 상태보다 개선되면 음수 항0, 악화되면 양수 항0, 정체면 둘 다0이다.
+Target 보호·지지 유효성 등 새로운 gate는 추가하지 않았다.
+
+`mdp/rewards.py`에 `clearance_contact_improvement`와 `clearance_regression`을 공개 함수로
+추가했다. 공통 `_clearance_quality_change`가 기존의 finite geometry/직전 품질 검사를
+사용하며 history를 변경하지 않는다. `TaskState.advance/reset`의 step별 snapshot과 부분
+reset 기준은 유지한다. 이전 signed `clearance_contact_progress` 함수의 수치 동작도 보존한다.
+음수 항은 contact sensor를 조회하지 않는다. 양수는 기존 native sensor cache를 사용하며,
+새로운 물리 조회·ray·CPU 전송·이력 버퍼나 step cache는 추가하지 않았다.
+
+기본 `RewardsCfg`의 `clearance` 이름을 유지하고 함수만 양수 전용으로 바꿨다.
+새 `clearance_regression`의 음수 weight로 악화 강도를 독립 조절할 수 있다.
+세 파생 실험은 기본 Reward cfg를 상속한다. Relocation·Distance·Contact hold·Normal alignment,
+curriculum·termination·제어 설정은 이 변경에서 수정하지 않았다.
+TensorBoard는 양의 `Episode_Reward/clearance`와 음의
+`Episode_Reward/clearance_regression`을 따로 기록한다.
+이전 signed `clearance` 로그와 새 양수 전용 로그는 의미가 다르므로 직접 비교하지 않는다.
+
+`tests/test_clearance_split.py`에 부호 분리·접촉 없는 악화·pad 수 독립성·독립 weight,
+native dt1회 적용·반복 조회·reset/부분 reset·invalid 샘플과 함수 연결을 검증하는 소스를
+추가했다. 기존 signed 함수 검사는 유지하고 기본 cfg의 함수 연결 검사만 갱신했다.
+**학습 중이므로 테스트·모듈 import·시뮬레이션·학습은 실행하지 않았다.**
+이번 작업의 검증은 소스 읽기와 텍스트 diff 점검이며 실행 검증은 남아 있다.
+
+## 173. 2026-11-17 — Relocation 양·음 분리: 양수 접촉 가중, 음수 고정 배율
+
+사용자가172절의 Clearance와 동일한 방식으로 Relocation을 분리하도록 요청했다.
+기존 기준 거리·목표 영역·현재/직전 Blocker 위치는 유지한다.
+
+`s=clip((d_prev-d)/(reference_speed*step_dt),-1,1)`에 대해 기본 설정은 다음과 같다.
+
+| 항 | Weight 적용 전 값 | 기본 weight |
+|---|---|---:|
+| `blocker_relocation` | `n_t*max(s,0)` | +30 |
+| `blocker_relocation_regression` | `max(-s,0)` | −30 |
+
+따라서 weight를 포함한 두 항의 합은 `30*n_t*max(s,0)+30*min(s,0)`이다.
+음수에는 접촉 여부·pad 수가 들어가지 않으며, 접촉이 끊긴 뒤 목표에서 멀어져도 비용이 발생한다.
+고정 배율은 새 regression term의 weight로 조절한다. 정체·목표 내부 이동은 둘 다0이며,
+목표에서 나가는 변화는 음수 항으로 평가한다. 품질이 유효하지 않거나 목표 영역이 없으면0이다.
+
+`reference_speed=4.0m/s`,50Hz에서 기준 거리80mm, signed fraction의[-1,1] 제한을
+유지한다. 거리의 목표는 설정된 목적지와 전방 통로의 합집합이다.
+`_relocation_distance_change`가 기존 거리·유효성 계산을 공유하고,
+`blocker_relocation_distance_improvement`와 `blocker_relocation_distance_regression`을
+새 공개 함수로 연결했다. 기존 `blocker_relocation_distance_progress`의 signed 수치 동작은
+유지했다. 지수식 `blocker_relocation`·`blocker_relocation_contact_progress`도 보존한다.
+새 악화 함수는 contact sensor를 조회하지 않는다. 각 항은 기존 TaskState 이력을 읽기만 하고,
+Manager가 weight와 control dt를 한 번 적용한다. 별도 이력·CPU 전송·물리 step은 추가하지 않는다.
+
+기본 task와 학습1은 새 분리를 사용한다. 학습2·3은 기존 exponential 진행 함수로 양수 항을
+재정의하므로, metric 악화 항이 섞이지 않도록 새 regression을 명시적으로 None으로 둔다.
+과거 비교의 목적·정규화를 바꾸지 않기 위한 처리다. 다른 reward·termination·curriculum·제어는
+이번 변경에서 수정하지 않았다. TensorBoard에서는 개선과 악화 기여가 별도 항으로 기록되며,
+이전 signed `blocker_relocation`과 새 양수 전용 로그는 의미가 다르다.
+
+`tests/test_relocation_split.py`에 접촉 없는 악화·pad 수 독립성·포화·영역·이력·부분 reset,
+native dt와 weight 검증 소스를 추가하고 기본/실험 설정의 함수 연결 검사를 갱신했다.
+기존 signed 함수 수치 검사는 유지했다. **학습 중이므로 테스트·모듈 import·시뮬레이션·학습은
+실행하지 않았다.** 소스·텍스트 diff만 점검했으며 실행 검증은 남아 있다.
+
+## 174. 2026-11-17 — 양·음 분리 대신 Clearance·Relocation의 양의 max 항만 유지
+
+사용자가 별도 양·음 term 분리를 사용하지 않고 max 항들만 남기는 실험을 요청했다.
+172–173절의 활성 설정을 다음으로 대체했다.
+
+| 항 | Weight 적용 전 값 | Weight |
+|---|---|---:|
+| `clearance` | `n_t*max(C_t-C_prev,0)` | +30 |
+| `blocker_relocation` | `n_t*max(clip((d_prev-d)/(4*step_dt),-1,1),0)` | +30 |
+
+두 항은 개선에만 지급하며 악화·정체·무접촉이면0이다.
+`RewardsCfg`의 `clearance_regression`·`blocker_relocation_regression` 선언을 제거했다.
+학습2·3에서 이전에 추가한 불필요한 regression=None override도 제거했다.
+학습1은 기본 거리 개선 함수를, 학습2·3은 기존 exponential 양수 함수를 유지한다.
+Weight·현재 접촉 pad 수·기준 거리·clipping·목표 영역·현재/직전 snapshot은 바꾸지 않았다.
+추가 geometry 계산이나 negative reward 호출 없이 각 양수 함수만 실행한다.
+
+이전 signed 함수와 regression 함수는 비교용으로 보존하되 현재 cfg에서는 선택하지 않는다.
+해당 함수들의 수치 검사는 유지하고, 기본/실험 cfg 검사는 악화 term이 존재하지 않는지를
+확인하도록 수정했다. README·CONTEXT는 현재 상태로 갱신하고172–173절은 변경 이력으로 남긴다.
+다른 reward·termination·물체 수 curriculum·제어 설정은 이번 변경에 포함하지 않는다.
+학습 중이므로 테스트·Python import·시뮬레이션·학습은 실행하지 않았다.
+소스 읽기·텍스트 diff만 점검했으며 실행 검증은 남아 있다.

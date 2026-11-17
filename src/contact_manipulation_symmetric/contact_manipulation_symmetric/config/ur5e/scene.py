@@ -2040,6 +2040,9 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
     library = Usd.Stage.Open(layer)
     for index, path in enumerate(bodies):
         live = stage.GetPrimAtPath(path)
+        physics_material, _ = UsdShade.MaterialBindingAPI(live).ComputeBoundMaterial("physics")
+        shared_material = (physics_material.GetPath() if physics_material
+                           and physics_material.GetPath().HasPrefix(Sdf.Path(f'{template_path}/ContactMaterials')) else None)
         filtered_pairs = (UsdPhysics.FilteredPairsAPI(live).GetFilteredPairsRel().GetTargets()
                           if live.HasAPI(UsdPhysics.FilteredPairsAPI) else [])
         expected_meshes = sum(prim.IsA(UsdGeom.Mesh) for prim in Usd.PrimRange(stage.GetPrimAtPath(path)))
@@ -2055,6 +2058,12 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
                     for rel in prim.GetRelationships() if rel.GetName().startswith('material:binding')]
         materials = {}
         for relationship, targets in bindings:
+            if shared_material is not None and relationship.GetName().endswith(':physics'):
+                # Environment-shared bindings belong on the editable root.
+                # Copying them into each prototype creates per-clone materials;
+                # an external target also cannot cross a USD reference's scope.
+                relationship.GetPrim().RemoveProperty(relationship.GetName())
+                continue
             remapped = []
             for target in targets:
                 if target.HasPrefix(destination) or not flattened.GetPrimAtPath(target):
@@ -2067,11 +2076,25 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
                     materials[target] = material
                 remapped.append(materials[target])
             relationship.SetTargets(remapped)
+        if shared_material is not None:
+            # Visual materials can also carry legacy physics schemas. Keep
+            # shaders, but prevent unused physics materials being cloned.
+            # CopySpec's _SharedMaterials ancestors can be undefined ``over``
+            # prims. Default traversal skips those complete subtrees.
+            for prim in Usd.PrimRange(prototype, Usd.PrimAllPrimsPredicate):
+                if prim.HasAPI(UsdPhysics.MaterialAPI):
+                    prim.RemoveAPI(UsdPhysics.MaterialAPI)
+                if prim.HasAPI(PhysxSchema.PhysxMaterialAPI):
+                    prim.RemoveAPI(PhysxSchema.PhysxMaterialAPI)
         # Root bindings/poses remain editable; only descendants form prototypes.
         # The baked subtree contains the resolved asset and our collision edits.
         # An older, stronger reference can restore its original offsets or
         # colliders once local descendant edits become instance proxies.
         live.GetReferences().SetReferences([Sdf.Reference(output_path, destination)])
+        if shared_material is not None:
+            UsdShade.MaterialBindingAPI.Apply(live).Bind(
+                UsdShade.Material(stage.GetPrimAtPath(shared_material)),
+                bindingStrength=UsdShade.Tokens.strongerThanDescendants, materialPurpose='physics')
         if filtered_pairs:
             UsdPhysics.FilteredPairsAPI.Apply(live).CreateFilteredPairsRel().SetTargets(filtered_pairs)
         live.SetInstanceable(True)
@@ -2080,8 +2103,64 @@ def share_rigid_body_geometry(stage, template_path: str, output_path: str) -> in
         actual_meshes = sum(prim.IsA(UsdGeom.Mesh) for prim in Usd.PrimRange(live, Usd.TraverseInstanceProxies()))
         if actual_meshes != expected_meshes:
             raise RuntimeError(f'Geometry sharing changed mesh count below {path}: {expected_meshes} -> {actual_meshes}.')
+        if shared_material is not None:
+            for prim in Usd.PrimRange(live, Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)):
+                if prim.HasAPI(UsdPhysics.MaterialAPI) or prim.HasAPI(PhysxSchema.PhysxMaterialAPI):
+                    raise RuntimeError(f'Physics material remains inside a cloned body: {prim.GetPath()}')
+                if (prim.HasAPI(UsdPhysics.CollisionAPI)
+                        and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is True):
+                    bound, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial('physics')
+                    if not bound or bound.GetPath() != shared_material:
+                        raise RuntimeError(f'Shared physics material binding was lost: {prim.GetPath()}')
     layer.Save()
     return len(bodies)
+
+
+def configure_contact_materials(stage: Usd.Stage, template_path: str, cfg) -> dict[str, int]:
+    """Share three physics materials per environment, outside body prototypes.
+
+    Strong physics-purpose bindings on asset roots cover all their colliders.
+    Geometry sharing keeps these bindings on editable body roots and never
+    copies physics materials into the body library. Cloning remaps the bindings
+    to each environment's own three materials; a single world-global material
+    triggers heap corruption in this PhysX version's parallel replicator.
+    Legacy physics schemas are removed while preserving visual shaders. The
+    hand override excludes the arm and F/T assembly.
+    """
+    counts = {"shelf": 0, "object": 0, "hand": 0}
+    for category in counts:
+        material_cfg = getattr(cfg, f"{category}_contact_material")
+        material_cfg.func(f"{template_path}/ContactMaterials/{category}", material_cfg)
+    assets = [
+        ("shelf", f"{template_path}/Shelf", cfg.shelf_contact_material),
+        *(("object", f"{template_path}/{name}", cfg.object_contact_material) for name in OBJECT_NAMES),
+        ("hand", f"{template_path}/Robot/ROASRightHand", cfg.hand_contact_material),
+    ]
+    for category, asset_path, material_cfg in assets:
+        root = stage.GetPrimAtPath(asset_path)
+        if not root.IsValid():
+            raise RuntimeError(f"Contact-material asset is missing: {asset_path}")
+        colliders = [prim for prim in Usd.PrimRange(root)
+                     if prim.HasAPI(UsdPhysics.CollisionAPI)
+                     and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get() is True]
+        if not colliders:
+            raise RuntimeError(f"Contact-material asset has no enabled collision shapes: {asset_path}")
+        for prim in Usd.PrimRange(root, Usd.PrimAllPrimsPredicate):
+            for relationship in prim.GetRelationships():
+                if (relationship.GetName().startswith('material:binding')
+                        and relationship.GetName().endswith(':physics')):
+                    prim.RemoveProperty(relationship.GetName())
+            if prim.HasAPI(UsdPhysics.MaterialAPI):
+                prim.RemoveAPI(UsdPhysics.MaterialAPI)
+            if prim.HasAPI(PhysxSchema.PhysxMaterialAPI):
+                prim.RemoveAPI(PhysxSchema.PhysxMaterialAPI)
+        # The Lab binding utility requires CollisionAPI on its target. Here
+        # official USD binding inheritance also covers non-collider Xform roots.
+        UsdShade.MaterialBindingAPI.Apply(root).Bind(
+            UsdShade.Material(stage.GetPrimAtPath(f"{template_path}/ContactMaterials/{category}")),
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants, materialPurpose='physics')
+        counts[category] += len(colliders)
+    return counts
 
 
 def spawn_shared_geometry(prim_path, cfg, translation=None, orientation=None, **kwargs):
@@ -2095,13 +2174,29 @@ def spawn_shared_geometry(prim_path, cfg, translation=None, orientation=None, **
     directory = tempfile.mkdtemp(prefix='contact_geometry_')
     atexit.register(shutil.rmtree, directory, ignore_errors=True)
     output = str(Path(directory) / 'geometry.usdc')
-    count = share_rigid_body_geometry(stage, '/World/envs/env_0', output)
+    template_path = '/World/envs/env_0'
+    _deinstance_subtree(stage, template_path)
+    configure_contact_materials(stage, template_path, cfg)
+    count = share_rigid_body_geometry(stage, template_path, output)
     print(f'[INFO] Shared geometry for {count} rigid bodies before environment cloning.', flush=True)
+    print('[INFO] Contact materials: 3 definitions per environment, shared across bodies; '
+          'per-object friction uses the fixed reset palette.', flush=True)
     return root
 
 
 @configclass
 class SharedGeometryCfg(sim_utils.SpawnerCfg):
     func: Callable = spawn_shared_geometry
+    # Object--shelf pairs use each object's sampled coefficient via min. Object--hand
+    # pairs instead use the larger hand coefficient via max's higher priority.
+    shelf_contact_material: sim_utils.RigidBodyMaterialCfg = sim_utils.RigidBodyMaterialCfg(
+        static_friction=0.4, dynamic_friction=0.32, friction_combine_mode="min",
+    )
+    object_contact_material: sim_utils.RigidBodyMaterialCfg = sim_utils.RigidBodyMaterialCfg(
+        static_friction=0.25, dynamic_friction=0.20, friction_combine_mode="average",
+    )
+    hand_contact_material: sim_utils.RigidBodyMaterialCfg = sim_utils.RigidBodyMaterialCfg(
+        static_friction=0.8, dynamic_friction=0.64, friction_combine_mode="max",
+    )
 
 

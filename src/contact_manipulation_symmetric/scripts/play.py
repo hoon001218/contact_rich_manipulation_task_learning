@@ -68,6 +68,11 @@ def main(env_cfg, agent_cfg):
     """Load trained weights, infer deterministic actions, and let the env auto-reset."""
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+    # Playback always uses the full configured clutter range, even for an
+    # early checkpoint or a configuration exported during curriculum training.
+    env_cfg.curriculum.scene_object_count = None
+    env_cfg.spawn_object_count_range = None
+    env_cfg.scene_object_curriculum_start_iteration = None
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed

@@ -12,6 +12,77 @@
 
 ## 최신 진입점 — 2026-11-17
 
+**2026-11-17 — Clearance·Relocation은 양의 max 항만 유지.**
+사용자 요청으로172–173절의 양·음 분리 설정을 대체했다.
+`clearance=30*n_t*max(C_t-C_prev,0)`,
+`blocker_relocation=30*n_t*max(clip((d_prev-d)/(4*step_dt),-1,1),0)`이다.
+별도 `clearance_regression`·`blocker_relocation_regression` term은 cfg에서 제거했다.
+악화·정체·무접촉의 두 항은0이며 weight30·접촉 조건·정규화·영역·이력은 유지한다.
+이전 signed/regression 함수는 보존하되 기본 설정에서 호출하지 않는다.
+학습2·3의 exponential 양수 함수는 유지한다. 실행·테스트 없이 정적 점검만 했으며
+상세는 TRAINING_LOG174절이다.
+
+**2026-11-17 — 학습 전용 주변 물체 수 curriculum.**
+사용자가0–10,000 iteration은 Target·Blocker만,10,000–45,000은 점진 증가를 선택했다.
+`train.py`가 공식 CurriculumManager에 `scene_object_count` term을 연결한다.
+최종15–25개 범위까지 최소·최대 개수를 각각 정수 보간하고 새 공통 scene에서만 적용한다.
+생성용 SpawnRules 복사본만 바꾸며 영구 pool capacity25·관측10slot은 유지한다.
+`play.py`는 term·runtime 개수 제한을 끄므로 모든 checkpoint에서 기존 배치를 사용한다.
+재개 iteration은 최초 reset 전에 읽어 반영한다. 설정은 env cfg의
+`scene_object_curriculum_start_iteration/end_iteration`, 비활성화는 start=None이다.
+현재 실행 중인 학습에는 소스 변경이 소급 적용되지 않는다. 테스트 소스는 추가했지만
+학습 중이므로 실행·시뮬레이션은 하지 않았다. 상세와 검증 공백은 TRAINING_LOG171절이다.
+
+**2026-11-17 — Clearance·Relocation 논의 보류, Hand action 설정 비교.**
+사용자 요청으로 보상 논의를 잠시 보류했다. Relocation을 여러 가능한 재배치 방향의
+기하학적 힌트로 사용하는 목적과, 현재 최단 직선거리 수식의 타당성은 구분한다.
+가까운 영역이 실제로 가장 빠르거나 쉬운 조작을 뜻하지 않으며, 해별 Hand 준비 동작을
+보상으로 직접 정의하는 안은 채택하지 않았다. 후속 논의는 TRAINING_LOG169절에서 이어간다.
+Hand action 검토에서는 로컬 UR5e 예제의 `JointPositionAction(scale=0.5)`와 현재
+`JointPositionToLimitsAction(scale=0.5)`가 서로 다른 단위·매핑임을 확인했다.
+공식 Shadow Hand는 관절 범위 매핑·선택적 목표 평활화·action 크기 제곱 비용을 사용한다.
+현재 Hand는 raw±2에서 목표가 포화되고, clipping한 action 변화량 비용만으로는
+지속적으로 큰 raw 출력 자체를 억제하지 못한다. 상세는170절이다.
+이번 점검은 소스 읽기와 문서 기록만 했으며 학습·제어 설정은 변경하지 않았다.
+
+**2026-11-17 — 전역 재질 공유에서 native double-free: 환경당3개로 수정.**
+167절의 world-global3개 방식은 설치된 PhysX의 병렬 복제 중 native heap 손상을 재현했다.
+GDB에서 `PhysXReplicator.cpp:883/1015`, `vector<pair<PxShape*,const char*>>::push_back`
+경로를 확보했다. 전체 재질이5개인 상태에서도 실패했으므로64K 초과와 구분한다.
+이제 재질은 `/World/envs/env_i/ContactMaterials/{shelf,object,hand}`에 환경당3개만
+공유한다.1,024환경에서3,072개이며 body prototype에는 복사하지 않는다.
+동일 초기화 비교에서 전역 공유는abort, 환경별 공유는정상 종료했다.
+최종 실제 코드로1,024환경의 초기화·episode reset·물리1step·정상 종료를 확인했고,
+native material readback81,920행이 배정된128개 palette와 일치했다. 학습은 실행하지 않았다.
+물리 복제·물체 pool·물체별 마찰 샘플링은 유지한다. 상세와 검증 범위는168절을 따른다.
+
+**2026-11-17 — 초기화 중 PhysX 64K material 한도 초과 수정.**
+사용자 실행 로그 `kit_20261117_144438.log`의37.457초 오류와 해당 실행의 geometry library를
+조사했다. 기존 library에는112개 Physics MaterialAPI 정의가 있었으며, 환경 내부 정의가
+복제되어128개 randomization bucket과 무관하게64K 한도에 도달할 수 있었다.
+167절에서는 선반·물체·Hand 기본 재질을 `/World/ContactMaterials` 아래3개로 공유했다.
+공식 USD의 strong physics-purpose root binding을 사용하고, geometry prototype에는
+physics binding·schema를 복사하지 않는다. 시각 재질은 보존한다. 물체별128개 palette와
+scene 경계 재샘플링은 유지했다. 이 전역 공유 방식은168절의 환경별 공유로 대체한다.
+
+**2026-11-17 — Normal alignment에서 손끝 cap5개 제외.**
+URDF와 기존 `FINGERTIP_BODY_NAMES`로 엄지4번·검지/중지/약지/소지3번을 확인했다.
+`blocker_normal_alignment`는 기본 `exclude_fingertips=True`로 나머지12pad 점수만 평균한다.
+Weight1과45°에서0.5인 decay는 유지하며 접촉 관측·Distance·Contact hold는17개 그대로다.
+선택 인덱스는 최초1회 device에 캐시한다. 기존17개 평균은False 옵션으로 비교할 수 있다.
+상세는 TRAINING_LOG166절을 따른다.
+
+**2026-11-17 — 공통 scene 교체 시 선반 마찰 randomization·Hand 고마찰.**
+최초164절의 선반별 샘플에서 사용자 요청으로 **환경·물체별 독립 샘플**로 바꿨다.
+물체 정적0.25–0.4·동적0.8배(0.20–0.32), 고정 선반0.4/0.32 min,
+Hand 전체0.8/0.64 max다. 물체average이므로 물체–선반은 각 물체 값, 물체–물체는 평균이다.
+`SceneFrictionRandomization`은 `ManagerTermBase`로 collection의 공식 PhysX material
+get/set 및 native reshape를 사용한다. 기본 material event가 collection을 지원하지 않아
+작은 adapter로 연결하며,128개 palette에서 물체당 하나를 뽑아 모든 hull에 동일하게 쓴다.
+`reset_scene → scene_friction → reset_mdp` 순서이며 같은 scene의 부분 reset에는 재질
+조회·샘플링·쓰기가 없다. Arm·F/T는 제외한다.80%와 Hand 값은 초기 근사이며
+근거는 TRAINING_LOG164절, 물체별 샘플링은165절, 최종 공유 재질 수정은168절을 따른다.
+
 **2026-11-17 — 스폰 높이에0.1mm 여유 적용.**
 사용자가 지정한 `spawn_rules.spawn_height_offset=0.0001m`를 현재 Symmetric task에 적용했다.
 공통 `object_spawn_height()`가 생성과 runtime support-height cache에 한 번씩 같은 결과를

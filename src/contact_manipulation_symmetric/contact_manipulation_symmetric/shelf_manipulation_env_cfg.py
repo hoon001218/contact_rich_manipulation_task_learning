@@ -17,6 +17,7 @@ from isaaclab.utils import configclass
 from . import mdp
 from .mdp.events import MdpCfg, SpawnRules, RobotStartRules
 from .mdp.sensors import BlockerContactHold, InitialVisionCfg
+from .mdp.materials import SceneFrictionRandomization
 
 
 @configclass
@@ -84,6 +85,18 @@ class EventCfg:
 
     role_obb_visualization = EventTermCfg(func=mdp.initialize_role_obb_visualization, mode="startup")
     reset_scene = EventTermCfg(func=mdp.reset_scene, mode="reset")
+    scene_friction = EventTermCfg(
+        func=SceneFrictionRandomization, mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("object_collection"),
+            "static_friction_range": (0.25, 0.4),
+            "dynamic_friction_range": (0.20, 0.32),
+            "dynamic_friction_ratio": 0.8,
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 128,
+            "make_consistent": True,
+        },
+    )
     reset_mdp = EventTermCfg(func=mdp.reset_task, mode="reset")
 
 
@@ -92,6 +105,7 @@ class CurriculumCfg:
     """The training entrypoint arms the native schedule from the runner budget."""
 
     time_penalty: CurriculumTermCfg | None = None
+    scene_object_count: CurriculumTermCfg | None = None
 
 
 @configclass
@@ -99,19 +113,21 @@ class RewardsCfg:
     """Raw task scores/costs, integrated by the native RewardManager."""
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
-    clearance = RewardTermCfg(func=mdp.clearance_contact_progress, weight=30.0)
+    # Reward contact-weighted improvements only; worsening contributes zero.
+    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=30.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
     blocker_normal_alignment = RewardTermCfg(
         func=mdp.blocker_normal_alignment, weight=1.0,
-        params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))},
+        params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0)),
+                "exclude_fingertips": True},
     )
     # blocker_relocation = RewardTermCfg(
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation_distance_progress, weight=30.0,
+        func=mdp.blocker_relocation_distance_improvement, weight=30.0,
         params={"reference_speed": 4.0, "threshold": 0.01},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
@@ -208,6 +224,12 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
     # Fraction of max_iterations; None keeps the configured Time weight from the start.
     time_penalty_start_fraction: float | None = 0.5
+    # Training entry point only: two role objects, then grow toward spawn_rules.
+    # Absolute completed iterations; None disables the object-count curriculum.
+    scene_object_curriculum_start_iteration: int | None = 10000
+    scene_object_curriculum_end_iteration: int = 45000
+    # Runtime sampling bounds only. Never resize the physical pool/observation.
+    spawn_object_count_range: tuple[int, int] | None = None
     mdp: MdpCfg = MdpCfg()
     # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(

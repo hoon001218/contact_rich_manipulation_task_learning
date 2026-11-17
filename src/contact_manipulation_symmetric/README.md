@@ -1,14 +1,80 @@
 # Contact Manipulation Symmetric
 
+**2026-11-17 Clearance·Relocation은 양의 개선량만 지급:** 양·음 분리 대신
+각각의 `max(진행량,0)` 항만 사용한다. 현재 Blocker 접촉 pad 수를 곱하며 weight는 각각30이다.
+
+| TensorBoard 항목 | Weight 적용 전 값 | Weight |
+|---|---|---:|
+| `Episode_Reward/clearance` | `n_t * max(C_t-C_prev, 0)` | +30 |
+| `Episode_Reward/blocker_relocation` | `n_t * max(s,0)` | +30 |
+
+`C=1-O/O0`, `s=clip((d_prev-d)/(4.0*step_dt),-1,1)`이다.
+악화·정체·무접촉에서는 두 항이0이다. `clearance_regression`과
+`blocker_relocation_regression`은 기본·파생 cfg에서 제거했다.
+Relocation의 목표는 기존 목적지·전방 통로의 합집합이며 기준 거리는50Hz에서80mm다.
+Manager의 dt1회 적용·snapshot·부분 reset은 유지한다. 이전 signed/regression 함수는
+보존하지만 활성 설정에서는 호출하지 않는다. 학습2·3의 과거 exponential 양수 함수도 유지한다.
+과거 signed 로그와 현재 양수 전용 로그는 의미가 다르다. 학습 중이므로 실행·테스트하지 않았다.
+
+**2026-11-17 물체 수 curriculum:** `scripts/train.py`는 처음에는 Target·Blocker만
+배치하고, 완료 iteration10,000–45,000에서 주변 물체 수를 점진적으로 늘린다.
+`scripts/play.py`는 checkpoint iteration과 무관하게 기존15–25개 배치를 사용한다.
+
+| 완료 iteration | 학습에서 요청하는 총 물체 수(Target·Blocker 포함) |
+|---|---:|
+| 0–10,000 | 2 |
+| 20,000 | 5–8 |
+| 30,000 | 9–15 |
+| 40,000 | 13–21 |
+| 45,000 이후 | 15–25 |
+
+설정 위치는 `shelf_manipulation_env_cfg.py`의
+`scene_object_curriculum_start_iteration=10000`,
+`scene_object_curriculum_end_iteration=45000`이다.
+두 경계 사이에서 최소·최대 개수를 각각 정수 단위로 늘리고 새 공통 scene 생성 시 적용한다.
+부분 reset은 같은 배치를 유지한다. `spawn_rules.min_objects/max_objects`는 최종 배치 범위이며
+pool·tensor capacity25와 관측10slot은 학습 중에도 고정한다. 재개 시 checkpoint의 완료 iteration을
+최초 reset 전에 반영한다. 물체 배치의 나머지 규칙·보상·종료·제어 설정은 이 변경에 포함하지 않는다.
+기존 packer의 공간 부족에 따른 개수 shortfall 처리는 유지하므로 실제 개수는
+TensorBoard `Reset/scene_object_count`로 확인한다. 요청 범위와 진행률은
+`Curriculum/scene_object_count/{min_objects,max_objects,progress}`에 기록된다.
+
+실행 명령은 기존과 같다. 다음은 일반 학습과 curriculum 비활성화 비교 실행이다.
+
+```bash
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/scripts/train.py --num_envs 1024 --headless
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/scripts/train.py --num_envs 1024 --headless env.scene_object_curriculum_start_iteration=null
+```
+
+위 구간은 `--max_iterations`에 비례하는 비율이 아니라 절대 iteration이다.
+Play 명령은 변경하지 않으며 기본 물체 수는 현재 `spawn_rules` 범위를 따른다.
+이번 변경은 소스 점검만 했고, 진행 중인 학습을 보호하기 위해 테스트·시뮬레이션은 실행하지 않았다.
+
+**2026-11-17 접촉 마찰 설정:** 물체–선반 접촉의 정적 마찰은 새 공통 scene마다
+**환경·물체별로 독립적으로** `[0.25, 0.4]` 범위에서 다시 샘플링하고,
+동적 마찰은 해당 물체 정적 값의0.8배로 둔다. 한 물체의 모든 hull은 같은 값을 사용한다.
+같은 scene의 부분 reset에서는 유지한다. Hand 전체–물체 접촉은 정적0.8·동적0.64다.
+고정 선반0.4/0.32 `min`·물체 `average`·Hand `max`로 실제 접촉 쌍의 값을 맞춘다.
+물체–물체는 양쪽 계수의 평균이다.128개 bucket과 공식 PhysX material API를 사용하며
+매 step 재질을 갱신하지 않는다. 공식 기본 event는 물체 collection을 지원하지 않아
+collection의 native reshape/get/set API로 연결한다.80%는 실측 상수가 아닌 근사 가정이며
+기본 재질은 `env_i/ContactMaterials`의 **환경당3개 정의**를 공유하며 geometry
+prototype에 물리 재질을 복사하지 않는다.1,024환경에서3,072개이고 pool 크기와 무관하다.
+앞선 월드 전체3개 공유는 PhysX 병렬 복제에서 native abort를 재현해 대체했다.
+근거는 TRAINING_LOG164절, 물체별 샘플링은165절, 최종 공유 재질 수정은168절을 따른다.
+
 **2026-11-17 초기 높이 여유:** `spawn_rules.spawn_height_offset=0.0001`로
 활성 물체의 upright bounding box 하단을 선반 윗면보다0.1mm 높게 배치한다.
 생성·vision/IK 입력·reset이 같은 높이를 사용한다. 실제 collision 최저점의 간격을
 직접 지정하는 설정은 아니며 선반 통과 현상의 해결 여부는 아직 검증하지 않았다.
 
-**2026-11-16 pad 방향 보상 추가:** `blocker_normal_alignment`는 현재 Blocker 중심을 향하는
-17개 pad의 `mean(exp(-a*(1-cosine)))`을 지급한다. Weight1, `a≈2.36655`로45° 오차에서
+**2026-11-17 pad 방향 보상:** `blocker_normal_alignment`는 현재 Blocker 중심을 향하는
+**손끝 cap5개를 제외한12개 pad**의 `mean(exp(-a*(1-cosine)))`을 지급한다.
+제외 대상은 엄지4번과 검지·중지·약지·소지의3번 센서다. Weight1, `a≈2.36655`로45° 오차에서
 점수0.5다. 접촉·거리·Target 보호 gate 없이 접촉 전 자세 준비도 평가한다.
 Pad 접촉면의 명목 외향 local+Z와 현재 native pose를 사용하고 전부 tensor로 계산한다.
+관측·Distance·Contact hold는 기존17pad를 유지한다. `exclude_fingertips=False`는
+이 항만 기존17pad 평균으로 복원하는 비교 옵션이다.
 
 **2026-11-16 signed 진행량 변경:** Clearance와 실거리 Relocation은 개선 시 양수,
 악화 시 음수를 반환한다. 현재 Blocker 접촉 pad 수를 곱하는 조건과 영역 설정은 유지한다.
@@ -101,7 +167,7 @@ Relocation은 학습1에서 사용한 실거리 정규화 방식을 기본값으
 | Clearance | `현재 접촉 pad 수 * (Q_clear(t)-Q_clear(t-1))`, weight30 |
 | Access region | 후방 X를 선반 지지면 후방까지 확장, 기존 정면 X·좌우 Y 유지 |
 | Hand–Blocker distance | **현재**17pad 거리의 `mean(exp(-10*d))`, weight5·Target 보호 gate |
-| Pad–Blocker 방향 | `mean(exp(-2.36655*(1-cosine)))`, 17pad 평균·weight1·정면1/45°에서0.5 |
+| Pad–Blocker 방향 | `mean(exp(-2.36655*(1-cosine)))`, 손끝5개 제외한12pad 평균·weight1·정면1/45°에서0.5 |
 | Blocker relocation | `현재 접촉 pad 수 * clip((d(t-1)-d(t))/(4*step_dt), -1, 1)`, weight30 |
 | Contact hold | `BlockerContactHold` 활성, weight3. Clearance·Relocation도 별도로 현재 접촉 pad 수를 사용 |
 | Shelf / Target / 일반 물체 비용 | 각각−.5, 기존 수식 |
