@@ -3288,6 +3288,7 @@ class UrdfCoupledHandActionTests(unittest.TestCase):
 class NativeArmEffortLimitTests(unittest.TestCase):
     def test_explicit_arm_clips_physx_submission_while_implicit_hand_keeps_position_targets(self):
         from unittest.mock import Mock
+        from xml.etree import ElementTree
 
         # Execute checkout methods; only SDK initialization/config containers are replaced.
         root = Path(__file__).resolve().parents[3]
@@ -3311,10 +3312,14 @@ class NativeArmEffortLimitTests(unittest.TestCase):
 
         path = root / 'src/contact_manipulation_symmetric/contact_manipulation_symmetric/config/ur5e/scene.py'
         nodes = [node for node in ast.parse(path.read_text()).body
-                 if (isinstance(node, ast.FunctionDef) and node.name == 'make_ur5e_hand_cfg')
+                 if (isinstance(node, ast.FunctionDef)
+                     and node.name in ('make_ur5e_hand_cfg', 'hand_joint_limits', 'hand_joint_mapping'))
                  or (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
                      and node.targets[0].id in ('ARM_JOINT_NAMES', 'HAND_JOINT_NAMES'))]
-        namespace = dict(os=SimpleNamespace(environ={}), DEFAULT_HAND_URDF_PATH='hand.urdf',
+        urdf = root / ('assets/robots/Roas_provided_inspire_urdf/RH56E2 URDF/'
+                       'RH56E2_R_2025_9_11/urdf/RH56E2_R_2025_9_11_relative.urdf')
+        namespace = dict(os=SimpleNamespace(environ={}), math=math, ElementTree=ElementTree,
+                         DEFAULT_HAND_URDF_PATH=urdf,
                          DEFAULT_UR5E_USD_PATH='ur5e.usd', Ur5eHandSpawnerCfg=SimpleNamespace,
                          ArticulationCfg=Config, IdealPDActuatorCfg=IdealConfig,
                          ImplicitActuatorCfg=ImplicitConfig)
@@ -3331,6 +3336,27 @@ class NativeArmEffortLimitTests(unittest.TestCase):
         self.assertEqual((arm_cfg.stiffness, arm_cfg.damping), (0., 0.))
         self.assertEqual((hand_cfg.effort_limit_sim, hand_cfg.velocity_limit_sim), (None, None))
         self.assertEqual((hand_cfg.stiffness, hand_cfg.damping), (20., 1.))
+
+        # Native raw zero denotes the midpoint of the startup's coupled learning
+        # interval, and every driven child must start at that command's angle.
+        feasible, _ = namespace['hand_joint_limits'](str(urdf))
+        masters = namespace['HAND_JOINT_NAMES']
+        midpoints = [(feasible[name][0]+feasible[name][1])*.5 for name in masters]
+        driven, indices, multipliers, offsets = namespace['hand_joint_mapping'](str(urdf))
+        initial = cfg.init_state.joint_pos
+        self.assertEqual(set(initial).difference(names), set(driven))
+        sources = {joint.attrib['name']: joint for joint in ElementTree.parse(urdf).findall('joint')
+                   if joint.attrib['type'] == 'revolute'}
+        for name, master, multiplier, offset in zip(driven, indices, multipliers, offsets):
+            self.assertAlmostEqual(initial[name], midpoints[master]*multiplier+offset, places=12)
+            limit = sources[name].find('limit')
+            self.assertGreaterEqual(initial[name], float(limit.attrib['lower'])-1.e-12)
+            self.assertLessEqual(initial[name], float(limit.attrib['upper'])+1.e-12)
+            mimic = sources[name].find('mimic')
+            if mimic is not None:
+                expected = (float(mimic.attrib.get('multiplier', 1.))*initial[mimic.attrib['joint']]
+                            + float(mimic.attrib.get('offset', 0.)))
+                self.assertAlmostEqual(initial[name], expected, places=12)
 
         clip = native_method('actuators/actuator_base.py', 'ActuatorBase', '_clip_effort')
         arm_compute = native_method('actuators/actuator_pd.py', 'IdealPDActuator', 'compute')

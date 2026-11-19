@@ -79,6 +79,7 @@ def load_configs():
     @dataclass
     class ModelCfg:
         marker: str = "unchanged graph encoder"
+        scene_readout: str = "full"
 
     @configclass
     class TermCfg:
@@ -195,6 +196,8 @@ class ExperimentConfigurationTests(unittest.TestCase):
 
     def test_runner_ppo_models_and_observation_settings_are_identical_except_log_name(self):
         baseline = freeze(self.baseline_runner())
+        self.assertEqual(baseline["actor"]["model_cfg"]["scene_readout"], "attention")
+        self.assertEqual(baseline["critic"]["model_cfg"]["scene_readout"], "attention")
         for variant, (_, runner_class) in self.variants.items():
             with self.subTest(variant=variant):
                 actual = freeze(runner_class())

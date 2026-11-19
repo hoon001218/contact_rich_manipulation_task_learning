@@ -23,6 +23,16 @@ _MODEL_SETTINGS = ("hidden_dims", "activation", "obs_normalization", "distributi
 _GRAPH_CRITIC = "contact_manipulation_symmetric.config.ur5e.agents.model:NativeContactCritic"
 
 
+def _model_contract(settings):
+    """Missing readout metadata belongs to the original full 320D encoder."""
+    if not isinstance(settings, Mapping):
+        raise ValueError("Checkpoint scene model configuration is missing.")
+    settings = deepcopy(dict(settings))
+    # Do not infer an old checkpoint's architecture from the training preset.
+    settings.setdefault("scene_readout", "full")
+    return asdict(ModelCfg(**settings))
+
+
 def _actor_contract(checkpoint):
     """Read a native actor contract or translate the two supported legacy layouts."""
     actor = checkpoint.get("actor_state_dict", {})
@@ -32,7 +42,9 @@ def _actor_contract(checkpoint):
                 or contract.get("architecture") != "native_graph_actor_v3"
                 or contract.get("action_contract") != ACTION_CONTRACT):
             raise ValueError("Checkpoint actor architecture or action contract differs from this task.")
-        return deepcopy(dict(contract))
+        contract = deepcopy(dict(contract))
+        contract["model_cfg"] = _model_contract(contract.get("model_cfg"))
+        return contract
     metadata = checkpoint.get("research_metadata")
     if (not isinstance(metadata, Mapping) or metadata.get("action_contract") != ACTION_CONTRACT):
         raise ValueError("Checkpoint action contract is missing or differs from this task.")
@@ -44,7 +56,7 @@ def _actor_contract(checkpoint):
         raise ValueError("Checkpoint F/T sensor profile differs from this task.")
     model = deepcopy(metadata.get("model_cfg", {}))
     initial_std = model.pop("initial_std", 0.3)
-    model = asdict(ModelCfg(**model))
+    model = _model_contract(model)
     if architecture == "separate_actor_mlp_critic_v1":
         actor_model = {
             "hidden_dims": [2 * model["latent_dim"], model["latent_dim"]],
@@ -75,7 +87,9 @@ def _critic_contract(checkpoint):
     if (contract["architecture"] == "native_graph_critic_v2"
             and contract.get("observation_contract") != CRITIC_OBSERVATION_CONTRACT):
         raise ValueError("Checkpoint critic Actor-observation contract differs from this task.")
-    return deepcopy(dict(contract))
+    contract = deepcopy(dict(contract))
+    contract["model_cfg"] = _model_contract(contract.get("model_cfg"))
+    return contract
 
 
 def _critic_settings(checkpoint):

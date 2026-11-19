@@ -11,7 +11,9 @@ from .model import CRITIC_OBSERVATION_CONTRACT, ModelCfg
 @configclass
 class ContactActorCfg(RslRlMLPModelCfg):
     class_name: str = "contact_manipulation_symmetric.config.ur5e.agents.model:NativeContactActor"
-    model_cfg: dict = asdict(ModelCfg())
+    # Inherited by the independent Critic as well; swap these lines to revert.
+    model_cfg: dict = asdict(ModelCfg(scene_readout="attention"))  # 128D
+    # model_cfg: dict = asdict(ModelCfg(scene_readout="full"))  # Preserved 320D baseline.
     hidden_dims = [256, 128]
     # Native actor/critic MLP heads follow the examples; scene GNN stays ReLU.
     activation = "elu"

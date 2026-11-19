@@ -704,6 +704,16 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
     hand_urdf_path = os.environ.get(
         "CONTACT_MANIPULATION_HAND_URDF_PATH", str(DEFAULT_HAND_URDF_PATH)
     )
+    # Native ToLimits maps raw action 0 to the coupled master range midpoint.
+    # Use the same bounds as configure_hand_action_limits, then expand every
+    # driven joint so initial state, reset targets and collision-checked IK agree.
+    hand_limits, _ = hand_joint_limits(hand_urdf_path)
+    master_midpoints = [sum(hand_limits[name]) * 0.5 for name in HAND_JOINT_NAMES]
+    hand_names, master_indices, multipliers, offsets = hand_joint_mapping(hand_urdf_path)
+    hand_initial_positions = {
+        name: master_midpoints[index] * multiplier + offset
+        for name, index, multiplier, offset in zip(hand_names, master_indices, multipliers, offsets)
+    }
     spawn_cfg = Ur5eHandSpawnerCfg(
         ur5e_usd_path=os.environ.get("CONTACT_MANIPULATION_UR5E_USD_PATH", DEFAULT_UR5E_USD_PATH),
         hand_urdf_path=hand_urdf_path,
@@ -721,9 +731,8 @@ def make_ur5e_hand_cfg() -> ArticulationCfg:
                 "elbow_joint": 1.1994,
                 "wrist_1_joint": 0.6010,
                 "wrist_2_joint": 1.5712,
-                # Retain hand_rl's open-hand posture for spawn inspection.
                 "wrist_3_joint": -1.5700,
-                ".*(thumb|index|middle|ring|little).*": 0.0,
+                **hand_initial_positions,
             },
             joint_vel={".*": 0.0},
         ),
@@ -988,7 +997,7 @@ def _arm_ik_kernel(targets: wp.array(dtype=wp.vec3), orientations: wp.array(dtyp
 
 
 class RobotPoseModel:
-    """Exact USD joint-frame FK and bounded IK for the mounted open hand.
+    """Exact USD joint-frame FK and bounded IK with the configured hand posture.
 
     Body transforms and collider bounds use meters and column-vector matrices.
     Environment origins are applied by the reset caller. This model is built
@@ -1183,7 +1192,7 @@ class RobotPoseModel:
         """Reset collision pairs, shared by scalar validation and GPU acceptance.
 
         Check every hand collider against the arm, except wrist_3 and the fixed
-        sensor mount: their relative poses cannot change in open-hand reset IK.
+        sensor mount: their relative poses cannot change in fixed-hand reset IK.
         Hand internal joint housings are likewise fixed during this search.
         Only arm-arm pairs retain the two-joint mechanical-housing exclusion.
         """
@@ -1291,7 +1300,7 @@ class RobotPoseModel:
         return frames, joint_frames, tcp, torch.cat((linear, axes), -1).transpose(1, 2)
 
     def forward_batch(self, joint_positions):
-        """Physical-link transforms in ``body_names`` order, for open-hand reset poses."""
+        """Physical-link transforms in ``body_names`` order, for fixed-hand reset poses."""
         constants = self._tensor_constants(joint_positions.device, joint_positions.dtype)
         frames, _, _ = self.arm_forward_batch(joint_positions[:, constants["arm_ids"]])
         return frames[:, constants["body_owners"]] @ constants["body_offsets"]

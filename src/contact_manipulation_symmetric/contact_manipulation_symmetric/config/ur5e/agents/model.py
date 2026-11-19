@@ -110,10 +110,15 @@ class ModelCfg:
     node_dim: int = 64
     graph_layers: int = 2
     latent_dim: int = 128
+    # Legacy checkpoints omitted this field and used the full 320D readout.
+    # The training runner explicitly selects attention-only for the new trial.
+    scene_readout: str = "full"
 
     def __post_init__(self):
         if self.activation != "relu":
             raise ValueError("This baseline uses relu activation.")
+        if self.scene_readout not in ("full", "attention"):
+            raise ValueError("scene_readout must be 'full' or 'attention'.")
         dimensions = (
             self.max_objects, self.history_steps, self.action_dim, self.node_features,
             self.step_features, self.node_dim, self.graph_layers, self.latent_dim,
@@ -134,6 +139,10 @@ class ModelCfg:
     @property
     def observation_dim(self) -> int:
         return self.max_objects * self.node_features + self.history_steps * self.step_features
+
+    @property
+    def scene_dim(self) -> int:
+        return (2 if self.scene_readout == "attention" else 5) * self.node_dim
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,7 @@ class SceneGraphEncoder(nn.Module):
         self.keys = nn.Linear(width, width, bias=False)
         self.values = nn.Linear(width, width, bias=False)
         self.width = width
+        self.scene_readout = cfg.scene_readout
         self.register_buffer("nonself_edges", ~torch.eye(cfg.max_objects, dtype=torch.bool), persistent=False)
 
     def forward(self, geometry: Tensor, valid: Tensor, roles: Tensor) -> Tensor:
@@ -250,6 +260,11 @@ class SceneGraphEncoder(nn.Module):
         scores = torch.matmul(queries, self.keys(hidden).transpose(-2, -1)) / math.sqrt(self.width)
         attention = _masked_softmax(scores, valid[..., None, :].expand_as(scores))
         contextual = torch.matmul(attention, self.values(hidden)).flatten(-2)
+        if self.scene_readout == "attention":
+            # Both role queries still use Target/Blocker features. Only the
+            # direct readout paths are omitted; GNN and attention are unchanged.
+            return contextual
+        # Preserved baseline: Target64 + Blocker64 + context128 + global64.
         return torch.cat((target, blocker, contextual, _masked_mean(hidden, valid)), dim=-1)
 
 
@@ -302,7 +317,7 @@ class ContactManipulationEncoder(nn.Module):
                                    masks.roles.reshape(-1, self.cfg.max_objects, 2))
         # Keep both 66D samples in order; there is no learned history encoder.
         values = self.history_input(observation, masks=masks, history=history).reshape(scene.shape[0], -1)
-        return torch.cat((scene, values), dim=-1).reshape(*leading, 5 * self.cfg.node_dim + values.shape[-1])
+        return torch.cat((scene, values), dim=-1).reshape(*leading, self.cfg.scene_dim + values.shape[-1])
 
 
 class _NativeContactModel(MLPModel):
@@ -382,13 +397,19 @@ class _NativeContactModel(MLPModel):
         return state
 
     def set_extra_state(self, state):
-        if state != self.get_extra_state():
+        # Native runner.load passes the original state_dict extra state. Older
+        # checkpoints have no readout field; ModelCfg's default restores full.
+        saved = deepcopy(state)
+        if isinstance(saved, Mapping) and isinstance(saved.get("model_cfg"), Mapping):
+            saved = dict(saved)
+            saved["model_cfg"] = asdict(ModelCfg(**saved["model_cfg"]))
+        if saved != self.get_extra_state():
             raise ValueError(f"Checkpoint {self._role} input/action/model configuration differs from this model.")
 
     def extra_repr(self) -> str:
         # nn.Module lists children in registration order, not execution order.
         # Keep that order (and native optimizer parameter ordering) unchanged.
-        return ("forward: scene encoder (GNN + role attention) -> "
+        return (f"forward: scene encoder (GNN + role attention, {self.cfg.scene_readout}, {self.cfg.scene_dim}D) -> "
                 "concat(current, previous) -> mlp"
                 + (" -> Gaussian distribution" if self.distribution is not None else " -> value"))
 
@@ -400,7 +421,7 @@ class _NativeContactModel(MLPModel):
         return groups, self.cfg.history_steps * self.cfg.step_features
 
     def _get_latent_dim(self) -> int:
-        return 5 * self.cfg.node_dim + self.cfg.history_steps * self.cfg.step_features
+        return self.cfg.scene_dim + self.cfg.history_steps * self.cfg.step_features
 
     def get_policy_observation(self, obs: Mapping[str, Tensor]) -> Tensor:
         value = obs[self._observation_group]

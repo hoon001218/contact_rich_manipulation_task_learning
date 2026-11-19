@@ -140,6 +140,65 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "observation_layout"):
             ModelCfg(observation_layout="categorical_roles")
 
+    def test_readout_option_preserves_legacy_default_and_observation_contract(self):
+        legacy, attention = ModelCfg(), ModelCfg(scene_readout="attention")
+        self.assertEqual(legacy.scene_readout, "full")
+        self.assertEqual(legacy.scene_dim, 320)
+        self.assertEqual(attention.scene_dim, 128)
+        self.assertEqual(attention.observation_dim, legacy.observation_dim)
+        self.assertEqual(attention.action_dim, legacy.action_dim)
+        self.assertEqual(asdict(ModelCfg(**{}))["scene_readout"], "full")
+        with self.assertRaisesRegex(ValueError, "scene_readout"):
+            ModelCfg(scene_readout="pooled")
+
+    def test_attention_readout_is_exactly_the_existing_context_with_identical_gradients(self):
+        full = self.model.encoder.scene_encoder.double()
+        attention = ContactManipulationEncoder(
+            replace(self.cfg, scene_readout="attention")).scene_encoder.double()
+        attention.load_state_dict(full.state_dict())
+        geometry, _ = self.model.encoder._split(self.observation)
+        masks = self.masks()
+        first = geometry.double().detach().requires_grad_()
+        second = first.detach().clone().requires_grad_()
+        width = self.cfg.node_dim
+        expected = full(first, masks.object_valid, masks.roles)[:, 2 * width:4 * width]
+        actual = attention(second, masks.object_valid, masks.roles)
+        self.assertEqual(actual.shape, (3, 2 * width))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        objective = torch.randn_like(actual)
+        (expected * objective).sum().backward()
+        (actual * objective).sum().backward()
+        torch.testing.assert_close(second.grad, first.grad, rtol=1e-10, atol=1e-10)
+        for (name, actual_parameter), (_, expected_parameter) in zip(
+                attention.named_parameters(), full.named_parameters()):
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(actual_parameter.grad)
+                torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad,
+                                           rtol=1e-10, atol=1e-10)
+        # Both target/blocker roles still condition both attention queries;
+        # removing their direct output concatenation must not remove that path.
+        query_gradient = attention.role_queries.weight.grad
+        self.assertGreater(float(query_gradient[:, :width].abs().sum()), 0)
+        self.assertGreater(float(query_gradient[:, width:].abs().sum()), 0)
+        self.assertGreater(float(query_gradient[:width].abs().sum()), 0)
+        self.assertGreater(float(query_gradient[width:].abs().sum()), 0)
+
+    def test_attention_readout_keeps_role_semantics_and_ignores_distractor_order(self):
+        cfg = replace(self.cfg, scene_readout="attention")
+        encoder = ContactManipulationEncoder(cfg)
+        encoder.load_state_dict(self.model.encoder.state_dict())
+        geometry, history = encoder._split(self.observation)
+        actual = encoder(self.observation, masks=build_policy_masks(self.observation, cfg))
+        self.assertEqual(actual.shape, (3, 2 * cfg.node_dim + 132))
+        permuted = pack(geometry[:, torch.tensor([0, 1, 4, 2, 3])], history)
+        torch.testing.assert_close(
+            actual, encoder(permuted, masks=build_policy_masks(permuted, cfg)), atol=1e-6, rtol=1e-5)
+        swapped = pack(geometry[:, torch.tensor([1, 0, 2, 3, 4])], history)
+        swapped_features = encoder(swapped, masks=build_policy_masks(swapped, cfg))
+        self.assertGreater(float((actual[:, :cfg.scene_dim]
+                                  - swapped_features[:, :cfg.scene_dim]).abs().max()), 1e-6)
+        torch.testing.assert_close(actual[:, -132:], swapped_features[:, -132:], rtol=0, atol=0)
+
     def test_native_model_owns_head_distribution_and_common_interfaces(self):
         self.assertIsInstance(self.model, MLPModel)
         self.assertIsInstance(self.model.encoder, ContactManipulationEncoder)
@@ -759,7 +818,7 @@ class NativeLearningTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(81)
 
-    def test_training_configuration_matches_original_except_head_activation_paths_and_logs(self):
+    def test_training_configuration_matches_original_except_readout_head_activation_paths_and_logs(self):
         workspace = Path(__file__).resolve().parents[3]
         baseline = workspace / "src/contact_manipulation/contact_manipulation/config/ur5e/agents/rsl_rl_ppo_cfg.py"
         production = Path(__file__).resolve().parents[1] / "contact_manipulation_symmetric/config/ur5e/agents/rsl_rl_ppo_cfg.py"
@@ -801,6 +860,14 @@ class NativeLearningTests(unittest.TestCase):
             "contact_manipulation.", "contact_manipulation_symmetric.")
         original_actor["activation"] = "elu"  # Deliberate native-head-only experiment.
         self.assertEqual(actor, original_actor)
+        production_tree = ast.parse(production.read_text())
+        actor_class = next(node for node in production_tree.body
+                           if isinstance(node, ast.ClassDef) and node.name == "ContactActorCfg")
+        readout = next(node.value.args[0] for node in actor_class.body
+                       if isinstance(node, ast.AnnAssign) and node.target.id == "model_cfg")
+        self.assertEqual(readout.func.id, "ModelCfg")
+        self.assertEqual({keyword.arg: ast.literal_eval(keyword.value) for keyword in readout.keywords},
+                         {"scene_readout": "attention"})
         # Scene features keep their ReLU contract; only the native heads use ELU.
         self.assertEqual(actor["hidden_dims"], [256, 128])
         self.assertEqual(actor["activation"], "elu")
@@ -809,7 +876,6 @@ class NativeLearningTests(unittest.TestCase):
         self.assertIsNone(critic["distribution_cfg"])
         # The critic inherits the actor's feature/head configuration, rather than
         # diverging silently from the independently instantiated actor.
-        production_tree = ast.parse(production.read_text())
         critic_class = next(node for node in production_tree.body
                             if isinstance(node, ast.ClassDef) and node.name == "ContactCriticCfg")
         self.assertIn("ContactActorCfg", [base.id for base in critic_class.bases if isinstance(base, ast.Name)])
@@ -926,6 +992,23 @@ class NativeLearningTests(unittest.TestCase):
                 torch.testing.assert_close(head_inputs[0][:, -132:], expected_history)
                 self.assertFalse(hasattr(model.encoder, "history_encoder"))
                 self.assertFalse(hasattr(model.encoder, "fusion"))
+
+    def test_attention_actor_and_critic_keep_independent_graphs_and_native_heads(self):
+        cfg = ModelCfg(scene_readout="attention")
+        algorithm, env = make_algorithm(runner_config(cfg))
+        inputs = env.get_observations()
+        actor_parameters = {value.data_ptr() for value in algorithm.actor.parameters()}
+        self.assertTrue(actor_parameters.isdisjoint(
+            value.data_ptr() for value in algorithm.critic.parameters()))
+        for model, output_dim in ((algorithm.actor, 12), (algorithm.critic, 1)):
+            with self.subTest(role=type(model).__name__):
+                self.assertEqual(model.cfg.scene_dim, 128)
+                self.assertEqual(model.mlp[0].in_features, 260)
+                self.assertEqual(model(inputs).shape, (env.num_envs, output_dim))
+                self.assertEqual(model.get_extra_state()["model_cfg"]["scene_readout"], "attention")
+        algorithm.actor(inputs).square().sum().backward()
+        self.assertTrue(any(value.grad is not None for value in algorithm.actor.parameters()))
+        self.assertTrue(all(value.grad is None for value in algorithm.critic.parameters()))
 
     def test_asymmetric_groups_keep_tracked_current_geometry_out_of_actor(self):
         algorithm, env = make_algorithm()
@@ -1126,10 +1209,12 @@ class NativeLearningTests(unittest.TestCase):
         saved = deepcopy(original.save())
         saved["actor_state_dict"].pop("_extra_state")
         saved["iter"], saved["infos"] = 19100, {"test": "legacy"}
+        legacy_model = asdict(original.actor.cfg)
+        legacy_model.pop("scene_readout")  # Checkpoints written before the readout option existed.
         saved["research_metadata"] = {
             "action_contract": ACTION_CONTRACT,
             "actor_critic_architecture": "separate_native_graph_actor_mlp_critic_v2",
-            "model_cfg": {**asdict(original.actor.cfg), "initial_std": .3},
+            "model_cfg": {**legacy_model, "initial_std": .3},
             "actor_model": deepcopy(original.actor.native_model_cfg),
             "output_distribution": deepcopy(original.actor.native_model_cfg["distribution_cfg"]),
             "critic_model": deepcopy(legacy_cfg["critic"]),
@@ -1156,7 +1241,8 @@ class NativeLearningTests(unittest.TestCase):
                     checkpoint["actor_state_dict"] = converted
                 path = Path(directory) / f"legacy_v{version}.pt"
                 torch.save(checkpoint, path)
-                cfg = runner_config()
+                cfg = runner_config(ModelCfg(max_objects=5, node_dim=16, latent_dim=24,
+                                             scene_readout="attention"))
                 cfg["actor"]["distribution_cfg"] = {
                     "class_name": "GaussianDistribution", "std_type": "scalar", "init_std": 1.,
                 }
@@ -1165,6 +1251,7 @@ class NativeLearningTests(unittest.TestCase):
                                             critic=SimpleNamespace(**cfg["critic"]))
                 loaded = prepare_inference_checkpoint(agent_cfg, path)
                 self.assertNotIn("initial_std", agent_cfg.actor.model_cfg)
+                self.assertEqual(agent_cfg.actor.model_cfg["scene_readout"], "full")
                 self.assertEqual(agent_cfg.actor.distribution_cfg["std_type"], "log")
                 self.assertEqual(agent_cfg.critic.class_name, "MLPModel")
                 self.assertEqual(agent_cfg.obs_groups["critic"], ["policy"])
@@ -1182,6 +1269,71 @@ class NativeLearningTests(unittest.TestCase):
                     with torch.no_grad():
                         torch.testing.assert_close(player.get_inference_policy()(env.get_observations()),
                                                    original.actor(env.get_observations()), rtol=0, atol=0)
+
+    def test_playback_restores_saved_readout_for_old_native_and_new_attention_checkpoints(self):
+        for readout in ("full", "attention"):
+            with self.subTest(readout=readout), tempfile.TemporaryDirectory() as directory, \
+                    redirect_stdout(io.StringIO()):
+                model_cfg = ModelCfg(max_objects=5, node_dim=16, latent_dim=24, scene_readout=readout)
+                cfg = runner_config(model_cfg)
+                env = SmallVectorEnv(model_cfg)
+                source = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+                saved = deepcopy(source.alg.save())
+                saved.update(iter=4, infos={"readout": readout})
+                if readout == "full":
+                    # Both extra states from existing checkpoints lack this key.
+                    for group in ("actor_state_dict", "critic_state_dict"):
+                        saved[group]["_extra_state"]["model_cfg"].pop("scene_readout")
+                path = Path(directory) / f"{readout}.pt"
+                torch.save(saved, path)
+                other = "attention" if readout == "full" else "full"
+                current = runner_config(replace(model_cfg, scene_readout=other))
+                agent = SimpleNamespace(obs_groups=deepcopy(current["obs_groups"]),
+                                        actor=SimpleNamespace(**deepcopy(current["actor"])),
+                                        critic=SimpleNamespace(**deepcopy(current["critic"])))
+                checkpoint = prepare_inference_checkpoint(agent, path)
+                self.assertEqual(agent.actor.model_cfg["scene_readout"], readout)
+                self.assertEqual(agent.critic.model_cfg["scene_readout"], readout)
+                current.update(actor=vars(agent.actor), critic=vars(agent.critic), obs_groups=agent.obs_groups)
+                player = OnPolicyRunner(env, deepcopy(current), log_dir=None, device="cpu")
+                infos = load_checkpoint(player, path, inference=True, checkpoint=checkpoint)
+                self.assertEqual(infos, {"readout": readout})
+                self.assertEqual(player.current_learning_iteration, 4)
+                for source_model, restored_model in ((source.alg.actor, player.alg.actor),
+                                                     (source.alg.critic, player.alg.critic)):
+                    self.assertEqual(restored_model.mlp[0].in_features, model_cfg.scene_dim + 132)
+                    with torch.no_grad():
+                        torch.testing.assert_close(restored_model(env.get_observations()),
+                                                   source_model(env.get_observations()), rtol=0, atol=0)
+                if readout == "full":
+                    # Native training resume of an unchanged old full model also
+                    # accepts the added default key without touching optimizer semantics.
+                    resumed = OnPolicyRunner(env, deepcopy(cfg), log_dir=None, device="cpu")
+                    load_checkpoint(resumed, path, checkpoint=checkpoint)
+                    self.assertEqual(resumed.alg.actor.cfg.scene_readout, "full")
+
+    def test_cross_readout_resume_rejects_before_actor_or_critic_weights_change(self):
+        for readout in ("full", "attention"):
+            with self.subTest(readout=readout), tempfile.TemporaryDirectory() as directory, \
+                    redirect_stdout(io.StringIO()):
+                cfg = ModelCfg(max_objects=5, node_dim=16, latent_dim=24, scene_readout=readout)
+                source, _ = make_algorithm(runner_config(cfg))
+                saved = deepcopy(source.save())
+                saved.update(iter=4, infos=None)
+                path = Path(directory) / "other_readout.pt"
+                torch.save(saved, path)
+                other = "attention" if readout == "full" else "full"
+                target_cfg = runner_config(replace(cfg, scene_readout=other))
+                env = SmallVectorEnv(cfg)
+                target = OnPolicyRunner(env, target_cfg, log_dir=None, device="cpu")
+                before = [{name: value.detach().clone() for name, value in model.named_parameters()}
+                          for model in (target.alg.actor, target.alg.critic)]
+                with self.assertRaisesRegex(ValueError, "model configuration|model.*differs"):
+                    load_checkpoint(target, path)
+                for model, parameters in zip((target.alg.actor, target.alg.critic), before):
+                    for name, value in model.named_parameters():
+                        torch.testing.assert_close(value, parameters[name], rtol=0, atol=0)
+                self.assertFalse(target.alg.optimizer.state)
 
     def test_native_checkpoint_helpers_keep_native_training_resume_and_model_semantics(self):
         cfg = runner_config()

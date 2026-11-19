@@ -1,6 +1,6 @@
 # 연구와 Isaac Lab 개발 맥락
 
-최종 갱신: **2026-11-17, Asia/Seoul**.
+최종 갱신: **2026-11-19, Asia/Seoul**.
 
 밀집 선반에서 Target 접근 공간을 확보하는 비파지 재배치 연구의 목적, 설계가
 바뀐 이유, 현재 구현과 검증 결과, 미결 질문을 유지한다. 새 대화와 개발 작업은
@@ -10,7 +10,29 @@
 이다. 해당 페이지의 연구 기준일은 2026-10-08이며, 2026-10-09에 다시 확인했다.
 이 문서는 그 맥락과 이후 이 저장소에서의 개발을 통합한다.
 
-## 최신 진입점 — 2026-11-17
+## 최신 진입점 — 2026-11-19
+
+**2026-11-19 — Symmetric Hand 초기 자세를 raw action 0에 맞춤.**
+기존 모든 Hand 0rad 초기값은 현재 ToLimits(scale0.5)의 raw−2에 해당했다.
+이제 시작 시6개 master의 URDF 연동 허용 범위 중간값을 구하고 multiplier·offset으로
+12개 관절의 native init_state.joint_pos를 설정한다. 첫 reset 전부터 asset default와
+FK·IK·충돌 검사·실제 reset target이 같은 손 자세를 사용한다. 초기 물리 자세와
+탐색 중심의 불일치를 제거하는 비교 변경이며 Hand mean·std 확대의 원인으로
+확정한 것은 아니다. 학습 중이므로 소스·테스트 수정과 텍스트 검토만 진행했고,
+실행·테스트·GPU 사용은 하지 않았다. 상세는 TRAINING_LOG177절이다.
+
+**2026-11-17 — Attention-only128D 비교 설정 적용, 기존320D 경로 보존.**
+사용자는 현재 비전 갱신 유무 비교에 추가해116절의 보류 실험을 승인했다.
+새 학습 runner의 Actor·Critic은 각각 독립 GNN·역할별 attention context128D만 장면
+표현으로 사용한다. 두 역할의 query 생성은 유지하고 직접 Target64·Blocker64·전체 평균64
+readout을 제외한다. 이력132D를 포함한 MLP 입력은452→260D, 은닉층256→128·ELU는 유지한다.
+`ContactActorCfg.model_cfg.scene_readout="attention"`이며 같은 위치의 주석 처리된
+`"full"` 설정으로 두 모델을320D로 되돌릴 수 있다. CLI에서는 actor·critic 양쪽
+`model_cfg.scene_readout=full`을 지정한다. 비전 주기·reward·termination·curriculum·PPO는
+변경하지 않았다.128D 비교는 기존 비전 갱신 실험과 같은 주기로 새 학습을 시작한다.
+Checkpoint에 readout을 저장하며 이전 필드 누락은full로 정규화한다. play는 저장 당시
+모델을 복원하고 서로 다른 readout으로의 resume는 거부한다. 진행 중인 학습에는 영향이
+없다. 테스트 소스만 추가·수정했고 실행은 하지 않았다. 상세는 TRAINING_LOG176절이다.
 
 **2026-11-17 — Symmetric의 물체 종료를 예제식 object_drop으로 교체.**
 활성 물체 link 원점의 world Z<1.04m 또는 upright 기준 |roll|/|pitch|>0.9rad이면
@@ -304,10 +326,10 @@ GNN과 최적화 edge 커널은 ReLU, attention은 Softmax를 유지한다. 대�
 ReLU 사례와 GAT의 ELU/LeakyReLU 구분, 변경 범위·checkpoint 호환·정적 검증은 **115절**을 따른다.
 학습·시뮬레이션·GPU 실행은 하지 않았다.
 
-**다음 학습을 시작하기 전 사용자에게 다시 알릴 항목:** 현재 scene readout320D와
-**attention-only128D**를 동일 조건에서 비교하는 안을 검토한다. 사용자가 2026-11-07에
-"검토가 끝나고 학습을 돌릴 때" 이 논의를 다시 말해달라고 요청했다. 아직 구조 변경은
-승인·적용하지 않았으며, 현재320D를 유지한다. 배경과 비교 범위는 **TRAINING_LOG116절**을 따른다.
+**2026-11-17 후속:** 학습 재개 때 다시 언급하기로 한 scene readout320D 대
+attention-only128D 비교를 사용자에게 제안했고, 승인에 따라 선택 가능한 설정으로 적용했다.
+새 학습 기본은attention, 이전full 경로는 보존한다. 배경은 **TRAINING_LOG116절**,
+적용·복원 방법과 미실행 검증 범위는 **176절**을 따른다.
 
 현재 Hand는 사용자 승인으로 **PhysX mimic을 제거하고12관절 모두 position drive로 구동**한다.
 Action 출력은 Arm6+Hand6 그대로이며, Hand6개 명령 목표각을 URDF multiplier·offset의 누적

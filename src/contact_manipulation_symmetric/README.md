@@ -1,5 +1,27 @@
 # Contact Manipulation Symmetric
 
+**2026-11-17 Attention-only 비교:** 새 학습의 Actor·Critic은 각각 독립 GNN·역할별
+attention의 출력128D를 장면 표현으로 사용한다. Target·Blocker는 query 생성에 계속
+사용하며, 기존 직접 특징·전체 평균을 붙이는320D 경로도 보존한다. 현재·직전 이력132D를
+합친 MLP 입력은452D에서260D가 되고, 은닉층256→128·ELU와 PPO 설정은 유지한다.
+
+`config/ur5e/agents/rsl_rl_ppo_cfg.py`의 `ContactActorCfg.model_cfg`에서
+`ModelCfg(scene_readout="attention")`을 사용한다. 바로 아래 주석으로 남긴
+`ModelCfg(scene_readout="full")` 줄로 바꾸면 Actor·Critic 모두 기존 구조로 돌아간다.
+파일 수정 없이 기존 학습 명령 뒤에 다음을 붙여320D를 선택할 수도 있다.
+
+```bash
+agent.actor.model_cfg.scene_readout=full agent.critic.model_cfg.scene_readout=full
+```
+
+128D 실험은 새 학습으로 시작하고 기존 비전 갱신 실험의 실행 명령에
+`--run_name attention128`을 추가해 구분한다. 비전 갱신 주기는 이 변경에서 수정하지
+않았으므로 대조군과 같은 값을 명시한다.320D↔128D 사이의 checkpoint 재개는 거부하고,
+play는 저장된 readout을 자동 복원한다. 이전 checkpoint에서 해당 필드가 없으면320D로
+해석한다. 진행 중인 학습은 그대로이며, 실행·테스트는 하지 않았다.
+이 runner를 상속하는 기존 파생 task도 새 기본값을 사용하므로,320D 비교를 유지할 때는
+위의full 설정을 지정한다.
+
 **2026-11-17 물체 종료 조건 통합:** 활성 물체 중 하나라도 link 원점의 world 높이가
 `1.04m` 미만이거나 upright 기준 `|roll|` 또는 `|pitch|`가 `0.9rad`(약51.6°)를 넘으면
 `object_drop`으로 즉시 종료한다. 기존 `object_support_lost`·`object_tilt` 종료 term을
@@ -317,6 +339,12 @@ position drive로 구동한다. `UrdfCoupledHandAction`은 공식 `JointPosition
 `q_i_target = multiplier_i * q_motor_target + offset_i`로12개 목표각을 생성한다.
 기준은 접촉으로 밀린 측정각이 아니라 명령 목표각이다. URDF 해석·관절 ID 조회는 초기화 때
 한 번 수행하며, rollout은 환경 전체의 GPU tensor 연산과 공식 position-target API만 사용한다.
+
+**2026-11-19 Hand 초기 자세:** raw action 0에 해당하는 자세로 시작한다.
+6개 구동 관절의 URDF 연동 허용 범위 중간값을 구하고 multiplier·offset으로
+12개 관절의 기본 각도를 설정한다. 실제 reset·position target·IK 충돌 검사가
+이 기본 자세를 함께 사용한다. 기존 초기값 0rad는 raw action −2에 해당했다.
+학습 중이므로 실행·테스트 없이 수정했으며 다음 실행부터 적용된다.
 
 모든 Hand drive의 초기 PD는20/1, 임시 armature는0.0001kg·m²이며, 원문 URDF의 위치·속도·
 effort 상한(1N·m)은 보존한다.

@@ -12060,3 +12060,88 @@ Object stability 비용과 보상은 유지한다. 사용자가 미리 주석 �
 수치 경계·기준 frame·활성 마스크·현재 world pose·반복 조회·부분 reset·실패 집계를
 확인하는 테스트 소스를 추가/조정했다. **학습 중이므로 테스트·Python import·시뮬레이션·
 학습은 실행하지 않았다.** 검증은 소스 읽기와 텍스트 diff 점검이며 실행 검증은 남아 있다.
+
+## 176. 2026-11-17 — 독립 Actor·Critic의 attention-only128D 실험, full320D 보존
+
+사용자는 현재 비전 갱신 유무의 두 학습에 추가할 실험을 요청했다.116절에서 보류했던
+320D readout 대 attention-only128D 비교를 다시 제안했고, 기존 설정으로 쉽게 돌아갈 수
+있도록 보존한 상태에서 구현하도록 승인했다. 비전 갱신 중인 실험을 대조군으로 삼고
+새 실험도 동일한 갱신 주기·reward·termination·curriculum·PPO 조건을 사용한다.
+
+| 설정 | 장면 표현 | 현재·직전 이력을 포함한 MLP 입력 |
+|---|---|---:|
+| `scene_readout="full"` | Target64 + Blocker64 + attention context128 + 전체 평균64 | 452D |
+| `scene_readout="attention"` | 역할별 attention context 두 개 | 260D |
+
+물체 node64D·GNN2층·ReLU·Target/Blocker 기반 query 두 개·key/value·masked attention은
+같다. 새 경로에서는 최종 장면 출력만128D context로 선택한다. Target·Blocker 특징은
+query 생성에 계속 사용한다. 두66D 로봇·센서 이력, 최종 MLP256→128·ELU와 출력12D/1D는
+그대로이며 Actor·Critic은 각각 별도 encoder·head를 구성하므로 가중치를 공유하지 않는다.
+Readout의 효과와 함께 MLP 입력 차원·파라미터 수도 달라지는 실험임을 고려해야 한다.
+
+`ModelCfg.scene_readout`은 `full`과 `attention`을 허용하고 `scene_dim`으로 scene 출력과
+native MLP 입력 크기를 함께 결정한다. 저장된 기존 계약의 해석을 유지하려고 ModelCfg의
+기본값은full로 남겼으며, **실제 새 학습 runner의 ContactActorCfg는attention을 명시**한다.
+Critic은 이 설정을 상속하되 독립 인스턴스를 만든다. 바로 아래에 주석 처리한full 설정을
+남겨 한 줄 교체로 두 모델을 되돌릴 수 있다. 실행 명령에서도 다음 두 인자를 함께 주면
+소스 수정 없이 기존320D를 사용할 수 있다.
+
+```bash
+agent.actor.model_cfg.scene_readout=full agent.critic.model_cfg.scene_readout=full
+```
+
+새128D 학습은 기존 비전 갱신 실행 명령에 `--run_name attention128`을 추가하여 구분한다.
+현재 비전 주기는 변경하지 않았으므로 대조군에서 사용한 값을 그대로 명시한다.
+재생 시에는 checkpoint의 Actor·Critic readout을 각각 복원한다. 이전 checkpoint의
+필드 누락은full로 정규화하며 native `set_extra_state`에서도 같은 처리를 적용한다.
+따라서 이전320D의 저장된 구조를128D로 오해하지 않는다. 서로 다른 readout의 학습 재개는
+기존 계약 검사에서 거부하고 새 학습을 요구한다. checkpoint의 native 구조 버전·관측 및
+action 계약은 유지하고 readout 선택을 모델 설정에 저장한다.
+
+모델 출력 시작 로그에 readout 종류와 장면 차원을 표시한다. 선택은 모델 초기화 시
+고정되며 runtime tensor에 따른 분기·CPU 전송·새 PhysX/센서 조회를 추가하지 않는다.
+기존full 분기와 파라미터 이름은 보존하고 attention에서는 마지막 직접 특징 결합을 생략한다.
+보상·종료·물리·제어·배치 설정은 수정하지 않았다. 진행 중인 두 학습 프로세스는 그대로이며
+새 실행부터attention 기본값을 사용한다. 같은 runner를 상속하는 기존 파생 task도
+이 선택을 상속하므로320D 비교를 유지하려면full을 명시한다.
+
+Full/context 수치 일치·입력/출력 차원·역할 query의 사용·gradient·독립 가중치와
+이전/새 checkpoint 재생·서로 다른 구조의 resume 거부를 확인하는 테스트 소스를 마련했다.
+**학습 중이므로 테스트·모듈 import·시뮬레이션·학습은 실행하지 않았다.**
+검증은 소스 읽기와 텍스트 diff 점검이며 실행 검증은 남아 있다. 이후 같은 평가 배치에서
+성공 상태 도달률·첫 도달 시간·접촉 중 Blocker 이동량·주변 물체 이동량을 비교한다.
+현재 success 종료가 주석 처리되어 있으므로 종료 횟수로 성공을 대신 측정하지 않는다.
+
+## 177. 2026-11-19 — Hand 초기 자세를 raw action 0의 목표와 일치시킴
+
+사용자는 현재 학습을 유지하면서 실행 없이 Symmetric Hand 초기 자세를 수정하도록
+요청했다. 여기서0은 물리 관절각0rad가 아닌 **raw action 0**을 의미한다.
+기존 관절각0rad는 허용 하한이며 raw−2의 목표였다.
+
+| 항목 | 기존 | 수정 |
+|---|---|---|
+|6개 구동 관절 초기 자세 | 허용 하한0rad | 연동 허용 범위 중간값 |
+| 초기 자세에 해당하는 raw action | −2 |0 |
+| 나머지6개 관절 |0rad | URDF multiplier·offset으로 연동 |
+
+`scene.py:make_ur5e_hand_cfg()`에서 기존 `hand_joint_limits()`의 master 교집합 범위를
+사용한다. 이는 startup `configure_hand_action_limits()`가 native ToLimits에 제공하는
+범위와 같다.6개 master의 중간값을 구한 뒤 `hand_joint_mapping()`으로12개 관절에
+확장하여 native `ArticulationCfg.InitialStateCfg.joint_pos`를 설정한다. 각 자식 관절의
+hard-limit 중간값을 독립적으로 사용하지 않는다.
+
+`RobotPoseModel.from_env()`는 asset의 `default_joint_pos`를 읽고, batched IK는 이 기본값을
+복제한 뒤 UR5e6관절만 갱신한다. 따라서 초기 생성·FK·IK·충돌 검사·에피소드
+reset의 손 자세가 일치한다. `_write_robot_reset()`은 해당 전체 관절값을 상태와
+position target에 같게 쓰고 초기 속도를0으로 둔다. 추가 reset tensor 연산은 없다.
+
+가설은 기존 하한 자세에서 raw0 중심 탐색을 하면 관절 범위 중간으로 움직이며,
+이 초기 조건이 경계 자세 선호에 영향을 주었을 수 있다는 것이다. 현재 로그의
+경계 선호는 후반 Hand std의 큰 확대보다 먼저 나타났지만, 인과관계는 확정하지 않았다.
+이 수정은 초기 자세와 action0의 목표를 일치시키는 비교 조건이며 Gaussian·entropy·
+clipping·action scale·보상·종료·curriculum은 변경하지 않는다.
+
+기존 native actuator 설정 테스트의 fixture와 초기 자세 확인을 수정했다.
+**학습 중이므로 테스트·모듈 import·시뮬레이션·학습을 실행하지 않았다.**
+소스·텍스트 diff만 점검했으며 새 손 자세의 실제 접촉·초기 IK 성공률은 후속 실행에서
+확인한다. 진행 중인 프로세스는 변경하지 않았으며 새 설정은 다음 실행부터 적용된다.
