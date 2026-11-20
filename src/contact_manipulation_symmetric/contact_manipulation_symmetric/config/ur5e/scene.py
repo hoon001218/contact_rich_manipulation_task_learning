@@ -612,7 +612,7 @@ def spawn_ur5e_hand(
         make_instanceable=False,
         self_collision=False,
         collider_type="convex_hull",
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=0.1),
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=5.0),
         activate_contact_sensors=True,
         # The native implicit actuator sets all twelve position-drive gains.
         joint_drive=None,

@@ -219,6 +219,11 @@ def render_overlay(raw_video, output_video, samples, frame_indices, metadata):
             tactile_names = set(pad_names)
             non_pad = [name for name in hand_bodies if name not in tactile_names]
             label(18, 371, f"Non-pad links on object: {len(non_pad)}", MUTED, small)
+            if "minimum_native_contact_separation_m" in sample:
+                gap = sample["minimum_native_contact_separation_m"]
+                depth = "–" if gap is None else f"{1000 * max(0., -float(gap)):.3f} mm"
+                load = sum(sample["hand_body_object_force_N"].values())
+                label(298, 373, f"Link force sum {load:.2f} N  |  Contact depth {depth}", TEXT, tiny)
             label(674, 371, f"Kp {settings.get('stiffness', '?')}  |  Kd {settings.get('damping', '?')}  |  "
                   f"Armature {settings.get('armature', '?')}", MUTED, tiny)
             if "objects" in metadata:

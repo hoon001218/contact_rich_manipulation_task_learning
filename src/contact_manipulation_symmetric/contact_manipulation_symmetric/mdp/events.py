@@ -6489,19 +6489,16 @@ def _robot_start_noise(seeds: wp.array(dtype=wp.int64), noise: wp.array3d(dtype=
 
 
 def _robot_start_singularity_settings(env):
-    """Bind the same enabled native failure and numeric parameters as the MDP.
+    """Bind initial-pose admission independently of runtime termination.
 
     Configuration is host metadata, read once before candidate tensor work or
-    CUDA capture. Standalone IK callers without native termination config keep
-    their original behavior. The resulting tuple also fingerprints both reset
+    CUDA capture. Native starts retain the MDP's margin and threshold even if
+    singularity termination is disabled. Standalone IK callers without MDP
+    configuration keep their original behavior. The tuple fingerprints both reset
     caches, whose captured Python constants must not survive a config change.
     """
     mdp_cfg = getattr(env.cfg, 'mdp', None)
-    termination_cfg = getattr(env.cfg, 'terminations', None)
-    if mdp_cfg is None or termination_cfg is None:
-        return None
-    enabled, _ = configured_terminations(termination_cfg, device='cpu')
-    if not bool(enabled[FAILURE_REASON_NAMES.index('singularity')]):
+    if mdp_cfg is None:
         return None
     body_name = env.cfg.actions.arm_action.body_name
     try:

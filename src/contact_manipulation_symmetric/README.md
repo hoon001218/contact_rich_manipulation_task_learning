@@ -93,10 +93,10 @@ prototype에 물리 재질을 복사하지 않는다.1,024환경에서3,072개�
 앞선 월드 전체3개 공유는 PhysX 병렬 복제에서 native abort를 재현해 대체했다.
 근거는 TRAINING_LOG164절, 물체별 샘플링은165절, 최종 공유 재질 수정은168절을 따른다.
 
-**2026-11-17 초기 높이 여유:** `spawn_rules.spawn_height_offset=0.0001`로
-활성 물체의 upright bounding box 하단을 선반 윗면보다0.1mm 높게 배치한다.
-생성·vision/IK 입력·reset이 같은 높이를 사용한다. 실제 collision 최저점의 간격을
-직접 지정하는 설정은 아니며 선반 통과 현상의 해결 여부는 아직 검증하지 않았다.
+**초기 높이 여유:** `spawn_rules.spawn_height_offset=0.001`로 활성 물체의 upright
+bounding box 하단을 선반 윗면보다 1 mm 높게 배치한다. 생성·vision/IK 입력·reset이 같은
+높이를 사용한다. 1,024환경의 비접촉 reset 비교에서 1 mm 조건의 안착 후 최대 수평 이동은
+0.56 mm였다. 측정 범위와 한계는 [학습 기록](../../docs/TRAINING_LOG.md)을 참고한다.
 
 **2026-11-17 pad 방향 보상:** `blocker_normal_alignment`는 현재 Blocker 중심을 향하는
 **손끝 cap5개를 제외한12개 pad**의 `mean(exp(-a*(1-cosine)))`을 지급한다.

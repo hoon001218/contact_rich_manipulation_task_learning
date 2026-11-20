@@ -179,7 +179,10 @@ class TerminationsCfg:
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     target_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "target_displacement"})
     # invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
-    singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
+    # Reset IK retains its singularity check independently. Swap the two lines
+    # below to restore the runtime termination in both training and playback.
+    # singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
+    singularity: TerminationTermCfg | None = None
     # Actual arm overspeed; the UR5e config selects only the six arm joints.
     hand_velocity = TerminationTermCfg(
         func=joint_vel_out_of_manual_limit,
@@ -233,7 +236,7 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     mdp: MdpCfg = MdpCfg()
     # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(
-        generation_mode="sequential", min_objects=15, spawn_height_offset=0.0001,
+        generation_mode="sequential", min_objects=15, spawn_height_offset=0.001,
         max_objects=int(os.environ.get("CONTACT_MANIPULATION_NUM_OBJECTS", "25")),
     )
     robot_start: RobotStartRules = RobotStartRules()
