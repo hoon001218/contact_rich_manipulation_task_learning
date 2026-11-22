@@ -179,10 +179,8 @@ class TerminationsCfg:
     shelf_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "shelf_displacement"})
     target_displacement = TerminationTermCfg(func=mdp.failure, params={"reason": "target_displacement"})
     # invalid_state = TerminationTermCfg(func=mdp.failure, params={"reason": "invalid_state"})
-    # Reset IK retains its singularity check independently. Swap the two lines
-    # below to restore the runtime termination in both training and playback.
+    # Uncomment to enable both episode termination and the initial IK candidate check.
     # singularity = TerminationTermCfg(func=mdp.failure, params={"reason": "singularity"})
-    singularity: TerminationTermCfg | None = None
     # Actual arm overspeed; the UR5e config selects only the six arm joints.
     hand_velocity = TerminationTermCfg(
         func=joint_vel_out_of_manual_limit,

@@ -1,4 +1,4 @@
-"""CPU geometry and packing checks for the configured spawn clearance."""
+"""CPU geometry/packing checks for the configured 0.1 mm spawn clearance."""
 
 import ast
 import dataclasses
@@ -13,7 +13,7 @@ import test_mdp as mdp_tests
 from test_mdp import episode_reset_fixture, task
 
 
-OFFSET = 0.001
+OFFSET = 0.0001
 
 
 class SpawnHeightOffsetTests(unittest.TestCase):
@@ -22,12 +22,12 @@ class SpawnHeightOffsetTests(unittest.TestCase):
         baseline = task.SpawnRules()
         rules = dataclasses.replace(baseline, spawn_height_offset=OFFSET)
         self.assertEqual(baseline.spawn_height_offset, 0.0)
-        self.assertAlmostEqual(task.object_spawn_height(rules, geometry), 1.058, places=12)
+        self.assertAlmostEqual(task.object_spawn_height(rules, geometry), 1.0571, places=12)
         self.assertAlmostEqual(task.object_spawn_height(rules, geometry)
                                - task.object_spawn_height(baseline, geometry), OFFSET, places=12)
         mapping_rules = dict(shelf_top=1.05, spawn_height_offset=OFFSET)
         mapping_geometry = dict(lower=geometry.lower)
-        self.assertAlmostEqual(task.object_spawn_height(mapping_rules, mapping_geometry), 1.058, places=12)
+        self.assertAlmostEqual(task.object_spawn_height(mapping_rules, mapping_geometry), 1.0571, places=12)
         self.assertAlmostEqual(task.object_spawn_height(dict(shelf_top=1.05), mapping_geometry), 1.057,
                                places=12)
 
@@ -115,7 +115,7 @@ class SpawnHeightOffsetTests(unittest.TestCase):
         torch.testing.assert_close(actual[ids, :, 7:], torch.zeros_like(source[..., 7:]), rtol=0, atol=0)
         torch.testing.assert_close(source, original_source, rtol=0, atol=0)
 
-    def test_current_task_explicitly_selects_one_millimetre(self):
+    def test_current_task_explicitly_selects_point_one_millimetre(self):
         path = Path(__file__).resolve().parents[1] / 'contact_manipulation_symmetric/shelf_manipulation_env_cfg.py'
         module = ast.parse(path.read_text())
         cfg = next(node for node in module.body

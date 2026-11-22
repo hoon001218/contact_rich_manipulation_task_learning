@@ -5493,9 +5493,8 @@ class NativeAdapterTests(unittest.TestCase):
             exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)
         cfg = {name: value for name, value in vars(namespace['TerminationsCfg']).items()
                if isinstance(value, TermCfg)}
-        self.assertIsNone(namespace['TerminationsCfg'].singularity)
         self.assertNotIn('singularity', cfg)
-        # This fixture exercises every cause, including explicit runtime opt-ins.
+        self.assertNotIn('invalid_state', cfg)
         for reason in ('invalid_state', 'singularity'):
             cfg[reason] = TermCfg(func=terminations.failure, params={'reason': reason})
         expected_names = {'time_out', 'object_drop',
@@ -10433,7 +10432,7 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
         terminated = ~torch.isfinite(values) | (values <= threshold)
         torch.testing.assert_close(keep, ~terminated)
 
-    def test_reset_singularity_filter_is_independent_of_runtime_termination_and_caches_numeric_settings(self):
+    def test_enabled_singularity_configuration_invalidates_cached_reset_inputs(self):
         model = self.model()
         model.shelf_boxes = []
         geometry = tuple(task.ObjectGeometry(str(i), (-.02, -.02, 0.), (.02, .02, .08)) for i in range(2))
@@ -10458,19 +10457,11 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
         with patch.object(model, 'solve_batch', side_effect=solve), \
              patch.object(task, '_robot_candidate_clearance',
                           side_effect=lambda _env, frames, *_a: (torch.ones(len(frames), dtype=torch.bool),
-                                                                 torch.full((len(frames),), .1))), \
-             patch.object(task, '_robot_start_nonsingular', wraps=task._robot_start_nonsingular) as check:
-            task._sample_robot_starts(env, [sample], [17], scene_cache=cache, max_attempts=1)
-            check.assert_called_once()
-            disabled_settings = task._robot_start_singularity_settings(env)
-            self.assertIsNotNone(disabled_settings)
-            self.assertEqual(disabled_settings[3], cfg.mdp.singularity_termination_threshold)
+                                                                 torch.full((len(frames),), .1))):
+            with patch.object(task, '_robot_start_nonsingular', side_effect=AssertionError('disabled criterion evaluated')):
+                task._sample_robot_starts(env, [sample], [17], scene_cache=cache, max_attempts=1)
             keys.append(cache.robot[0])
             cfg.terminations.singularity = term
-            task._sample_robot_starts(env, [sample], [17], scene_cache=cache, max_attempts=1)
-            keys.append(cache.robot[0])
-            self.assertEqual(task._robot_start_singularity_settings(env), disabled_settings)
-            cfg.terminations.singularity = None
             task._sample_robot_starts(env, [sample], [17], scene_cache=cache, max_attempts=1)
             keys.append(cache.robot[0])
             cfg.mdp.singularity_termination_threshold *= 2
@@ -10485,15 +10476,10 @@ class BatchedRobotKinematicsTests(unittest.TestCase):
             cfg.terminations.singularity = None
             task._sample_robot_starts(env, [sample], [17], scene_cache=cache, max_attempts=1)
             keys.append(cache.robot[0])
-            self.assertEqual(check.call_count, len(keys))
-        self.assertEqual(keys[0], keys[1])
-        self.assertEqual(keys[0], keys[2])
-        self.assertEqual(keys[-2], keys[-1])
-        self.assertEqual(len(set(keys)), 4)
+        self.assertEqual(keys[0], keys[-1])
+        self.assertEqual(len(set(keys)), 5)
         self.assertEqual(getter.call_count, 1)
-        self.assertIsNotNone(task._robot_start_singularity_settings(env))
-        enabled, _ = terminations.configured_terminations(cfg.terminations, device='cpu')
-        self.assertFalse(enabled[terminations.FAILURE_REASON_NAMES.index('singularity')])
+        self.assertIsNone(task._robot_start_singularity_settings(env))
         # Both captured-dispatch and scene-input cache keys fingerprint the
         # same host settings; candidate tensors never materialize a host scalar.
         tree = ast.parse(Path(task.__file__).read_text())
