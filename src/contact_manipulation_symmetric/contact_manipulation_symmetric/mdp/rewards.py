@@ -23,6 +23,7 @@ __all__ = [
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "blocker_relocation_distance_progress",
     "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
+    "blocker_pose_hold",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -165,7 +166,7 @@ def blocker_normal_alignment_quality(pad_points, pad_normals, blocker_center,
 
 
 def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0)),
-                             exclude_fingertips=True):
+                             exclude_fingertips=True, *, stop_on_success=False):
     """Pay facing quality for the 12 palmar pads, excluding five fingertip caps.
 
     Canonical points/normals still contain all 17 sensors. Only this reward
@@ -196,7 +197,8 @@ def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi 
     # Transition geometry removes cloned environment origins, whereas native
     # pad body poses are world-frame. Restore the origin before subtracting.
     center_w = state.blocker_center + env.scene.env_origins
-    return blocker_normal_alignment_quality(points, normals, center_w, decay=decay)
+    quality = blocker_normal_alignment_quality(points, normals, center_w, decay=decay)
+    return torch.where(state.success, 0.0, quality) if stop_on_success else quality
 
 
 def _blocker_pad_distances(pad_points, blocker_center, blocker_rotation, blocker_half_extent):
@@ -349,13 +351,20 @@ def clearance_contact_progress(env, threshold=0.01):
     return _current_blocker_contact_count(env, threshold) * progress
 
 
-def clearance_contact_improvement(env, threshold=0.01):
+def _before_success(env, score):
+    from .events import get_task_state
+
+    return torch.where(get_task_state(env).success, 0.0, score)
+
+
+def clearance_contact_improvement(env, threshold=0.01, *, stop_on_success=False):
     """Positive part of the existing contact-weighted one-step progress.
 
     The native RewardManager applies a positive weight and dt. The original
     signed function stays available for older reward configurations.
     """
-    return clearance_contact_progress(env, threshold=threshold).clamp_min(0.0)
+    reward = clearance_contact_progress(env, threshold=threshold).clamp_min(0.0)
+    return _before_success(env, reward) if stop_on_success else reward
 
 
 def clearance_regression(env):
@@ -382,7 +391,7 @@ def _current_blocker_pad_distances(env):
     return _blocker_pad_distances(tactile_pad_points(env), center, rotation, (upper - lower) * .5)
 
 
-def blocker_distance(env, decay=math.log(2.0) / 0.10):
+def blocker_distance(env, decay=math.log(2.0) / 0.10, *, stop_on_success=False):
     """Original current-distance quality; pay only while Target remains protected."""
     from .events import get_task_state
 
@@ -390,7 +399,8 @@ def blocker_distance(env, decay=math.log(2.0) / 0.10):
         raise ValueError("Distance decay must be finite and positive.")
     state = get_task_state(env)
     quality = torch.exp(-decay * _current_blocker_pad_distances(env)).mean(-1)
-    return torch.where(state.target_protected, quality, 0.0)
+    eligible = (state.target_protected & ~state.success) if stop_on_success else state.target_protected
+    return torch.where(eligible, quality, 0.0)
 
 
 @torch.no_grad()
@@ -474,7 +484,7 @@ def blocker_relocation(env, decay=math.log(2.0) / 0.10):
     return torch.exp(-decay * distance)
 
 
-def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, threshold=0.01):
+def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, threshold=0.01, *, stop_on_success=False):
     """Current Blocker pad count times positive relocation-quality improvement.
 
     Preserve the original exp(-decay * distance) quality and fixed reset-time
@@ -494,6 +504,8 @@ def blocker_relocation_contact_progress(env, decay=math.log(2.0) / 0.10, thresho
     progress = _positive_improvement(current, torch.exp(-decay * previous_distance))
     valid = (torch.isfinite(state.blocker_center).all(-1)
              & torch.isfinite(state.previous_blocker_center).all(-1))
+    if stop_on_success:
+        valid = valid & ~state.success
     return _current_blocker_contact_count(env, threshold) * torch.where(valid, progress, 0.0)
 
 
@@ -541,11 +553,12 @@ def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.0
     return _current_blocker_contact_count(env, threshold) * progress
 
 
-def blocker_relocation_distance_improvement(env, reference_speed=4.0, threshold=0.01):
+def blocker_relocation_distance_improvement(env, reference_speed=4.0, threshold=0.01, *, stop_on_success=False):
     """Positive normalized approach progress weighted by current contact pads."""
-    return blocker_relocation_distance_progress(
+    reward = blocker_relocation_distance_progress(
         env, reference_speed=reference_speed, threshold=threshold,
     ).clamp_min(0.0)
+    return _before_success(env, reward) if stop_on_success else reward
 
 
 def blocker_relocation_distance_regression(env, reference_speed=4.0):
@@ -555,6 +568,18 @@ def blocker_relocation_distance_regression(env, reference_speed=4.0):
     Losing contact does not waive worsening; pad count never scales this cost.
     """
     return (-_relocation_distance_change(env, reference_speed)).clamp_min(0.0)
+
+
+def blocker_pose_hold(env, half_distance=0.001):
+    """Score the mean Blocker OBB corner displacement during current valid success."""
+    from .events import get_task_state
+
+    if not math.isfinite(half_distance) or half_distance <= 0.0:
+        raise ValueError("Pose hold half distance must be finite and positive.")
+    state = get_task_state(env)
+    distance = state.blocker_pose_change
+    quality = torch.exp(-math.log(2.0) * distance / half_distance)
+    return torch.where(state.success & torch.isfinite(distance), quality, 0.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

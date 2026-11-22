@@ -16,7 +16,7 @@ class AccessBackWallEnvCfg(ExperimentEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.rewards.blocker_relocation.func = mdp.blocker_relocation_contact_progress
-        self.rewards.blocker_relocation.params = {"decay": 10.0}
+        self.rewards.blocker_relocation.params = {"decay": 10.0, "stop_on_success": True}
 
 
 @configclass

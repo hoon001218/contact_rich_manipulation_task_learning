@@ -680,7 +680,7 @@ class BlockerContactHold(ManagerTermBase):
         # Keep the global timestamp: resetting one row cannot advance another
         # row's contact history or re-read the previous episode's last sample.
 
-    def __call__(self, env, threshold=0.01):
+    def __call__(self, env, threshold=0.01, *, stop_on_success=False):
         from .events import get_task_state
         from .rewards import blocker_contact_hold
 
@@ -701,9 +701,9 @@ class BlockerContactHold(ManagerTermBase):
             self.new_count.copy_(new)
             self.previous_contact.copy_(current)
             self.last_step = env.common_step_counter
-        # Keep contact history current while gated so restoring the Target
-        # resumes ordinary consecutive-sample contact evaluation.
-        return (self.held_count + 0.5 * self.new_count) * state.target_protected
+        # Keep consecutive samples current across both reward phases.
+        eligible = (state.target_protected & ~state.success) if stop_on_success else state.target_protected
+        return (self.held_count + 0.5 * self.new_count) * eligible
 
 
 def make_tactile_contact_cfg(body_names: tuple[str, ...]) -> ContactSensorCfg:

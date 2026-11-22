@@ -18,7 +18,9 @@ class RelocationDistanceEnvCfg(ExperimentEnvCfg):
         self.rewards.blocker_relocation.func = mdp.blocker_relocation_distance_improvement
         # Reference distance = official TCP speed * actual policy step duration.
         # At the unchanged 50 Hz this is 4.0 m/s * 0.02 s = 0.08 m.
-        self.rewards.blocker_relocation.params = {"reference_speed": 4.0, "threshold": 0.01}
+        self.rewards.blocker_relocation.params = {
+            "reference_speed": 4.0, "threshold": 0.01, "stop_on_success": True,
+        }
 
 
 @configclass

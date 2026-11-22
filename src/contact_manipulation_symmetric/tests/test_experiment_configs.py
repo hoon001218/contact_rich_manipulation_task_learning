@@ -150,7 +150,15 @@ class ExperimentConfigurationTests(unittest.TestCase):
         self.assertTrue(baseline["relocation_include_front_corridors"])
         relocation = baseline["rewards"]["blocker_relocation"]
         self.assertIs(relocation["func"], self.mdp.blocker_relocation_distance_improvement)
-        self.assertEqual(relocation["params"], {"reference_speed": 4.0, "threshold": 0.01})
+        self.assertEqual(relocation["params"], {
+            "reference_speed": 4.0, "threshold": 0.01, "stop_on_success": True,
+        })
+        for name in ("clearance", "blocker_distance", "blocker_contact_hold", "blocker_normal_alignment"):
+            self.assertTrue(baseline["rewards"][name]["params"]["stop_on_success"])
+        pose_hold = baseline["rewards"]["blocker_pose_hold"]
+        self.assertIs(pose_hold["func"], self.mdp.blocker_pose_hold)
+        self.assertEqual(pose_hold["weight"], 5.0)
+        self.assertEqual(pose_hold["params"], {"half_distance": 0.001})
         self.assertNotIn("clearance_regression", baseline["rewards"])
         self.assertNotIn("blocker_relocation_regression", baseline["rewards"])
         # Research weights may be tuned independently; variants below must
@@ -165,7 +173,7 @@ class ExperimentConfigurationTests(unittest.TestCase):
                     expected["relocation_include_front_corridors"] = False
                     expected["rewards"]["blocker_relocation"]["func"] = (
                         self.mdp.blocker_relocation_contact_progress)
-                    expected["rewards"]["blocker_relocation"]["params"] = {"decay": 10.0}
+                    expected["rewards"]["blocker_relocation"]["params"] = {"decay": 10.0, "stop_on_success": True}
                 # Learning 1/3 keep the original access depth; only the main
                 # task combines metric relocation with rear-wall access now.
                 expected["access_region_to_back_wall"] = variant == "access_back_wall"

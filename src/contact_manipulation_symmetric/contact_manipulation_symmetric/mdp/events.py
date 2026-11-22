@@ -572,6 +572,8 @@ class TaskState:
         self.object_motion_cost = zeros(n)
         self.blocker_center = torch.full((n, 3), math.nan, device=device, dtype=dtype)
         self.previous_blocker_center = self.blocker_center.clone()
+        self._blocker_corners = self.blocker_center.new_full((n, 8, 3), math.nan)
+        self.blocker_pose_change = zeros(n)
         # Immutable scene metadata is attached at reset as broadcast views.
         # No region geometry is rebuilt or copied per environment/physics step.
         self.relocation_regions = zeros(n, 0, 3, 2)
@@ -626,6 +628,15 @@ class TaskState:
         self.blocker_overlap = zeros(n)
         self.singularity_margin = zeros(n)
 
+    @staticmethod
+    def _blocker_geometry(center, corners, role):
+        """Select the designated Blocker's center and corresponding OBB corners."""
+        index = role.long().argmax(-1)
+        unique = role.sum(-1) == 1
+        center = center.gather(1, index[:, None, None].expand(-1, 1, 3)).squeeze(1)
+        corners = corners.gather(1, index[:, None, None, None].expand(-1, 1, 8, 3)).squeeze(1)
+        return torch.where(unique[:, None], center, math.nan), torch.where(unique[:, None, None], corners, math.nan)
+
     @torch.no_grad()
     def reset(self, ids, batch, *, geometry_b, geometry_valid, active, target, blocker,
               access_region, workspace_bounds, shelf_top, ceiling, shelf_local_corners,
@@ -650,9 +661,11 @@ class TaskState:
             getattr(self, name)[ids] = value[rows]
         self.initial_shelf_pose[ids] = batch.shelf_pose[rows]
         role = self.blocker[ids] & self.active[ids]
-        center = batch.center[rows].gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
-        self.blocker_center[ids] = torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan)
-        self.previous_blocker_center[ids] = self.blocker_center[ids]
+        center, corners = self._blocker_geometry(batch.center[rows], batch.corners[rows], role)
+        self.blocker_center[ids] = center
+        self.previous_blocker_center[ids] = center
+        self._blocker_corners[ids] = corners
+        self.blocker_pose_change[ids] = 0.0
         self.initial_target_pose[ids] = 0
         if self.bindings is not None and hasattr(self.bindings, "objects"):
             target_slots = self.target[ids].long().argmax(-1)
@@ -774,8 +787,10 @@ class TaskState:
         self.previous_clearance_quality.copy_(torch.where(
             torch.isfinite(self.blocker_overlap), self.clearance_quality, math.nan))
         role = self.blocker & self.active
-        center = batch.center.gather(1, role.long().argmax(-1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
-        self.blocker_center.copy_(torch.where(role.sum(-1, keepdim=True) == 1, center, math.nan))
+        center, corners = self._blocker_geometry(batch.center, batch.corners, role)
+        self.blocker_center.copy_(center)
+        self.blocker_pose_change.copy_(torch.linalg.vector_norm(corners - self._blocker_corners, dim=-1).mean(-1))
+        self._blocker_corners.copy_(corners)
         if singularity is None:
             self.singularity_margin.fill_(self.cfg.motion_singularity_threshold)
         else:

@@ -741,7 +741,7 @@ class EpisodeMinimumDistanceTests(unittest.TestCase):
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
         self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_distance')
         self.assertEqual(ast.literal_eval(fields['weight']), 5.)
-        self.assertEqual(ast.literal_eval(fields['params']), {'decay': 10.})
+        self.assertEqual(ast.literal_eval(fields['params']), {'decay': 10., 'stop_on_success': True})
         for decay in (0., -1., math.nan, math.inf):
             with self.subTest(decay=decay):
                 for function in (rewards.blocker_min_distance, rewards.blocker_distance):
@@ -868,7 +868,7 @@ class RelocationRewardTests(unittest.TestCase):
         self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_improvement')
         self.assertGreater(ast.literal_eval(fields['weight']), 0.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
-        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01})
+        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01, 'stop_on_success': True})
         names = {node.targets[0].id for node in definition.body if isinstance(node, ast.Assign)}
         self.assertNotIn('blocker_relocation_regression', names)
 
@@ -885,6 +885,36 @@ class ContactProgressRewardTests(unittest.TestCase):
         state.relocation_regions = polygon[None, None].expand(len(batch.center), 1, -1, -1)
         state.relocation_vertex_counts = torch.full((len(batch.center), 1), 4, dtype=torch.long)
         state.relocation_valid = torch.ones((len(batch.center), 1), dtype=torch.bool)
+
+    def test_manipulation_rewards_stop_on_first_success_and_resume_after_losing_it(self):
+        state, batch, _ = fixture(2)
+        self.regions(state, batch)
+        batch.center[:, 1, 0] += .07
+        batch.corners[:, 1, :, 0] += .07
+        state.advance(batch, 1)
+        self.assertFalse(state.success.any())
+
+        points = state.blocker_center[:, None].expand(-1, 17, -1).clone()
+        points[..., 0] -= .1
+        normals = torch.zeros_like(points)
+        normals[..., 0] = 1.0
+        env = SimpleNamespace(step_dt=.02, scene=SimpleNamespace(env_origins=state.env_origins))
+        terms = (rewards.clearance_contact_improvement, rewards.blocker_relocation_distance_improvement,
+                 rewards.blocker_relocation_contact_progress, rewards.blocker_distance,
+                 rewards.blocker_normal_alignment)
+        with patch.object(task, 'get_task_state', return_value=state), \
+             patch.object(rewards, '_current_blocker_contact_count', return_value=torch.ones_like(state.blocker_overlap)), \
+             patch.object(rewards, '_current_blocker_pad_distances', return_value=points.new_full((2, 17), .1)), \
+             patch.object(rewards, 'tactile_pad_frames', return_value=(points, normals)):
+            for term in terms:
+                with self.subTest(term=term.__name__):
+                    params = {'exclude_fingertips': False} if term is rewards.blocker_normal_alignment else {}
+                    before = term(env, stop_on_success=True, **params)
+                    self.assertTrue((before > 0.0).all())
+                    state.success[1] = True
+                    torch.testing.assert_close(term(env, stop_on_success=True, **params), before * before.new_tensor([1., 0.]))
+                    state.success[1] = False
+                    torch.testing.assert_close(term(env, stop_on_success=True, **params), before)
 
     def test_clearance_pays_current_contact_count_times_signed_step_change(self):
         quality = torch.tensor([.3, .4, .1, .2, -.3, math.nan, .5], dtype=torch.float64)
@@ -4630,6 +4660,31 @@ class CudaGraphSwitchTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_success_pose_hold_uses_adjacent_obb_corners_and_rebases_reset_rows(self):
+        state, batch, reset = fixture(3)
+        state.dt = .02
+        batch.center[:, 1, 0] += .4
+        batch.corners[:, 1, :, 0] += .4
+        state.advance(batch, 1)
+        self.assertTrue(state.success.all())
+        batch.center[1, 1, 0] += .001
+        batch.corners[1, 1, :, 0] += .001
+        batch.corners[2, 1, :, :2] = 2 * batch.center[2, 1, :2] - batch.corners[2, 1, :, :2]
+        batch.rotation[2, 1] = batch.rotation.new_tensor([0., 0., 0., 1.])
+        state.advance(batch, 2)
+        expected_motion = batch.center.new_tensor([0., .001, math.hypot(.1, .1)])
+        torch.testing.assert_close(state.blocker_pose_change, expected_motion)
+        env = SimpleNamespace(step_dt=state.dt)
+        with patch.object(task, 'get_task_state', return_value=state):
+            torch.testing.assert_close(rewards.blocker_pose_hold(env), 2.0 ** (-expected_motion / .001))
+            batch.center[2, 1, 0] += .1
+            batch.corners[2, 1, :, 0] += .1
+            state.reset(torch.tensor([2]), batch, **reset, step=2)
+            self.assertEqual(rewards.blocker_pose_hold(env)[2], 0.0)
+            self.assertAlmostEqual(float(state.blocker_pose_change[1]), .001)
+            state.advance(batch, 3)
+            torch.testing.assert_close(rewards.blocker_pose_hold(env), expected_motion.new_ones(3))
+
     @unittest.skipUnless(torch.cuda.is_available(), 'Support replay cache requires CUDA.')
     def test_support_graph_tracks_new_samples_counters_partial_reset_and_inference_modes(self):
         _, source, reset = fixture(4, dtype=torch.float32)
@@ -9155,6 +9210,18 @@ class BlockerContactManagerTests(unittest.TestCase):
         sensor.contact(0, 9, 1)  # A non-Blocker contact cannot earn hold reward.
         sensor.contact(1, 16, 3)
         sensor.contact(2, 8, 3)
+
+    def test_success_masks_payment_without_resetting_consecutive_contacts(self):
+        env, sensor, _, term = self.fixture()
+        self.seed_contacts(sensor)
+        state = SimpleNamespace(target_protected=torch.ones(3, dtype=torch.bool),
+                                success=torch.tensor([True, False, False]))
+        with patch.object(task, 'get_task_state', return_value=state):
+            env.common_step_counter = 1
+            torch.testing.assert_close(term(env, stop_on_success=True), torch.tensor([0., .5, .5]))
+            env.common_step_counter = 2
+            state.success[0] = False
+            torch.testing.assert_close(term(env, stop_on_success=True), torch.tensor([2., 1., 1.]))
 
     def test_lazy_registration_and_single_column_native_pad_order_and_step_cache(self):
         env, sensor, _, term = self.fixture(configure=False)
