@@ -23,7 +23,7 @@ __all__ = [
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "blocker_relocation_distance_progress",
     "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
-    "blocker_pose_hold",
+    "blocker_pose_hold", "eef_access_front",
     "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
@@ -570,16 +570,46 @@ def blocker_relocation_distance_regression(env, reference_speed=4.0):
     return (-_relocation_distance_change(env, reference_speed)).clamp_min(0.0)
 
 
-def blocker_pose_hold(env, half_distance=0.001):
-    """Score the mean Blocker OBB corner displacement during current valid success."""
+def blocker_pose_hold(env, half_distance=0.001, *, success_confirmation_steps=0):
+    """Score the mean OBB corner displacement after the success confirmation window."""
     from .events import get_task_state
+    from .terminations import _success_duration_steps
 
     if not math.isfinite(half_distance) or half_distance <= 0.0:
         raise ValueError("Pose hold half distance must be finite and positive.")
+    if type(success_confirmation_steps) is not int or success_confirmation_steps < 0:
+        raise ValueError("Pose hold confirmation must be a nonnegative number of policy steps.")
     state = get_task_state(env)
+    eligible = state.success
+    if success_confirmation_steps:
+        # This transition's action was chosen after confirmation only when the
+        # streak already qualified at the preceding state. Current success is required too.
+        required = _success_duration_steps(state.cfg, state.dt) + success_confirmation_steps
+        eligible = eligible & (state.stable_count >= required)
     distance = state.blocker_pose_change
     quality = torch.exp(-math.log(2.0) * distance / half_distance)
-    return torch.where(state.success & torch.isfinite(distance), quality, 0.0)
+    return torch.where(eligible & torch.isfinite(distance), quality, 0.0)
+
+
+def eef_access_front(env, front_offset=0.06, half_distance=0.10, *,
+                     blocker_half_distance=0.001, success_confirmation_steps=3):
+    """Guide the OSC control-frame origin toward the cleared corridor entrance."""
+    from .events import get_task_state
+
+    if not math.isfinite(front_offset) or front_offset < 0.0:
+        raise ValueError("EEF front offset must be finite and nonnegative.")
+    if not math.isfinite(half_distance) or half_distance <= 0.0:
+        raise ValueError("EEF front half distance must be finite and positive.")
+    state = get_task_state(env)
+    bindings = state.bindings
+    eef_xy = bindings.robot.data.body_link_pos_w[:, bindings.tcp_id, :2] - state.env_origins[:, :2]
+    access = state.access_region
+    target_xy = torch.stack((access[:, 1] + front_offset, (access[:, 2] + access[:, 3]) * 0.5), dim=-1)
+    distance = torch.linalg.vector_norm(eef_xy - target_xy, dim=-1)
+    proximity = torch.exp(-math.log(2.0) * distance / half_distance)
+    pose_hold = blocker_pose_hold(env, half_distance=blocker_half_distance,
+                                  success_confirmation_steps=success_confirmation_steps)
+    return torch.where(torch.isfinite(distance), proximity * pose_hold, 0.0)
 
 
 def object_motion_cost(center, corners, velocity, active, blocker, target):

@@ -61,12 +61,16 @@ def scene_time_out(env):
     return expired
 
 
+def _success_duration_steps(cfg, step_dt):
+    if not math.isfinite(step_dt) or step_dt <= 0:
+        raise ValueError("step_dt must be finite and positive.")
+    return max(1, math.ceil(cfg.success_duration / step_dt - 1.e-9))
+
+
 def terminal_transition(success_candidate, failure, stable_count, success_paid, failure_paid, cfg,
                         *, step_dt=0.01):
     """Pay success once independently of termination, and a later failure once."""
-    if not math.isfinite(step_dt) or step_dt <= 0:
-        raise ValueError("step_dt must be finite and positive.")
-    stable_steps = max(1, math.ceil(cfg.success_duration / step_dt - 1.e-9))
+    stable_steps = _success_duration_steps(cfg, step_dt)
     successful = success_candidate & (stable_count >= stable_steps) & ~failure
     fresh_success = successful & ~success_paid & ~failure_paid
     fresh_failure = failure & ~failure_paid

@@ -741,7 +741,7 @@ class EpisodeMinimumDistanceTests(unittest.TestCase):
         fields = {keyword.arg: keyword.value for keyword in term.keywords}
         self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_distance')
         self.assertEqual(ast.literal_eval(fields['weight']), 5.)
-        self.assertEqual(ast.literal_eval(fields['params']), {'decay': 10., 'stop_on_success': True})
+        self.assertEqual(ast.literal_eval(fields['params']), {'decay': 10.})
         for decay in (0., -1., math.nan, math.inf):
             with self.subTest(decay=decay):
                 for function in (rewards.blocker_min_distance, rewards.blocker_distance):
@@ -868,7 +868,7 @@ class RelocationRewardTests(unittest.TestCase):
         self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_improvement')
         self.assertGreater(ast.literal_eval(fields['weight']), 0.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
-        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01, 'stop_on_success': True})
+        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01})
         names = {node.targets[0].id for node in definition.body if isinstance(node, ast.Assign)}
         self.assertNotIn('blocker_relocation_regression', names)
 
@@ -4660,6 +4660,52 @@ class CudaGraphSwitchTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_eef_access_front_uses_osc_link_environment_xy_and_the_confirmed_success_gate(self):
+        origins = torch.tensor([[0., 0., 0.], [10., -15., 0.]], dtype=torch.float64).repeat(4, 1)
+        access = origins.new_tensor([-.89, -.51, -.2, .4]).expand(8, -1).clone()
+        access[1, 2:] -= .2  # A different lateral center in the translated environment.
+        position = origins.new_zeros((8, 2, 3))
+        position[:, 1, 0] = origins[:, 0] - .45
+        position[:, 1, 1] = origins[:, 1] + access[:, 2:].mean(-1)
+        position[1, 1, 2] = 1.3
+        position[2, 1, 1] += .10
+        position[3, 1, 0] -= .10
+        position[7, 1, 0] = math.nan
+        state = SimpleNamespace(
+            access_region=access, env_origins=origins, dt=.02, cfg=task.MdpCfg(),
+            bindings=SimpleNamespace(tcp_id=1, robot=SimpleNamespace(data=SimpleNamespace(body_link_pos_w=position))),
+            success=torch.tensor([True, True, True, True, True, True, False, True]),
+            stable_count=torch.tensor([4, 4, 4, 4, 4, 3, 0, 4]),
+            blocker_pose_change=origins.new_tensor([0., 0., 0., 0., .001, 0., 0., 0.]),
+        )
+        with patch.object(task, 'get_task_state', return_value=state):
+            torch.testing.assert_close(rewards.eef_access_front(SimpleNamespace()),
+                                       origins.new_tensor([1., 1., .5, .5, .5, 0., 0., 0.]))
+
+    def test_pose_hold_confirmation_starts_after_three_success_steps_and_closes_on_loss(self):
+        for success_duration, first_reward_step in ((0.0, 4), (.04, 5)):
+            with self.subTest(success_duration=success_duration):
+                state, batch, reset = fixture(2)
+                state.dt = .02
+                state.cfg.success_duration = success_duration
+                batch.center[:, 1, 0] += .4
+                batch.corners[:, 1, :, 0] += .4
+                env = SimpleNamespace(step_dt=state.dt)
+                with patch.object(task, 'get_task_state', return_value=state):
+                    for step in range(1, first_reward_step + 1):
+                        state.advance(batch, step)
+                        score = rewards.blocker_pose_hold(env, success_confirmation_steps=3)
+                        torch.testing.assert_close(score, score.new_full((2,), float(step == first_reward_step)))
+                    batch.center[0, 1, 0] -= .4
+                    batch.corners[0, 1, :, 0] -= .4
+                    state.advance(batch, first_reward_step + 1)
+                    score = rewards.blocker_pose_hold(env, success_confirmation_steps=3)
+                    torch.testing.assert_close(score, score.new_tensor([0., 1.]))
+                    state.reset(torch.tensor([1]), batch, **reset, step=first_reward_step + 1)
+                    state.advance(batch, first_reward_step + 2)
+                    score = rewards.blocker_pose_hold(env, success_confirmation_steps=3)
+                    torch.testing.assert_close(score, score.new_zeros(2))
+
     def test_success_pose_hold_uses_adjacent_obb_corners_and_rebases_reset_rows(self):
         state, batch, reset = fixture(3)
         state.dt = .02

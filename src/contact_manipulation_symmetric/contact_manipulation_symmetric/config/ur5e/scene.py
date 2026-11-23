@@ -152,7 +152,7 @@ FINGERTIP_BODY_NAMES = (
     "right_ring_force_sensor_3",
     "right_little_force_sensor_3",
 )
-# Hand placement/IK reference and tactile pad; the OSC/observation EEF is wrist_3_link.
+# Hand placement/IK uses the palm pad. OSC and observations use the F/T datum.
 TCP_BODY_NAME = "right_plam_force_sensor"
 FORCE_TORQUE_PROXIMAL_BODY_NAME = "SensorMountProximal"
 FORCE_TORQUE_BODY_NAME = "ToolForceTorqueLink"
