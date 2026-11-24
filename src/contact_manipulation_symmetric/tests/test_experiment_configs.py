@@ -148,6 +148,7 @@ class ExperimentConfigurationTests(unittest.TestCase):
             self.assertIs(terminal["func"], self.mdp.terminal)
         self.assertTrue(baseline["access_region_to_back_wall"])
         self.assertTrue(baseline["relocation_include_front_corridors"])
+        self.assertEqual(baseline["mdp"]["finish_contact_confirmation_steps"], 3)
         relocation = baseline["rewards"]["blocker_relocation"]
         self.assertIs(relocation["func"], self.mdp.blocker_relocation_distance_improvement)
         self.assertEqual(relocation["params"], {"reference_speed": 4.0, "threshold": 0.01})

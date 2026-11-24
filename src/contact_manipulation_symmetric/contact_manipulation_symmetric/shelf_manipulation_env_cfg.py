@@ -244,7 +244,7 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     scene_object_curriculum_end_iteration: int = 45000
     # Runtime sampling bounds only. Never resize the physical pool/observation.
     spawn_object_count_range: tuple[int, int] | None = None
-    mdp: MdpCfg = MdpCfg()
+    mdp: MdpCfg = MdpCfg(finish_contact_confirmation_steps=3)
     # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(
         generation_mode="sequential", min_objects=15, spawn_height_offset=0.001,

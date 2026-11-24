@@ -4660,6 +4660,38 @@ class CudaGraphSwitchTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_finish_rewards_confirm_success_with_blocker_contact_and_continue_after_release(self):
+        env, _, _ = native_fixture(3)
+        env.cfg.mdp.finish_contact_confirmation_steps = 3
+        task.reset_task(env)
+        blocker_x = env.scene['object_collection'].data.object_link_pose_w[:, 0, 0]
+        blocker_x += .5
+        with patch.object(task, '_current_blocker_contact_count') as contacts:
+            def evaluate(step, counts, expected_gate):
+                env.common_step_counter = step
+                contacts.return_value = torch.tensor(counts)
+                pose_hold = rewards.blocker_pose_hold(env, success_confirmation_steps=3)
+                eef_front = rewards.eef_access_front(env)
+                self.assertEqual((pose_hold > 0).tolist(), expected_gate)
+                self.assertEqual((eef_front > 0).tolist(), expected_gate)
+                self.assertEqual(contacts.call_count, step)
+                contacts.assert_called_with(env, env.cfg.mdp.tactile_threshold)
+
+            evaluate(1, [1, 2, 0], [False, False, False])
+            evaluate(2, [2, 0, 0], [False, False, False])
+            evaluate(3, [1, 1, 0], [True, False, False])
+            evaluate(4, [0, 1, 0], [True, False, False])
+            state = task.get_task_state(env)
+            self.assertEqual(state.success.tolist(), [True, True, True])
+            blocker_x[0] -= .5
+            evaluate(5, [1, 1, 0], [False, True, False])
+            blocker_x[0] += .5
+            evaluate(6, [1, 0, 0], [False, True, False])
+            task.reset_task(env, torch.tensor([1]))
+            self.assertEqual(state.finish_contact_streak.tolist(), [1, 0, 0])
+            evaluate(7, [1, 0, 0], [False, False, False])
+            evaluate(8, [1, 0, 0], [True, False, False])
+
     def test_eef_access_front_uses_osc_link_environment_xy_and_the_confirmed_success_gate(self):
         origins = torch.tensor([[0., 0., 0.], [10., -15., 0.]], dtype=torch.float64).repeat(4, 1)
         access = origins.new_tensor([-.89, -.51, -.2, .4]).expand(8, -1).clone()

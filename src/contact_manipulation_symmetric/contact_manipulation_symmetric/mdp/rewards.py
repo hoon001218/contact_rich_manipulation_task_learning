@@ -581,7 +581,10 @@ def blocker_pose_hold(env, half_distance=0.001, *, success_confirmation_steps=0)
         raise ValueError("Pose hold confirmation must be a nonnegative number of policy steps.")
     state = get_task_state(env)
     eligible = state.success
-    if success_confirmation_steps:
+    contact_steps = state.cfg.finish_contact_confirmation_steps
+    if contact_steps:
+        eligible = eligible & (state.finish_contact_streak >= contact_steps)
+    elif success_confirmation_steps:
         # This transition's action was chosen after confirmation only when the
         # streak already qualified at the preceding state. Current success is required too.
         required = _success_duration_steps(state.cfg, state.dt) + success_confirmation_steps

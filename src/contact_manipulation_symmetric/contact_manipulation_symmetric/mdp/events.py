@@ -35,7 +35,7 @@ from .observations import (
     dynamic_sample, geometry_in_eef_frame, pack_policy_observation, prepare_initial_geometry,
     quat_apply, quat_conjugate, quat_mul, self_motion_wrench, action_input_limits,
 )
-from .rewards import clearance_quality, object_motion_cost, singularity_margin
+from .rewards import _current_blocker_contact_count, clearance_quality, object_motion_cost, singularity_margin
 from .curriculums import curriculum_spawn_rules
 from .terminations import (
     FAILURE_REASON_NAMES, configured_terminations, object_drop_condition, object_support_validity,
@@ -88,6 +88,8 @@ class MdpCfg:
     stable_linear_velocity: float = 0.05
     stable_angular_velocity: float = 0.30
     success_duration: float = 0.0
+    # Zero selects the original success-only confirmation in the reward terms.
+    finish_contact_confirmation_steps: int = 0
     # Geometric proxies, not measured contact forces. Validate with resting
     # collider geometry; progress permits motion and small recovering pivots.
     progress_support_gap: float = 0.010
@@ -117,6 +119,8 @@ class MdpCfg:
             raise ValueError("Observation capacity must include distinct Target and Blocker slots.")
         if self.success_duration < 0 or self.support_loss_duration <= 0:
             raise ValueError("Success duration must be nonnegative; support-loss duration must be positive.")
+        if type(self.finish_contact_confirmation_steps) is not int or self.finish_contact_confirmation_steps < 0:
+            raise ValueError("Finish contact confirmation must be a nonnegative number of policy steps.")
         if not (self.success_support_gap <= self.progress_support_gap < self.support_loss_distance
                 and 0 <= self.support_warning_distance < self.support_loss_distance
                 and self.support_stability_decay > 0):
@@ -598,6 +602,7 @@ class TaskState:
         self.previous_wrench = zeros(n, 6)
         self.elapsed_time = zeros(n, kind=torch.float64)
         self.stable_count = zeros(n, kind=torch.long)
+        self.finish_contact_streak = zeros(n, kind=torch.long)
         self.tilt_count = zeros(n, o, kind=torch.long)
         self.support_loss_count = zeros(n, o, kind=torch.long)
         self.support_distance = zeros(n, o)
@@ -721,7 +726,7 @@ class TaskState:
         self.history[ids, 0, 31:37] = 0
         self.history[ids, 0, 37:54] = -1
         self.history[ids, 0, 54:] = 0
-        for name in ("previous_wrench", "elapsed_time", "stable_count", "tilt_count",
+        for name in ("previous_wrench", "elapsed_time", "stable_count", "finish_contact_streak", "tilt_count",
                      "support_loss_count", "support_distance", "stability_distance", "tilt_angle",
                      "clearance_progress_valid", "completion_valid", "raw_goal",
                      "raw_goal_seen", "unsupported_goal_seen", "goal_failure_seen",
@@ -773,7 +778,7 @@ class TaskState:
         self.critic_observation = None
 
     @torch.no_grad()
-    def advance(self, batch, step, *, singularity=None, hand_velocity=None, object_drop=None):
+    def advance(self, batch, step, *, singularity=None, hand_velocity=None, object_drop=None, blocker_contact=None):
         if step == self.last_step:
             return
         if not self.ready:
@@ -853,6 +858,13 @@ class TaskState:
             candidate, failed, stable, self.success_paid, self.failure_paid, self.cfg,
             step_dt=self.dt,
         )
+        if blocker_contact is not None:
+            required = self.cfg.finish_contact_confirmation_steps
+            streak = self.finish_contact_streak
+            # Once confirmed, hold at the threshold even after the hand releases.
+            # Losing valid success clears the entire confirmation window.
+            continues = successful & (blocker_contact | (streak >= required))
+            streak.copy_(torch.where(continues, (streak + 1).clamp_max(required), 0))
         self.clearance_progress_valid.copy_(support.progress_valid & self.target_protected
                                            & ~failed & ~reasons[:, self.invalid_reason_index])
         self.completion_valid.copy_(support.completion_valid)
@@ -1716,8 +1728,11 @@ def get_task_state(env):
             height_condition=state.cfg.object_drop_height,
             rotation_condition=state.cfg.object_drop_rotation,
         )
-        state.advance(batch, env.common_step_counter,
-                      singularity=margin, hand_velocity=velocity_failure, object_drop=dropped)
+        blocker_contact = None
+        if state.cfg.finish_contact_confirmation_steps:
+            blocker_contact = _current_blocker_contact_count(env, state.cfg.tactile_threshold) > 0
+        state.advance(batch, env.common_step_counter, singularity=margin, hand_velocity=velocity_failure,
+                      object_drop=dropped, blocker_contact=blocker_contact)
         monitor = getattr(env, "_tensorboard_sensor_monitor", None)
         if monitor is not None:
             monitor.record(batch)
