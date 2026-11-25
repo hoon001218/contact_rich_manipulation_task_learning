@@ -1,12 +1,69 @@
-"""Object-count schedules for the native curriculum manager and scene builder."""
+"""Shared-scene layout and legacy object-count curriculum schedules."""
 
 from dataclasses import replace
+import math
+import random
+
+
+SCENE_LAYOUTS_BY_DIFFICULTY = (
+    (("direct", "direct"), ("direct", "front"), ("direct", "blocked")),
+    (("front", "direct"), ("front", "front"), ("front", "blocked"), ("blocked", "direct")),
+    (("blocked", "front"),),
+)
+INITIAL_LAYOUT_WEIGHTS = (.85, .10, .05)
+EQUAL_LAYOUT_WEIGHTS = (1.0 / 3.0,) * 3
 
 
 def _nonnegative_integer(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer.")
     return value
+
+
+def layout_difficulty(near_status, far_status):
+    """Count the fewest extra requirements across the layout's available routes."""
+    for difficulty, layouts in enumerate(SCENE_LAYOUTS_BY_DIFFICULTY):
+        if (near_status, far_status) in layouts:
+            return difficulty
+    raise ValueError(f"Invalid or unsolvable scene layout: {(near_status, far_status)!r}.")
+
+
+def scene_layout_probabilities(step, *, start_step, end_step,
+                               start_weights=INITIAL_LAYOUT_WEIGHTS, end_weights=EQUAL_LAYOUT_WEIGHTS):
+    """Interpolate the easy, medium, and hard probabilities on the training clock."""
+    step = _nonnegative_integer(step, "step")
+    start_step = _nonnegative_integer(start_step, "start_step")
+    end_step = _nonnegative_integer(end_step, "end_step")
+    if end_step <= start_step:
+        raise ValueError("Layout curriculum end_step must exceed start_step.")
+    for weights in (start_weights, end_weights):
+        if (len(weights) != 3 or any(not math.isfinite(weight) or weight < 0 for weight in weights)
+                or not math.isclose(math.fsum(weights), 1.0, rel_tol=0., abs_tol=1.e-9)):
+            raise ValueError("Layout curriculum needs three nonnegative weights summing to one.")
+    if step <= start_step:
+        return tuple(start_weights)
+    if step >= end_step:
+        return tuple(end_weights)
+    fraction = (step - start_step) / (end_step - start_step)
+    return tuple(start + fraction * (end - start) for start, end in zip(start_weights, end_weights))
+
+
+def choose_scene_layout(seed, scene_generation, step, *, start_step, end_step,
+                        start_weights=INITIAL_LAYOUT_WEIGHTS, end_weights=EQUAL_LAYOUT_WEIGHTS):
+    """Choose a near side and near/far conditions for one common scene replacement.
+
+    Each replacement draws difficulty independently from the current weights.
+    The seed and scene number make the draw reproducible and independent of the
+    random numbers consumed by asset selection and placement.
+    """
+    scene_generation = _nonnegative_integer(scene_generation, "scene_generation")
+    weights = scene_layout_probabilities(
+        step, start_step=start_step, end_step=end_step, start_weights=start_weights, end_weights=end_weights,
+    )
+    rng = random.Random(f"scene-layout/{seed}/{scene_generation}")
+    difficulty = rng.choices(range(len(SCENE_LAYOUTS_BY_DIFFICULTY)), weights=weights, k=1)[0]
+    near_status, far_status = rng.choice(SCENE_LAYOUTS_BY_DIFFICULTY[difficulty])
+    return rng.choice((-1, 1)), near_status, far_status
 
 
 def object_count_range(step, *, start_step, end_step, final_min, final_max):

@@ -5732,9 +5732,12 @@ class SequentialSceneGenerator:
         exclusions=[self._world_rect(self.target),self.state['clearance'],self._world_rect(self.blocker)]+self.state['pockets']+self.state['pocket_front_corridors']
         if self.state['blocker_front_corridor'] is not None:
             exclusions.append(self.state['blocker_front_corridor'])
+        fixed_ids = set(self.state['active_ids'])
+        exclusions.extend(self._world_rect(index) for index in self.state['metadata'].get('layout_guards', ()))
+        exclusions.extend(self.state.get('protected_layout_rectangles', ()))
         for rectangle in exclusions:
             free=_sequential_maxrects_cut_all(free,_sequential_inflate(rectangle,gap))
-        requested=self.rng.randint(int(_sequential_attr(self.rules,'min_objects',15)),int(_sequential_attr(self.rules,'max_objects',25)))
+        requested=max(len(fixed_ids),self.rng.randint(int(_sequential_attr(self.rules,'min_objects',15)),int(_sequential_attr(self.rules,'max_objects',25))))
         copies=min(len(v) for name,v in self.by_type.items() if name!=self.target_type)
         # Early curriculum scenes contain only the role objects, so a type
         # count cannot exceed the requested body count. Full scenes keep the
@@ -5744,17 +5747,19 @@ class SequentialSceneGenerator:
         k=(maximum_types
            if _sequential_attr(self.rules,'all_asset_types',False)
            else self.rng.randint(minimum_types,maximum_types))
-        extras=[t for t in self.types if t not in (self.target_type,self.blocker_type)]
-        selected=[self.blocker_type]+self.rng.sample(extras,k-2)
+        fixed_types = [name for name in self.types if name != self.target_type and
+                       name != self.blocker_type and any(index in fixed_ids for index in self.by_type[name])]
+        extras=[t for t in self.types if t not in (self.target_type,self.blocker_type) and t not in fixed_types]
+        selected=[self.blocker_type]+fixed_types+self.rng.sample(extras,max(0,k-2-len(fixed_types)))
         self.background_base_yaws={name:self.rng.uniform(-math.pi,math.pi) for name in selected}
-        counts={name:int(name==self.blocker_type) for name in selected}
-        next_copy={name:int(name==self.blocker_type) for name in selected}
-        background_ids={name:[i for i in self.by_type[name] if i!=self.blocker] for name in selected}
+        counts={name:sum(i in fixed_ids for i in self.by_type[name]) for name in selected}
+        next_copy={name:0 for name in selected}
+        background_ids={name:[i for i in self.by_type[name] if i not in fixed_ids] for name in selected}
         placed=[];stopped=None;domains=[];skipped=[]
         minimum=int(_sequential_attr(self.rules,'min_objects',15))
         recovery_attempted=False;recoveries=[]
-        for ordinal in range(max(0,requested-2)):
-            available=[name for name in selected if next_copy[name]-int(name==self.blocker_type)<len(background_ids[name])]
+        for ordinal in range(max(0,requested-len(fixed_ids))):
+            available=[name for name in selected if next_copy[name]<len(background_ids[name])]
             if not available:
                 stopped='Selected type pool capacity exhausted';break
             # Evaluate all type/orientation/free-rectangle domains once. Choose
@@ -5762,7 +5767,7 @@ class SequentialSceneGenerator:
             # type never causes an immediate stop while other types still fit.
             type_choices={}
             for name in available:
-                index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                index=background_ids[name][next_copy[name]]
                 base=self.background_base_yaws[name];choices=[]
                 for yaw in (base,base+math.pi/2):
                     shape=self._shape(index,yaw);r0=shape['bounds'];dx=r0[1]-r0[0];dy=r0[3]-r0[2]
@@ -5782,7 +5787,7 @@ class SequentialSceneGenerator:
                 for name in available:
                     if counts[name]!=least:
                         continue
-                    index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                    index=background_ids[name][next_copy[name]]
                     bounds=self._shape(index,0.)['bounds']
                     width,depth=bounds[1]-bounds[0],bounds[3]-bounds[2]
                     candidates=[]
@@ -5797,7 +5802,7 @@ class SequentialSceneGenerator:
                     _,(_,j,angles)=alternatives[name]
                     lo,hi=self.rng.choices(angles,weights=[b-a for a,b in angles],k=1)[0]
                     yaw=self.rng.uniform(lo,hi)
-                    index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+                    index=background_ids[name][next_copy[name]]
                     r0=self._shape(index,yaw)['bounds'];dx=r0[1]-r0[0];dy=r0[3]-r0[2];r=free[j]
                     sx,sy=r[1]-r[0]-dx,r[3]-r[2]-dy
                     score=((r[1]-r[0])*(r[3]-r[2])-dx*dy,min(sx,sy),max(sx,sy))
@@ -5813,7 +5818,7 @@ class SequentialSceneGenerator:
                          'No selected non-Target type fits any remaining free rectangle')
                 break
             name=max(balanced,key=lambda name:type_choices[name][-2]*type_choices[name][-1])
-            index=background_ids[name][next_copy[name]-int(name==self.blocker_type)]
+            index=background_ids[name][next_copy[name]]
             _,j,yaw,r0,dx,dy=type_choices[name]
             r=free[j];slackx=r[1]-r[0]-dx;slacky=r[3]-r[2]-dy
             # Compact at a real free-rectangle corner. No throwaway RNG draws.
@@ -5861,7 +5866,8 @@ class SequentialSceneGenerator:
 
 
 def sample_sequential_scene(geometries, rules, rng=None, *, seed=None,
-                            target_id=None, blocker_id=None, active_ids=None, margin=.01):
+                            target_id=None, blocker_id=None, active_ids=None, margin=.01,
+                            layout=None, hand_width_m=None):
     """Generate one layout directly; no visibility catalog or scene retry.
 
     ``seed`` matches the diagnostic generator exactly. A supplied RNG supports
@@ -5876,6 +5882,12 @@ def sample_sequential_scene(geometries, rules, rng=None, *, seed=None,
         seed=0
     builder=SequentialSceneGenerator(geometries,rules,seed=seed,margin=margin,rng=rng,
         target_id=target_id,blocker_id=blocker_id,capture_snapshots=False)
+    if layout is not None:
+        from .layout_generator import HAND_APPROACH_WIDTH_METERS, populate_layout
+
+        populate_layout(builder, layout, HAND_APPROACH_WIDTH_METERS if hand_width_m is None else hand_width_m)
+        builder.step7_background()
+        return builder.as_sample()
     for step in (builder.step1_target,builder.step2_place_target,builder.step3_clearance,
                  builder.step4_blocker,builder.step5_place_blocker,builder.step6_pockets,
                  builder.step7_background):
@@ -8794,6 +8806,19 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
     capacity, observation_capacity = _active_object_capacity(env), env.cfg.mdp.max_objects
     sequential = env.spawn_rules.generation_mode == 'sequential'
     sampling_rules = curriculum_spawn_rules(env) if sequential else env.spawn_rules
+    layout = getattr(env.cfg, "layout_scene_override", None) if sequential else None
+    layout_start = getattr(env.cfg, "layout_curriculum_start_step", None)
+    if sequential and layout is None and layout_start is not None:
+        from .curriculums import choose_scene_layout
+
+        layout = choose_scene_layout(
+            int(env.cfg.seed), scene_generation or 0,
+            env.common_step_counter + env.cfg.layout_curriculum_resume_steps,
+            start_step=layout_start, end_step=env.cfg.layout_curriculum_end_step,
+            start_weights=env.cfg.layout_curriculum_start_weights,
+            end_weights=env.cfg.layout_curriculum_end_weights,
+        )
+    layout_kwargs = {"layout": layout} if layout is not None else {}
     clutter = env.spawn_rules.generation_mode == 'clutter'
     parameterized = env.spawn_rules.generation_mode in ('parameterized', 'clutter')
     constructive = sequential or parameterized or env.spawn_rules.generation_mode == "constructive"
@@ -8863,7 +8888,7 @@ def _build_episode_batch(env, runtime, ids, *, scene_generation=None):
                 # print(f"[Episode reset] sampling {len(pending)} independent episodes, proposal {attempt + 1}", flush=True)
                 if sequential:
                     proposals = [sample_sequential_scene(env.spawn_geometries, sampling_rules,
-                        seed=seeds[row], target_id=roles[row][0], blocker_id=roles[row][1]) for row in pending]
+                        seed=seeds[row], target_id=roles[row][0], blocker_id=roles[row][1], **layout_kwargs) for row in pending]
                 elif clutter:
                     proposals = [sample_clutter_episode(runtime.parameter_catalog, env.spawn_geometries,
                         env.spawn_rules, streams[row], *roles[row], device=env.device,
@@ -9206,6 +9231,8 @@ def reset_scene(env, env_ids=None):
     apply_episode_batch(env, ids, batch)
     # Host metadata already belongs to this shared layout; no tensor readback.
     runtime.pending_reset_metrics["Reset/scene_object_count"] = float(len(sample.active_ids))
+    if isinstance(sample.parameter_certificate, Mapping) and "layout_difficulty" in sample.parameter_certificate:
+        runtime.pending_reset_metrics["Reset/layout_difficulty"] = float(sample.parameter_certificate["layout_difficulty"])
     if refresh:
         vertices, counts, valid = relocation
         scene = env.task_scene_data

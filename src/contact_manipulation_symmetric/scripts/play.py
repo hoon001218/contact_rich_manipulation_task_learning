@@ -33,12 +33,20 @@ parser.add_argument("--max_steps", type=int, default=None, help="Exit after this
 parser.add_argument("--real-time", action="store_true", help="Pace playback to simulation time when possible.")
 parser.add_argument("--video", action="store_true", help="Record one video and exit after --video_length steps.")
 parser.add_argument("--video_length", type=int, default=300)
+parser.add_argument("--scene-layout", nargs=3, metavar=("NEAR_SIDE", "NEAR", "FAR"),
+                    help="Replay a layout type. Use left/right and two conditions from direct/front/blocked.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 if any(value is not None and value <= 0 for value in
        (args_cli.num_envs, args_cli.max_steps, args_cli.video_length)):
     parser.error("Environment, playback, and video step counts must be positive.")
+if args_cli.scene_layout is not None:
+    side, near, far = args_cli.scene_layout
+    valid_conditions = {"direct", "front", "blocked"}
+    if (side not in ("left", "right") or not {near, far} <= valid_conditions
+            or (near == far == "blocked")):
+        parser.error("--scene-layout needs left/right and two conditions from direct/front/blocked, with a usable side.")
 installed_version = version("rsl-rl-lib")
 if int(installed_version.split(".")[0]) < 5:
     parser.error("This project's separate graph actor/critic requires RSL-RL >= 5.0.")
@@ -73,6 +81,12 @@ def main(env_cfg, agent_cfg):
     env_cfg.curriculum.scene_object_count = None
     env_cfg.spawn_object_count_range = None
     env_cfg.scene_object_curriculum_start_iteration = None
+    env_cfg.layout_curriculum_start_step = None
+    env_cfg.layout_curriculum_end_step = None
+    env_cfg.layout_curriculum_resume_steps = 0
+    if args_cli.scene_layout is not None:
+        side, near, far = args_cli.scene_layout
+        env_cfg.layout_scene_override = (-1 if side == "left" else 1, near, far)
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed

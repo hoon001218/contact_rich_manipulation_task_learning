@@ -114,12 +114,12 @@ class RewardsCfg:
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     # Keep rewarding contact-weighted improvements on the transition into success.
-    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=30.0)
+    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=150.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
     blocker_normal_alignment = RewardTermCfg(
-        func=mdp.blocker_normal_alignment, weight=1.0,
+        func=mdp.blocker_normal_alignment, weight=3.0,
         params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0)),
                 "exclude_fingertips": True},
     )
@@ -127,23 +127,23 @@ class RewardsCfg:
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation_distance_improvement, weight=30.0,
+        func=mdp.blocker_relocation_distance_improvement, weight=150.0,
         params={"reference_speed": 4.0, "threshold": 0.01},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
-    blocker_pose_hold = RewardTermCfg(
-        func=mdp.blocker_pose_hold, weight=1.0,
-        params={"half_distance": 0.001, "success_confirmation_steps": 3},
-    )
-    eef_access_front = RewardTermCfg(
-        func=mdp.eef_access_front, weight=14.0,
-        params={
-            "front_offset": 0.06,
-            "half_distance": 0.10,
-            "blocker_half_distance": 0.001,
-            "success_confirmation_steps": 3,
-        },
-    )
+    # blocker_pose_hold = RewardTermCfg(
+    #     func=mdp.blocker_pose_hold, weight=1.0,
+    #     params={"half_distance": 0.001, "success_confirmation_steps": 3},
+    # )
+    # eef_access_front = RewardTermCfg(
+    #     func=mdp.eef_access_front, weight=14.0,
+    #     params={
+    #         "front_offset": 0.06,
+    #         "half_distance": 0.10,
+    #         "blocker_half_distance": 0.001,
+    #         "success_confirmation_steps": 3,
+    #     },
+    # )
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
@@ -238,13 +238,23 @@ class ShelfManipulationEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
     # Fraction of max_iterations; None keeps the configured Time weight from the start.
     time_penalty_start_fraction: float | None = 0.5
-    # Training entry point only: two role objects, then grow toward spawn_rules.
-    # Absolute completed iterations; None disables the object-count curriculum.
+    # Training picks a layout mix at each common scene replacement. Iterations
+    # are absolute completed rollouts. None selects the legacy count schedule.
+    layout_curriculum_start_iteration: int | None = 5000
+    layout_curriculum_end_iteration: int = 45000
+    layout_curriculum_start_weights: tuple[float, float, float] = (0.85, 0.10, 0.05)
+    layout_curriculum_end_weights: tuple[float, float, float] = (1.0 / 3.0,) * 3
+    layout_curriculum_start_step: int | None = None
+    layout_curriculum_end_step: int | None = None
+    layout_curriculum_resume_steps: int = 0
+    # Optional fixed (near world-Y side, near condition, far condition).
+    layout_scene_override: tuple[int, str, str] | None = None
+    # Legacy count schedule used when layout curriculum is disabled.
     scene_object_curriculum_start_iteration: int | None = 10000
     scene_object_curriculum_end_iteration: int = 45000
     # Runtime sampling bounds only. Never resize the physical pool/observation.
     spawn_object_count_range: tuple[int, int] | None = None
-    mdp: MdpCfg = MdpCfg(finish_contact_confirmation_steps=3)
+    mdp: MdpCfg = MdpCfg(finish_contact_confirmation_steps=26)
     # Construct one shared layout directly; partial resets reuse its vision.
     spawn_rules: SpawnRules = SpawnRules(
         generation_mode="sequential", min_objects=15, spawn_height_offset=0.001,

@@ -1,4 +1,4 @@
-"""CPU regressions for staged clutter, fixed tensor capacity, and full-scene play.
+"""CPU regressions for layout and object-count schedules and full-scene play.
 
 These checks reuse the numerical scene fixtures; they do not start Isaac Sim.
 The test source was added without running it while training was active.
@@ -7,6 +7,7 @@ The test source was added without running it while training was active.
 import ast
 from collections import Counter
 from dataclasses import asdict, replace
+import math
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ import torch
 
 import test_mdp as fixtures
 from contact_manipulation_symmetric.mdp import curriculums
+from contact_manipulation_symmetric.mdp.layout_geometry import lateral_cut_blocked
 
 
 task, observations = fixtures.task, fixtures.obs
@@ -36,12 +38,80 @@ def training_helpers():
     path = PROJECT / "scripts/train.py"
     module = ast.parse(path.read_text())
     selected = [node for node in module.body if isinstance(node, ast.FunctionDef)
-                and node.name in ("prepare_scene_object_curriculum", "checkpoint_completed_iterations")]
+                and node.name in ("prepare_scene_layout_curriculum", "prepare_scene_object_curriculum",
+                                  "checkpoint_completed_iterations")]
     namespace = dict(torch=torch, object_count_range=curriculums.object_count_range,
+                     scene_layout_probabilities=curriculums.scene_layout_probabilities,
                      scene_object_count_curriculum=curriculums.scene_object_count_curriculum,
                      CurriculumTermCfg=lambda **kwargs: SimpleNamespace(**kwargs))
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
     return namespace
+
+
+class LayoutScheduleTests(unittest.TestCase):
+    def test_probability_phases_and_independent_shared_scene_draws(self):
+        schedule = dict(start_step=20, end_step=120)
+        phase = curriculums.scene_layout_probabilities
+        self.assertEqual(phase(0, **schedule), (.85, .10, .05))
+        self.assertEqual(phase(20, **schedule), (.85, .10, .05))
+        self.assertEqual(phase(120, **schedule), (1.0/3.0,) * 3)
+        for actual, expected in zip(phase(70, **schedule), (71./120., 13./60., 23./120.)):
+            self.assertAlmostEqual(actual, expected)
+
+        draw = curriculums.choose_scene_layout
+        classify = curriculums.layout_difficulty
+        for step in (0, 70, 120, 200):
+            easy, medium, _ = phase(step, **schedule)
+            for generation in range(100):
+                quantile = random.Random(f"scene-layout/123/{generation}").random()
+                expected = int(quantile >= easy) + int(quantile >= easy + medium)
+                layout = draw(123, generation, step, **schedule)
+                self.assertEqual(classify(*layout[1:]), expected)
+                self.assertEqual(layout, draw(123, generation, step, **schedule))
+        with self.assertRaises(ValueError):
+            classify("blocked", "blocked")
+
+    def test_train_uses_resume_clock_and_preserves_the_object_pool(self):
+        prepare = training_helpers()["prepare_scene_layout_curriculum"]
+        cfg = SimpleNamespace(layout_curriculum_start_iteration=5_000, layout_curriculum_end_iteration=45_000,
+                              layout_curriculum_start_weights=(.85, .10, .05),
+                              layout_curriculum_end_weights=(1.0/3.0,) * 3, layout_scene_override=None,
+                              spawn_rules=task.SpawnRules(generation_mode="sequential", min_objects=15, max_objects=25))
+        runner = SimpleNamespace(num_steps_per_env=STEPS_PER_ITERATION)
+        self.assertEqual(prepare(cfg, runner, completed_iterations=45_000), (5_000, 45_000))
+        self.assertEqual((cfg.layout_curriculum_start_step, cfg.layout_curriculum_end_step),
+                         (5_000 * STEPS_PER_ITERATION, 45_000 * STEPS_PER_ITERATION))
+        self.assertEqual(cfg.layout_curriculum_resume_steps, 45_000 * STEPS_PER_ITERATION)
+        self.assertEqual((cfg.spawn_rules.min_objects, cfg.spawn_rules.max_objects), (15, 25))
+        cfg.layout_scene_override = (-1, "blocked", "front")
+        self.assertIsNone(prepare(cfg, runner, completed_iterations=45_000))
+        self.assertIsNone(cfg.layout_curriculum_start_step)
+        self.assertIsNone(cfg.layout_curriculum_end_step)
+        self.assertEqual(cfg.layout_curriculum_resume_steps, 0)
+
+    def test_rounded_assets_can_close_both_lateral_cuts(self):
+        geometries = []
+        for radius, name in ((.037, "target"), (.040, "blocker"), (.033, "bottle"), (.044, "cup")):
+            vertices = tuple((radius * math.cos(a * math.tau / 32), radius * math.sin(a * math.tau / 32))
+                             for a in range(32))
+            for slot in range(8):
+                geometries.append(task.ObjectGeometry(f"{name}_{slot}", (-radius, -radius, 0.),
+                    (radius, radius, .1), name, collision_footprint_vertices=vertices))
+        rules = task.SpawnRules(generation_mode="sequential", min_objects=10, max_objects=16, max_asset_types=4)
+        used_types = set()
+        for seed in range(8):
+            with self.subTest(seed=seed):
+                sample = task.sample_sequential_scene(geometries, rules, seed=seed,
+                    target_id=0, blocker_id=8, layout=((-1 if seed % 2 else 1), "blocked", "front"))
+                self.assertEqual(len(set(sample.active_ids)), len(sample.active_ids))
+                data = sample.parameter_certificate
+                used_types.update(geometries[i].asset_name for i in data["layout_guards"])
+                obstacles = [task._collision_polygon(geometries[i], sample.yaws[i]) + sample.positions[i][:2]
+                             for i in sample.active_ids if i != sample.blocker_id]
+                for cut, limit in data["layout_barriers"]:
+                    self.assertTrue(lateral_cut_blocked((*rules.x_range, *rules.y_range), cut,
+                        data["layout_inscribed_radius_m"], obstacles, x_upper=limit))
+        self.assertEqual(used_types, {"blocker", "bottle", "cup"})
 
 
 class ObjectCountScheduleTests(unittest.TestCase):
@@ -240,6 +310,8 @@ class ObjectCountEntrypointTests(unittest.TestCase):
         self.assertEqual(ast.literal_eval(fields["scene_object_curriculum_start_iteration"]), 10_000)
         self.assertEqual(ast.literal_eval(fields["scene_object_curriculum_end_iteration"]), 45_000)
         self.assertIsNone(ast.literal_eval(fields["spawn_object_count_range"]))
+        self.assertEqual(ast.literal_eval(fields["layout_curriculum_start_iteration"]), 5000)
+        self.assertEqual(ast.literal_eval(fields["layout_curriculum_end_iteration"]), 45_000)
         module = ast.parse((PROJECT / "scripts/play.py").read_text())
         main = next(node for node in module.body if isinstance(node, ast.FunctionDef)
                     and node.name == "main")
@@ -247,7 +319,9 @@ class ObjectCountEntrypointTests(unittest.TestCase):
                         and ast.unparse(node.func) == "gym.make")
         for attribute in ("env_cfg.curriculum.scene_object_count",
                           "env_cfg.spawn_object_count_range",
-                          "env_cfg.scene_object_curriculum_start_iteration"):
+                          "env_cfg.scene_object_curriculum_start_iteration",
+                          "env_cfg.layout_curriculum_start_step",
+                          "env_cfg.layout_curriculum_end_step"):
             assignment = next(node for node in ast.walk(main) if isinstance(node, ast.Assign)
                               and any(ast.unparse(target) == attribute for target in node.targets))
             self.assertIsNone(ast.literal_eval(assignment.value))
@@ -257,9 +331,11 @@ class ObjectCountEntrypointTests(unittest.TestCase):
                     and node.name == "main")
         calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
         checkpoint = next(node for node in calls if ast.unparse(node.func) == "checkpoint_completed_iterations")
+        layout_prepare = next(node for node in calls if ast.unparse(node.func) == "prepare_scene_layout_curriculum")
         prepare = next(node for node in calls if ast.unparse(node.func) == "prepare_scene_object_curriculum")
         gym_make = next(node for node in calls if ast.unparse(node.func) == "gym.make")
-        self.assertLess(checkpoint.lineno, prepare.lineno)
+        self.assertLess(checkpoint.lineno, layout_prepare.lineno)
+        self.assertLess(layout_prepare.lineno, prepare.lineno)
         self.assertLess(prepare.lineno, gym_make.lineno)
 
 

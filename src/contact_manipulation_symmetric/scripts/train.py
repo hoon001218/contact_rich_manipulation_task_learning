@@ -62,7 +62,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import contact_manipulation_symmetric  # Register the local task after AppLauncher.
 from contact_manipulation_symmetric.config.ur5e.agents.ppo import load_checkpoint
-from contact_manipulation_symmetric.mdp.curriculums import object_count_range, scene_object_count_curriculum
+from contact_manipulation_symmetric.mdp.curriculums import (
+    object_count_range, scene_layout_probabilities, scene_object_count_curriculum,
+)
 from contact_manipulation_symmetric.mdp.events import SensorMonitoringLogger, TensorboardSensorMonitor
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -150,6 +152,36 @@ def prepare_scene_object_curriculum(env_cfg, agent_cfg, *, completed_iterations=
     return start, end
 
 
+def prepare_scene_layout_curriculum(env_cfg, agent_cfg, *, completed_iterations=0):
+    """Initialize the shared-scene schedule before the first native reset."""
+    env_cfg.layout_curriculum_start_step = None
+    env_cfg.layout_curriculum_end_step = None
+    env_cfg.layout_curriculum_resume_steps = 0
+    start = env_cfg.layout_curriculum_start_iteration
+    if start is None or env_cfg.layout_scene_override is not None:
+        return None
+    end = env_cfg.layout_curriculum_end_iteration
+    steps_per_iteration = agent_cfg.num_steps_per_env
+    for name, value, minimum in (("layout_curriculum_start_iteration", start, 0),
+                                 ("layout_curriculum_end_iteration", end, 1),
+                                 ("num_steps_per_env", steps_per_iteration, 1),
+                                 ("completed_iterations", completed_iterations, 0)):
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}.")
+    if env_cfg.spawn_rules.generation_mode != "sequential":
+        raise ValueError("The layout curriculum requires the sequential scene generator.")
+    start_step, end_step = start * steps_per_iteration, end * steps_per_iteration
+    resume_steps = completed_iterations * steps_per_iteration
+    scene_layout_probabilities(
+        resume_steps, start_step=start_step, end_step=end_step,
+        start_weights=env_cfg.layout_curriculum_start_weights, end_weights=env_cfg.layout_curriculum_end_weights,
+    )
+    env_cfg.layout_curriculum_start_step = start_step
+    env_cfg.layout_curriculum_end_step = end_step
+    env_cfg.layout_curriculum_resume_steps = resume_steps
+    return start, end
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg, agent_cfg):
     """Configure, create, wrap, and train with the standard managers and runner."""
@@ -178,9 +210,17 @@ def main(env_cfg, agent_cfg):
     resume_path = (get_checkpoint_path(str(log_root), agent_cfg.load_run, agent_cfg.load_checkpoint)
                    if agent_cfg.resume else None)
     resume_completed = checkpoint_completed_iterations(resume_path)
-    object_count_phase = prepare_scene_object_curriculum(
+    layout_phase = prepare_scene_layout_curriculum(
         env_cfg, agent_cfg, completed_iterations=resume_completed,
     )
+    object_count_phase = None
+    if layout_phase is None and env_cfg.layout_scene_override is None:
+        object_count_phase = prepare_scene_object_curriculum(
+            env_cfg, agent_cfg, completed_iterations=resume_completed,
+        )
+    else:
+        env_cfg.curriculum.scene_object_count = None
+        env_cfg.spawn_object_count_range = None
     env_cfg.log_dir = str(log_dir)
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -218,6 +258,12 @@ def main(env_cfg, agent_cfg):
             print(f"[INFO] Scene object curriculum: Target + Blocker only through iteration {start}; "
                   f"grow to {env_cfg.spawn_rules.min_objects}..{env_cfg.spawn_rules.max_objects} "
                   f"by iteration {end} (completed rollouts: {completed}; new shared scenes only).", flush=True)
+        if layout_phase is not None:
+            start, end = layout_phase
+            print(f"[INFO] Scene layout curriculum (easy, medium, hard): "
+                  f"{env_cfg.layout_curriculum_start_weights} at iteration {start} -> "
+                  f"{env_cfg.layout_curriculum_end_weights} at iteration {end} "
+                  f"(completed rollouts: {completed}; new shared scenes only).", flush=True)
         dump_yaml(str(log_dir / "params/env.yaml"), env_cfg)
         dump_yaml(str(log_dir / "params/agent.yaml"), agent_cfg)
         started = time.time()
