@@ -12370,3 +12370,172 @@ Symmetric의 마무리 보상은 유효 성공이 3개 정책 스텝 연속 성�
 접촉과 재배치 행동을 학습하고, 접촉 중 Clearance가 개선되고 유효 성공이 반복되는
 시점부터 두 마무리 항의 weight를 단계적으로 올리는 안을 비교한다. 현재 실험은
 위 가중치를 처음부터 사용하며, 커리큘럼의 시작 시점과 증가 폭은 학습 결과로 결정한다.
+
+## 185. 2026-11-25 — Hand 초기 raw action 랜덤화 검증
+
+`contact_manipulation_symmetric`의 독립 Hand action 6개를 각각 `[-1, 1]`에서
+샘플링하는 조건을 검사했다. 현재 action scale `0.5`를 적용하면 각 독립 관절의
+위치 범위 중 25–75%에 해당한다. 실제 제어와 동일한 URDF 연동 관계로 12개 구동
+관절의 위치를 계산했다. 비교 기준은 현재 초기 자세인 `raw=0`이다.
+
+### URDF 충돌 형상 검사
+
+6차원 Sobol 표본 4,096개, `-1`과 `+1`의 조합 64개, 그리고 기준 자세를 검사했다.
+고정 연결 및 인접 관절과 현재 스포너에서 충돌을 제외한 결합부 쌍을 빼고, 충돌
+형상 397쌍을 비교했다. 원본 URDF 충돌 메시에서 Sobol 표본 446/4,096개(10.89%)와
+끝값 조합 8/64개가 교차했다. 모두 엄지–검지 사이였다. `right_thumb_4`와
+`right_index_2`의 교차가 Sobol 표본 416개에서 관찰됐다. 기준 자세의 교차는 0개다.
+각 충돌 형상의 단일 convex hull을 사용한 별도 검사에서는 647/4,096개가 교차했다.
+
+### 실제 Isaac Sim reset 검사
+
+현재 Symmetric 장면 9개에서 각각 64개 환경을 사용했다. 팔과 선반·물체의 초기 상태를
+짝별로 맞춘 뒤, Hand의 관절 위치와 drive 목표를 모두 샘플링된 자세로 초기화하고
+관절 속도를 0으로 설정했다. 팔에는 zero wrench를 주고, Hand에는 같은 목표를 적용하며
+100 Hz 물리 스텝 8회(80 ms)를 검사했다. 균등 샘플은 독립 추출한 512개이고, 끝값
+64개 조합은 마지막 장면에서 별도로 검사했다. 관통은 PhysX가 보고한 접촉점 중 signed
+separation이 음수인 경우로 집계했다.
+
+| 초기 Hand 조건 | 손 내부 관통 | Hand–물체 관통 | Hand–선반 관통 | 최대 Hand 관절 속도 | 초기 목표 대비 최대 관절 편차 |
+|---|---:|---:|---:|---:|---:|
+| `raw=0` | 0/576 | 0/576 | 0/576 | 0.044 rad/s | 0.0022 rad |
+| `[-1, 1]` 균등 샘플 | 65/512 (12.70%) | 0/512 | 0/512 | 6.75 rad/s | 0.197 rad |
+| `-1`/`+1` 끝값 조합 | 8/64 | 8/64 | 0/64 | 6.17 rad/s | 0.160 rad |
+
+손 내부 관통은 모두 엄지–검지 사이에서 발생했고, 최대 보고 깊이는 16.49 mm였다.
+끝값 조합의 물체 관통은 중지·약지와 크래커 상자 사이에서 발생했고 최대 깊이는
+9.89 mm였다. 초기 OBB 검사에서는 균등 표본 2/512개와 끝값 조합 24/64개가 물체에
+대한 기존 15 mm 여유 조건을 통과하지 못했다. 물체 쪽 수치는 사용한 장면에 따라 달라진다.
+
+6개 채널을 독립 샘플링하면 관절 범위 가운데 절반만 사용해도 초기 자세에서 손 내부
+관통이 생길 수 있다. 관통이 있으면 목표 자세를 고정한 상태에서도 reset 직후 관절이
+크게 움직일 수 있다. 초기 자세 랜덤화를 적용할 때는 URDF 연동을 반영해 손 내부 교차를
+먼저 확인하고, 선택한 팔 자세에서 새 Hand 형상으로 선반과 물체 여유를 검사하는 것이
+적절하다. 이번 랜덤화는 아래 진단 스크립트에서만 적용했다.
+
+- [URDF 검사 스크립트](../src/contact_manipulation_symmetric/tests/probe_hand_reset_geometry.py) · [집계](../outputs/contact_manipulation_symmetric/hand_reset_randomization_2026-11-25/static_geometry_summary.json) · [표본](../outputs/contact_manipulation_symmetric/hand_reset_randomization_2026-11-25/static_geometry_samples.npz)
+- [Isaac Sim 검사 스크립트](../src/contact_manipulation_symmetric/tests/probe_hand_reset_randomization.py) · [측정 결과](../outputs/contact_manipulation_symmetric/hand_reset_randomization_2026-11-25/native.json) · [실행 로그](../outputs/contact_manipulation_symmetric/hand_reset_randomization_2026-11-25/native.log)
+
+```bash
+python src/contact_manipulation_symmetric/tests/probe_hand_reset_geometry.py
+./IsaacLab/isaaclab.sh -p src/contact_manipulation_symmetric/tests/probe_hand_reset_randomization.py --headless
+```
+
+## 186. 2026-11-25 — Hand 전체 범위에서 재추첨 없는 초기 자세 생성
+
+현재 Hand scale `0.5`에서 실제 구동 범위 전체에 대응하는 명령은 raw `[-2, 2]`다.
+엄지와 검지의 교차가 가능하므로, 각 축의 범위는 유지하면서 관절 간에 유효한 조합을
+정해야 한다. 목표는 유효 구간들을 각 action 축에 투영했을 때 모두 `[-2, 2]`를 덮도록 하는
+것이다. 같은 자세에서 여섯 채널의 임의 조합까지 허용하면 §185의 교차가 다시 나타난다.
+
+1. 셋업 시 URDF의 독립 관절·연동 관절 관계와 PhysX의 손 충돌 형상을 사용한다.
+2. Raw action의 6차원 구간마다 중심 자세에서 형상 쌍의 분리 거리를 구한다. 각 형상이
+   구간 안에서 이동할 수 있는 거리의 상한을 빼고도 여유가 남는 구간만 저장한다. 중심부터
+   구간 경계까지 각 관절의 최대 회전량을 `Δθ`, 해당 관절축부터 형상까지의 반경 상한을
+   `R`이라고 두면 형상의 이동량은 관절별 `R·|Δθ|`의 합으로 상계할 수 있다. 이 비교는
+   구간 내부의 연속 자세 전체에 적용된다.
+3. Reset에서는 저장된 구간 하나를 직접 선택하고 그 안에서 6개 값을 한 번 뽑은 뒤, URDF
+   multiplier와 offset으로 12개 구동 관절의 초기 위치와 목표를 계산한다. 구간 선택은
+   균등, 각 구간 내부 좌표의 선택도 균등으로 두므로 축별 최종 분포는 균등할 필요가 없다.
+
+손 내부 검증은 장면과 독립적이다. 선반·물체까지 피하려면 각 구간의 Hand 이동 외곽을
+손바닥 TCP 기준의 상자로 함께 저장한다. 기존 IK로 구한 팔 시작 자세들에 이 상자를
+놓고, 모든 선반·물체 상자와 15 mm 이상 분리되는 팔·손 구간 조합을 한 번에 구한다.
+먼저 월드 3축으로 검사하고, 어느 팔 자세에도 매칭되지 않은 손 구간만 기존 OBB 분리축
+검사를 한 번 적용한다. 통과한 조합에서 바로 샘플링하므로 Hand 자세 재추첨이 없다.
+분리 조건은 해당 구간의 연속 자세 전체에 적용된다. 팔 자체의 여유와 지면 조건은 기존
+IK 검사로 처리한다.
+
+### 자세 생성 시험
+
+Isaac Sim 5.1의 Hand 충돌 32개 body에서 59개의 convex 조각을 얻었다. URDF의 관절
+연동과 장착부 충돌 필터를 적용해 1,240개의 조각 쌍을 검증했다. 최소 0.10 mm 분리를
+요구한 결과 667개 연속 구간을 저장했다. 각 구간은 6개 축 모두 폭이 있고, 합집합의 축별
+투영은 6개 모두 `[-2, 2]`를 빈틈없이 덮었다. `right_thumb_1_joint`의 raw `−2`는
+엄지 두 번째 채널을 `−1.7`에 둔 자세가 한 예다. 구간을 생성하는 1회 CPU 계산에는
+1.13초가 걸렸다. 이 시간에는 추출한 형상을 읽고 구간과 Hand 외곽을 계산해 저장하는
+과정이 포함된다.
+Simulator 시작과 충돌 형상 추출은 별도다.
+
+Ryzen 7 3700X에서 구간 선택, 6개 raw 값 샘플링, 12개 관절 위치 계산을 묶어 측정했다.
+크기별로 100회 예열 후 2,000번 반복하고 배치당 벽시계 평균을 구했다.
+
+| 배치 크기 | 평균 생성 시간 | P95 |
+|---:|---:|---:|
+| 1개 | 14.84 µs | 21.24 µs |
+| 100개 | 23.74 µs | 26.55 µs |
+| 1,024개 | 93.05 µs | 130.27 µs |
+
+100개를 한 배치로 만들 때 자세당 평균은 0.237 µs다. 이 수치는 CPU 샘플링과 연동
+관절 변환을 포함하며, 팔 IK와 장면 충돌 판단은 별도 비용이다.
+
+### Isaac Sim 검증
+
+생성한 100개에 여섯 축의 두 끝값을 확인하는 12개 자세를 추가했다. 동일한 112개를
+9개 장면에서 각각 새 초기 팔 자세로 배치하고, 속도를 0으로 초기화해 80 ms 동안 같은
+Hand 목표를 주었다. 원본 URDF 충돌 메시 검사에서는 112개 모두 손 내부 교차가 0건이었다.
+기존 팔 시작 범위에서는 손 내부 관통이 0/1,008회였고, 주변 물체
+관통이 6/1,008회였다. 초기 15 mm 여유를 위반한 물체 쌍이 있는 자세는 27회였다.
+
+667개 구간을 한꺼번에 감싸는 148.91 mm 반경의 구도 비교했다. 이 값을 전체 팔 시작
+범위의 X 하한에 반영하면 일부 장면에서는 기존 전완 방향 조건을 만족하는 IK 해를
+만들지 못했다. 구간별 외곽을 기존 팔 후보와 매칭하는 방식으로 변경했다.
+
+최종 방식은 각 장면에서 기존 팔 후보 112개와 인증된 손 구간 667개를 한 번에
+비교했다. 9개 장면 모두 모든 손 구간에 유효한 팔 후보가 하나 이상 있었고, 각 장면에서
+6개 축의 전체 범위가 유지됐다. 이 시험에서는 월드 3축 검사에서 모든 구간의 후보를
+확보했다. 매칭 결과, 무작위 자세 900회와 끝값 자세 108회 모두 손 내부·팔·선반·물체
+관통이 0회였다. 초기 15 mm 장면 여유도 모두 통과했다. 최대 손 관절 속도는
+0.053 rad/s, 초기 목표 대비 최대 편차는 0.00262 rad였다.
+
+팔·손 구간 매칭은 9개 장면 평균 3.59 ms, 첫 실행을 제외한 8개의 평균 2.08 ms였다.
+이 측정은 기존 팔 후보가 준비된 뒤의 비용이다. 손 자세는 그대로 사용했고, 초기 팔
+자세가 달라진 경우는 총 164/1,008회로 한 장면에서 최대 77/112회였다. 학습에 적용할
+경우 팔 시작과 Hand 자세의 분포가 이 매칭에 따라 달라진다. 이번 랜덤화는 진단
+스크립트에서만 적용했다.
+
+- [무작위 자세 100개 CSV](diagnostics/hand_reset_full_range_2026-11-25/poses.csv) · [생성 시간 원자료](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/sampling_summary.json)
+- [구간 검증 집계](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/certified_action_boxes_refined.json) · [구간 테이블](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/certified_action_boxes_refined.npz)
+- [기존 팔 시작 범위의 PhysX 측정 결과](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/native.json)
+- [팔·손 구간 매칭 후 PhysX 측정 결과](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/native_matched_v2.json)
+
+```bash
+probe=src/contact_manipulation_symmetric/tests
+out=outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25
+./IsaacLab/isaaclab.sh -p "$probe/probe_hand_reset_randomization.py" --headless --export-hand-hulls "$out/cooked_hulls.json"
+python "$probe/probe_hand_reset_certify.py" "$out/cooked_hulls.json" --output "$out/certified_action_boxes_refined.npz"
+python "$probe/probe_hand_reset_sampler.py" "$out/certified_action_boxes_refined.npz"
+./IsaacLab/isaaclab.sh -p "$probe/probe_hand_reset_randomization.py" --headless --raw-actions-file "$out/native_input.json" --num-scenes 9 --output "$out/native.json"
+./IsaacLab/isaaclab.sh -p "$probe/probe_hand_reset_randomization.py" --headless --raw-actions-file "$out/native_input.json" --num-scenes 9 --hand-envelope-certificate "$out/certified_action_boxes_refined.npz" --output "$out/native_matched_v2.json"
+```
+
+## 187. 2026-11-25 — Symmetric 학습 reset에서 GPU 조건부 Hand 랜덤화
+
+`UR5eContactManipulationEnvCfg.hand_reset_randomization`을 기본 `True`로 적용했다.
+공통 장면 교체와 개별 환경의 부분 reset에서 각 episode seed를 사용해 엄지 1을 뽑고,
+엄지 2의 64개 후보와 검지·중지의 각 32개 후보를 GPU에서 검증한다. 약지·소지는
+손 내부 간섭 기준으로 raw `[-2, 2]`를 사용한다. 엄지 2를 실시간 검사에서 확보하기
+어려운 경우에는 패키지에 포함한 호환 구간에서 원래 엄지 1을 유지하며 뽑는다.
+
+샘플링된 12개 연동 관절 자세를 실제 USD FK에 적용해 기존 팔 자세에서 선반·물체와
+15 mm, 팔과 2 mm의 여유를 검사한다. 간섭하면 같은 손 자세를 그 장면의 기존 검증된
+팔 시작 자세에서 한 번 더 평가한다. 두 팔 자세에서 여유를 확보하지 못하면 해당
+환경의 원래 팔과 중립 손 자세를 유지한다. 모든 경우 reset writer가 관절 위치와
+drive 목표를 같은 값으로 기록하고 속도를 0으로 초기화한다. TensorBoard의
+`Reset/hand_start_*_fraction`에서 구간 대체, 팔 재배정, 장면 대체의 비율을 확인할 수 있다.
+
+RTX 3090의 64환경에서 장면 3개에 대해 전체 reset 3회와 32환경 부분 reset 3회를
+검증했다. 모두 합쳐 288개 자세가 손 내부, 선반·물체 및 팔 여유 검사를 통과했다.
+같은 손 자세를 유지하면서 팔 후보를 바꾼 경우는 12회였고, 중립 손으로 돌아간 경우와
+사전 계산한 엄지 구간을 사용한 경우는 모두 0회였다. 부분 reset에서는 다른 환경의
+관절 상태가 보존됐다. 이 검사에서 가장 낮은 손 내부 분리 하한은 0.1033 mm였다.
+
+학습 진입점 `train.py`에서도 seed `2511`, 64환경, PPO 1 iteration으로 확인했다.
+스모크 테스트는 두 실행의 Actor·Critic 컴파일을 끄고 Hand 랜덤화만 바꿨다.
+랜덤화 사용 시 첫 iteration의 `hand_velocity`는 0.9987, 중립 손 조건에서는
+0.9991이었다. 평균 episode 길이는 각각 1.03과 1.05 스텝이었다.
+
+- [GPU 조건부 생성 30개 영상](videos/hand_reset_randomization_2026-11-25/hand_reset_conditional_gpu_30.mp4)
+- [영상 자세별 raw action](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/conditional_gpu_video_poses.csv)
+- [전체·부분 reset 검증](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_smoke.json)
+- [PPO 스모크 테스트](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_ppo.log) · [중립 자세 비교](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_baseline_ppo.log)

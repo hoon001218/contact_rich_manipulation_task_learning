@@ -14,7 +14,7 @@ dependencies = ["gymnasium", "numba>=0.59", "trimesh", "warp-lang"]
 include = ["contact_manipulation_symmetric*"]
 
 [tool.setuptools.package-data]
-contact_manipulation_symmetric = ["data/initial_scene_catalog/*"]
+contact_manipulation_symmetric = ["data/initial_scene_catalog/*", "data/hand_reset_geometry.npz"]
 
 [tool.ruff]
 line-length = 120

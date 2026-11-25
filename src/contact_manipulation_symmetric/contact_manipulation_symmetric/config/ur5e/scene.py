@@ -1305,6 +1305,72 @@ class RobotPoseModel:
         frames, _, _ = self.arm_forward_batch(joint_positions[:, constants["arm_ids"]])
         return frames[:, constants["body_owners"]] @ constants["body_offsets"]
 
+    def reset_collider_transforms(self, joint_positions):
+        """World collider frames with the actual Hand angles, using the USD joint tree."""
+        constants = self._tensor_constants(joint_positions.device, joint_positions.dtype)
+        if "reset_hand_fk" not in constants:
+            identity = np.eye(4)
+            arm_indices = {int(joint_id): i + 1 for i, joint_id in enumerate(self.arm_ids)}
+            chains = {self.root_body_name: (0, (), identity)}
+            for joint in self.joints:
+                if joint.index in arm_indices:
+                    chains[joint.child] = (arm_indices[joint.index], (), identity)
+                    continue
+                owner, steps, trailing = chains[joint.parent]
+                if joint.index is None:
+                    trailing = trailing @ self._motion(joint, self.default_joint_positions)
+                else:
+                    before, after, axis = joint.frame0, joint.frame1_inverse, joint.axis
+                    if joint.reverse:
+                        before, after, axis = np.linalg.inv(after), np.linalg.inv(before), -axis
+                    steps = (*steps, (joint.index, trailing @ before, axis))
+                    trailing = after
+                chains[joint.child] = (owner, steps, trailing)
+
+            colliders = [i for i, box in enumerate(self.colliders) if "/ROASRightHand/" in box.path]
+            if not colliders:
+                raise RuntimeError("Hand reset randomization requires RH56E2 collision links.")
+            owners, targets, steps = [], [], []
+            for i in colliders:
+                box = self.colliders[i]
+                owner, chain, trailing = chains[box.body_name]
+                local = identity.copy()
+                local[:3, :3], local[:3, 3] = box.rotation_local, box.center_local
+                owners.append(owner)
+                targets.append(trailing @ local)
+                steps.append(chain)
+            depth = max(map(len, steps))
+            padded = [(*chain, *((0, identity, np.zeros(3)),) * (depth - len(chain))) for chain in steps]
+
+            def tensor(values):
+                return joint_positions.new_tensor(np.asarray(values))
+
+            def indices(values):
+                return torch.as_tensor(values, device=joint_positions.device, dtype=torch.long)
+
+            step_tensors = []
+            for level in zip(*padded):
+                ids, before, axes = zip(*level)
+                x, y, z = np.asarray(axes).T
+                zeros = np.zeros_like(x)
+                skew = np.stack((zeros, -z, y, z, zeros, -x, -y, x, zeros), axis=-1).reshape(-1, 3, 3)
+                step_tensors.append((indices(ids), tensor(before), tensor(skew), tensor(skew @ skew)))
+            constants["reset_hand_fk"] = (indices(colliders), indices(owners), tensor(targets), step_tensors)
+
+        hand_ids, owners, trailing, steps = constants["reset_hand_fk"]
+        positions = joint_positions[:, constants["arm_ids"]]
+        frames, _, _ = self.arm_forward_batch(positions)
+        colliders = frames[:, constants["collider_owners"]] @ constants["collider_offsets"]
+        hand = frames[:, owners]
+        identity = torch.eye(4, device=joint_positions.device, dtype=joint_positions.dtype)
+        for ids, before, skew, skew2 in steps:
+            angle = joint_positions[:, ids, None, None]
+            motion = identity.expand(*angle.shape[:2], 4, 4).clone()
+            motion[..., :3, :3] = identity[:3, :3] + angle.sin() * skew + (1 - angle.cos()) * skew2
+            hand = hand @ before @ motion
+        colliders[:, hand_ids] = hand @ trailing
+        return colliders, hand_ids
+
     @staticmethod
     def _rotation_error_batch(target, current):
         relative = target @ current.transpose(-1, -2)

@@ -6530,6 +6530,49 @@ def _robot_start_noise(seeds: wp.array(dtype=wp.int64), noise: wp.array3d(dtype=
         noise[row, attempt, component] = wp.randf(state)
 
 
+@wp.func
+def _reset_collider_frame(frames: wp.array4d(dtype=wp.float32), row: int, collider: int):
+    center = wp.vec3(frames[row, collider, 0, 3], frames[row, collider, 1, 3], frames[row, collider, 2, 3])
+    rotation = wp.mat33(frames[row, collider, 0, 0], frames[row, collider, 0, 1], frames[row, collider, 0, 2],
+                        frames[row, collider, 1, 0], frames[row, collider, 1, 1], frames[row, collider, 1, 2],
+                        frames[row, collider, 2, 0], frames[row, collider, 2, 1], frames[row, collider, 2, 2])
+    return center, rotation
+
+
+@wp.kernel(enable_backward=False)
+def _hand_start_clearance_kernel(
+    frames: wp.array4d(dtype=wp.float32), hand_ids: wp.array(dtype=wp.int64),
+    half: wp.array2d(dtype=wp.float32), arm_checks: wp.array2d(dtype=wp.int32),
+    arm_counts: wp.array(dtype=wp.int32), centers: wp.array2d(dtype=wp.float32),
+    rotations: wp.array3d(dtype=wp.float32), obstacle_half: wp.array2d(dtype=wp.float32),
+    obstacle_valid: wp.array(dtype=wp.bool), clearance: float, safe: wp.array2d(dtype=wp.bool),
+):
+    row, slot = wp.tid()
+    collider = hand_ids[slot]
+    center, rotation = _reset_collider_frame(frames, row, wp.int32(collider))
+    extent = wp.vec3(half[collider, 0], half[collider, 1], half[collider, 2])
+    safe[row, slot] = False
+    ground = wp.abs(rotation[2, 0]) * extent[0] + wp.abs(rotation[2, 1]) * extent[1] + wp.abs(rotation[2, 2]) * extent[2]
+    if not (center[2] - ground >= clearance):
+        return
+    for obstacle in range(centers.shape[0]):
+        if obstacle_valid[obstacle]:
+            c = wp.vec3(centers[obstacle, 0], centers[obstacle, 1], centers[obstacle, 2])
+            r = wp.mat33(rotations[obstacle, 0, 0], rotations[obstacle, 0, 1], rotations[obstacle, 0, 2],
+                         rotations[obstacle, 1, 0], rotations[obstacle, 1, 1], rotations[obstacle, 1, 2],
+                         rotations[obstacle, 2, 0], rotations[obstacle, 2, 1], rotations[obstacle, 2, 2])
+            h = wp.vec3(obstacle_half[obstacle, 0], obstacle_half[obstacle, 1], obstacle_half[obstacle, 2])
+            if not _sat_separated(center, rotation, extent, c, r, h, clearance):
+                return
+    for index in range(arm_counts[slot]):
+        other = arm_checks[slot, index]
+        c, r = _reset_collider_frame(frames, row, other)
+        h = wp.vec3(half[other, 0], half[other, 1], half[other, 2])
+        if not _sat_separated(center, rotation, extent, c, r, h, .002):
+            return
+    safe[row, slot] = True
+
+
 def _robot_start_singularity_settings(env):
     """Bind the same enabled native failure and numeric parameters as the MDP.
 
@@ -9112,6 +9155,97 @@ def apply_episode_batch(env, ids, batch):
     env.sim.forward()
 
 
+def _hand_start_clearance(env, joint_positions, scene_boxes, stream):
+    model = env.robot_pose_model
+    transforms, hand_ids = model.reset_collider_transforms(joint_positions)
+    constants = model._tensor_constants(joint_positions.device, joint_positions.dtype)
+    if "reset_hand_arm_checks" not in constants:
+        hand = hand_ids.tolist()
+        checks = {collider: [] for collider in hand}
+        for a, b in model.self_collision_pairs():
+            if a in checks:
+                checks[a].append(b)
+            elif b in checks:
+                checks[b].append(a)
+        # The Hand mount is attached to the wrist. The moving finger links
+        # still need clearance from the fixed bodies near that attachment.
+        attachment = {"wrist_3_link", "SensorMountProximal", "ToolForceTorqueLink"}
+        mount = [i for i, box in enumerate(model.colliders) if box.body_name in attachment]
+        for i in hand:
+            if model.colliders[i].body_name.startswith(("right_thumb", "right_index", "right_middle",
+                                                        "right_ring", "right_little")):
+                checks[i].extend(mount)
+        counts = [len(checks[i]) for i in hand]
+        width = max(1, max(counts))
+        neighbors = joint_positions.new_tensor([checks[i] + [0] * (width - len(checks[i])) for i in hand],
+                                               dtype=torch.int32)
+        constants["reset_hand_arm_checks"] = (neighbors, joint_positions.new_tensor(counts, dtype=torch.int32))
+    checks, counts = constants["reset_hand_arm_checks"]
+    safe = torch.empty((len(joint_positions), len(hand_ids)), device=joint_positions.device, dtype=torch.bool)
+    wp.launch(_hand_start_clearance_kernel, dim=safe.shape, inputs=[
+        wp.from_torch(transforms.contiguous()), wp.from_torch(hand_ids), wp.from_torch(constants["collider_half"]),
+        wp.from_torch(checks), wp.from_torch(counts), *(wp.from_torch(t[0]) for t in scene_boxes),
+        env.cfg.robot_start.collision_clearance, wp.from_torch(safe),
+    ], device=str(joint_positions.device), stream=stream)
+    return safe.all(dim=1)
+
+
+def _randomize_hand_starts(env, runtime, batch, template, sample, cache):
+    """Draw once per row, with the original checked start as the last fallback."""
+    positions = batch.joint_positions
+    device = positions.device
+    if not hasattr(runtime, "hand_reset_sampler"):
+        from .hand_reset_sampler import HandResetSampler
+        from ..config.ur5e.scene import HAND_JOINT_NAMES, hand_joint_limits, hand_joint_mapping
+
+        robot = env.scene["robot"]
+        path = robot.cfg.spawn.hand_urdf_path
+        joints, indices, gains, offsets = hand_joint_mapping(str(path))
+        joint_ids, actual_names = robot.find_joints(list(joints), preserve_order=True)
+        if tuple(actual_names) != joints:
+            raise RuntimeError("The reset sampler must use the same twelve joints as the Hand action.")
+        bounds, _ = hand_joint_limits(str(path))
+        limits = positions.new_tensor([bounds[HAND_JOINT_NAMES[index]] for index in indices])
+        gains = positions.new_tensor(gains)
+        runtime.hand_reset_mapping = (joint_ids, limits.mean(dim=1) * gains + positions.new_tensor(offsets),
+                                      (limits[:, 1] - limits[:, 0]) * 0.25 * gains,
+                                      torch.as_tensor(indices, device=device, dtype=torch.long))
+        runtime.hand_reset_sampler = HandResetSampler(device, urdf_path=path)
+
+    stream = wp.stream_from_torch(torch.cuda.current_stream(device)) if device.type == "cuda" else None
+    noise = positions.new_empty((len(positions), 1, 12))
+    hand_seeds = batch.seeds ^ 0x418AD2C8E19D602B
+    wp.launch(_robot_start_noise, dim=noise.shape[:2], inputs=[wp.from_torch(hand_seeds), wp.from_torch(noise)],
+              device=str(device), stream=stream)
+    sampler = runtime.hand_reset_sampler
+    raw = sampler.sample(noise[:, 0, :9].contiguous())
+    joint_ids, bias, slope, masters = runtime.hand_reset_mapping
+    target = bias + slope * raw[:, masters]
+    drawn = positions.clone()
+    drawn[:, joint_ids] = target
+
+    boxes = cache.robot[1][:4] if cache.robot is not None else _scene_boxes_tensor(env, [sample], cache.proposals)
+    compatible = _hand_start_clearance(env, drawn, boxes, stream)
+    blocked = (~compatible).nonzero().flatten()
+    reassigned = positions.new_zeros(())
+    fallback = blocked.numel()
+    if fallback:
+        alternate = template.joint_positions.expand(fallback, -1).clone()
+        alternate[:, joint_ids] = target[blocked]
+        alternate_safe = _hand_start_clearance(env, alternate, boxes, stream)
+        drawn[blocked] = torch.where(alternate_safe[:, None], alternate, positions[blocked])
+        for name in ("robot_regions", "robot_tcp"):
+            value = getattr(batch, name)
+            value[blocked] = torch.where(alternate_safe[:, None], getattr(template, name), value[blocked])
+        reassigned = alternate_safe.sum()
+    positions.copy_(drawn)
+    runtime.pending_reset_metrics.update({
+        "Reset/hand_start_scene_fallback_fraction": (fallback - reassigned) / len(positions),
+        "Reset/hand_start_arm_reassigned_fraction": reassigned / len(positions),
+        "Reset/hand_start_interval_fallback_fraction": sampler.last_fallback.any(dim=1).float().mean(),
+    })
+
+
 def _shared_reset_batch(env, runtime, ids, template, sample):
     """Broadcast frozen vision/layout and sample fresh continuous EEF starts.
 
@@ -9198,6 +9332,8 @@ def _shared_reset_batch(env, runtime, ids, template, sample):
         "Reset/robot_start_recovery_count": float(recovery_count),
         "Reset/robot_start_search_rounds": float(searches),
     }
+    if getattr(env.cfg, "hand_reset_randomization", False):
+        _randomize_hand_starts(env, runtime, batch, template, sample, cache)
     runtime.shared_inputs = cache
     return batch
 

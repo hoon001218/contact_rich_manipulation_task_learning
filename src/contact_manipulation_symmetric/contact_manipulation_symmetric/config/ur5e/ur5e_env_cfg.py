@@ -126,6 +126,7 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
     scene: UR5eContactSceneCfg = UR5eContactSceneCfg(
         num_envs=1, env_spacing=2.5, replicate_physics=True, clone_in_fabric=False,
     )
+    hand_reset_randomization: bool = True  # Sample six coupled motor commands at each episode reset.
 
     def __post_init__(self):
         super().__post_init__()
