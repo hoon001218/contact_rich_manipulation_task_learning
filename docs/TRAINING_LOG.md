@@ -12539,3 +12539,31 @@ RTX 3090의 64환경에서 장면 3개에 대해 전체 reset 3회와 32환경 �
 - [영상 자세별 raw action](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/conditional_gpu_video_poses.csv)
 - [전체·부분 reset 검증](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_smoke.json)
 - [PPO 스모크 테스트](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_ppo.log) · [중립 자세 비교](../outputs/contact_manipulation_symmetric/hand_reset_full_range_2026-11-25/training_hand_reset_baseline_ppo.log)
+
+## 188. 2026-11-25 — Symmetric 접촉·재배치·마무리 보상 가중치 비교안
+
+변경 전의 활성 보상 가중치와 첫 비교 실험에 적용할 값을 기록한다. `time_penalty`의
+표 값은 커리큘럼 목표 가중치이며, 학습 초반에 적용되는 값은 `0`이다.
+
+| Reward term | 변경 전 | 비교 실험 |
+|---|---:|---:|
+| `clearance` | 30 | 75 |
+| `blocker_distance` | 5 | 3 |
+| `blocker_normal_alignment` | 3 | 3 |
+| `blocker_relocation` | 30 | 60 |
+| `blocker_contact_hold` | 3 | 2 |
+| `blocker_pose_hold` | 1 | 3 |
+| `eef_access_front` | 14 | 16 |
+| `shelf_collision` | −0.5 | −0.5 |
+| `target_collision` | −0.5 | −0.5 |
+| `object_collision` | −0.5 | −0.5 |
+| `motion_action_rate` | −0.03 | −0.03 |
+| `motion_joint_velocity` | −0.03 | −0.03 |
+| `object_stability` | 0.5 | 0.5 |
+| `time_penalty` | −0.3 | −0.3 |
+
+비교안의 목적은 접촉한 채 통로를 비우고 재배치할 때의 점수를 높이고, 성공 후에는
+Blocker를 정지시킨 상태에서 통로 입구로 이동하는 유인을 주는 것이다. 마무리 보상은
+유효 성공과 Blocker tactile 접촉이 26스텝(50 Hz에서 0.52초) 연속으로 성립할 때 열린다.
+비교 시 접촉 유지, 접촉 중 순수한 재배치 진전, 마무리 gate 진입 및 접촉 해제 뒤 성공
+유지 여부를 본다.

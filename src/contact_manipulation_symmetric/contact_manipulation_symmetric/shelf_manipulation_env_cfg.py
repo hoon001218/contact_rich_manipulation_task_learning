@@ -114,9 +114,9 @@ class RewardsCfg:
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     # Keep rewarding contact-weighted improvements on the transition into success.
-    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=30.0)
+    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=75.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
+        func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
     )
     blocker_normal_alignment = RewardTermCfg(
         func=mdp.blocker_normal_alignment, weight=3.0,
@@ -127,23 +127,23 @@ class RewardsCfg:
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation_distance_improvement, weight=30.0,
+        func=mdp.blocker_relocation_distance_improvement, weight=60.0,
         params={"reference_speed": 4.0, "threshold": 0.01},
     )
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
-    # blocker_pose_hold = RewardTermCfg(
-    #     func=mdp.blocker_pose_hold, weight=1.0,
-    #     params={"half_distance": 0.001, "success_confirmation_steps": 3},
-    # )
-    # eef_access_front = RewardTermCfg(
-    #     func=mdp.eef_access_front, weight=14.0,
-    #     params={
-    #         "front_offset": 0.06,
-    #         "half_distance": 0.10,
-    #         "blocker_half_distance": 0.001,
-    #         "success_confirmation_steps": 3,
-    #     },
-    # )
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=2.0)
+    blocker_pose_hold = RewardTermCfg(
+        func=mdp.blocker_pose_hold, weight=3.0,
+        params={"half_distance": 0.001, "success_confirmation_steps": 3},
+    )
+    eef_access_front = RewardTermCfg(
+        func=mdp.eef_access_front, weight=16.0,
+        params={
+            "front_offset": 0.06,
+            "half_distance": 0.10,
+            "blocker_half_distance": 0.001,
+            "success_confirmation_steps": 3,
+        },
+    )
     shelf_collision = RewardTermCfg(
         func=mdp.shelf_collision, weight=-0.5,
         params={
