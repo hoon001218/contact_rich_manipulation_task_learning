@@ -64,6 +64,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import contact_manipulation_symmetric  # Register the local task after AppLauncher.
 from contact_manipulation_symmetric.config.ur5e.agents.ppo import load_checkpoint, prepare_inference_checkpoint
+from contact_manipulation_symmetric.mdp.curriculums import checkpoint_completed_iterations, prepare_scene_curriculum
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -76,14 +77,6 @@ def main(env_cfg, agent_cfg):
     """Load trained weights, infer deterministic actions, and let the env auto-reset."""
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    # Playback always uses the full configured clutter range, even for an
-    # early checkpoint or a configuration exported during curriculum training.
-    env_cfg.curriculum.scene_object_count = None
-    env_cfg.spawn_object_count_range = None
-    env_cfg.scene_object_curriculum_start_iteration = None
-    env_cfg.layout_curriculum_start_step = None
-    env_cfg.layout_curriculum_end_step = None
-    env_cfg.layout_curriculum_resume_steps = 0
     if args_cli.scene_layout is not None:
         side, near, far = args_cli.scene_layout
         env_cfg.layout_scene_override = (-1 if side == "left" else 1, near, far)
@@ -104,6 +97,14 @@ def main(env_cfg, agent_cfg):
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     saved_checkpoint = prepare_inference_checkpoint(agent_cfg, checkpoint)
+    layout_phase, object_count_phase = prepare_scene_curriculum(
+        env_cfg, agent_cfg, completed_iterations=checkpoint_completed_iterations(saved_checkpoint), advance=False,
+    )
+    if layout_phase is not None:
+        print(f"[INFO] Playback layout probabilities (easy, medium, hard): "
+              f"{env_cfg.layout_curriculum_start_weights}", flush=True)
+    if object_count_phase is not None:
+        print(f"[INFO] Playback object count range: {env_cfg.spawn_object_count_range}", flush=True)
     print(f"[INFO] Loading model checkpoint from: {checkpoint}", flush=True)
     env_cfg.log_dir = str(checkpoint.parent)
 

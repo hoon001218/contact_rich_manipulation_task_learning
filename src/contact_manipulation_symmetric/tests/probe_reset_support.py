@@ -164,7 +164,7 @@ def run(args, report):
             "z_velocity": "Native rigid-body COM world-Z velocity, m/s.",
             "contacts": "Optional native object-to-shelf / object-to-robot normal-force vector sums, N. Step zero is invalid after reset. Tactile alone does not exclude non-pad robot contacts.",
             "control": "Native production actions/controllers at configured decimation; no policy, reward, termination or automatic reset. Parked mode changes only reset robot root translation.",
-            "object_count": "Object-count curriculum disabled, using the configured full clutter range as play.py does.",
+            "object_count": "Object-count curriculum disabled, using the configured full clutter range.",
             "movement_windows": "Statistics include only reset-selected environment/object pairs. Each sample is a window peak or accumulated path, as its metric name states. Per-object percentiles differ from percentiles of each environment's maximum.",
             "tilt": "Angle of canonical upright +Z, excluding yaw. Shelf-relative tilt follows the current shelf plane. Initial/window tilt changes compare upright directions, not Euler roll/pitch. Angles use atan2(cross norm, dot) to resolve small motion.",
             "rebound": "Maximum increase in root world Z after an earlier running minimum within the measurement window; distinct from the intentional initial downward height offset.",

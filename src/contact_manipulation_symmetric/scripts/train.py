@@ -63,7 +63,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import contact_manipulation_symmetric  # Register the local task after AppLauncher.
 from contact_manipulation_symmetric.config.ur5e.agents.ppo import load_checkpoint
 from contact_manipulation_symmetric.mdp.curriculums import (
-    object_count_range, scene_layout_probabilities, scene_object_count_curriculum,
+    checkpoint_completed_iterations, prepare_scene_curriculum,
 )
 from contact_manipulation_symmetric.mdp.events import SensorMonitoringLogger, TensorboardSensorMonitor
 
@@ -109,79 +109,6 @@ def sync_time_penalty_curriculum(env, env_cfg, *, completed_iterations=0, num_st
     manager.compute()
 
 
-def checkpoint_completed_iterations(path):
-    """Read the native clock before the initial reset, without allocating on GPU."""
-    if path is None:
-        return 0
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    iteration = checkpoint.get("iter")
-    if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 0:
-        raise ValueError("Resume checkpoint must contain a nonnegative native 'iter' integer.")
-    return iteration + 1
-
-
-def prepare_scene_object_curriculum(env_cfg, agent_cfg, *, completed_iterations=0):
-    """Configure the native curriculum before any episode is generated."""
-    env_cfg.curriculum.scene_object_count = None
-    env_cfg.spawn_object_count_range = None
-    start = env_cfg.scene_object_curriculum_start_iteration
-    if start is None:
-        return None
-    end = env_cfg.scene_object_curriculum_end_iteration
-    rollout = agent_cfg.num_steps_per_env
-    for name, value, minimum in (("scene_object_curriculum_start_iteration", start, 0),
-                                 ("scene_object_curriculum_end_iteration", end, 1),
-                                 ("num_steps_per_env", rollout, 1),
-                                 ("completed_iterations", completed_iterations, 0)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}.")
-    if end <= start:
-        raise ValueError("scene_object_curriculum_end_iteration must exceed its start iteration.")
-    if env_cfg.spawn_rules.generation_mode != "sequential":
-        raise ValueError("The scene object-count curriculum requires sequential generation.")
-    params = dict(start_step=start * rollout, end_step=end * rollout,
-                  final_min=env_cfg.spawn_rules.min_objects, final_max=env_cfg.spawn_rules.max_objects,
-                  resume_steps=completed_iterations * rollout)
-    env_cfg.spawn_object_count_range = object_count_range(
-        params["resume_steps"], start_step=params["start_step"], end_step=params["end_step"],
-        final_min=params["final_min"], final_max=params["final_max"],
-    )
-    env_cfg.curriculum.scene_object_count = CurriculumTermCfg(
-        func=scene_object_count_curriculum, params=params,
-    )
-    return start, end
-
-
-def prepare_scene_layout_curriculum(env_cfg, agent_cfg, *, completed_iterations=0):
-    """Initialize the shared-scene schedule before the first native reset."""
-    env_cfg.layout_curriculum_start_step = None
-    env_cfg.layout_curriculum_end_step = None
-    env_cfg.layout_curriculum_resume_steps = 0
-    start = env_cfg.layout_curriculum_start_iteration
-    if start is None or env_cfg.layout_scene_override is not None:
-        return None
-    end = env_cfg.layout_curriculum_end_iteration
-    steps_per_iteration = agent_cfg.num_steps_per_env
-    for name, value, minimum in (("layout_curriculum_start_iteration", start, 0),
-                                 ("layout_curriculum_end_iteration", end, 1),
-                                 ("num_steps_per_env", steps_per_iteration, 1),
-                                 ("completed_iterations", completed_iterations, 0)):
-        if type(value) is not int or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}.")
-    if env_cfg.spawn_rules.generation_mode != "sequential":
-        raise ValueError("The layout curriculum requires the sequential scene generator.")
-    start_step, end_step = start * steps_per_iteration, end * steps_per_iteration
-    resume_steps = completed_iterations * steps_per_iteration
-    scene_layout_probabilities(
-        resume_steps, start_step=start_step, end_step=end_step,
-        start_weights=env_cfg.layout_curriculum_start_weights, end_weights=env_cfg.layout_curriculum_end_weights,
-    )
-    env_cfg.layout_curriculum_start_step = start_step
-    env_cfg.layout_curriculum_end_step = end_step
-    env_cfg.layout_curriculum_resume_steps = resume_steps
-    return start, end
-
-
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg, agent_cfg):
     """Configure, create, wrap, and train with the standard managers and runner."""
@@ -209,18 +136,12 @@ def main(env_cfg, agent_cfg):
     log_dir = log_root / run_name
     resume_path = (get_checkpoint_path(str(log_root), agent_cfg.load_run, agent_cfg.load_checkpoint)
                    if agent_cfg.resume else None)
-    resume_completed = checkpoint_completed_iterations(resume_path)
-    layout_phase = prepare_scene_layout_curriculum(
+    resume_completed = checkpoint_completed_iterations(
+        torch.load(resume_path, map_location="cpu", weights_only=False) if resume_path is not None else None,
+    )
+    layout_phase, object_count_phase = prepare_scene_curriculum(
         env_cfg, agent_cfg, completed_iterations=resume_completed,
     )
-    object_count_phase = None
-    if layout_phase is None and env_cfg.layout_scene_override is None:
-        object_count_phase = prepare_scene_object_curriculum(
-            env_cfg, agent_cfg, completed_iterations=resume_completed,
-        )
-    else:
-        env_cfg.curriculum.scene_object_count = None
-        env_cfg.spawn_object_count_range = None
     env_cfg.log_dir = str(log_dir)
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

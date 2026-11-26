@@ -1,8 +1,4 @@
-"""CPU regressions for layout and object-count schedules and full-scene play.
-
-These checks reuse the numerical scene fixtures; they do not start Isaac Sim.
-The test source was added without running it while training was active.
-"""
+"""CPU regressions for the scene schedules shared by training and playback."""
 
 import ast
 from collections import Counter
@@ -10,6 +6,7 @@ from dataclasses import asdict, replace
 import math
 from pathlib import Path
 import random
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -33,19 +30,14 @@ def scheduled_range(iteration):
     return curriculums.object_count_range(iteration * STEPS_PER_ITERATION, **SCHEDULE)
 
 
-def training_helpers():
-    """Load only clock/config helpers, without executing AppLauncher or training."""
-    path = PROJECT / "scripts/train.py"
-    module = ast.parse(path.read_text())
-    selected = [node for node in module.body if isinstance(node, ast.FunctionDef)
-                and node.name in ("prepare_scene_layout_curriculum", "prepare_scene_object_curriculum",
-                                  "checkpoint_completed_iterations")]
-    namespace = dict(torch=torch, object_count_range=curriculums.object_count_range,
-                     scene_layout_probabilities=curriculums.scene_layout_probabilities,
-                     scene_object_count_curriculum=curriculums.scene_object_count_curriculum,
-                     CurriculumTermCfg=lambda **kwargs: SimpleNamespace(**kwargs))
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
-    return namespace
+def scene_config(*, layout_start=5_000, object_start=10_000):
+    return SimpleNamespace(
+        layout_curriculum_start_iteration=layout_start, layout_curriculum_end_iteration=45_000,
+        layout_curriculum_start_weights=(.85, .10, .05), layout_curriculum_end_weights=(1.0/3.0,) * 3,
+        layout_scene_override=None, scene_object_curriculum_start_iteration=object_start,
+        scene_object_curriculum_end_iteration=45_000, curriculum=SimpleNamespace(scene_object_count=None),
+        spawn_rules=task.SpawnRules(generation_mode="sequential", min_objects=15, max_objects=25),
+    )
 
 
 class LayoutScheduleTests(unittest.TestCase):
@@ -72,22 +64,43 @@ class LayoutScheduleTests(unittest.TestCase):
             classify("blocked", "blocked")
 
     def test_train_uses_resume_clock_and_preserves_the_object_pool(self):
-        prepare = training_helpers()["prepare_scene_layout_curriculum"]
-        cfg = SimpleNamespace(layout_curriculum_start_iteration=5_000, layout_curriculum_end_iteration=45_000,
-                              layout_curriculum_start_weights=(.85, .10, .05),
-                              layout_curriculum_end_weights=(1.0/3.0,) * 3, layout_scene_override=None,
-                              spawn_rules=task.SpawnRules(generation_mode="sequential", min_objects=15, max_objects=25))
+        prepare = curriculums.prepare_scene_curriculum
+        cfg = scene_config()
         runner = SimpleNamespace(num_steps_per_env=STEPS_PER_ITERATION)
-        self.assertEqual(prepare(cfg, runner, completed_iterations=45_000), (5_000, 45_000))
+        self.assertEqual(prepare(cfg, runner, completed_iterations=45_000), ((5_000, 45_000), None))
         self.assertEqual((cfg.layout_curriculum_start_step, cfg.layout_curriculum_end_step),
                          (5_000 * STEPS_PER_ITERATION, 45_000 * STEPS_PER_ITERATION))
         self.assertEqual(cfg.layout_curriculum_resume_steps, 45_000 * STEPS_PER_ITERATION)
         self.assertEqual((cfg.spawn_rules.min_objects, cfg.spawn_rules.max_objects), (15, 25))
         cfg.layout_scene_override = (-1, "blocked", "front")
-        self.assertIsNone(prepare(cfg, runner, completed_iterations=45_000))
+        self.assertEqual(prepare(cfg, runner, completed_iterations=45_000, advance=False), (None, None))
         self.assertIsNone(cfg.layout_curriculum_start_step)
         self.assertIsNone(cfg.layout_curriculum_end_step)
         self.assertEqual(cfg.layout_curriculum_resume_steps, 0)
+        self.assertIsNone(cfg.spawn_object_count_range)
+        self.assertEqual(cfg.layout_scene_override, (-1, "blocked", "front"))
+
+    def test_play_draws_from_the_checkpoint_mix_without_advancing_it(self):
+        prepare = curriculums.prepare_scene_curriculum
+        runner = SimpleNamespace(num_steps_per_env=STEPS_PER_ITERATION)
+
+        def draw(cfg, generation, steps_since_launch):
+            return curriculums.choose_scene_layout(
+                42, generation, cfg.layout_curriculum_resume_steps + steps_since_launch,
+                start_step=cfg.layout_curriculum_start_step, end_step=cfg.layout_curriculum_end_step,
+                start_weights=cfg.layout_curriculum_start_weights, end_weights=cfg.layout_curriculum_end_weights,
+            )
+
+        for completed in (1, 25_000, 45_000):
+            with self.subTest(completed=completed):
+                train, play = scene_config(), scene_config()
+                prepare(train, runner, completed_iterations=completed)
+                prepare(play, runner, completed_iterations=completed, advance=False)
+                expected = [draw(train, generation, 0) for generation in range(20)]
+                self.assertGreater(len(set(expected)), 1)
+                for elapsed in (0, 90_000 * STEPS_PER_ITERATION):
+                    self.assertEqual([draw(play, generation, elapsed) for generation in range(20)], expected)
+                self.assertIsNone(play.spawn_object_count_range)
 
     def test_rounded_assets_can_close_both_lateral_cuts(self):
         geometries = []
@@ -260,16 +273,14 @@ class ObjectCountSceneBoundaryTests(unittest.TestCase):
 
 class ObjectCountEntrypointTests(unittest.TestCase):
     def test_train_prepares_fresh_and_resumed_scene_ranges_without_reducing_full_capacity(self):
-        prepare = training_helpers()["prepare_scene_object_curriculum"]
+        prepare = curriculums.prepare_scene_curriculum
         runner = SimpleNamespace(num_steps_per_env=STEPS_PER_ITERATION)
         for completed, expected in ((0, (2, 2)), (27_500, (8, 13)), (45_000, (15, 25))):
-            cfg = SimpleNamespace(scene_object_curriculum_start_iteration=10_000,
-                scene_object_curriculum_end_iteration=45_000,
-                curriculum=SimpleNamespace(scene_object_count=None),
-                spawn_rules=task.SpawnRules(generation_mode="sequential", min_objects=15, max_objects=25))
+            cfg = scene_config(layout_start=None)
             with self.subTest(completed=completed):
-                phase = prepare(cfg, runner, completed_iterations=completed)
-                self.assertEqual(phase, (10_000, 45_000))
+                with patch.dict(sys.modules, {"isaaclab.managers": SimpleNamespace(CurriculumTermCfg=SimpleNamespace)}):
+                    phases = prepare(cfg, runner, completed_iterations=completed)
+                self.assertEqual(phases, (None, (10_000, 45_000)))
                 self.assertEqual(cfg.spawn_object_count_range, expected)
                 self.assertEqual((cfg.spawn_rules.min_objects, cfg.spawn_rules.max_objects), (15, 25))
                 term = cfg.curriculum.scene_object_count
@@ -281,27 +292,33 @@ class ObjectCountEntrypointTests(unittest.TestCase):
                 term.func(env, slice(None), **term.params)
                 self.assertEqual(cfg.spawn_object_count_range, expected)
 
+    def test_play_keeps_the_checkpoint_count_range_without_a_curriculum_term(self):
+        cfg = scene_config(layout_start=None)
+        runner = SimpleNamespace(num_steps_per_env=STEPS_PER_ITERATION)
+        phases = curriculums.prepare_scene_curriculum(cfg, runner, completed_iterations=27_500, advance=False)
+        self.assertEqual(phases, (None, (10_000, 45_000)))
+        self.assertEqual(cfg.spawn_object_count_range, (8, 13))
+        self.assertIsNone(cfg.curriculum.scene_object_count)
+
     def test_disabling_curriculum_clears_a_stale_runtime_override(self):
-        prepare = training_helpers()["prepare_scene_object_curriculum"]
-        cfg = SimpleNamespace(scene_object_curriculum_start_iteration=None,
-            scene_object_curriculum_end_iteration=None,
-            curriculum=SimpleNamespace(scene_object_count=object()), spawn_object_count_range=(2, 2))
-        self.assertIsNone(prepare(cfg, SimpleNamespace()))
+        cfg = scene_config(layout_start=None, object_start=None)
+        cfg.curriculum.scene_object_count = object()
+        cfg.spawn_object_count_range = (2, 2)
+        self.assertEqual(curriculums.prepare_scene_curriculum(cfg, SimpleNamespace(), completed_iterations=0),
+                         (None, None))
         self.assertIsNone(cfg.curriculum.scene_object_count)
         self.assertIsNone(cfg.spawn_object_count_range)
 
-    def test_native_checkpoint_clock_is_read_on_cpu_and_converted_from_zero_based_label(self):
-        completed = training_helpers()["checkpoint_completed_iterations"]
-        with patch.object(torch, "load", return_value={"iter": 44_999}) as load:
-            self.assertEqual(completed("model_44999.pt"), 45_000)
-            self.assertEqual(load.call_args.kwargs["map_location"], "cpu")
+    def test_native_checkpoint_clock_is_converted_from_zero_based_label(self):
+        completed = curriculums.checkpoint_completed_iterations
+        self.assertEqual(completed({"iter": 44_999}), 45_000)
+        self.assertEqual(completed({"iter": 0}), 1)
         self.assertEqual(completed(None), 0)
         for invalid in (-1, True, 3.5, None):
-            with self.subTest(iteration=invalid), patch.object(torch, "load", return_value={"iter": invalid}):
-                with self.assertRaises(ValueError):
-                    completed("bad_clock.pt")
+            with self.subTest(iteration=invalid), self.assertRaises(ValueError):
+                completed({"iter": invalid})
 
-    def test_default_schedule_and_play_full_scene_override_are_explicit(self):
+    def test_default_schedule_and_entrypoint_setup_before_environment_creation(self):
         module = ast.parse((PACKAGE / "shelf_manipulation_env_cfg.py").read_text())
         cfg = next(node for node in module.body if isinstance(node, ast.ClassDef)
                    and node.name == "ShelfManipulationEnvCfg")
@@ -312,31 +329,20 @@ class ObjectCountEntrypointTests(unittest.TestCase):
         self.assertIsNone(ast.literal_eval(fields["spawn_object_count_range"]))
         self.assertEqual(ast.literal_eval(fields["layout_curriculum_start_iteration"]), 5000)
         self.assertEqual(ast.literal_eval(fields["layout_curriculum_end_iteration"]), 45_000)
-        module = ast.parse((PROJECT / "scripts/play.py").read_text())
-        main = next(node for node in module.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "main")
-        gym_make = next(node for node in ast.walk(main) if isinstance(node, ast.Call)
-                        and ast.unparse(node.func) == "gym.make")
-        for attribute in ("env_cfg.curriculum.scene_object_count",
-                          "env_cfg.spawn_object_count_range",
-                          "env_cfg.scene_object_curriculum_start_iteration",
-                          "env_cfg.layout_curriculum_start_step",
-                          "env_cfg.layout_curriculum_end_step"):
-            assignment = next(node for node in ast.walk(main) if isinstance(node, ast.Assign)
-                              and any(ast.unparse(target) == attribute for target in node.targets))
-            self.assertIsNone(ast.literal_eval(assignment.value))
-            self.assertLess(assignment.lineno, gym_make.lineno)
-        train = ast.parse((PROJECT / "scripts/train.py").read_text())
-        main = next(node for node in train.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "main")
-        calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
-        checkpoint = next(node for node in calls if ast.unparse(node.func) == "checkpoint_completed_iterations")
-        layout_prepare = next(node for node in calls if ast.unparse(node.func) == "prepare_scene_layout_curriculum")
-        prepare = next(node for node in calls if ast.unparse(node.func) == "prepare_scene_object_curriculum")
-        gym_make = next(node for node in calls if ast.unparse(node.func) == "gym.make")
-        self.assertLess(checkpoint.lineno, layout_prepare.lineno)
-        self.assertLess(layout_prepare.lineno, prepare.lineno)
-        self.assertLess(prepare.lineno, gym_make.lineno)
+        for script in ("train.py", "play.py"):
+            with self.subTest(script=script):
+                module = ast.parse((PROJECT / "scripts" / script).read_text())
+                main = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+                calls = {ast.unparse(node.func): node for node in ast.walk(main) if isinstance(node, ast.Call)}
+                prepare = calls["prepare_scene_curriculum"]
+                checkpoint = calls["checkpoint_completed_iterations"]
+                self.assertLessEqual(checkpoint.lineno, prepare.end_lineno)
+                self.assertLess(prepare.end_lineno, calls["gym.make"].lineno)
+                if script == "play.py":
+                    self.assertLess(calls["prepare_inference_checkpoint"].lineno, prepare.lineno)
+                    self.assertEqual(ast.unparse(checkpoint.args[0]), "saved_checkpoint")
+                    advance = next(node.value for node in prepare.keywords if node.arg == "advance")
+                    self.assertIs(ast.literal_eval(advance), False)
 
 
 if __name__ == "__main__":

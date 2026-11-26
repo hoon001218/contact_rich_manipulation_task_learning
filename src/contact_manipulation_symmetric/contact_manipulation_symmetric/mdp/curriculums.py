@@ -20,6 +20,13 @@ def _nonnegative_integer(value, name):
     return value
 
 
+def checkpoint_completed_iterations(checkpoint):
+    """Convert the native checkpoint's zero-based iteration to completed rollouts."""
+    if checkpoint is None:
+        return 0
+    return _nonnegative_integer(checkpoint.get("iter"), "checkpoint 'iter'") + 1
+
+
 def layout_difficulty(near_status, far_status):
     """Count the fewest extra requirements across the layout's available routes."""
     for difficulty, layouts in enumerate(SCENE_LAYOUTS_BY_DIFFICULTY):
@@ -107,12 +114,71 @@ def scene_object_count_curriculum(
     return {"min_objects": bounds[0], "max_objects": bounds[1], "progress": progress}
 
 
+def prepare_scene_curriculum(env_cfg, agent_cfg, *, completed_iterations, advance=True):
+    """Select the shared spawn schedule before the first reset."""
+    env_cfg.layout_curriculum_start_step = None
+    env_cfg.layout_curriculum_end_step = None
+    env_cfg.layout_curriculum_resume_steps = 0
+    env_cfg.curriculum.scene_object_count = None
+    env_cfg.spawn_object_count_range = None
+    if env_cfg.layout_scene_override is not None:
+        return None, None
+
+    start = env_cfg.layout_curriculum_start_iteration
+    if start is not None:
+        end = env_cfg.layout_curriculum_end_iteration
+        start_step, end_step, resume_steps = _scene_schedule_steps(
+            env_cfg, agent_cfg, start, end, completed_iterations, "layout_curriculum",
+        )
+        weights = scene_layout_probabilities(
+            resume_steps, start_step=start_step, end_step=end_step,
+            start_weights=env_cfg.layout_curriculum_start_weights,
+            end_weights=env_cfg.layout_curriculum_end_weights,
+        )
+        env_cfg.layout_curriculum_start_step = start_step
+        env_cfg.layout_curriculum_end_step = end_step
+        env_cfg.layout_curriculum_resume_steps = resume_steps
+        if not advance:
+            # Keep the checkpoint's probabilities while still drawing every new scene.
+            env_cfg.layout_curriculum_start_weights = env_cfg.layout_curriculum_end_weights = weights
+        return (start, end), None
+
+    start = env_cfg.scene_object_curriculum_start_iteration
+    if start is None:
+        return None, None
+    end = env_cfg.scene_object_curriculum_end_iteration
+    start_step, end_step, resume_steps = _scene_schedule_steps(
+        env_cfg, agent_cfg, start, end, completed_iterations, "scene_object_curriculum",
+    )
+    params = dict(start_step=start_step, end_step=end_step, final_min=env_cfg.spawn_rules.min_objects,
+                  final_max=env_cfg.spawn_rules.max_objects)
+    env_cfg.spawn_object_count_range = object_count_range(resume_steps, **params)
+    if advance:
+        from isaaclab.managers import CurriculumTermCfg
+
+        env_cfg.curriculum.scene_object_count = CurriculumTermCfg(
+            func=scene_object_count_curriculum, params={**params, "resume_steps": resume_steps},
+        )
+    return None, (start, end)
+
+
+def _scene_schedule_steps(env_cfg, agent_cfg, start, end, completed_iterations, schedule):
+    _nonnegative_integer(start, f"{schedule}_start_iteration")
+    _nonnegative_integer(end, f"{schedule}_end_iteration")
+    rollout = _nonnegative_integer(agent_cfg.num_steps_per_env, "num_steps_per_env")
+    _nonnegative_integer(completed_iterations, "completed_iterations")
+    if rollout == 0 or end <= start:
+        raise ValueError(f"{schedule} needs a positive rollout length and an end after its start.")
+    if env_cfg.spawn_rules.generation_mode != "sequential":
+        raise ValueError(f"{schedule} requires sequential generation.")
+    return start * rollout, end * rollout, completed_iterations * rollout
+
+
 def curriculum_spawn_rules(env):
     """Return temporary sampling rules while preserving physical pool capacity.
 
     ``env.spawn_rules.max_objects`` also defines tensor capacity and captured
-    graph shapes, so it must remain unchanged throughout training. Playback
-    leaves the independent count override unset and receives the original rules.
+    graph shapes, so it must remain unchanged throughout training and playback.
     """
     rules = env.spawn_rules
     bounds = getattr(env.cfg, "spawn_object_count_range", None)
