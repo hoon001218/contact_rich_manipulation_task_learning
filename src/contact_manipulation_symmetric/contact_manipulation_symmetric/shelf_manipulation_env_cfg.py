@@ -116,10 +116,10 @@ class RewardsCfg:
     # Keep rewarding contact-weighted improvements on the transition into success.
     clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=75.0)
     blocker_distance = RewardTermCfg(
-        func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
+        func=mdp.blocker_distance, weight=3.0, params={"decay": 5.0},
     )
     blocker_normal_alignment = RewardTermCfg(
-        func=mdp.blocker_surface_normal_alignment, weight=3.0,
+        func=mdp.blocker_surface_normal_alignment, weight=1.0,
         params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))},
     )
     # blocker_relocation = RewardTermCfg(
@@ -129,7 +129,7 @@ class RewardsCfg:
         func=mdp.blocker_relocation_distance_improvement, weight=60.0,
         params={"reference_speed": 4.0, "threshold": 0.01},
     )
-    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=2.0)
+    blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=5.0)
     blocker_pose_hold = RewardTermCfg(
         func=mdp.blocker_pose_hold, weight=3.0,
         params={"half_distance": 0.001, "success_confirmation_steps": 3},
