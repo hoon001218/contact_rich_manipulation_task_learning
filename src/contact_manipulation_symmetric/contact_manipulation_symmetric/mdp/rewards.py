@@ -19,7 +19,7 @@ __all__ = [
     "shelf_collision", "target_collision", "object_collision",
     "object_motion_cost", "shelf_motion_cost",
     "tactile_pad_points", "tactile_pad_frames", "blocker_distance_quality", "blocker_contact_hold", "blocker_distance",
-    "blocker_normal_alignment_quality", "blocker_normal_alignment",
+    "blocker_normal_alignment_quality", "blocker_normal_alignment", "blocker_surface_normal_alignment",
     "blocker_min_distance", "relocation_distance", "blocker_relocation", "blocker_relocation_contact_progress",
     "blocker_relocation_distance_progress",
     "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
@@ -199,6 +199,18 @@ def blocker_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi 
     center_w = state.blocker_center + env.scene.env_origins
     quality = blocker_normal_alignment_quality(points, normals, center_w, decay=decay)
     return torch.where(state.success, 0.0, quality) if stop_on_success else quality
+
+
+def blocker_surface_normal_alignment(env, decay=math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))):
+    """Average surface-facing quality across all 17 pads, including the fingertips."""
+    points, normals = tactile_pad_frames(env)
+    alignment = getattr(env, "_blocker_surface_alignment", None)
+    if alignment is None:
+        from .surface_alignment import BlockerSurfaceAlignment
+
+        alignment = BlockerSurfaceAlignment(env, num_pads=points.shape[1])
+        env._blocker_surface_alignment = alignment
+    return alignment.compute(points, normals, env.task_scene_data.blocker_id, decay=decay)
 
 
 def _blocker_pad_distances(pad_points, blocker_center, blocker_rotation, blocker_half_extent):

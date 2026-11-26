@@ -1665,6 +1665,42 @@ class RewardTests(unittest.TestCase):
         state.advance(batch, 2)
         torch.testing.assert_close(state.tilt_angle[:, 1], angles, atol=1.e-12, rtol=0.)
 
+
+class SurfaceAlignmentTests(unittest.TestCase):
+    def test_surface_alignment_uses_all_pads_and_current_blocker(self):
+        import trimesh
+
+        from contact_manipulation_symmetric.mdp.surface_alignment import _mean_pad_scores, _score_pads
+
+        box = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+        indices = wp.array(box.faces.reshape(-1), dtype=wp.int32, device="cpu")
+        meshes = [
+            wp.Mesh(points=wp.array(box.vertices + offset, dtype=wp.vec3, device="cpu"), indices=indices)
+            for offset in (0.0, np.array([1.0, 0.0, 0.0]))
+        ]
+        mesh_ids = wp.array(np.array([mesh.id for mesh in meshes], dtype=np.uint64), dtype=wp.uint64, device="cpu")
+        points = torch.zeros((2, 17, 3), dtype=torch.float32)
+        points[..., 0] = 0.051
+        normals = torch.zeros_like(points)
+        normals[:, :12, 0] = -1.0
+        normals[:, 12:, 0] = 1.0
+        poses = torch.zeros((2, 2, 7), dtype=torch.float32)
+        poses[..., 3] = 1.0
+        blocker_ids = torch.empty(2, dtype=torch.long)
+        scores = wp.empty((2, 17), dtype=float, device="cpu")
+        means = wp.empty(2, dtype=float, device="cpu")
+        decay = math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))
+        args = [wp.from_torch(points, dtype=wp.vec3), wp.from_torch(normals, dtype=wp.vec3),
+                wp.from_torch(poses), wp.from_torch(blocker_ids), mesh_ids, decay, scores]
+        opposite = math.exp(-2.0 * decay)
+        expected = np.array([(12 + 5 * opposite) / 17, (5 + 12 * opposite) / 17])
+        for object_ids, values in (([0, 1], expected), ([1, 0], expected[::-1])):
+            blocker_ids.copy_(torch.tensor(object_ids))
+            wp.launch(_score_pads, dim=(2, 17), inputs=args, device="cpu")
+            wp.launch(_mean_pad_scores, dim=2, inputs=[scores, means], device="cpu")
+            np.testing.assert_allclose(means.numpy(), values, atol=1.0e-6)
+
+
 class ActionRateRewardTests(unittest.TestCase):
     """Grouped L2 change uses accepted wrench/hand inputs, preserving PPO raw data."""
 
@@ -3470,7 +3506,7 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             expected[[1, 2]] = True
             torch.testing.assert_close(actual, expected)
 
-    def test_ur5e_configuration_binds_velocity_reward_and_termination_to_arm_joints(self):
+    def test_ur5e_configuration_binds_velocity_reward_to_all_policy_joints_and_termination_to_arm(self):
         source = Path(task.__file__).parent.parent / 'config/ur5e/ur5e_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'UR5eContactManipulationEnvCfg')
@@ -3490,9 +3526,11 @@ class NativeVelocityTerminationTests(unittest.TestCase):
                 'velocity_reward is not None', 'self.terminations.hand_velocity is not None'))]
         # Execute actual specialization bindings for either experiment setting.
         code = compile(ast.fix_missing_locations(ast.Module(body=binding, type_ignores=[])), str(source), 'exec')
-        expected = action_names['arm_action']
-        self.assertEqual(len(set(expected)), 6)
-        self.assertTrue(set(expected).isdisjoint(action_names['hand_action']))
+        arm_names = action_names['arm_action']
+        hand_names = action_names['hand_action']
+        self.assertEqual(len(set(arm_names)), 6)
+        self.assertEqual(len(set(hand_names)), 6)
+        self.assertTrue(set(arm_names).isdisjoint(hand_names))
         for enabled in (False, True):
             velocity_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
             reward_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
@@ -3506,8 +3544,8 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             exec(code, {'self': cfg})
             self.assertEqual(hasattr(cfg.rewards, 'motion_joint_velocity'), enabled)
             if enabled:
-                self.assertEqual(reward_asset.joint_names, expected)
-            self.assertEqual(velocity_asset.joint_names, expected)
+                self.assertEqual(reward_asset.joint_names, arm_names + hand_names)
+            self.assertEqual(velocity_asset.joint_names, arm_names)
             self.assertIn('right_little_1_joint', action_names['hand_action'])
             cfg.terminations.hand_velocity = None
             exec(code, {'self': cfg})
@@ -3717,7 +3755,8 @@ class NativeControllerTests(unittest.TestCase):
         self.assertEqual(velocity.params['asset_cfg'].joint_names, arm.joint_names)
         joint_velocity_reward = getattr(cfg.rewards, 'motion_joint_velocity', None)
         if joint_velocity_reward is not None:
-            self.assertEqual(joint_velocity_reward.params['asset_cfg'].joint_names, arm.joint_names)
+            self.assertEqual(joint_velocity_reward.params['asset_cfg'].joint_names,
+                             arm.joint_names + cfg.actions.hand_action.joint_names)
         # Reset IK targets the palm; changing the control point must preserve
         # both the hand's Blocker-front start and its existing tactile links.
         self.assertEqual(TCP_BODY_NAME, "right_plam_force_sensor")
