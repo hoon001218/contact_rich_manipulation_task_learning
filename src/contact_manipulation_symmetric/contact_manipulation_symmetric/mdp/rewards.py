@@ -24,7 +24,7 @@ __all__ = [
     "blocker_relocation_distance_progress",
     "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
     "blocker_pose_hold", "eef_access_front",
-    "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
+    "hand_action_l2", "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
     "time_penalty", "terminal",
@@ -719,6 +719,15 @@ def motion_torque_growth(env):
     from .events import get_task_state
 
     return get_task_state(env).torque_growth.square()
+
+
+def hand_action_l2(env):
+    """Sum squared raw commands for the six Hand channels before position clipping."""
+    action = env.action_manager.action
+    if action.ndim != 2 or action.shape[1] != 12:
+        raise ValueError("Hand action cost requires [N,12] wrench-hand actions.")
+    cost = action[:, 6:].square().sum(-1)
+    return torch.nan_to_num(cost, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def motion_action_rate(env):

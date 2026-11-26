@@ -1701,6 +1701,33 @@ class SurfaceAlignmentTests(unittest.TestCase):
             np.testing.assert_allclose(means.numpy(), values, atol=1.0e-6)
 
 
+class HandActionL2RewardTests(unittest.TestCase):
+    def test_hand_action_l2_uses_raw_hand_channels_per_environment(self):
+        action = torch.zeros(4, 12, dtype=torch.float64)
+        action[:, :6] = torch.arange(1, 5, dtype=action.dtype)[:, None] * 100.0
+        action[1, 6:] = action.new_tensor([2.0, -2.0, 2.0, -2.0, 2.0, -2.0])
+        action[2, 6:] = action.new_tensor([5.0, -5.0, 5.0, -5.0, 5.0, -5.0])
+        action[3, 6:] = action.new_tensor([0.0, 0.5, -1.0, 0.0, 1.5, -2.0])
+        before = action.clone()
+        env = SimpleNamespace(action_manager=SimpleNamespace(action=action))
+
+        cost = rewards.hand_action_l2(env)
+
+        torch.testing.assert_close(cost, action.new_tensor([0.0, 24.0, 150.0, 7.5]))
+        torch.testing.assert_close(action, before)
+
+    def test_hand_action_l2_sanitizes_only_invalid_hand_cost_rows(self):
+        action = torch.ones(4, 12, dtype=torch.float64)
+        action[0, 0] = math.nan
+        action[1, 6] = math.nan
+        action[2, 11] = math.inf
+        env = SimpleNamespace(action_manager=SimpleNamespace(action=action))
+
+        cost = rewards.hand_action_l2(env)
+
+        torch.testing.assert_close(cost, action.new_tensor([6.0, 0.0, 0.0, 6.0]))
+
+
 class ActionRateRewardTests(unittest.TestCase):
     """Grouped L2 change uses accepted wrench/hand inputs, preserving PPO raw data."""
 
