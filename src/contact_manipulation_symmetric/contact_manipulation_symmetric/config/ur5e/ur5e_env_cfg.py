@@ -170,11 +170,9 @@ class UR5eContactManipulationEnvCfg(ShelfManipulationEnvCfg):
             rescale_to_limits=True,
         )
         self.events.hand_action_limits = EventTermCfg(func=configure_hand_action_limits, mode="startup")
-        # If enabled, velocity cost covers twelve independent joints; overspeed is arm-only.
+        # Both the velocity cost and overspeed termination use the six arm joints.
         velocity_reward = getattr(self.rewards, "motion_joint_velocity", None)
         if velocity_reward is not None:
-            velocity_reward.params["asset_cfg"].joint_names = (
-                self.actions.arm_action.joint_names + self.actions.hand_action.joint_names
-            )
+            velocity_reward.params["asset_cfg"].joint_names = self.actions.arm_action.joint_names
         if self.terminations.hand_velocity is not None:
             self.terminations.hand_velocity.params["asset_cfg"].joint_names = self.actions.arm_action.joint_names

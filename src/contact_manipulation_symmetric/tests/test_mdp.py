@@ -3470,7 +3470,7 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             expected[[1, 2]] = True
             torch.testing.assert_close(actual, expected)
 
-    def test_ur5e_configuration_binds_optional_velocity_reward_and_six_arm_termination_joints(self):
+    def test_ur5e_configuration_binds_velocity_reward_and_termination_to_arm_joints(self):
         source = Path(task.__file__).parent.parent / 'config/ur5e/ur5e_env_cfg.py'
         definition = next(node for node in ast.parse(source.read_text()).body
                           if isinstance(node, ast.ClassDef) and node.name == 'UR5eContactManipulationEnvCfg')
@@ -3490,8 +3490,9 @@ class NativeVelocityTerminationTests(unittest.TestCase):
                 'velocity_reward is not None', 'self.terminations.hand_velocity is not None'))]
         # Execute actual specialization bindings for either experiment setting.
         code = compile(ast.fix_missing_locations(ast.Module(body=binding, type_ignores=[])), str(source), 'exec')
-        expected = action_names['arm_action'] + action_names['hand_action']
-        self.assertEqual(len(set(expected)), 12)
+        expected = action_names['arm_action']
+        self.assertEqual(len(set(expected)), 6)
+        self.assertTrue(set(expected).isdisjoint(action_names['hand_action']))
         for enabled in (False, True):
             velocity_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
             reward_asset = SimpleNamespace(joint_names=dataclasses.MISSING)
@@ -3506,9 +3507,7 @@ class NativeVelocityTerminationTests(unittest.TestCase):
             self.assertEqual(hasattr(cfg.rewards, 'motion_joint_velocity'), enabled)
             if enabled:
                 self.assertEqual(reward_asset.joint_names, expected)
-            self.assertEqual(velocity_asset.joint_names, action_names['arm_action'])
-            self.assertEqual(len(velocity_asset.joint_names), 6)
-            self.assertTrue(set(velocity_asset.joint_names).isdisjoint(action_names['hand_action']))
+            self.assertEqual(velocity_asset.joint_names, expected)
             self.assertIn('right_little_1_joint', action_names['hand_action'])
             cfg.terminations.hand_velocity = None
             exec(code, {'self': cfg})
@@ -3713,13 +3712,12 @@ class NativeControllerTests(unittest.TestCase):
         self.assertTrue(arm.controller_cfg.gravity_compensation)
         velocity = cfg.terminations.hand_velocity
         self.assertEqual(velocity.func.__name__, 'joint_vel_out_of_manual_limit')
-        self.assertEqual(velocity.params['max_velocity'], 3.0)
+        self.assertEqual(velocity.params['max_velocity'], 1.0)
         self.assertFalse(velocity.time_out)
         self.assertEqual(velocity.params['asset_cfg'].joint_names, arm.joint_names)
         joint_velocity_reward = getattr(cfg.rewards, 'motion_joint_velocity', None)
         if joint_velocity_reward is not None:
-            self.assertEqual(joint_velocity_reward.params['asset_cfg'].joint_names,
-                             arm.joint_names + cfg.actions.hand_action.joint_names)
+            self.assertEqual(joint_velocity_reward.params['asset_cfg'].joint_names, arm.joint_names)
         # Reset IK targets the palm; changing the control point must preserve
         # both the hand's Blocker-front start and its existing tactile links.
         self.assertEqual(TCP_BODY_NAME, "right_plam_force_sensor")
