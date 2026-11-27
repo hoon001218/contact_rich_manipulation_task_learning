@@ -96,6 +96,10 @@ def run(args, report):
     cfg = UR5eContactManipulationEnvCfg()
     term = cfg.rewards.blocker_normal_alignment
     decay = term.params["decay"]
+    if not args.exclude_fingertips:
+        # Exercise the 17-pad surface term through the native reward manager.
+        term.func = rewards.blocker_surface_normal_alignment
+        term.params = {"decay": decay}
     selected = [i for i, name in enumerate(TACTILE_BODY_NAMES)
                 if not args.exclude_fingertips or name not in FINGERTIP_BODY_NAMES]
     num_pads = len(selected)

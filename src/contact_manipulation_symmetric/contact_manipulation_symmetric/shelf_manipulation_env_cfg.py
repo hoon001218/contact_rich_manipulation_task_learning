@@ -122,9 +122,14 @@ class RewardsCfg:
         func=mdp.blocker_distance, weight=5.0, params={"decay": 10.0},
     )
     blocker_normal_alignment = RewardTermCfg(
-        func=mdp.blocker_surface_normal_alignment, weight=1.0,
-        params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))},
+        func=mdp.blocker_normal_alignment, weight=1.0,
+        params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0)), "exclude_fingertips": True},
     )
+    # To use nearest-face alignment with all 17 pads, enable this term instead.
+    # blocker_normal_alignment = RewardTermCfg(
+    #     func=mdp.blocker_surface_normal_alignment, weight=1.0,
+    #     params={"decay": math.log(2.0) / (1.0 - math.cos(math.pi / 4.0))},
+    # )
     # blocker_relocation = RewardTermCfg(
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
