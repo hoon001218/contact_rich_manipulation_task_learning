@@ -114,7 +114,7 @@ class RewardsCfg:
 
     # clearance = RewardTermCfg(func=mdp.clearance, weight=12.0)
     # Keep rewarding contact-weighted improvements on the transition into success.
-    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=75.0)
+    clearance = RewardTermCfg(func=mdp.clearance_contact_improvement, weight=30.0)
     blocker_distance = RewardTermCfg(
         func=mdp.blocker_distance, weight=3.0, params={"decay": 10.0},
     )
@@ -126,7 +126,7 @@ class RewardsCfg:
     #     func=mdp.blocker_relocation, weight=3.0, params={"decay": 10.0},
     # )
     blocker_relocation = RewardTermCfg(
-        func=mdp.blocker_relocation_distance_improvement, weight=60.0,
+        func=mdp.blocker_relocation_distance_improvement, weight=30.0,
         params={"reference_speed": 4.0, "threshold": 0.01},
     )
     blocker_contact_hold = RewardTermCfg(func=BlockerContactHold, weight=3.0)
@@ -163,7 +163,7 @@ class RewardsCfg:
         },
     )
     object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
-    hand_action_l2 = RewardTermCfg(func=mdp.hand_action_l2, weight=-0.0003)
+    hand_action_l2 = RewardTermCfg(func=mdp.hand_action_l2, weight=-0.03)
     # Command variation and actual speed are different control objectives.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
     motion_joint_velocity = RewardTermCfg(
