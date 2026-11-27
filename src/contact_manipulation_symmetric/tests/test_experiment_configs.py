@@ -151,7 +151,7 @@ class ExperimentConfigurationTests(unittest.TestCase):
         self.assertEqual(baseline["mdp"]["finish_contact_confirmation_steps"], 3)
         relocation = baseline["rewards"]["blocker_relocation"]
         self.assertIs(relocation["func"], self.mdp.blocker_relocation_distance_improvement)
-        self.assertEqual(relocation["params"], {"reference_speed": 4.0, "threshold": 0.01})
+        self.assertEqual(relocation["params"], {"reference_speed": 4.0, "threshold": 0.01, "contact_exponent": 1.2})
         for name in ("clearance", "blocker_distance", "blocker_contact_hold", "blocker_normal_alignment"):
             self.assertFalse(baseline["rewards"][name]["params"].get("stop_on_success", False))
         pose_hold = baseline["rewards"]["blocker_pose_hold"]
@@ -171,6 +171,7 @@ class ExperimentConfigurationTests(unittest.TestCase):
             with self.subTest(variant=variant):
                 expected = freeze(self.baseline_env())
                 expected["rewards"]["terminal"] = None
+                expected["rewards"]["clearance"]["params"]["contact_exponent"] = 1.0
                 # Existing Learning 2/3 comparisons retain their historical
                 # relocation definition even after the default becomes Learning 1.
                 if variant != "relocation_distance":
@@ -178,6 +179,8 @@ class ExperimentConfigurationTests(unittest.TestCase):
                     expected["rewards"]["blocker_relocation"]["func"] = (
                         self.mdp.blocker_relocation_contact_progress)
                     expected["rewards"]["blocker_relocation"]["params"] = {"decay": 10.0}
+                else:
+                    expected["rewards"]["blocker_relocation"]["params"].pop("contact_exponent")
                 # Learning 1/3 keep the original access depth; only the main
                 # task combines metric relocation with rear-wall access now.
                 expected["access_region_to_back_wall"] = variant == "access_back_wall"

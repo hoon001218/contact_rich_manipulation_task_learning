@@ -334,6 +334,14 @@ def _current_blocker_contact_count(env, threshold):
     return current.sum(-1).to(force.dtype)
 
 
+def _blocker_contact_multiplier(env, threshold, contact_exponent):
+    """Weight current Blocker contacts without changing the linear default."""
+    if not math.isfinite(contact_exponent) or contact_exponent <= 0.0:
+        raise ValueError("Contact exponent must be finite and positive.")
+    count = _current_blocker_contact_count(env, threshold)
+    return count if contact_exponent == 1.0 else count.pow(contact_exponent)
+
+
 def _positive_improvement(current, previous):
     """Finite, positive one-control-step quality change; invalid pairs pay zero."""
     valid = torch.isfinite(current) & torch.isfinite(previous)
@@ -370,13 +378,14 @@ def _before_success(env, score):
     return torch.where(get_task_state(env).success, 0.0, score)
 
 
-def clearance_contact_improvement(env, threshold=0.01, *, stop_on_success=False):
-    """Positive part of the existing contact-weighted one-step progress.
+def clearance_contact_improvement(env, threshold=0.01, *, stop_on_success=False, contact_exponent=1.0):
+    """Positive one-step clearance progress weighted by the current pad count raised to a power.
 
     The native RewardManager applies a positive weight and dt. The original
     signed function stays available for older reward configurations.
     """
-    reward = clearance_contact_progress(env, threshold=threshold).clamp_min(0.0)
+    progress = _clearance_quality_change(env).clamp_min(0.0)
+    reward = _blocker_contact_multiplier(env, threshold, contact_exponent) * progress
     return _before_success(env, reward) if stop_on_success else reward
 
 
@@ -566,11 +575,12 @@ def blocker_relocation_distance_progress(env, reference_speed=4.0, threshold=0.0
     return _current_blocker_contact_count(env, threshold) * progress
 
 
-def blocker_relocation_distance_improvement(env, reference_speed=4.0, threshold=0.01, *, stop_on_success=False):
-    """Positive normalized approach progress weighted by current contact pads."""
-    reward = blocker_relocation_distance_progress(
-        env, reference_speed=reference_speed, threshold=threshold,
-    ).clamp_min(0.0)
+def blocker_relocation_distance_improvement(
+    env, reference_speed=4.0, threshold=0.01, *, stop_on_success=False, contact_exponent=1.0,
+):
+    """Positive normalized approach progress weighted by the current pad count raised to a power."""
+    progress = _relocation_distance_change(env, reference_speed).clamp_min(0.0)
+    reward = _blocker_contact_multiplier(env, threshold, contact_exponent) * progress
     return _before_success(env, reward) if stop_on_success else reward
 
 

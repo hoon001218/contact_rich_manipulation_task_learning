@@ -211,6 +211,7 @@ class ClearanceSplitTests(unittest.TestCase):
                         for node in cfg.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)}
         self.assertEqual(ast.unparse(declarations["clearance"]["func"]), "mdp.clearance_contact_improvement")
         self.assertEqual(ast.literal_eval(declarations["clearance"]["weight"]), 30.)
+        self.assertEqual(ast.literal_eval(declarations["clearance"]["params"]), {"contact_exponent": 1.2})
         self.assertNotIn("clearance_regression", declarations)
 
 

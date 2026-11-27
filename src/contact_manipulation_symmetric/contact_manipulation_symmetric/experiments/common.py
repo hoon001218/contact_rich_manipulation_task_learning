@@ -1,4 +1,4 @@
-"""The single shared change across the three reward/control experiments."""
+"""Shared configuration for the three earlier reward/control experiments."""
 
 from isaaclab.utils import configclass
 
@@ -13,3 +13,5 @@ class ExperimentEnvCfg(UR5eContactManipulationEnvCfg):
         super().__post_init__()
         # Success/failure/time-out termination conditions remain inherited.
         self.rewards.terminal = None
+        # Match these experiments' historical linear contact weighting.
+        self.rewards.clearance.params["contact_exponent"] = 1.0

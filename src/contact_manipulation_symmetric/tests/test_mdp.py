@@ -868,7 +868,7 @@ class RelocationRewardTests(unittest.TestCase):
         self.assertEqual(ast.unparse(fields['func']), 'mdp.blocker_relocation_distance_improvement')
         self.assertGreater(ast.literal_eval(fields['weight']), 0.)
         params = eval(compile(ast.Expression(fields['params']), str(source), 'eval'), {'math': math})
-        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01})
+        self.assertEqual(params, {'reference_speed': 4., 'threshold': .01, 'contact_exponent': 1.2})
         names = {node.targets[0].id for node in definition.body if isinstance(node, ast.Assign)}
         self.assertNotIn('blocker_relocation_regression', names)
 
@@ -879,6 +879,24 @@ class RelocationRewardTests(unittest.TestCase):
 
 
 class ContactProgressRewardTests(unittest.TestCase):
+    def test_positive_progress_terms_can_raise_current_contact_count_to_a_power(self):
+        contacts = torch.tensor([0., 1., 2., 4., 17., 17.], dtype=torch.float64)
+        progress = contacts.new_tensor([.2, .2, .2, .2, -.2, 0.])
+        linear = contacts.new_tensor([0., .2, .4, .8, 0., 0.])
+        nonlinear = contacts.new_tensor([0., .2, .2 * 2**1.2, .2 * 4**1.2, 0., 0.])
+        env = SimpleNamespace()
+        terms = (
+            (rewards.clearance_contact_improvement, '_clearance_quality_change'),
+            (rewards.blocker_relocation_distance_improvement, '_relocation_distance_change'),
+        )
+        for term, progress_function in terms:
+            with self.subTest(term=term.__name__), \
+                 patch.object(rewards, progress_function, return_value=progress), \
+                 patch.object(rewards, '_current_blocker_contact_count', return_value=contacts):
+                torch.testing.assert_close(term(env, contact_exponent=1.2), nonlinear)
+                torch.testing.assert_close(term(env, contact_exponent=1.0), linear)
+                torch.testing.assert_close(term(env), linear)
+
     @staticmethod
     def regions(state, batch):
         polygon = batch.center.new_tensor([[.3, -.1], [.4, -.1], [.4, .1], [.3, .1]])

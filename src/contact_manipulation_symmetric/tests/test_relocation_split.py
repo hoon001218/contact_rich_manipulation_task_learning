@@ -226,7 +226,8 @@ class RelocationSplitTests(unittest.TestCase):
         positive = declarations['blocker_relocation']
         self.assertEqual(ast.unparse(positive['func']), 'mdp.blocker_relocation_distance_improvement')
         self.assertEqual(ast.literal_eval(positive['weight']), 30.)
-        self.assertEqual(ast.literal_eval(positive['params']), {'reference_speed': 4., 'threshold': .01})
+        self.assertEqual(ast.literal_eval(positive['params']),
+                         {'reference_speed': 4., 'threshold': .01, 'contact_exponent': 1.2})
         self.assertNotIn('blocker_relocation_regression', declarations)
         state, contacts = self.state([.4], [.36]), torch.tensor([2.], dtype=torch.float64)
         env = SimpleNamespace(step_dt=.02)
