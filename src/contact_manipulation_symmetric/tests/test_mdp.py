@@ -1728,6 +1728,27 @@ class HandActionL2RewardTests(unittest.TestCase):
         torch.testing.assert_close(cost, action.new_tensor([6.0, 0.0, 0.0, 6.0]))
 
 
+class HandActionLimitsRewardTests(unittest.TestCase):
+    def test_raw_hand_cost_is_linear_outside_the_soft_range(self):
+        action = torch.zeros(5, 12, dtype=torch.float64)
+        action[:, :6] = 100.0
+        action[0, 6:8] = action.new_tensor([1.8, -1.8])
+        action[1, 6:8] = action.new_tensor([1.9, -1.9])
+        action[2, 6:8] = action.new_tensor([2.0, -2.0])
+        action[3, 6:8] = action.new_tensor([2.1, -2.1])
+        action[4, 6:8] = action.new_tensor([math.nan, 3.0])
+        env = SimpleNamespace(action_manager=SimpleNamespace(action=action))
+        state = clipped_action_state(action)
+
+        with patch.object(task, "get_task_state", return_value=state):
+            cost = rewards.hand_action_limits(env, soft_limit_fraction=0.9)
+            state.bindings.action_limits[6:] = 1.0
+            rescaled_cost = rewards.hand_action_limits(env, soft_limit_fraction=0.9)
+
+        torch.testing.assert_close(cost, action.new_tensor([0.0, 0.2, 0.4, 0.6, 0.0]))
+        torch.testing.assert_close(rescaled_cost[2], action.new_tensor(2.2))
+
+
 class ActionRateRewardTests(unittest.TestCase):
     """Grouped L2 change uses accepted wrench/hand inputs, preserving PPO raw data."""
 

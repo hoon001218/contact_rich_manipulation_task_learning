@@ -24,7 +24,8 @@ __all__ = [
     "blocker_relocation_distance_progress",
     "blocker_relocation_distance_improvement", "blocker_relocation_distance_regression",
     "blocker_pose_hold", "eef_access_front",
-    "hand_action_l2", "motion_action_rate", "motion_joint_velocity", "motion_force_growth", "motion_torque_growth",
+    "hand_action_l2", "hand_action_limits", "motion_action_rate", "motion_joint_velocity",
+    "motion_force_growth", "motion_torque_growth",
     "object_stability",
     "singularity_margin", "singularity_penalty", "motion_singularity",
     "time_penalty", "terminal",
@@ -727,6 +728,19 @@ def hand_action_l2(env):
     if action.ndim != 2 or action.shape[1] != 12:
         raise ValueError("Hand action cost requires [N,12] wrench-hand actions.")
     cost = action[:, 6:].square().sum(-1)
+    return torch.nan_to_num(cost, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def hand_action_limits(env, *, soft_limit_fraction):
+    """Sum distances outside the symmetric soft range of the raw Hand commands."""
+    from .events import get_task_state
+
+    action = env.action_manager.action
+    if action.ndim != 2 or action.shape[1] != 12:
+        raise ValueError("Hand action cost requires [N,12] wrench-hand actions.")
+    clip_limits = get_task_state(env).bindings.action_limits[6:]
+    soft_limits = soft_limit_fraction * clip_limits
+    cost = (action[:, 6:].abs() - soft_limits).clamp_min(0.0).sum(-1)
     return torch.nan_to_num(cost, nan=0.0, posinf=0.0, neginf=0.0)
 
 
