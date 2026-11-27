@@ -163,7 +163,7 @@ class RewardsCfg:
         },
     )
     object_collision = RewardTermCfg(func=mdp.object_collision, weight=-0.5)
-    hand_action_l2 = RewardTermCfg(func=mdp.hand_action_l2, weight=-0.03)
+    hand_action_l2 = RewardTermCfg(func=mdp.hand_action_l2, weight=-0.003)
     # Command variation and actual speed are different control objectives.
     motion_action_rate = RewardTermCfg(func=mdp.motion_action_rate, weight=-0.03)
     motion_joint_velocity = RewardTermCfg(
